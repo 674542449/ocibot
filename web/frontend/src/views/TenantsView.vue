@@ -250,8 +250,8 @@ key_file=~/.oci/oci_api_key.pem"
 
       <div class="pwd-policy card-inset">
         <div class="pwd-policy-head">
-          <strong>Oracle 控制台密码提醒</strong>
-          <span class="muted" style="font-size: 12px">仅本地提醒，不会替你改 Oracle 密码</span>
+          <strong>Oracle 控制台密码提醒（写数据库）</strong>
+          <span class="muted" style="font-size: 12px">可改天数 / 改密日；0=关闭提醒</span>
         </div>
         <div class="grid-2">
           <div class="field">
@@ -260,12 +260,26 @@ key_file=~/.oci/oci_api_key.pem"
           </div>
           <div class="field">
             <label>提醒周期（天）</label>
-            <input v-model.number="form.password_expiry_days" type="number" min="0" max="3650" />
+            <div class="row" style="gap: 0.4rem">
+              <input
+                v-model.number="form.password_expiry_days"
+                type="number"
+                min="0"
+                max="3650"
+                style="flex: 1"
+              />
+              <button type="button" title="关闭到期提醒" @click="form.password_expiry_days = 0">关</button>
+              <button type="button" title="常用 90 天" @click="form.password_expiry_days = 90">90</button>
+              <button type="button" title="常用 120 天" @click="form.password_expiry_days = 120">120</button>
+            </div>
           </div>
         </div>
         <p class="field-hint" style="margin: 0">
-          填 <strong>0</strong> = 关闭到期提醒（不强制 120 天）。Oracle 账号本身是否强制改密以官网策略为准；
-          这里只决定面板徽章与推送。修改后点「仅保存密码策略」或下方「保存」写入数据库。
+          这是面板本地策略，会写入租户表
+          <code>password_expiry_days</code> /
+          <code>password_changed_at</code>。
+          填 <strong>0</strong> 关闭徽章与推送；不是 Oracle 官网强制改密。
+          改完后请点「仅保存密码策略」或「保存全部」。
         </p>
         <p v-if="editPolicyPreview" class="muted" style="margin: 0; font-size: 13px">
           {{ editPolicyPreview }}
@@ -280,14 +294,14 @@ key_file=~/.oci/oci_api_key.pem"
             :disabled="saving || !editingId"
             @click="savePasswordPolicyOnly"
           >
-            仅保存密码策略
+            {{ saving ? '写入中…' : '仅保存密码策略' }}
           </button>
         </div>
       </div>
 
       <div class="row">
         <button class="primary" :disabled="saving" @click="saveManual">
-          {{ saving ? '保存中…' : '保存' }}
+          {{ saving ? '保存中…' : '保存全部' }}
         </button>
         <button @click="showForm = false">取消</button>
       </div>
@@ -362,8 +376,9 @@ function passwordBadge(t: Tenant): { cls: string; text: string } {
   // Prefer server-computed fields (real countdown from DB values).
   const status = t.password_status
   const left = t.password_days_left
-  if (status === 'off' || (status == null && Number(t.password_expiry_days || 0) <= 0)) {
-    return { cls: '', text: '未启用' }
+  const days = Number(t.password_expiry_days || 0)
+  if (status === 'off' || days <= 0) {
+    return { cls: '', text: '提醒关闭' }
   }
   if (status === 'expired' || (typeof left === 'number' && left < 0)) {
     const n = typeof left === 'number' ? Math.abs(left) : '?'
@@ -373,11 +388,9 @@ function passwordBadge(t: Tenant): { cls: string; text: string } {
     return { cls: 'warn', text: `${left ?? '?'} 天后到期` }
   }
   if (typeof left === 'number') {
-    return { cls: 'running', text: `${left} 天` }
+    return { cls: 'running', text: `还剩 ${left} 天` }
   }
   // Fallback client compute when API is older
-  const days = Number(t.password_expiry_days || 0)
-  if (days <= 0) return { cls: '', text: '未启用' }
   const base = (t.password_changed_at || t.created_at || '').slice(0, 10)
   if (!base) return { cls: 'warn', text: '未设基准日' }
   const start = new Date(base + 'T00:00:00Z')
@@ -386,7 +399,7 @@ function passwordBadge(t: Tenant): { cls: string; text: string } {
   const computed = Math.floor((expiry.getTime() - Date.now()) / 86400000)
   if (computed < 0) return { cls: 'err', text: `已过期 ${Math.abs(computed)} 天` }
   if (computed <= 14) return { cls: 'warn', text: `${computed} 天后到期` }
-  return { cls: 'running', text: `${computed} 天` }
+  return { cls: 'running', text: `还剩 ${computed} 天` }
 }
 
 function passwordHint(t: Tenant): string {
@@ -593,15 +606,23 @@ async function saveManual() {
         region: form.region,
         compartment_ocid: form.compartment_ocid,
         description: form.description,
-        password_changed_at: form.password_changed_at,
-        password_expiry_days: form.password_expiry_days,
+        password_changed_at: form.password_changed_at || '',
+        password_expiry_days: Number(form.password_expiry_days || 0),
         budget_monthly_usd: form.budget_monthly_usd,
       }
       if (form.private_key_pem.trim()) {
         payload.private_key_pem = form.private_key_pem
       }
-      await api.patch(`/tenants/${editingId.value}`, payload)
-      msg.value = '已更新'
+      const { data } = await api.patch<Tenant>(`/tenants/${editingId.value}`, payload)
+      // Prefer server-computed countdown fields immediately.
+      const idx = tenants.value.findIndex((x) => x.id === editingId.value)
+      if (idx >= 0) tenants.value[idx] = data
+      form.password_changed_at = (data.password_changed_at || '').slice(0, 10)
+      form.password_expiry_days = data.password_expiry_days ?? 0
+      msg.value =
+        data.password_expiry_days > 0
+          ? `已保存到数据库 · 密码策略：${data.password_status || 'ok'}，到期 ${data.password_expires_on || '—'}`
+          : '已保存到数据库 · 密码到期提醒已关闭（0 天）'
     } else {
       await api.post('/tenants', {
         name: form.name,
@@ -612,6 +633,9 @@ async function saveManual() {
         private_key_pem: form.private_key_pem,
         compartment_ocid: form.compartment_ocid,
         description: form.description,
+        password_changed_at: form.password_changed_at || '',
+        password_expiry_days: Number(form.password_expiry_days || 0),
+        budget_monthly_usd: form.budget_monthly_usd,
       })
       msg.value = '已添加'
     }
@@ -665,7 +689,9 @@ async function markPasswordChanged(t: Tenant) {
       mark_changed_today: true,
     })
     applyPolicyToTenant(t, data)
-    msg.value = `${t.name}: 已记为今天改密 · ${data.message || `到期 ${data.password_expires_on || '—'}`}`
+    // Keep list sorted identity stable; force array refresh for Vue.
+    tenants.value = tenants.value.map((x) => (x.id === t.id ? { ...x, ...t } : x))
+    msg.value = `${t.name}: 已写入数据库（今天改密）· ${data.message || `到期 ${data.password_expires_on || '—'}`}`
   } catch (e: any) {
     error.value = e?.message || '更新密码策略失败'
   } finally {
@@ -683,18 +709,26 @@ async function savePasswordPolicyOnly() {
   msg.value = ''
   saving.value = true
   try {
+    const days = Number(form.password_expiry_days)
+    const payload = {
+      password_changed_at: form.password_changed_at || '',
+      password_expiry_days: Number.isFinite(days) ? Math.max(0, Math.min(3650, Math.trunc(days))) : 0,
+    }
     const { data } = await api.patch<PasswordPolicy>(
       `/tenants/${editingId.value}/password-policy`,
-      {
-        password_changed_at: form.password_changed_at || '',
-        password_expiry_days: Number(form.password_expiry_days || 0),
-      },
+      payload,
     )
-    form.password_changed_at = data.password_changed_at
+    form.password_changed_at = (data.password_changed_at || '').slice(0, 10)
     form.password_expiry_days = data.password_expiry_days
     const hit = tenants.value.find((x) => x.id === editingId.value)
-    if (hit) applyPolicyToTenant(hit, data)
-    msg.value = `密码策略已写入数据库 · ${data.message || `到期 ${data.password_expires_on || '—'}`}`
+    if (hit) {
+      applyPolicyToTenant(hit, data)
+      tenants.value = tenants.value.map((x) => (x.id === hit.id ? { ...hit } : x))
+    }
+    msg.value =
+      data.password_expiry_days > 0
+        ? `密码策略已写入数据库 · ${data.message || `到期 ${data.password_expires_on || '—'}`}`
+        : '密码策略已写入数据库 · 到期提醒已关闭（0 天）'
   } catch (e: any) {
     error.value = e?.message || '保存密码策略失败'
   } finally {

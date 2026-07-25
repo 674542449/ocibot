@@ -364,7 +364,9 @@ def update_password_policy(
         changed = True
 
     if "password_expiry_days" in data and data["password_expiry_days"] is not None:
-        row.password_expiry_days = int(data["password_expiry_days"])
+        row.password_expiry_days = max(0, min(3650, int(data["password_expiry_days"])))
+        # Changing the period should allow a fresh notification cycle.
+        row.pwd_expiry_notified_on = ""
         changed = True
 
     if not changed:

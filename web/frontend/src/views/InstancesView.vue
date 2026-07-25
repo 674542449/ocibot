@@ -9,7 +9,7 @@
       </div>
       <div class="page-tools">
         <select v-model="tenantId">
-          <option value="">全部租户（聚合）</option>
+          <option v-if="!tenants.length" value="" disabled>请先添加租户</option>
           <option v-for="t in tenants" :key="t.id" :value="t.id">{{ t.name }} · {{ t.region }}</option>
         </select>
         <input v-model="search" type="search" placeholder="搜索名称 / IP / OCID" />
@@ -380,30 +380,37 @@ function copyIp(text?: string | null, ev?: Event) {
 async function loadTenants() {
   const { data } = await api.get<Tenant[]>('/tenants')
   tenants.value = data
+  // Default to the first tenant only — never auto-aggregate all tenants.
+  if (!tenantId.value && data.length) {
+    tenantId.value = data[0].id
+  }
+  // If current selection disappeared (deleted tenant), fall back to first.
+  if (tenantId.value && data.length && !data.some((t) => t.id === tenantId.value)) {
+    tenantId.value = data[0].id
+  }
 }
 
 let loadSeq = 0
 async function load() {
   error.value = ''
   msg.value = ''
+  if (!tenantId.value) {
+    instances.value = []
+    loading.value = false
+    if (!tenants.value.length) {
+      error.value = '还没有租户。请先到「租户」页添加 API 配置。'
+    }
+    return
+  }
   loading.value = true
   const seq = ++loadSeq
   try {
-    let data: Instance[]
-    if (tenantId.value) {
-      const res = await api.get<Instance[]>(`/tenants/${tenantId.value}/instances`, {
-        params: { resolve_ips: resolveIps.value, include_subcompartments: true },
-      })
-      data = res.data
-    } else {
-      const res = await api.get<Instance[]>('/instances', {
-        params: { resolve_ips: resolveIps.value },
-      })
-      data = res.data
-    }
+    const res = await api.get<Instance[]>(`/tenants/${tenantId.value}/instances`, {
+      params: { resolve_ips: resolveIps.value, include_subcompartments: true },
+    })
     // Discard out-of-order responses from a superseded tenant switch.
     if (seq !== loadSeq) return
-    instances.value = data
+    instances.value = res.data
   } catch (e: any) {
     if (seq !== loadSeq) return
     error.value = e?.message || '加载失败'
@@ -493,18 +500,25 @@ async function terminate(ins: Instance) {
   }
 }
 
-watch(tenantId, () => {
-  load()
+watch(tenantId, (id, prev) => {
+  // Skip the initial empty→first-tenant assignment double-load handled in onMounted.
+  if (!id) {
+    instances.value = []
+    return
+  }
+  if (id !== prev) load()
 })
 
 onMounted(async () => {
   try {
     await loadTenants()
     const q = String(route.query.tenant || '')
-    if (q && q !== tenantId.value) {
-      // Changing tenantId triggers the watcher, which loads — avoid a double fetch.
-      tenantId.value = q
-    } else {
+    if (q && tenants.value.some((t) => t.id === q)) {
+      // Changing tenantId triggers the watcher, which loads — avoid a double fetch
+      // only when the value actually changes.
+      if (q !== tenantId.value) tenantId.value = q
+      else await load()
+    } else if (tenantId.value) {
       await load()
     }
   } catch (e: any) {
