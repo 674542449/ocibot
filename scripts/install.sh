@@ -152,22 +152,61 @@ do_install() {
   warn "健康检查超时，请运行：$0 status  或  docker compose -f $REPO_DIR/docker-compose.yml logs"
 }
 
+sync_repo_to_origin() {
+  # Force local tree to match origin/<branch>, preserving only web/.env.
+  # Shallow clones + local commits (or mixed histories) often break --ff-only.
+  need_cmd git
+  if [ ! -d "$REPO_DIR/.git" ]; then
+    warn "不是 git 仓库，跳过代码同步：$REPO_DIR"
+    return 0
+  fi
+  log "同步代码到 origin/$BRANCH …"
+  # Keep secrets even if reset is hard.
+  if [ -f "$REPO_DIR/web/.env" ]; then
+    cp -a "$REPO_DIR/web/.env" "/tmp/ocibot.env.backup.$$" || true
+  fi
+  # Show divergence for operators (best-effort).
+  git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null | awk '{print "本地 HEAD: "$0}' || true
+  if ! git -C "$REPO_DIR" fetch --depth 50 origin "$BRANCH"; then
+    warn "git fetch 失败，将尝试全量 fetch…"
+    git -C "$REPO_DIR" fetch origin "$BRANCH" || die "无法从 origin 拉取 $BRANCH"
+  fi
+  if ! git -C "$REPO_DIR" rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
+    die "找不到 origin/$BRANCH，请检查远程仓库"
+  fi
+  local remote_sha
+  remote_sha="$(git -C "$REPO_DIR" rev-parse --short "origin/$BRANCH")"
+  log "远程 origin/$BRANCH: $remote_sha"
+  # Discard local commits/dirty tracked files; untracked junk outside .env is left alone.
+  git -C "$REPO_DIR" checkout -B "$BRANCH" "origin/$BRANCH"
+  git -C "$REPO_DIR" reset --hard "origin/$BRANCH"
+  git -C "$REPO_DIR" clean -fd --exclude=web/.env --exclude=web_data || true
+  if [ -f "/tmp/ocibot.env.backup.$$" ]; then
+    mkdir -p "$REPO_DIR/web"
+    mv -f "/tmp/ocibot.env.backup.$$" "$REPO_DIR/web/.env"
+    log "已恢复 web/.env"
+  fi
+  log "代码已对齐：$(git -C "$REPO_DIR" rev-parse --short HEAD)"
+}
+
 do_update() {
   ensure_docker
   ensure_repo
   if [ -d "$REPO_DIR/.git" ]; then
-    log "拉取最新代码（$BRANCH）…"
-    need_cmd git
-    git -C "$REPO_DIR" fetch --depth 1 origin "$BRANCH" || true
-    git -C "$REPO_DIR" checkout "$BRANCH" || true
-    git -C "$REPO_DIR" pull --ff-only origin "$BRANCH" || \
-      warn "git pull 失败（可能是本地改动）— 继续用当前树 rebuild"
+    sync_repo_to_origin
+  else
+    warn "目录无 .git，仅重建当前文件树（不会拉 GitHub 新代码）"
   fi
   ensure_env
   export_build_env
-  log "重新构建并滚动更新…"
-  compose up -d --build
-  log "更新完成。健康检查：curl -fsS http://127.0.0.1:${OCIBOT_PORT:-8000}/api/health"
+  log "重新构建并滚动更新（无缓存前端层）…"
+  # --pull refreshes base images; build runs with current tree after hard reset.
+  compose build --pull api worker || compose build api worker
+  compose up -d
+  log "更新完成。请验证："
+  log "  curl -fsS http://127.0.0.1:${OCIBOT_PORT:-8000}/api/health"
+  log "  期望 version 为最新（当前源码 app_version 见 web/backend/config.py）"
+  curl -fsS "http://127.0.0.1:${OCIBOT_PORT:-8000}/api/health" && echo || warn "API 暂未就绪，稍候再 curl"
 }
 
 do_status() {

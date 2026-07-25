@@ -317,55 +317,104 @@ def _apply_job(username: str) -> None:
             )
             return
 
-        # 1) git fetch/pull on host repo
+        # 1) git fetch + hard reset on host repo (same policy as install.sh update)
         branch = _branch()
-        code, out = _run_cmd(["git", "-C", str(host), "status", "--porcelain"], timeout=30)
-        log_buf = _append_log(log_buf, f"$ git status\n{out}\n")
-        if code != 0:
-            save("error", "无法读取宿主机仓库 git 状态", last_error=out[-500:])
-            return
-        dirty = bool(out.strip())
-        if dirty:
-            log_buf = _append_log(log_buf, "[warn] working tree dirty; pull may fail\n")
+        code, out = _run_cmd(["git", "-C", str(host), "rev-parse", "--short", "HEAD"], timeout=20)
+        log_buf = _append_log(log_buf, f"local HEAD before: {out}\n")
+        save("running", "正在 fetch 远程…", log_tail=log_buf)
 
-        code, out = _run_cmd(["git", "-C", str(host), "fetch", "--depth", "1", "origin", branch], timeout=120)
-        log_buf = _append_log(log_buf, f"$ git fetch origin {branch}\n{out}\n")
-        save("running", "已 fetch，正在合并…", log_tail=log_buf)
-
-        code, out = _run_cmd(["git", "-C", str(host), "checkout", branch], timeout=60)
-        log_buf = _append_log(log_buf, f"$ git checkout {branch}\n{out}\n")
         code, out = _run_cmd(
-            ["git", "-C", str(host), "pull", "--ff-only", "origin", branch],
-            timeout=120,
+            ["git", "-C", str(host), "fetch", "--depth", "50", "origin", branch],
+            timeout=180,
         )
-        log_buf = _append_log(log_buf, f"$ git pull --ff-only origin {branch}\n{out}\n")
+        log_buf = _append_log(log_buf, f"$ git fetch origin {branch}\n{out}\n")
+        if code != 0:
+            code, out = _run_cmd(
+                ["git", "-C", str(host), "fetch", "origin", branch],
+                timeout=180,
+            )
+            log_buf = _append_log(log_buf, f"$ git fetch origin {branch} (full)\n{out}\n")
+            if code != 0:
+                save("error", "git fetch 失败", last_error=out[-800:], log_tail=log_buf)
+                return
+
+        # Preserve .env across hard reset
+        env_src = host / "web" / ".env"
+        env_bak = Path(f"/tmp/ocibot.env.backup.{os.getpid()}")
+        if env_src.is_file():
+            try:
+                shutil.copy2(env_src, env_bak)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("backup .env failed: %s", exc)
+
+        code, out = _run_cmd(
+            ["git", "-C", str(host), "checkout", "-B", branch, f"origin/{branch}"],
+            timeout=60,
+        )
+        log_buf = _append_log(log_buf, f"$ git checkout -B {branch} origin/{branch}\n{out}\n")
+        code, out = _run_cmd(
+            ["git", "-C", str(host), "reset", "--hard", f"origin/{branch}"],
+            timeout=60,
+        )
+        log_buf = _append_log(log_buf, f"$ git reset --hard origin/{branch}\n{out}\n")
         if code != 0:
             save(
                 "error",
-                "git pull 失败（可能有本地改动）。请 SSH 上服务器手动处理后再更新。",
+                "git reset 失败，请 SSH 上服务器手动：git fetch && git reset --hard origin/main",
                 last_error=out[-800:],
                 log_tail=log_buf,
             )
             return
 
-        # Record new sha
+        if env_bak.is_file():
+            try:
+                (host / "web").mkdir(parents=True, exist_ok=True)
+                shutil.copy2(env_bak, env_src)
+                env_bak.unlink(missing_ok=True)
+                log_buf = _append_log(log_buf, "restored web/.env\n")
+            except Exception as exc:  # noqa: BLE001
+                log_buf = _append_log(log_buf, f"[warn] restore .env failed: {exc}\n")
+
         code, out = _run_cmd(["git", "-C", str(host), "rev-parse", "HEAD"], timeout=20)
         new_sha = out.strip() if code == 0 else ""
-        log_buf = _append_log(log_buf, f"HEAD={new_sha}\n")
+        log_buf = _append_log(log_buf, f"HEAD after reset={new_sha}\n")
 
-        # 2) docker compose build/up (recreates api/worker; db volume preserved)
+        # 2) docker compose build + up
         compose = _compose_cmd(host)
-        save("running", "正在构建并重启容器（可能需几分钟）…", log_tail=log_buf)
+        save("running", "正在构建镜像（可能需几分钟）…", log_tail=log_buf)
         code, out = _run_cmd(
-            [*compose, "up", "-d", "--build"],
+            [*compose, "build", "--pull", "api", "worker"],
             cwd=str(host),
             timeout=1200,
         )
-        log_buf = _append_log(log_buf, f"$ {' '.join(compose)} up -d --build\n{out}\n")
+        log_buf = _append_log(log_buf, f"$ compose build\n{out}\n")
+        if code != 0:
+            code, out = _run_cmd(
+                [*compose, "build", "api", "worker"],
+                cwd=str(host),
+                timeout=1200,
+            )
+            log_buf = _append_log(log_buf, f"$ compose build (retry)\n{out}\n")
+            if code != 0:
+                save(
+                    "error",
+                    "docker compose build 失败",
+                    last_error=out[-800:],
+                    log_tail=log_buf,
+                )
+                return
+
+        save("running", "正在启动新容器…", log_tail=log_buf)
+        code, out = _run_cmd(
+            [*compose, "up", "-d"],
+            cwd=str(host),
+            timeout=300,
+        )
+        log_buf = _append_log(log_buf, f"$ compose up -d\n{out}\n")
         if code != 0:
             save(
                 "error",
-                "docker compose 更新失败，请查看日志或 SSH 手动执行 ./scripts/install.sh update",
+                "docker compose up 失败",
                 last_error=out[-800:],
                 log_tail=log_buf,
             )
@@ -373,7 +422,7 @@ def _apply_job(username: str) -> None:
 
         save(
             "success",
-            f"更新完成（{new_sha[:7] or 'ok'}）。请强制刷新浏览器；若页面短暂不可用属正常现象。",
+            f"更新完成（{new_sha[:7] or 'ok'}）。请强制刷新浏览器（Ctrl+F5）。",
             log_tail=log_buf,
             applied_sha=new_sha,
         )
