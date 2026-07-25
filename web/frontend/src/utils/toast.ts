@@ -68,17 +68,66 @@ export function showToast(text: string, kind: ToastKind = 'ok', ms = 1800) {
   return id
 }
 
-/** Copy text and show a toast; never throws. Returns true on success. */
-export async function copyText(text: string, label = '已复制'): Promise<boolean> {
-  const v = (text || '').trim()
-  if (!v || v === '—') return false
+/**
+ * Fallback for insecure contexts / denied clipboard permission / older browsers.
+ * Uses a transient textarea + execCommand('copy') — works on HTTP LAN deploys.
+ */
+function copyViaExecCommand(text: string): boolean {
   try {
-    await navigator.clipboard.writeText(v)
-    const short = v.length > 36 ? `${v.slice(0, 36)}…` : v
-    showToast(`${label}：${short}`, 'ok')
-    return true
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.setAttribute('readonly', '')
+    ta.setAttribute('aria-hidden', 'true')
+    // iOS / some WebViews need the field visible & selectable.
+    ta.style.position = 'fixed'
+    ta.style.top = '0'
+    ta.style.left = '0'
+    ta.style.width = '1px'
+    ta.style.height = '1px'
+    ta.style.padding = '0'
+    ta.style.border = 'none'
+    ta.style.outline = 'none'
+    ta.style.boxShadow = 'none'
+    ta.style.background = 'transparent'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.focus()
+    ta.select()
+    ta.setSelectionRange(0, text.length)
+    const ok = document.execCommand('copy')
+    document.body.removeChild(ta)
+    return ok
   } catch {
-    showToast('复制失败', 'err')
     return false
   }
+}
+
+async function writeClipboard(text: string): Promise<boolean> {
+  // Prefer modern API when available and likely to succeed (secure context).
+  if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return true
+    } catch {
+      // Fall through — common on http://LAN-IP, missing permission, or iframe.
+    }
+  }
+  return copyViaExecCommand(text)
+}
+
+/** Copy text and show a toast; never throws. Returns true on success. */
+export async function copyText(text: string, label = '已复制'): Promise<boolean> {
+  // Normalize NBSP / zero-width / BOM that sometimes sneak in from UI text nodes.
+  const v = String(text ?? '')
+    .replace(/[ ​﻿]/g, ' ')
+    .trim()
+  if (!v || v === '—' || v === '-' || v === '–') return false
+  const ok = await writeClipboard(v)
+  const short = v.length > 36 ? `${v.slice(0, 36)}…` : v
+  if (ok) {
+    showToast(`${label}：${short}`, 'ok')
+    return true
+  }
+  showToast('复制失败（浏览器限制，请手动全选复制）', 'err', 2800)
+  return false
 }

@@ -27,14 +27,17 @@
           <div
             class="muted copyable"
             style="font-size: 11px; word-break: break-all"
-            title="双击复制 OCID"
-            @dblclick="copy(instance.id)"
+            title="单击复制 OCID"
+            role="button"
+            tabindex="0"
+            @click="copy(instance.id)"
+            @keydown.enter.prevent="copy(instance.id)"
           >
             {{ instance.id }}
           </div>
         </div>
         <div>
-          <div class="muted" style="font-size: 12px">Shape / 网络（双击 IP 可复制）</div>
+          <div class="muted" style="font-size: 12px">Shape / 网络（单击 IP 可复制）</div>
           <div>
             {{ instance.shape }}
             <span v-if="instance.free_tier_tag" class="badge">{{ instance.free_tier_tag }}</span>
@@ -45,20 +48,24 @@
               <span
                 class="copyable"
                 :class="{ empty: !instance.public_ip }"
-                title="双击复制"
-                @dblclick="copyIp(instance.public_ip)"
-                >{{ instance.public_ip || '—' }}</span
-              >
+                title="单击复制"
+                role="button"
+                tabindex="0"
+                @click="copyIp(instance.public_ip, $event)"
+                @keydown.enter.prevent="copyIp(instance.public_ip)"
+              >{{ instance.public_ip || '—' }}</span>
             </div>
             <div>
               私网
               <span
                 class="copyable"
                 :class="{ empty: !instance.private_ip }"
-                title="双击复制"
-                @dblclick="copyIp(instance.private_ip)"
-                >{{ instance.private_ip || '—' }}</span
-              >
+                title="单击复制"
+                role="button"
+                tabindex="0"
+                @click="copyIp(instance.private_ip, $event)"
+                @keydown.enter.prevent="copyIp(instance.private_ip)"
+              >{{ instance.private_ip || '—' }}</span>
             </div>
             <div v-if="instance.ipv6_addresses?.length">
               IPv6
@@ -66,10 +73,12 @@
                 v-for="ip6 in instance.ipv6_addresses"
                 :key="ip6"
                 class="copyable ipv6-chip"
-                title="双击复制"
-                @dblclick="copyIp(ip6)"
-                >{{ ip6 }}</span
-              >
+                title="单击复制"
+                role="button"
+                tabindex="0"
+                @click="copyIp(ip6, $event)"
+                @keydown.enter.prevent="copyIp(ip6)"
+              >{{ ip6 }}</span>
             </div>
             <div v-else class="muted" style="font-size: 12px">IPv6 —</div>
           </div>
@@ -273,7 +282,14 @@
               <td colspan="5" class="muted">该区域暂无保留 IP。「新建保留 IP」后即可绑定到实例。</td>
             </tr>
             <tr v-for="ip in reservedIps" :key="ip.id">
-              <td class="copyable" title="双击复制" @dblclick="copy(ip.ip_address)">{{ ip.ip_address }}</td>
+              <td
+                class="copyable"
+                title="单击复制"
+                role="button"
+                tabindex="0"
+                @click="copy(ip.ip_address)"
+                @keydown.enter.prevent="copy(ip.ip_address)"
+              >{{ ip.ip_address }}</td>
               <td>{{ ip.display_name || '—' }}</td>
               <td><span class="badge">{{ ip.lifecycle_state }}</span></td>
               <td>
@@ -359,12 +375,15 @@
             <div>{{ bootInfo.availability_domain || '—' }}</div>
           </div>
           <div style="grid-column: 1 / -1">
-            <div class="muted" style="font-size: 12px">引导卷 OCID（双击复制）</div>
+            <div class="muted" style="font-size: 12px">引导卷 OCID（单击复制）</div>
             <div
               class="copyable"
               style="font-size: 12px; word-break: break-all"
-              title="双击复制"
-              @dblclick="copy(bootInfo.boot_volume_id)"
+              title="单击复制"
+              role="button"
+              tabindex="0"
+              @click="copy(bootInfo.boot_volume_id)"
+              @keydown.enter.prevent="copy(bootInfo.boot_volume_id)"
             >
               {{ bootInfo.boot_volume_id }}
             </div>
@@ -777,7 +796,11 @@ async function copy(text: string) {
   await copyText(text)
 }
 
-function copyIp(text?: string | null) {
+function copyIp(text?: string | null, ev?: Event) {
+  if (ev) {
+    ev.preventDefault()
+    ev.stopPropagation()
+  }
   if (!text) return
   void copyText(text, '已复制 IP')
 }

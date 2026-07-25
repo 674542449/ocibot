@@ -117,8 +117,11 @@
                 <div
                   class="muted copyable"
                   style="font-size: 11px; word-break: break-all"
-                  title="双击复制实例 OCID"
-                  @dblclick="copy(v.instance_id)"
+                  title="单击复制实例 OCID"
+                  role="button"
+                  tabindex="0"
+                  @click="copy(v.instance_id)"
+                  @keydown.enter.prevent="copy(v.instance_id)"
                 >
                   {{ v.instance_id }}
                 </div>
@@ -133,10 +136,12 @@
               <span
                 class="copyable"
                 style="font-size: 11px; word-break: break-all"
-                title="双击复制引导卷 OCID"
-                @dblclick="copy(v.id)"
-                >{{ shortId(v.id) }}</span
-              >
+                title="单击复制引导卷 OCID"
+                role="button"
+                tabindex="0"
+                @click="copy(v.id)"
+                @keydown.enter.prevent="copy(v.id)"
+              >{{ shortId(v.id) }}</span>
             </td>
           </tr>
         </tbody>

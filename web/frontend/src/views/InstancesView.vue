@@ -105,30 +105,36 @@
               <span
                 class="copyable"
                 :class="{ empty: !ins.public_ip }"
-                title="双击复制公网 IPv4"
-                @dblclick="copyIp(ins.public_ip)"
-                >{{ ins.public_ip || '—' }}</span
-              >
+                title="单击复制公网 IPv4"
+                role="button"
+                tabindex="0"
+                @click="copyIp(ins.public_ip, $event)"
+                @keydown.enter.prevent="copyIp(ins.public_ip)"
+              >{{ ins.public_ip || '—' }}</span>
               <div v-if="ins.ipv6_addresses?.length" class="muted" style="font-size: 11px; margin-top: 2px">
                 <span
                   v-for="ip6 in ins.ipv6_addresses"
                   :key="ip6"
                   class="copyable"
-                  title="双击复制 IPv6"
+                  title="单击复制 IPv6"
                   style="display: inline-block; margin-right: 0.35rem"
-                  @dblclick="copyIp(ip6)"
-                  >{{ ip6 }}</span
-                >
+                  role="button"
+                  tabindex="0"
+                  @click="copyIp(ip6, $event)"
+                  @keydown.enter.prevent="copyIp(ip6)"
+                >{{ ip6 }}</span>
               </div>
             </td>
             <td>
               <span
                 class="copyable"
                 :class="{ empty: !ins.private_ip }"
-                title="双击复制私网 IP"
-                @dblclick="copyIp(ins.private_ip)"
-                >{{ ins.private_ip || '—' }}</span
-              >
+                title="单击复制私网 IP"
+                role="button"
+                tabindex="0"
+                @click="copyIp(ins.private_ip, $event)"
+                @keydown.enter.prevent="copyIp(ins.private_ip)"
+              >{{ ins.private_ip || '—' }}</span>
             </td>
             <td>
               <div class="row">
@@ -148,7 +154,7 @@
       </table>
     </div>
     <p class="muted" style="font-size: 12px; margin: 0">
-      共 {{ filtered.length }} / {{ instances.length }} 台 · 双击公网 / 私网 / IPv6 可复制
+      共 {{ filtered.length }} / {{ instances.length }} 台 · 单击公网 / 私网 / IPv6 可复制
     </p>
   </div>
 </template>
@@ -328,7 +334,11 @@ async function copy(text: string) {
   await copyText(text)
 }
 
-function copyIp(text?: string | null) {
+function copyIp(text?: string | null, ev?: Event) {
+  if (ev) {
+    ev.preventDefault()
+    ev.stopPropagation()
+  }
   if (!text) return
   void copyText(text, '已复制 IP')
 }
