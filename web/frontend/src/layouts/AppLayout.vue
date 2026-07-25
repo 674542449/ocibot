@@ -48,7 +48,7 @@
           exact-active-class=""
           @click="navOpen = false"
         >
-          <span class="nav-ico" aria-hidden="true">{{ item.icon }}</span>
+          <span class="nav-ico" aria-hidden="true"><Icon :name="item.icon" :size="18" /></span>
           <span>{{ item.label }}</span>
         </router-link>
 
@@ -62,7 +62,7 @@
           exact-active-class=""
           @click="navOpen = false"
         >
-          <span class="nav-ico" aria-hidden="true">{{ item.icon }}</span>
+          <span class="nav-ico" aria-hidden="true"><Icon :name="item.icon" :size="18" /></span>
           <span>{{ item.label }}</span>
         </router-link>
 
@@ -76,7 +76,7 @@
           exact-active-class=""
           @click="navOpen = false"
         >
-          <span class="nav-ico" aria-hidden="true">{{ item.icon }}</span>
+          <span class="nav-ico" aria-hidden="true"><Icon :name="item.icon" :size="18" /></span>
           <span>{{ item.label }}</span>
         </router-link>
       </nav>
@@ -107,6 +107,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import api from '@/api/client'
+import Icon from '@/components/Icon.vue'
 import { useAuthStore } from '@/stores/auth'
 
 const auth = useAuthStore()
@@ -122,25 +123,25 @@ type NavItem = {
 }
 
 const primaryNav: NavItem[] = [
-  { to: '/', label: '实例', icon: '▣', match: 'instances' },
-  { to: '/launch', label: '创建实例', icon: '＋', match: 'exact' },
-  { to: '/jobs', label: '任务中心', icon: '◎', match: 'exact' },
+  { to: '/', label: '实例', icon: 'instances', match: 'instances' },
+  { to: '/launch', label: '创建实例', icon: 'launch', match: 'exact' },
+  { to: '/jobs', label: '任务中心', icon: 'jobs', match: 'exact' },
 ]
 
 const resourceNav: NavItem[] = [
-  { to: '/storage', label: '存储', icon: '▤', match: 'prefix' },
-  { to: '/tenants', label: '租户', icon: '☰', match: 'exact' },
-  { to: '/account', label: '账号用量', icon: '◉', match: 'exact' },
-  { to: '/backup', label: '备份恢复', icon: '⇩', match: 'exact' },
+  { to: '/storage', label: '存储', icon: 'storage', match: 'prefix' },
+  { to: '/tenants', label: '租户', icon: 'tenants', match: 'exact' },
+  { to: '/account', label: '账号用量', icon: 'account', match: 'exact' },
+  { to: '/backup', label: '备份恢复', icon: 'backup', match: 'exact' },
 ]
 
 const systemNav = computed<NavItem[]>(() => {
   const items: NavItem[] = [
-    { to: '/audit', label: '审计日志', icon: '≡', match: 'exact' },
-    { to: '/settings', label: '设置', icon: '⚙', match: 'exact' },
+    { to: '/audit', label: '审计日志', icon: 'audit', match: 'exact' },
+    { to: '/settings', label: '设置', icon: 'settings', match: 'exact' },
   ]
   if (auth.isAdmin) {
-    items.push({ to: '/admin', label: '用户管理 / 更新', icon: '☆', match: 'exact' })
+    items.push({ to: '/admin', label: '用户管理 / 更新', icon: 'admin', match: 'exact' })
   }
   return items
 })
@@ -354,10 +355,13 @@ onBeforeUnmount(() => {
 
 .nav-ico {
   width: 1.25rem;
-  text-align: center;
-  opacity: 0.85;
-  font-size: 13px;
+  height: 1.25rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.9;
   flex-shrink: 0;
+  color: inherit;
 }
 
 .sidebar-foot {

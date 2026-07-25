@@ -59,10 +59,25 @@ export type Tenant = {
   has_private_key: boolean
   password_changed_at: string
   password_expiry_days: number
+  /** Server-computed: YYYY-MM-DD when password should be changed, or "". */
+  password_expires_on?: string
+  /** Server-computed: whole days left (negative if overdue); null when off. */
+  password_days_left?: number | null
+  /** Server-computed: off | ok | warn | expired */
+  password_status?: string
   account_tier: string
   budget_monthly_usd: number
   created_at: string
   updated_at: string
+}
+
+export type PasswordPolicy = {
+  password_changed_at: string
+  password_expiry_days: number
+  password_expires_on: string
+  password_days_left: number | null
+  password_status: string
+  message: string
 }
 
 export type Instance = {
