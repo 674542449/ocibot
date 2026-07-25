@@ -14,7 +14,7 @@ set -euo pipefail
 
 REPO_URL="${OCIBOT_REPO_URL:-}"
 REPO_DIR="${OCIBOT_DIR:-$HOME/ocibot}"
-BRANCH="${OCIBOT_BRANCH:-master}"
+BRANCH="${OCIBOT_BRANCH:-main}"
 COMPOSE="docker compose"
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }

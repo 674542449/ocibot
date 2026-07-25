@@ -11,16 +11,17 @@
 **Linux / macOS**
 
 ```bash
-# 将 <OWNER>/<REPO> 换成你的 GitHub 仓库
-export OCIBOT_REPO_URL=https://github.com/<OWNER>/<REPO>.git
-curl -fsSL https://raw.githubusercontent.com/<OWNER>/<REPO>/master/scripts/install.sh | bash
+export OCIBOT_REPO_URL=https://github.com/674542449/ocibot.git
+export OCIBOT_BRANCH=main
+curl -fsSL https://raw.githubusercontent.com/674542449/ocibot/main/scripts/install.sh | bash
 ```
 
 **Windows（PowerShell + Docker Desktop）**
 
 ```powershell
-$env:OCIBOT_REPO_URL = "https://github.com/<OWNER>/<REPO>.git"
-irm https://raw.githubusercontent.com/<OWNER>/<REPO>/master/scripts/install.ps1 | iex
+$env:OCIBOT_REPO_URL = "https://github.com/674542449/ocibot.git"
+$env:OCIBOT_BRANCH = "main"
+irm https://raw.githubusercontent.com/674542449/ocibot/main/scripts/install.ps1 | iex
 # 或克隆后：
 #   .\scripts\install.ps1 install
 ```
@@ -85,7 +86,7 @@ Oracle Cloud API   (app/oci_client.py)
 ## 手动 Docker 部署
 
 ```bash
-git clone https://github.com/<OWNER>/<REPO>.git ocibot
+git clone https://github.com/674542449/ocibot.git
 cd ocibot
 cp web/.env.example web/.env
 # 编辑 web/.env：POSTGRES_PASSWORD / OCIBOT_MASTER_KEY / OCIBOT_JWT_SECRET

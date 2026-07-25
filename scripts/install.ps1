@@ -9,7 +9,7 @@ param(
   [string]$Command = "install",
   [string]$RepoUrl = $env:OCIBOT_REPO_URL,
   [string]$RepoDir = $(if ($env:OCIBOT_DIR) { $env:OCIBOT_DIR } else { Join-Path $HOME "ocibot" }),
-  [string]$Branch = $(if ($env:OCIBOT_BRANCH) { $env:OCIBOT_BRANCH } else { "master" }),
+  [string]$Branch = $(if ($env:OCIBOT_BRANCH) { $env:OCIBOT_BRANCH } else { "main" }),
   [int]$Port = $(if ($env:OCIBOT_PORT) { [int]$env:OCIBOT_PORT } else { 8000 })
 )
 
