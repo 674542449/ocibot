@@ -16,6 +16,7 @@ from web.backend.config import get_settings
 from web.backend.db import get_db
 from web.backend.meta import KEY_OPEN_REGISTRATION, get_meta, set_meta
 from web.backend.models import Tenant, User
+from web.backend import self_update
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -191,3 +192,51 @@ def put_admin_settings(
         detail=str(body.allow_open_registration),
     )
     return AdminSettingsOut(allow_open_registration=body.allow_open_registration, source="db")
+
+
+# ---------------------------------------------------------------------------
+# In-panel self-update (Docker host)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/update")
+def get_update_status(
+    admin: Annotated[User, Depends(get_admin_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    _ = admin
+    return self_update.get_status(db)
+
+
+@router.post("/update/check")
+def check_update(
+    admin: Annotated[User, Depends(get_admin_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    _ = admin
+    try:
+        return self_update.check_for_update(db)
+    except Exception as exc:  # noqa: BLE001
+        # check_for_update already persisted error state when possible
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/update/apply")
+def apply_update(
+    admin: Annotated[User, Depends(get_admin_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    try:
+        result = self_update.start_update(db, username=admin.username)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    write_audit(
+        db,
+        owner_id=admin.id,
+        action="admin.self_update",
+        target="apply",
+        detail={"repo": result.get("local", {}).get("repo"), "state": result.get("state")},
+    )
+    return result

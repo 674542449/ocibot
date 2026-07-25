@@ -118,10 +118,24 @@ compose() {
   (cd "$REPO_DIR" && $COMPOSE "$@")
 }
 
+export_build_env() {
+  # Pass host absolute path + current commit into compose (self-update + version badge).
+  export OCIBOT_HOST_REPO="$REPO_DIR"
+  export OCIBOT_UPDATE_ENABLED="${OCIBOT_UPDATE_ENABLED:-1}"
+  export OCIBOT_UPDATE_BRANCH="${OCIBOT_UPDATE_BRANCH:-$BRANCH}"
+  if [ -d "$REPO_DIR/.git" ] && command -v git >/dev/null 2>&1; then
+    export OCIBOT_GIT_SHA
+    OCIBOT_GIT_SHA="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+  else
+    export OCIBOT_GIT_SHA="${OCIBOT_GIT_SHA:-unknown}"
+  fi
+}
+
 do_install() {
   ensure_docker
   ensure_repo
   ensure_env
+  export_build_env
   log "构建并启动（PostgreSQL + API + Worker）…"
   compose up -d --build
   log "等待健康检查…"
@@ -130,6 +144,7 @@ do_install() {
     if curl -fsS "http://127.0.0.1:${OCIBOT_PORT:-8000}/api/health" >/dev/null 2>&1; then
       log "就绪：http://127.0.0.1:${OCIBOT_PORT:-8000}"
       log "首次打开页面 → 注册管理员账号"
+      log "管理员「用户管理」页可检查/执行在线更新"
       return 0
     fi
     sleep 3
@@ -149,6 +164,7 @@ do_update() {
       warn "git pull 失败（可能是本地改动）— 继续用当前树 rebuild"
   fi
   ensure_env
+  export_build_env
   log "重新构建并滚动更新…"
   compose up -d --build
   log "更新完成。健康检查：curl -fsS http://127.0.0.1:${OCIBOT_PORT:-8000}/api/health"

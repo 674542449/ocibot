@@ -24,6 +24,8 @@ Docker Compose 固定使用 **PostgreSQL 16**（服务名 `db`）。
 
 ## 一键更新
 
+### 命令行
+
 ```bash
 ./scripts/install.sh update
 ```
@@ -31,6 +33,21 @@ Docker Compose 固定使用 **PostgreSQL 16**（服务名 `db`）。
 - 有 `.git`：fast-forward `pull`  
 - 保留 `web/.env` 与 named volume `ocibot_pg`  
 - 重新 build 镜像并滚动 `api` / `worker`
+
+### 网页（管理员）
+
+打开 **用户管理 → 系统更新**：
+
+1. **检查更新** — 查询 GitHub 最新 commit  
+2. **一键更新** — 宿主机 `git pull` + `docker compose up -d --build`  
+
+`install.sh` / 根目录 compose 默认已挂载：
+
+- 宿主机仓库 → 容器 `/host/ocibot`  
+- `/var/run/docker.sock`  
+- `OCIBOT_UPDATE_ENABLED=1`  
+
+接口仅管理员可调用；公网请配合强密码 / TOTP / HTTPS。
 
 ## 性能相关
 

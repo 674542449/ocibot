@@ -25,6 +25,8 @@ services:
     build:
       context: ..
       dockerfile: web/Dockerfile
+      args:
+        OCIBOT_GIT_SHA: ${OCIBOT_GIT_SHA:-unknown}
     env_file:
       - .env
     environment:
@@ -33,6 +35,14 @@ services:
       OCIBOT_API_WORKERS: ${OCIBOT_API_WORKERS:-2}
       OCIBOT_DB_POOL_SIZE: ${OCIBOT_DB_POOL_SIZE:-10}
       OCIBOT_DB_MAX_OVERFLOW: ${OCIBOT_DB_MAX_OVERFLOW:-20}
+      OCIBOT_UPDATE_ENABLED: ${OCIBOT_UPDATE_ENABLED:-1}
+      OCIBOT_UPDATE_REPO: ${OCIBOT_UPDATE_REPO:-674542449/ocibot}
+      OCIBOT_UPDATE_BRANCH: ${OCIBOT_UPDATE_BRANCH:-main}
+      OCIBOT_HOST_DIR: /host/ocibot
+      OCIBOT_GIT_SHA: ${OCIBOT_GIT_SHA:-unknown}
+    volumes:
+      - ${OCIBOT_HOST_REPO:-..}:/host/ocibot
+      - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "${OCIBOT_PORT:-8000}:8000"
     depends_on:

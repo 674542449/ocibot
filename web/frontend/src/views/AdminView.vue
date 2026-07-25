@@ -26,6 +26,107 @@
       </div>
     </div>
 
+    <div class="card stack">
+      <div class="row" style="justify-content: space-between; align-items: flex-start">
+        <div>
+          <h3 style="margin: 0">系统更新</h3>
+          <p class="muted" style="margin: 0.25rem 0 0; font-size: 12px">
+            从 GitHub 拉取最新代码并重建 Docker 容器（保留数据库与密钥）。仅管理员。
+          </p>
+        </div>
+        <div class="row">
+          <button :disabled="updateBusy || updateRunning" @click="checkUpdate">
+            {{ updateBusy && !updateRunning ? '检查中…' : '检查更新' }}
+          </button>
+          <button
+            class="primary"
+            :disabled="updateBusy || updateRunning || !canApplyUpdate"
+            @click="applyUpdate"
+          >
+            {{ updateRunning ? '更新中…' : '一键更新' }}
+          </button>
+        </div>
+      </div>
+
+      <div v-if="!updateInfo" class="muted" style="font-size: 13px">点击「检查更新」获取版本信息。</div>
+      <template v-else>
+        <div class="grid-2" style="font-size: 13px">
+          <div>
+            <div class="muted" style="font-size: 12px">当前版本</div>
+            <div>
+              <code>{{ updateInfo.local?.git_sha || 'unknown' }}</code>
+              <span class="muted"> · app {{ updateInfo.local?.app_version || '—' }}</span>
+            </div>
+          </div>
+          <div>
+            <div class="muted" style="font-size: 12px">
+              远程
+              <a
+                v-if="updateInfo.remote?.html_url"
+                :href="updateInfo.remote.html_url"
+                target="_blank"
+                rel="noopener"
+                >GitHub</a
+              >
+            </div>
+            <div>
+              <code>{{ updateInfo.remote?.short_sha || updateInfo.remote?.sha?.slice?.(0, 7) || '—' }}</code>
+              <span v-if="updateInfo.update_available" class="badge warn" style="margin-left: 0.35rem"
+                >有新版本</span
+              >
+              <span
+                v-else-if="updateInfo.remote?.sha"
+                class="badge running"
+                style="margin-left: 0.35rem"
+                >已是最新</span
+              >
+            </div>
+            <div class="muted" style="font-size: 12px; margin-top: 0.2rem">
+              {{ updateInfo.remote?.message || '' }}
+            </div>
+          </div>
+        </div>
+
+        <div class="row" style="font-size: 12px">
+          <span class="badge" :class="updateStateClass">状态：{{ updateStateLabel }}</span>
+          <span v-if="updateInfo.message" class="muted">{{ updateInfo.message }}</span>
+        </div>
+
+        <div v-if="!updateInfo.capabilities?.can_apply" class="error-box" style="font-size: 13px">
+          当前环境无法在线更新（需要 Docker 部署并挂载宿主机仓库与 docker.sock）。
+          请 SSH 执行：
+          <code>cd ~/ocibot && bash scripts/install.sh update</code>
+          <div class="muted" style="margin-top: 0.35rem; font-size: 12px">
+            enabled={{ updateInfo.capabilities?.enabled }} · host_dir={{
+              updateInfo.capabilities?.host_dir_exists
+            }}
+            · compose={{ updateInfo.capabilities?.compose_file_exists }} · sock={{
+              updateInfo.capabilities?.docker_sock
+            }}
+            · docker={{ updateInfo.capabilities?.docker_bin }} · git={{
+              updateInfo.capabilities?.git_bin
+            }}
+          </div>
+        </div>
+
+        <details v-if="updateInfo.log_tail" style="font-size: 12px">
+          <summary class="muted">更新日志</summary>
+          <pre
+            class="muted"
+            style="
+              max-height: 240px;
+              overflow: auto;
+              white-space: pre-wrap;
+              background: var(--panel-2);
+              padding: 0.6rem;
+              border-radius: 8px;
+            "
+            >{{ updateInfo.log_tail }}</pre
+          >
+        </details>
+      </template>
+    </div>
+
     <div class="card table-wrap">
       <table>
         <thead>
@@ -72,7 +173,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import api from '@/api/client'
 import { useAuthStore } from '@/stores/auth'
 
@@ -94,12 +195,126 @@ const allowOpenRegistration = ref(true)
 const settingsSource = ref('env')
 const meId = ref('')
 
+const updateInfo = ref<any>(null)
+const updateBusy = ref(false)
+let updatePollTimer: number | undefined
+
+const updateRunning = computed(() => updateInfo.value?.state === 'running')
+const canApplyUpdate = computed(() => !!updateInfo.value?.capabilities?.can_apply)
+
+const updateStateLabel = computed(() => {
+  const s = updateInfo.value?.state || 'idle'
+  return (
+    (
+      {
+        idle: '空闲',
+        checking: '检查中',
+        running: '更新中',
+        success: '成功',
+        error: '失败',
+      } as Record<string, string>
+    )[s] || s
+  )
+})
+
+const updateStateClass = computed(() => {
+  const s = updateInfo.value?.state || 'idle'
+  if (s === 'success') return 'running'
+  if (s === 'error') return 'err'
+  if (s === 'running') return 'warn'
+  return ''
+})
+
 function fmt(v: string) {
   if (!v) return '—'
   try {
     return new Date(v).toLocaleString()
   } catch {
     return v
+  }
+}
+
+function stopUpdatePoll() {
+  if (updatePollTimer) {
+    window.clearInterval(updatePollTimer)
+    updatePollTimer = undefined
+  }
+}
+
+function startUpdatePoll() {
+  stopUpdatePoll()
+  updatePollTimer = window.setInterval(async () => {
+    try {
+      const { data } = await api.get('/admin/update')
+      updateInfo.value = data
+      if (data.state !== 'running') {
+        stopUpdatePoll()
+        updateBusy.value = false
+        if (data.state === 'success') {
+          msg.value = data.message || '更新完成，请强制刷新页面（Ctrl+F5）'
+        }
+        if (data.state === 'error') {
+          error.value = data.message || data.last_error || '更新失败'
+        }
+      }
+    } catch {
+      /* ignore transient errors while containers restart */
+    }
+  }, 3000)
+}
+
+async function loadUpdate() {
+  try {
+    const { data } = await api.get('/admin/update')
+    updateInfo.value = data
+    if (data.state === 'running') {
+      updateBusy.value = true
+      startUpdatePoll()
+    }
+  } catch {
+    updateInfo.value = null
+  }
+}
+
+async function checkUpdate() {
+  error.value = ''
+  msg.value = ''
+  updateBusy.value = true
+  try {
+    const { data } = await api.post('/admin/update/check')
+    updateInfo.value = data
+    if (data.update_available) {
+      msg.value = `发现新版本 ${data.remote?.short_sha || ''}：${data.remote?.message || ''}`
+    } else {
+      msg.value = '已是最新版本（或无法精确比对本地 commit）'
+    }
+  } catch (e: any) {
+    error.value = e?.message || '检查更新失败'
+    await loadUpdate()
+  } finally {
+    updateBusy.value = false
+  }
+}
+
+async function applyUpdate() {
+  if (
+    !confirm(
+      '确认从 GitHub 拉取最新代码并重建容器？\n\n会短暂中断面板访问；数据库与 web/.env 密钥会保留。',
+    )
+  ) {
+    return
+  }
+  error.value = ''
+  msg.value = ''
+  updateBusy.value = true
+  try {
+    const { data } = await api.post('/admin/update/apply')
+    updateInfo.value = data
+    msg.value = '更新已开始，请稍候…页面可能短暂无法访问。'
+    startUpdatePoll()
+  } catch (e: any) {
+    updateBusy.value = false
+    error.value = e?.message || '无法启动更新'
   }
 }
 
@@ -113,6 +328,7 @@ async function load() {
   allowOpenRegistration.value = !!s.data.allow_open_registration
   settingsSource.value = s.data.source
   meId.value = me.data.id
+  await loadUpdate()
 }
 
 async function saveSettings() {
@@ -181,5 +397,9 @@ onMounted(async () => {
   } catch (e: any) {
     error.value = e?.message || '加载失败（需要管理员权限）'
   }
+})
+
+onBeforeUnmount(() => {
+  stopUpdatePoll()
 })
 </script>

@@ -12,9 +12,21 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# curl: healthcheck; git: in-panel self-update (host repo); docker CLI: compose via socket
+ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
-    && rm -rf /var/lib/apt/lists/*
+    git \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && DOCKER_ARCH="$TARGETARCH" \
+    && if [ -z "$DOCKER_ARCH" ] || [ "$DOCKER_ARCH" = "amd64" ]; then DOCKER_ARCH=x86_64; fi \
+    && if [ "$DOCKER_ARCH" = "arm64" ]; then DOCKER_ARCH=aarch64; fi \
+    && curl -fsSL "https://download.docker.com/linux/static/stable/${DOCKER_ARCH}/docker-27.5.1.tgz" \
+      | tar -xz -C /tmp \
+    && mv /tmp/docker/docker /usr/local/bin/docker \
+    && rm -rf /tmp/docker \
+    && chmod +x /usr/local/bin/docker
 
 COPY requirements.txt /app/requirements.txt
 COPY web/backend/requirements.txt /app/web/backend/requirements.txt
@@ -23,6 +35,10 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY app /app/app
 COPY web/backend /app/web/backend
 COPY --from=frontend /src/dist /app/web/frontend/dist
+
+# Build-time commit (compose / CI can override with --build-arg)
+ARG OCIBOT_GIT_SHA=unknown
+ENV OCIBOT_GIT_SHA=${OCIBOT_GIT_SHA}
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
