@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.10 — 2026-07-26
+
+### 修复
+- 实例列表首屏不再双重拉取 OCI（bootstrap 门闩）
+- 创建实例切换租户时重置/校验 AD，并丢弃过期 launch-meta 响应
+- SMTP 发送时再次校验主机（防 DNS 重绑定 SSRF）
+
+### 升级
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 0.4.10
+```
+
+---
+
 ## 0.4.9 — 2026-07-26
 
 ### 修复

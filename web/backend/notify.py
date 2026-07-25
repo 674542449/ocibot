@@ -197,6 +197,16 @@ def _send_webhook(config: dict[str, Any], title: str, body: str) -> tuple[bool, 
 
 def _send_smtp(config: dict[str, Any], title: str, body: str) -> tuple[bool, str]:
     host = str(config.get("host") or "").strip()
+    # Re-check at send time (DNS may have changed since channel save).
+    from web.backend.url_safety import hostname_is_blocked, resolve_and_check_host
+
+    if hostname_is_blocked(host):
+        return False, f"SMTP 主机不允许为内网/本地地址：{host}"
+    try:
+        resolve_and_check_host(host)
+    except ValueError as exc:
+        return False, str(exc)
+
     port = int(config.get("port") or 465)
     username = str(config.get("username") or "").strip()
     password = str(config.get("password") or "")

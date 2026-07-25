@@ -496,34 +496,36 @@ async function terminate(ins: Instance) {
   }
 }
 
+let bootstrapped = false
+
 watch(tenantId, (id, prev) => {
-  // Skip the initial empty→first-tenant assignment double-load handled in onMounted.
   if (!id) {
     instances.value = []
     return
   }
+  // During first mount, onMounted owns the initial load to avoid double OCI fetch
+  // when loadTenants assigns the default first tenant.
+  if (!bootstrapped) return
   if (id !== prev) load()
 })
 
 // Toggling IP resolution must re-fetch the current tenant's instances.
 watch(resolveIps, () => {
-  if (tenantId.value) load()
+  if (bootstrapped && tenantId.value) load()
 })
 
 onMounted(async () => {
   try {
     await loadTenants()
     const q = String(route.query.tenant || '')
-    if (q && tenants.value.some((t) => t.id === q)) {
-      // Changing tenantId triggers the watcher, which loads — avoid a double fetch
-      // only when the value actually changes.
-      if (q !== tenantId.value) tenantId.value = q
-      else await load()
-    } else if (tenantId.value) {
-      await load()
+    if (q && tenants.value.some((t) => t.id === q) && q !== tenantId.value) {
+      tenantId.value = q
     }
+    if (tenantId.value) await load()
   } catch (e: any) {
     error.value = e?.message || '初始化失败'
+  } finally {
+    bootstrapped = true
   }
 })
 </script>

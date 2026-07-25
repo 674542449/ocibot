@@ -437,31 +437,57 @@ async function loadTenants() {
   else if (tenants.value[0]) tenantId.value = tenants.value[0].id
 }
 
+let metaSeq = 0
 async function loadMeta(force = false) {
   if (!tenantId.value) return
   error.value = ''
   loadingMeta.value = true
+  const seq = ++metaSeq
+  const requestedTenant = tenantId.value
   try {
-    const { data } = await api.get(`/tenants/${tenantId.value}/launch-meta`, {
+    const { data } = await api.get(`/tenants/${requestedTenant}/launch-meta`, {
       params: { force: force === true },
     })
+    // Drop stale responses if the user switched tenants mid-flight.
+    if (seq !== metaSeq || tenantId.value !== requestedTenant) return
     meta.value = data
     if (!form.display_name) form.display_name = data?.defaults?.display_name || padName()
     if (data?.defaults?.retry_interval_sec) form.retry_interval_sec = data.defaults.retry_interval_sec
     if (data?.defaults?.retry_max_attempts) form.retry_max_attempts = data.defaults.retry_max_attempts
-    if (data?.ads?.length && !form.availability_domain) form.availability_domain = data.ads[0]
-    // default image + shape
+    // Always rebind AD to this tenant's catalog (keep prior only if still valid).
+    const adsList: string[] = listAds(data)
+    if (adsList.length) {
+      if (!adsList.includes(form.availability_domain)) {
+        form.availability_domain = adsList[0]
+      }
+    } else {
+      form.availability_domain = ''
+    }
+    // default image + shape for this tenant
     if (data?.images?.length) {
       const preferArm = data.images.find((i: ImageInfo) => /arm|aarch64/i.test(`${i.label} ${i.architecture}`))
       form.image_id = (preferArm || data.images[0]).id
+    } else {
+      form.image_id = ''
+      form.shape = ''
     }
     onImageChange()
   } catch (e: any) {
+    if (seq !== metaSeq || tenantId.value !== requestedTenant) return
     meta.value = null
+    form.availability_domain = ''
+    form.image_id = ''
+    form.shape = ''
     error.value = e?.message || '加载创建元数据失败'
   } finally {
-    loadingMeta.value = false
+    if (seq === metaSeq) loadingMeta.value = false
   }
+}
+
+function listAds(data: any): string[] {
+  const raw = data?.ads
+  if (!Array.isArray(raw)) return []
+  return raw.map((a: any) => String(a || '')).filter(Boolean)
 }
 
 function onOsFamilyChange() {
