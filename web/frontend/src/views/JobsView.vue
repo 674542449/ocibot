@@ -354,24 +354,47 @@ async function toggleLog(j: CapacityJob) {
   await loadAttempts(j.id)
 }
 
+async function refreshCapacity() {
+  // Lightweight tick for the auto-refresh: only capacity jobs (and the open log)
+  // change during retries — no need to re-pull tenants/schedules/runs every 5s.
+  const { data } = await api.get<CapacityJob[]>('/jobs/capacity')
+  capacityJobs.value = data
+  if (openLog.value) await loadAttempts(openLog.value)
+}
+
 async function stopJob(j: CapacityJob) {
-  await api.post(`/jobs/capacity/${j.id}/stop`)
-  msg.value = '已停止'
-  await load()
+  error.value = ''
+  try {
+    await api.post(`/jobs/capacity/${j.id}/stop`)
+    msg.value = '已停止'
+    await load()
+  } catch (e: any) {
+    error.value = e?.message || '停止失败'
+  }
 }
 
 async function resumeJob(j: CapacityJob) {
-  await api.post(`/jobs/capacity/${j.id}/resume`)
-  msg.value = '已继续'
-  await load()
+  error.value = ''
+  try {
+    await api.post(`/jobs/capacity/${j.id}/resume`)
+    msg.value = '已继续'
+    await load()
+  } catch (e: any) {
+    error.value = e?.message || '继续失败'
+  }
 }
 
 async function deleteJob(j: CapacityJob) {
   if (!confirm(`删除任务「${j.name}」？`)) return
-  await api.delete(`/jobs/capacity/${j.id}`)
-  msg.value = '已删除'
-  if (openLog.value === j.id) openLog.value = ''
-  await load()
+  error.value = ''
+  try {
+    await api.delete(`/jobs/capacity/${j.id}`)
+    msg.value = '已删除'
+    if (openLog.value === j.id) openLog.value = ''
+    await load()
+  } catch (e: any) {
+    error.value = e?.message || '删除失败'
+  }
 }
 
 async function createSchedule() {
@@ -406,9 +429,14 @@ async function createSchedule() {
 
 async function deleteSchedule(s: ScheduleJob) {
   if (!confirm(`删除「${s.name}」？`)) return
-  await api.delete(`/jobs/schedules/${s.id}`)
-  msg.value = '已删除'
-  await load()
+  error.value = ''
+  try {
+    await api.delete(`/jobs/schedules/${s.id}`)
+    msg.value = '已删除'
+    await load()
+  } catch (e: any) {
+    error.value = e?.message || '删除失败'
+  }
 }
 
 onMounted(async () => {
@@ -422,7 +450,7 @@ onMounted(async () => {
     const active = capacityJobs.value.some((j) => j.enabled)
     if (active || openLog.value) {
       try {
-        await load()
+        await refreshCapacity()
       } catch {
         // transient errors during background refresh are non-fatal
       }

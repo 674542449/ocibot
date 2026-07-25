@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.oci_client import OCIClientError, POWER_ACTIONS, is_capacity_message, is_rate_limit_message
+from app.oci_client import OCIClientError, POWER_ACTIONS, is_capacity_message
 from web.backend.audit import write_audit
 from web.backend.auth import get_current_user
 from web.backend.crypto_util import encrypt_text
@@ -20,12 +20,17 @@ from web.backend.launch_service import (
     prepare_launch_network,
     schedule_post_launch_adjustments,
 )
-from web.backend.models import CapacityAttempt, CapacityJob, Tenant, User
+from web.backend.models import CapacityJob, Tenant, User
 from web.backend.oci_bridge import (
     get_owned_tenant,
     get_session_for_row,
     instance_to_dict,
     op_result_dict,
+)
+from web.backend.quota_guard import (
+    enforce_launch_quota,
+    enforce_shape_resize_quota,
+    format_guard_warnings,
 )
 from web.backend.schemas import (
     InstanceOut,
@@ -49,18 +54,6 @@ def _tenant_or_404(db: Session, user_id: str, tenant_id: str) -> Tenant:
 
 
 _HIDDEN_INSTANCE_STATES = frozenset({"TERMINATED"})
-
-
-def _config_label(payload: dict[str, Any]) -> str:
-    """Short 'nC/nG' label of the shape config used for an attempt."""
-    ocpus = payload.get("ocpus")
-    mem = payload.get("memory_in_gbs")
-    if ocpus is None and mem is None:
-        return ""
-    try:
-        return f"{float(ocpus):g}C/{float(mem):g}G"
-    except (TypeError, ValueError):
-        return ""
 
 
 def _visible_instances(infos: list) -> list:
@@ -249,16 +242,32 @@ def update_shape(
         session = get_session_for_row(row)
         # Extra guard: fixed shapes like E2.1.Micro cannot change OCPU/memory
         info = session.get_instance(instance_id, resolve_ips=False)
-        shape = str(getattr(info, "shape", "") or "").lower()
+        shape_raw = str(getattr(info, "shape", "") or "")
+        shape = shape_raw.lower()
         if "e2.1.micro" in shape or shape.endswith(".micro") or not (
             shape.endswith(".flex") or ".flex." in shape
         ):
             raise HTTPException(
                 status_code=400,
-                detail=f"Shape {getattr(info, 'shape', '') or '当前型号'} 为固定规格，不允许修改 OCPU / 内存（仅 *.Flex 支持）",
+                detail=f"Shape {shape_raw or '当前型号'} 为固定规格，不允许修改 OCPU / 内存（仅 *.Flex 支持）",
             )
+        guard = enforce_shape_resize_quota(
+            session,
+            account_tier=getattr(row, "account_tier", "") or "",
+            shape=shape_raw,
+            current_ocpus=getattr(info, "ocpus", None),
+            current_memory_in_gbs=getattr(info, "memory_gb", None)
+            if getattr(info, "memory_gb", None) is not None
+            else getattr(info, "memory_in_gbs", None),
+            new_ocpus=body.ocpus,
+            new_memory_in_gbs=body.memory_in_gbs,
+        )
         result = session.update_instance_shape(instance_id, body.ocpus, body.memory_in_gbs)
-        return PowerActionResult(**op_result_dict(result))
+        out = PowerActionResult(**op_result_dict(result))
+        warns = format_guard_warnings(guard)
+        if warns and out.ok:
+            out.message = (out.message or "已提交规格变更") + "（提醒：" + "；".join(warns) + "）"
+        return out
     except HTTPException:
         raise
     except OCIClientError as exc:
@@ -380,6 +389,29 @@ def account_usage(
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+@router.get("/tenants/{tenant_id}/free-quota")
+def free_quota(
+    tenant_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+    free_only_mode: bool = Query(True),
+) -> dict[str, Any]:
+    """Always-Free usage gauges (compute + storage) for the dashboard."""
+    row = _tenant_or_404(db, user.id, tenant_id)
+    try:
+        session = get_session_for_row(row)
+        result = session.get_free_quota_usage(free_only_mode=free_only_mode)
+        return {
+            "ok": bool(result.ok),
+            "message": result.message or "",
+            "data": result.data if isinstance(result.data, dict) else {},
+        }
+    except OCIClientError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"读取免费额度失败: {exc}") from exc
+
+
 @router.get("/tenants/{tenant_id}/launch-meta")
 def launch_meta(
     tenant_id: str,
@@ -426,6 +458,21 @@ def launch_instance(
     custom_user_data = str(built.get("custom_user_data") or "")
     boot_vpu = int(payload.get("boot_volume_vpus_per_gb") or 10)
 
+    # Always Free guard BEFORE network/NSG prep so we don't leave orphan resources.
+    try:
+        launch_guard = enforce_launch_quota(
+            session,
+            account_tier=getattr(row, "account_tier", "") or "",
+            shape=str(payload.get("shape") or ""),
+            ocpus=payload.get("ocpus"),
+            memory_in_gbs=payload.get("memory_in_gbs"),
+            boot_volume_size_in_gbs=payload.get("boot_volume_size_in_gbs"),
+            boot_volume_vpus_per_gb=boot_vpu,
+            fallback_configs=list(built.get("fallback_configs") or body.fallback_configs or []),
+        )
+    except HTTPException:
+        raise
+
     # Pre-launch: IPv6 + managed NSG (desktop parity)
     try:
         payload = prepare_launch_network(session, payload, meta=meta)
@@ -451,8 +498,32 @@ def launch_instance(
             },
         )
 
-    # Capacity retry path: enqueue job, optionally try once immediately.
+    # Capacity retry path: enqueue a job and let the WORKER own every LaunchInstance
+    # call. An immediate launch here would race the worker (a second launch for the
+    # same tenant) and, on a capacity miss, leave next_run_at=now so the worker fires
+    # attempt #2 under the 60s floor. Queue-only keeps retries compliant.
     if built["as_retry"]:
+        # Compliance: at most one active capacity-retry job per tenant.
+        existing = db.scalar(
+            select(CapacityJob)
+            .where(
+                CapacityJob.tenant_id == row.id,
+                CapacityJob.owner_id == user.id,
+                CapacityJob.enabled.is_(True),
+                CapacityJob.status.in_(("idle", "running")),
+            )
+            .limit(1)
+        )
+        if existing is not None:
+            if payload.get("managed_nsg_id"):
+                try:
+                    session.delete_managed_nsg(str(payload.get("managed_nsg_id")))
+                except Exception:
+                    pass
+            raise HTTPException(
+                status_code=409,
+                detail="该租户已有进行中的容量重试任务，请先在任务中心停止或删除后再新建",
+            )
         now = datetime.now(timezone.utc)
         job = CapacityJob(
             owner_id=user.id,
@@ -472,95 +543,19 @@ def launch_instance(
         db.add(job)
         db.commit()
         db.refresh(job)
-
-        def _log_attempt(ok: bool, message: str) -> None:
-            db.add(
-                CapacityAttempt(
-                    job_id=job.id,
-                    owner_id=user.id,
-                    n=1,
-                    seq=1,
-                    ok=ok,
-                    capacity=is_capacity_message(message or ""),
-                    rate_limited=is_rate_limit_message(message or ""),
-                    message=(message or "")[:2000],
-                    availability_domain=str(payload.get("availability_domain") or ""),
-                    config_label=_config_label(payload),
-                )
-            )
-
-        # Immediate first attempt
-        try:
-            result = session.launch_from_payload(
-                payload, root_password="", custom_user_data=custom_user_data
-            )
-        except Exception as exc:  # noqa: BLE001
-            job.attempts = 1
-            job.last_attempt_at = now
-            job.last_error = str(exc)[:2000]
-            job.status = "idle"
-            _log_attempt(False, str(exc))
-            db.commit()
-            return LaunchInstanceResult(
-                ok=False,
-                message=f"已加入容量重试，首次尝试失败：{exc}",
-                capacity_job_id=job.id,
-            )
-
-        job.attempts = 1
-        job.last_attempt_at = datetime.now(timezone.utc)
-        _log_attempt(bool(result.ok), result.message or "")
-        if result.ok:
-            job.status = "success"
-            job.enabled = False
-            job.next_run_at = None
-            data = result.data if isinstance(result.data, dict) else {}
-            job.success_instance_id = str(data.get("instance_id") or "")
-            db.commit()
-            schedule_post_launch_adjustments(
-                session,
-                instance_id=job.success_instance_id,
-                compartment_id=str(payload.get("compartment_id") or ""),
-                boot_vpu=boot_vpu,
-            )
-            msg = result.message or "创建成功"
-            if boot_vpu != 10 and job.success_instance_id:
-                msg += f"；引导卷性能 {boot_vpu} VPUs/GB 将在后台自动调整（hydration 完成后）"
-            _audit_launch(True, msg, job.success_instance_id, job.id)
-            return LaunchInstanceResult(
-                ok=True,
-                message=msg,
-                work_request_id=result.work_request_id or "",
-                instance_id=job.success_instance_id,
-                capacity_job_id=job.id,
-                data=data,
-            )
-
-        job.last_error = (result.message or "")[:2000]
-        if is_capacity_message(result.message or ""):
-            job.status = "idle"
-            db.commit()
-            _audit_launch(False, result.message or "capacity", "", job.id)
-            return LaunchInstanceResult(
-                ok=False,
-                message=f"容量不足，已加入自动重试（间隔 {job.interval_sec}s）：{result.message}",
-                capacity_job_id=job.id,
-                data=result.data if isinstance(result.data, dict) else {},
-            )
-        # permanent fail: try cleanup managed nsg
-        if payload.get("managed_nsg_id"):
-            try:
-                session.delete_managed_nsg(str(payload.get("managed_nsg_id")))
-            except Exception:
-                pass
-        job.status = "failed"
-        job.enabled = False
-        db.commit()
+        _audit_launch(False, "已加入容量重试队列", "", job.id)
+        retry_msg = (
+            f"已加入容量重试：后台将每 {job.interval_sec}s 尝试一次"
+            f"（最多 {job.max_attempts} 次）。请在「任务中心」查看进度与日志"
+            "（需保持 worker 进程运行）。"
+        )
+        warns = format_guard_warnings(launch_guard)
+        if warns:
+            retry_msg += " 提醒：" + "；".join(warns)
         return LaunchInstanceResult(
-            ok=False,
-            message=result.message or "创建失败",
+            ok=True,
+            message=retry_msg,
             capacity_job_id=job.id,
-            data=result.data if isinstance(result.data, dict) else {},
         )
 
     # Direct launch
@@ -588,6 +583,9 @@ def launch_instance(
         msg = result.message or "创建成功"
         if boot_vpu != 10 and instance_id:
             msg += f"；引导卷性能 {boot_vpu} VPUs/GB 将在后台自动调整（hydration 完成后）"
+        warns = format_guard_warnings(launch_guard)
+        if warns:
+            msg += "；提醒：" + "；".join(warns)
         _audit_launch(True, msg, instance_id)
         return LaunchInstanceResult(
             ok=True,

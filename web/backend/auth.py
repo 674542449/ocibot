@@ -102,16 +102,27 @@ def count_users(db: Session) -> int:
 def set_auth_cookie(response, token: str) -> None:
     settings = get_settings()
     max_age = int(settings.jwt_expire_minutes * 60)
+    samesite = (settings.cookie_samesite or "lax").strip().lower()
+    if samesite not in {"lax", "strict", "none"}:
+        samesite = "lax"
+    # Browsers reject SameSite=None without Secure; force Secure in that case.
+    secure = bool(settings.cookie_secure) or samesite == "none"
     response.set_cookie(
         key=COOKIE_NAME,
         value=token,
         httponly=True,
-        samesite="lax",
-        secure=False,  # set True behind HTTPS reverse proxy if desired
+        samesite=samesite,
+        secure=secure,
         max_age=max_age,
         path="/",
     )
 
 
 def clear_auth_cookie(response) -> None:
-    response.delete_cookie(key=COOKIE_NAME, path="/")
+    settings = get_settings()
+    samesite = (settings.cookie_samesite or "lax").strip().lower()
+    if samesite not in {"lax", "strict", "none"}:
+        samesite = "lax"
+    secure = bool(settings.cookie_secure) or samesite == "none"
+    # Match the attributes used when setting the cookie so the browser deletes it.
+    response.delete_cookie(key=COOKIE_NAME, path="/", samesite=samesite, secure=secure)

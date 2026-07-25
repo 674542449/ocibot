@@ -1,8 +1,7 @@
-"""Unit tests for lean list refresh / launch-meta helpers (no live OCI)."""
+"""Unit tests for lean list refresh helpers (no live OCI)."""
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from app.oci_client import InstanceInfo, TenantSession
@@ -69,59 +68,3 @@ def test_instance_needs_enrichment_logic():
     assert needs(filled, set()) is False
     assert needs(bare, {bare.id}) is False
     assert needs(_inst(lifecycle_state="TERMINATING"), set()) is False
-
-
-def test_fetch_launch_meta_does_not_scan_compartments():
-    """_fetch_launch_meta must not list VCNs across the tenancy tree."""
-    from app.gui import OCIBotApp
-
-    calls = {"list_vcns": 0, "list_subnets": 0}
-
-    class FakeSession:
-        def list_compartments(self):
-            return [{"id": "c1", "name": "a"}, {"id": "c2", "name": "b"}]
-
-        def list_availability_domains(self):
-            return ["AD-1"]
-
-        def list_images(self, **_kw):
-            return [{"id": "img", "label": "Ubuntu"}]
-
-        def list_shapes(self, **_kw):
-            return [{"shape": "VM.Standard.A1.Flex", "label": "VM.Standard.A1.Flex"}]
-
-        def ensure_default_network(self, **_kw):
-            return SimpleNamespace(
-                ok=True,
-                message="using default",
-                data={
-                    "created": False,
-                    "vcns": [{"id": "vcn1", "label": "vcn"}],
-                    "subnets_by_vcn": {"vcn1": [{"id": "sub1", "label": "sub"}]},
-                    "vcn": {"id": "vcn1"},
-                    "subnet": {"id": "sub1"},
-                },
-            )
-
-        def list_vcns(self, *_a, **_k):
-            calls["list_vcns"] += 1
-            return []
-
-        def list_subnets(self, *_a, **_k):
-            calls["list_subnets"] += 1
-            return []
-
-    app = object.__new__(OCIBotApp)
-    app.sessions = SimpleNamespace(get=lambda _t: FakeSession())
-    tenant = SimpleNamespace(
-        id="tid",
-        name="T",
-        region="ap-tokyo-1",
-        tenancy_ocid="ocid1.tenancy.oc1..t",
-        compartment_ocid="",
-    )
-    meta = OCIBotApp._fetch_launch_meta(app, tenant)
-    assert meta["ads"] == ["AD-1"]
-    assert meta["preferred_vcn_id"] == "vcn1"
-    assert calls["list_vcns"] == 0
-    assert calls["list_subnets"] == 0

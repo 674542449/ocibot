@@ -14,3 +14,5 @@ pyotp>=2.9.0
 # Shared OCI business layer
 oci>=2.182.0
 cryptography>=42.0.0
+# Guest SSH (WebSSH terminal + boot FS grow)
+asyncssh>=2.14.0

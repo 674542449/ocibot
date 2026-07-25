@@ -152,6 +152,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import api, { type Tenant } from '@/api/client'
+import { copyText } from '@/utils/toast'
 
 type BootVolume = {
   id: string
@@ -229,13 +230,7 @@ function formatTime(v: string) {
 }
 
 async function copy(text: string) {
-  try {
-    await navigator.clipboard.writeText(text || '')
-    msg.value = '已复制'
-    error.value = ''
-  } catch {
-    error.value = '复制失败'
-  }
+  await copyText(text || '')
 }
 
 async function loadTenants() {

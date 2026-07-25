@@ -153,3 +153,11 @@ def test_vpu_update_gives_clear_message_when_hydration_never_finishes(monkeypatc
     result = s.resize_boot_volume("i", "c", vpus_per_gb=120, wait_for_volume=False, hydration_timeout=0)
     assert not result.ok
     assert "hydrating" in result.message
+
+
+def test_resize_boot_volume_message_no_auto_fs_claim():
+    s = _session()
+    result = s.resize_boot_volume("i", "c", size_in_gbs=100, wait_for_volume=False)
+    assert result.ok, result.message
+    assert "自动扩展分区" not in (result.message or "")
+    assert "文件系统" in (result.message or "") or "控制面" in (result.message or "")

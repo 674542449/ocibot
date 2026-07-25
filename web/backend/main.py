@@ -9,7 +9,8 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 # Ensure repo root is on sys.path so `app.*` and `web.*` import cleanly
@@ -28,8 +29,10 @@ from web.backend.routers import (
     instances,
     jobs,
     notifications,
+    storage,
     system,
     tenants,
+    webssh,
 )
 from web.backend.schemas import HealthOut
 
@@ -57,10 +60,26 @@ def _bootstrap_admin() -> None:
             log.info("bootstrap: promoted first user '%s' to admin", first.username)
 
 
+def _warn_insecure_secrets() -> None:
+    """Loudly warn when running with built-in dev secrets (not a hard fail unless
+    OCIBOT_REQUIRE_SECURE_SECRETS=1, which get_settings() enforces separately)."""
+    from web.backend.config import _INSECURE_DEFAULTS, get_settings
+
+    settings = get_settings()
+    weak = settings.master_key in _INSECURE_DEFAULTS or settings.jwt_secret in _INSECURE_DEFAULTS
+    if weak:
+        log.warning(
+            "SECURITY: using built-in default OCIBOT_MASTER_KEY / OCIBOT_JWT_SECRET. "
+            "Set strong random values before exposing this panel on a network. "
+            "Rotating OCIBOT_MASTER_KEY makes existing encrypted private keys undecryptable."
+        )
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
     _bootstrap_admin()
+    _warn_insecure_secrets()
     yield
 
 
@@ -71,6 +90,7 @@ def create_app() -> FastAPI:
         version=settings.app_version,
         lifespan=lifespan,
     )
+    app.add_middleware(GZipMiddleware, minimum_size=500)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origin_list(),
@@ -83,6 +103,8 @@ def create_app() -> FastAPI:
     app.include_router(tenants.router, prefix="/api")
     app.include_router(instances.router, prefix="/api")
     app.include_router(instance_ops.router, prefix="/api")
+    app.include_router(storage.router, prefix="/api")
+    app.include_router(webssh.router, prefix="/api")
     app.include_router(jobs.router, prefix="/api")
     app.include_router(backup.router, prefix="/api")
     app.include_router(audit.router, prefix="/api")
@@ -98,12 +120,15 @@ def create_app() -> FastAPI:
         app.mount("/assets", StaticFiles(directory=_DIST_DIR / "assets"), name="assets")
 
         @app.get("/{full_path:path}", include_in_schema=False)
-        def spa(full_path: str) -> FileResponse:
+        def spa(full_path: str) -> Response:
+            # Unknown API paths must return JSON 404, not the SPA shell — otherwise
+            # the frontend's JSON client receives an HTML 200 for a missing route.
+            if full_path.startswith("api"):
+                return JSONResponse({"detail": "Not Found"}, status_code=404)
             # Serve real files (favicon etc.); everything else falls back to the SPA.
             candidate = (_DIST_DIR / full_path).resolve()
             if (
                 full_path
-                and not full_path.startswith("api")
                 and candidate.is_file()
                 and _DIST_DIR.resolve() in candidate.parents
             ):

@@ -3,20 +3,20 @@ import { computed, ref } from 'vue'
 import api, { type TokenResponse } from '@/api/client'
 
 export const useAuthStore = defineStore('auth', () => {
-  // Cookie is primary; localStorage token is optional fallback / display.
-  const token = ref<string | null>(localStorage.getItem('ocibot_token'))
+  // Auth is the server's HttpOnly cookie. We keep only the username (for display
+  // and an optimistic isLoggedIn), and validate the real session via refreshMe().
+  const token = ref<string | null>(null)
   const username = ref<string | null>(localStorage.getItem('ocibot_username'))
   const isAdmin = ref(false)
   const totpEnabled = ref(false)
   const sessionChecked = ref(false)
 
-  const isLoggedIn = computed(() => !!username.value || !!token.value)
+  const isLoggedIn = computed(() => !!username.value)
 
   function setSession(data: TokenResponse) {
+    // The token is never stored (the cookie carries auth); keep it in-memory only.
     token.value = data.access_token
     username.value = data.username
-    // Keep token for Bearer fallback; cookie is also set by server (HttpOnly).
-    localStorage.setItem('ocibot_token', data.access_token)
     localStorage.setItem('ocibot_username', data.username)
   }
 
@@ -25,7 +25,6 @@ export const useAuthStore = defineStore('auth', () => {
     username.value = null
     isAdmin.value = false
     totpEnabled.value = false
-    localStorage.removeItem('ocibot_token')
     localStorage.removeItem('ocibot_username')
   }
 

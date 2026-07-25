@@ -179,6 +179,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import api, { type Instance, type Tenant } from '@/api/client'
+import { copyText, showToast } from '@/utils/toast'
 
 const route = useRoute()
 const tenants = ref<Tenant[]>([])
@@ -320,24 +321,16 @@ function exportCsv() {
   a.download = `ocibot-instances-${new Date().toISOString().slice(0, 10)}.csv`
   a.click()
   URL.revokeObjectURL(url)
-  msg.value = `已导出 ${rows.length} 行`
+  showToast(`已导出 ${rows.length} 行`, 'ok')
 }
 
 async function copy(text: string) {
-  const v = (text || '').trim()
-  if (!v || v === '—') return
-  try {
-    await navigator.clipboard.writeText(v)
-    msg.value = `已复制：${v.length > 40 ? v.slice(0, 40) + '…' : v}`
-    error.value = ''
-  } catch {
-    error.value = '复制失败'
-  }
+  await copyText(text)
 }
 
 function copyIp(text?: string | null) {
   if (!text) return
-  copy(text)
+  void copyText(text, '已复制 IP')
 }
 
 async function loadTenants() {
@@ -345,31 +338,40 @@ async function loadTenants() {
   tenants.value = data
 }
 
+let loadSeq = 0
 async function load() {
   error.value = ''
   msg.value = ''
   loading.value = true
+  const seq = ++loadSeq
   try {
+    let data: Instance[]
     if (tenantId.value) {
-      const { data } = await api.get<Instance[]>(`/tenants/${tenantId.value}/instances`, {
+      const res = await api.get<Instance[]>(`/tenants/${tenantId.value}/instances`, {
         params: { resolve_ips: resolveIps.value, include_subcompartments: true },
       })
-      instances.value = data
+      data = res.data
     } else {
-      const { data } = await api.get<Instance[]>('/instances', {
+      const res = await api.get<Instance[]>('/instances', {
         params: { resolve_ips: resolveIps.value },
       })
-      instances.value = data
+      data = res.data
     }
+    // Discard out-of-order responses from a superseded tenant switch.
+    if (seq !== loadSeq) return
+    instances.value = data
   } catch (e: any) {
+    if (seq !== loadSeq) return
     error.value = e?.message || '加载失败'
     instances.value = []
   } finally {
-    loading.value = false
-    // Drop selections that no longer exist in the refreshed list.
-    const live = new Set(instances.value.map((i) => selKey(i)))
-    for (const key of [...selected]) {
-      if (!live.has(key)) selected.delete(key)
+    if (seq === loadSeq) {
+      loading.value = false
+      // Drop selections that no longer exist in the refreshed list.
+      const live = new Set(instances.value.map((i) => selKey(i)))
+      for (const key of [...selected]) {
+        if (!live.has(key)) selected.delete(key)
+      }
     }
   }
 }
@@ -455,8 +457,12 @@ onMounted(async () => {
   try {
     await loadTenants()
     const q = String(route.query.tenant || '')
-    if (q) tenantId.value = q
-    await load()
+    if (q && q !== tenantId.value) {
+      // Changing tenantId triggers the watcher, which loads — avoid a double fetch.
+      tenantId.value = q
+    } else {
+      await load()
+    }
   } catch (e: any) {
     error.value = e?.message || '初始化失败'
   }

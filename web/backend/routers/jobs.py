@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Annotated, Any
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
@@ -19,7 +19,8 @@ from app.scheduler import (
 from web.backend.auth import get_current_user
 from web.backend.db import get_db
 from web.backend.models import CapacityAttempt, CapacityJob, ScheduleJobRow, ScheduleRun, User
-from web.backend.oci_bridge import get_owned_tenant
+from web.backend.oci_bridge import get_owned_tenant, get_session_for_row
+from web.backend.quota_guard import enforce_launch_quota
 from web.backend.schemas import (
     CapacityAttemptOut,
     CapacityJobCreate,
@@ -75,14 +76,50 @@ def create_capacity_job(
     db: Annotated[Session, Depends(get_db)],
 ) -> CapacityJobOut:
     try:
-        get_owned_tenant(db, user.id, body.tenant_id)
+        tenant = get_owned_tenant(db, user.id, body.tenant_id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    # Compliance: at most one active capacity-retry job per tenant (serialize retries).
+    if body.enabled:
+        existing = db.scalar(
+            select(CapacityJob)
+            .where(
+                CapacityJob.tenant_id == body.tenant_id,
+                CapacityJob.owner_id == user.id,
+                CapacityJob.enabled.is_(True),
+                CapacityJob.status.in_(("idle", "running")),
+            )
+            .limit(1)
+        )
+        if existing is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="该租户已有进行中的容量重试任务，请先在任务中心停止或删除后再新建",
+            )
 
     try:
         payload = sanitize_launch_payload(body.launch_payload, for_retry=True)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Always Free guard — same rules as the launch wizard.
+    try:
+        session = get_session_for_row(tenant)
+        enforce_launch_quota(
+            session,
+            account_tier=getattr(tenant, "account_tier", "") or "",
+            shape=str(payload.get("shape") or ""),
+            ocpus=payload.get("ocpus"),
+            memory_in_gbs=payload.get("memory_in_gbs"),
+            boot_volume_size_in_gbs=payload.get("boot_volume_size_in_gbs"),
+            boot_volume_vpus_per_gb=payload.get("boot_volume_vpus_per_gb") or 10,
+            fallback_configs=list(getattr(body, "fallback_configs", None) or payload.get("fallback_configs") or []),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"校验免费额度失败: {exc}") from exc
 
     interval = clamp_retry_interval(body.interval_sec or DEFAULT_RETRY_INTERVAL_SEC)
     max_attempts = clamp_max_attempts(body.max_attempts or DEFAULT_MAX_ATTEMPTS)

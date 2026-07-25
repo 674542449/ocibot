@@ -19,6 +19,11 @@ def _make_engine():
     settings = get_settings()
     url = settings.database_url
     connect_args: dict = {}
+    engine_kwargs: dict = {
+        "pool_pre_ping": True,
+        "future": True,
+        "connect_args": connect_args,
+    }
     if settings.is_sqlite:
         # Ensure parent dir exists for default sqlite path
         if ":///" in url:
@@ -26,18 +31,24 @@ def _make_engine():
             if raw_path and raw_path != ":memory:":
                 Path(raw_path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
         connect_args["check_same_thread"] = False
-    engine = create_engine(
-        url,
-        pool_pre_ping=True,
-        future=True,
-        connect_args=connect_args,
-    )
+        # SQLite: small pool (often NullPool-ish behavior is fine; keep simple).
+        engine_kwargs["pool_size"] = 5
+        engine_kwargs["max_overflow"] = 0
+    else:
+        # PostgreSQL production pool — faster concurrent API + worker traffic.
+        engine_kwargs["pool_size"] = int(getattr(settings, "db_pool_size", 10) or 10)
+        engine_kwargs["max_overflow"] = int(getattr(settings, "db_max_overflow", 20) or 20)
+        engine_kwargs["pool_recycle"] = int(getattr(settings, "db_pool_recycle", 1800) or 1800)
+        engine_kwargs["pool_timeout"] = 30
+    engine = create_engine(url, **engine_kwargs)
     if settings.is_sqlite:
 
         @event.listens_for(engine, "connect")
         def _sqlite_pragma(dbapi_conn, _connection_record):  # type: ignore[no-untyped-def]
             cursor = dbapi_conn.cursor()
             cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.close()
 
     return engine

@@ -138,7 +138,7 @@ async def import_encrypted_zip(
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail="备份内容格式无效") from exc
 
-    items = data.get("tenants", data if isinstance(data, list) else [])
+    items = data.get("tenants", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
     imported_ids: list[str] = []
     for item in items:
         if not isinstance(item, dict):

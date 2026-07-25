@@ -9,16 +9,16 @@
         </div>
       </div>
       <nav class="nav">
-        <router-link to="/">实例</router-link>
-        <router-link to="/launch">创建实例</router-link>
-        <router-link to="/boot-volumes">引导卷</router-link>
-        <router-link to="/tenants">租户</router-link>
-        <router-link to="/jobs">任务中心</router-link>
-        <router-link to="/account">账号用量</router-link>
-        <router-link to="/backup">备份恢复</router-link>
-        <router-link to="/audit">审计日志</router-link>
-        <router-link to="/settings">设置</router-link>
-        <router-link v-if="auth.isAdmin" to="/admin">用户管理</router-link>
+        <router-link
+          v-for="item in navItems"
+          :key="item.to"
+          :to="item.to"
+          :class="{ 'nav-active': isNavActive(item) }"
+          active-class=""
+          exact-active-class=""
+        >
+          {{ item.label }}
+        </router-link>
       </nav>
       <div class="sidebar-foot stack">
         <button type="button" @click="toggleTheme">
@@ -38,13 +38,46 @@
 </template>
 
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import api from '@/api/client'
 import { useAuthStore } from '@/stores/auth'
 
 const auth = useAuthStore()
 const router = useRouter()
+const route = useRoute()
+
+type NavItem = { to: string; label: string; match?: 'exact' | 'prefix' | 'instances' }
+
+const navItems = computed<NavItem[]>(() => {
+  const items: NavItem[] = [
+    // `/` is a prefix of every path — must use exact/instances matching, not default active.
+    { to: '/', label: '实例', match: 'instances' },
+    { to: '/launch', label: '创建实例', match: 'exact' },
+    { to: '/storage', label: '存储', match: 'prefix' },
+    { to: '/tenants', label: '租户', match: 'exact' },
+    { to: '/jobs', label: '任务中心', match: 'exact' },
+    { to: '/account', label: '账号用量', match: 'exact' },
+    { to: '/backup', label: '备份恢复', match: 'exact' },
+    { to: '/audit', label: '审计日志', match: 'exact' },
+    { to: '/settings', label: '设置', match: 'exact' },
+  ]
+  if (auth.isAdmin) items.push({ to: '/admin', label: '用户管理', match: 'exact' })
+  return items
+})
+
+function isNavActive(item: NavItem): boolean {
+  const path = route.path || '/'
+  const mode = item.match || 'exact'
+  if (mode === 'instances') {
+    return path === '/' || path.startsWith('/instances/')
+  }
+  if (mode === 'prefix') {
+    return path === item.to || path.startsWith(item.to + '/')
+  }
+  // exact — also treat /boot-volumes redirect target under storage already handled
+  return path === item.to
+}
 
 const workerAlive = ref(true)
 const workerChecked = ref(false)
@@ -143,9 +176,17 @@ onBeforeUnmount(() => {
   border-radius: 8px;
   border: 1px solid transparent;
 }
-.nav a.router-link-active {
+/* Do not use .router-link-active: link to="/" matches every route as a prefix. */
+.nav a.nav-active {
   background: #1d4ed855;
   border-color: #3b82f6;
+  color: #fff;
+  font-weight: 600;
+}
+html[data-theme='light'] .nav a.nav-active {
+  background: #dbeafe;
+  border-color: #3b82f6;
+  color: #1e3a8a;
 }
 .sidebar-foot {
   margin-top: auto;

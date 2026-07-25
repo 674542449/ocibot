@@ -31,7 +31,22 @@
       </div>
       <p class="muted" style="margin: 0; font-size: 12px; color: #fbbf24">
         ⚠ 将开放 Guest 防火墙与实例 NSG 相关规则；容量重试会持续调用 LaunchInstance，请确认间隔与次数。
+        服务端会按 Always Free 额度拦截超额创建（免费/未知账号硬拦；已付费账号仅警告）。
       </p>
+      <div v-if="quotaPreview" class="card" style="padding: 0.65rem; font-size: 12px">
+        <div class="row" style="justify-content: space-between">
+          <strong>免费额度预览</strong>
+          <span class="badge" :class="quotaPreview.overall_status === 'ok' ? 'running' : 'warn'">
+            {{ quotaPreview.overall_status || '—' }}
+          </span>
+        </div>
+        <div class="muted" style="margin-top: 0.25rem">
+          {{ (quotaPreview.summary_lines || []).slice(0, 4).join(' · ') || '—' }}
+        </div>
+        <p v-if="quotaLoadError" class="muted" style="margin: 0.35rem 0 0; color: #fbbf24">
+          {{ quotaLoadError }}
+        </p>
+      </div>
       <div class="row">
         <button class="primary" :disabled="submitting" @click="doLaunch">
           {{ submitting ? '提交中，请稍候…' : '确认并创建' }}
@@ -293,6 +308,8 @@ const error = ref('')
 const msg = ref('')
 const presetHint = ref('')
 const sshFile = ref('')
+const quotaPreview = ref<any>(null)
+const quotaLoadError = ref('')
 
 const form = reactive({
   display_name: '',
@@ -488,13 +505,27 @@ function genPassword() {
   const digits = '23456789'
   const symbols = '!@#%^*-_=+'
   const all = upper + lower + digits + symbols
-  const pick = (s: string) => s[Math.floor(Math.random() * s.length)]
-  let out = pick(upper) + pick(lower) + pick(digits) + pick(symbols)
-  for (let i = 0; i < 12; i++) out += pick(all)
-  form.root_password = out
-    .split('')
-    .sort(() => Math.random() - 0.5)
-    .join('')
+  // Unbiased index in [0, n) from a CSPRNG (rejection sampling) — never Math.random
+  // for credential material.
+  const rnd = (n: number) => {
+    const limit = Math.floor(0x100000000 / n) * n
+    const buf = new Uint32Array(1)
+    let x = 0
+    do {
+      crypto.getRandomValues(buf)
+      x = buf[0]
+    } while (x >= limit)
+    return x % n
+  }
+  const pick = (s: string) => s[rnd(s.length)]
+  const chars = [pick(upper), pick(lower), pick(digits), pick(symbols)]
+  for (let i = 0; i < 12; i++) chars.push(pick(all))
+  // Fisher–Yates shuffle so the guaranteed char classes aren't always in front.
+  for (let i = chars.length - 1; i > 0; i--) {
+    const j = rnd(i + 1)
+    ;[chars[i], chars[j]] = [chars[j], chars[i]]
+  }
+  form.root_password = chars.join('')
 }
 
 async function pickSshKey() {
@@ -550,7 +581,19 @@ const confirmRows = computed(() => {
   ] as [string, string][]
 })
 
-function openConfirm() {
+async function loadQuotaPreview() {
+  quotaPreview.value = null
+  quotaLoadError.value = ''
+  if (!tenantId.value) return
+  try {
+    const { data } = await api.get(`/tenants/${tenantId.value}/free-quota`)
+    quotaPreview.value = data.data || null
+  } catch (e: any) {
+    quotaLoadError.value = e?.message || '无法读取免费额度（提交时仍会由服务端校验）'
+  }
+}
+
+async function openConfirm() {
   error.value = ''
   msg.value = ''
   if (!tenantId.value) {
@@ -565,6 +608,7 @@ function openConfirm() {
     error.value = '请完整选择 AD / 镜像 / Shape'
     return
   }
+  await loadQuotaPreview()
   confirmOpen.value = true
 }
 
@@ -619,9 +663,14 @@ async function doLaunch() {
         msg.value += ` · 实例 ${String(data.instance_id).slice(-12)}`
       }
       if (data.capacity_job_id) msg.value += ` · 任务 ${data.capacity_job_id.slice(0, 8)}…`
-      // Navigate after a short delay so the success toast is readable.
+      // A queued capacity-retry job (no instance yet) → task centre; else the list.
+      const queuedRetry = !!data.capacity_job_id && !data.instance_id
       window.setTimeout(() => {
-        router.push({ path: '/', query: { tenant: tenantId.value } }).catch(() => {})
+        if (queuedRetry) {
+          router.push({ path: '/jobs' }).catch(() => {})
+        } else {
+          router.push({ path: '/', query: { tenant: tenantId.value } }).catch(() => {})
+        }
       }, 800)
     } else if (data.capacity_job_id) {
       msg.value = data.message || '已加入容量重试'

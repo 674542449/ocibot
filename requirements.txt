@@ -1,5 +1,6 @@
-oci>=2.182.0
-cryptography>=42.0.0
-passlib>=1.7.4
-pyzipper>=0.3.6
-windnd>=1.0.7; platform_system=="Windows"
+# OCIBot Web — runtime dependencies.
+#
+# This installs the FastAPI web application together with the shared OCI
+# business layer under app/. It simply pulls in the backend's own pinned list,
+# so `pip install -r requirements.txt` from the repo root is all you need.
+-r web/backend/requirements.txt

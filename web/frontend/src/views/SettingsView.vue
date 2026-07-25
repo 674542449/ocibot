@@ -303,15 +303,25 @@ async function testChannel(c: Channel) {
 }
 
 async function toggleChannel(c: Channel) {
-  await api.patch(`/notifications/${c.id}`, { enabled: !c.enabled })
-  await load()
+  error.value = ''
+  try {
+    await api.patch(`/notifications/${c.id}`, { enabled: !c.enabled })
+    await load()
+  } catch (e: any) {
+    error.value = e?.message || '操作失败'
+  }
 }
 
 async function deleteChannel(c: Channel) {
   if (!confirm(`删除渠道「${c.name}」？`)) return
-  await api.delete(`/notifications/${c.id}`)
-  msg.value = '已删除'
-  await load()
+  error.value = ''
+  try {
+    await api.delete(`/notifications/${c.id}`)
+    msg.value = '已删除'
+    await load()
+  } catch (e: any) {
+    error.value = e?.message || '删除失败'
+  }
 }
 
 async function changePassword() {

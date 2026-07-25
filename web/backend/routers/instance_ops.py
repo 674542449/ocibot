@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.oci_client import FirewallRuleSpec, OCIClientError
+from app.oci_client import FirewallRuleSpec
 from web.backend.audit import write_audit
 from web.backend.auth import get_current_user
 from web.backend.db import get_db
@@ -26,6 +26,12 @@ class ConsoleCreateRequest(BaseModel):
 class BootVolumeUpdateRequest(BaseModel):
     size_in_gbs: Optional[int] = None
     vpus_per_gb: Optional[int] = None
+    # Optional SSH auto-grow of guest filesystem after OCI size expand (session-only creds).
+    auto_grow_fs: bool = False
+    ssh_username: str = "ubuntu"
+    ssh_private_key_pem: Optional[str] = None
+    ssh_password: Optional[str] = None
+    ssh_port: int = 22
 
 
 class FirewallRuleCreate(BaseModel):
@@ -176,6 +182,8 @@ def add_firewall_rule(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         result = session.add_instance_firewall_rule(body.nsg_id, spec)
         return PowerActionResult(**op_result_dict(result))
+    except HTTPException:
+        raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -275,18 +283,134 @@ def boot_volume_update(
     body: BootVolumeUpdateRequest,
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
-) -> PowerActionResult:
+) -> dict[str, Any]:
     row = _row(db, user.id, tenant_id)
     try:
+        from app import free_quota
+        from app.fs_grow import truncate_output
+        from web.backend.ssh_bridge import (
+            grow_filesystem_over_ssh,
+            resolve_instance_ssh_target,
+            validate_ssh_auth,
+        )
+
         session = get_session_for_row(row)
         info = session.get_instance(instance_id, resolve_ips=False)
+
+        current_size = 0
+        size_changing = body.size_in_gbs is not None
+        if size_changing:
+            try:
+                cur = session.get_boot_volume_info(instance_id, info.compartment_id)
+                if cur.ok and isinstance(cur.data, dict):
+                    current_size = int(cur.data.get("size_in_gbs") or 0)
+            except Exception:
+                current_size = 0
+            try:
+                usage_res = session.get_free_quota_usage(free_only_mode=True)
+                usage = usage_res.data if isinstance(usage_res.data, dict) else {}
+            except Exception:
+                usage = {}
+            guard = free_quota.validate_boot_resize_against_quota(
+                current_size_gb=current_size,
+                new_size_gb=body.size_in_gbs,
+                free_only_mode=True,
+                account_tier=getattr(row, "account_tier", "") or "",
+                usage=usage,
+            )
+            if not guard.ok:
+                raise HTTPException(
+                    status_code=400,
+                    detail="；".join(guard.error_messages()) or "超出免费块存储额度",
+                )
+
+        ssh_auth = None
+        if body.auto_grow_fs:
+            if not size_changing:
+                raise HTTPException(status_code=400, detail="自动扩展文件系统仅在扩大引导卷时可用")
+            try:
+                ssh_auth = validate_ssh_auth(
+                    username=body.ssh_username or "ubuntu",
+                    private_key_pem=body.ssh_private_key_pem,
+                    password=body.ssh_password,
+                    port=int(body.ssh_port or 22),
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
         result = session.resize_boot_volume(
             instance_id,
             info.compartment_id,
             size_in_gbs=body.size_in_gbs,
             vpus_per_gb=body.vpus_per_gb,
         )
-        return PowerActionResult(**op_result_dict(result))
+        oci_ok = bool(result.ok)
+        data: dict[str, Any] = dict(result.data) if isinstance(result.data, dict) else {}
+        data["oci_ok"] = oci_ok
+        data["fs_ok"] = None
+        data["stdout"] = ""
+        data["stderr"] = ""
+        data["hints"] = []
+        message = result.message or ""
+
+        if oci_ok and body.auto_grow_fs and ssh_auth and size_changing:
+            try:
+                target = resolve_instance_ssh_target(session, instance_id)
+                grow = grow_filesystem_over_ssh(
+                    target.host,
+                    port=ssh_auth["port"],
+                    username=ssh_auth["username"],
+                    private_key_pem=ssh_auth.get("private_key_pem"),
+                    password=ssh_auth.get("password"),
+                    retries=3,
+                    retry_delay_sec=8.0,
+                    timeout=120.0,
+                )
+                data["fs_ok"] = bool(grow.ok)
+                data["stdout"] = truncate_output(grow.stdout)
+                data["stderr"] = truncate_output(grow.stderr)
+                data["ssh_host"] = grow.host or target.host
+                if grow.ok:
+                    message = (message or "引导卷已调整") + "；文件系统已扩展"
+                else:
+                    hints = []
+                    if grow.message:
+                        hints.append(grow.message)
+                    hints.append("可稍后在实例内手动执行: sudo growpart <disk> <part> && sudo resize2fs <dev>")
+                    data["hints"] = hints
+                    message = (message or "引导卷已调整") + f"；文件系统扩展失败：{grow.message}"
+            except Exception as exc:  # noqa: BLE001
+                data["fs_ok"] = False
+                data["hints"] = [
+                    str(exc),
+                    "请确认实例有公网 IP、22 端口放行，或登录后手动 growpart/resize2fs",
+                ]
+                message = (message or "引导卷已调整") + f"；文件系统扩展失败：{exc}"
+
+        write_audit(
+            db,
+            owner_id=user.id,
+            action="boot_volume.resize",
+            target=instance_id,
+            detail={
+                "oci_ok": oci_ok,
+                "fs_ok": data.get("fs_ok"),
+                "auto_grow": bool(body.auto_grow_fs),
+                "size_in_gbs": body.size_in_gbs,
+                "vpus_per_gb": body.vpus_per_gb,
+                "auth_mode": (ssh_auth or {}).get("auth_mode") if ssh_auth else None,
+            },
+        )
+        # Drop any residual credential refs
+        ssh_auth = None
+        return {
+            "ok": oci_ok,
+            "message": message,
+            "work_request_id": getattr(result, "work_request_id", "") or "",
+            "data": data,
+        }
+    except HTTPException:
+        raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 

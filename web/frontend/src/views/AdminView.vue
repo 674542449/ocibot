@@ -117,13 +117,16 @@ async function load() {
 
 async function saveSettings() {
   error.value = ''
+  const attempted = allowOpenRegistration.value
   try {
     const { data } = await api.put('/admin/settings', {
-      allow_open_registration: allowOpenRegistration.value,
+      allow_open_registration: attempted,
     })
     settingsSource.value = data.source
+    allowOpenRegistration.value = !!data.allow_open_registration
     msg.value = data.allow_open_registration ? '已允许开放注册' : '已关闭开放注册'
   } catch (e: any) {
+    allowOpenRegistration.value = !attempted // revert the optimistic v-model toggle
     error.value = e?.message || '保存失败'
   }
 }

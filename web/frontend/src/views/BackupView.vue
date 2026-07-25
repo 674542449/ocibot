@@ -16,7 +16,7 @@
         <label>备份密码（≥6 位）</label>
         <input v-model="exportPassword" type="password" autocomplete="new-password" />
       </div>
-      <button class="primary" :disabled="busy" @click="doExport">
+      <button class="primary" :disabled="!!busy" @click="doExport">
         {{ busy === 'export' ? '导出中…' : '下载加密 ZIP' }}
       </button>
     </div>
@@ -31,7 +31,7 @@
         <label>备份密码</label>
         <input v-model="importPassword" type="password" autocomplete="current-password" />
       </div>
-      <button class="primary" :disabled="busy || !file" @click="doImport">
+      <button class="primary" :disabled="!!busy || !file" @click="doImport">
         {{ busy === 'import' ? '导入中…' : '导入租户' }}
       </button>
     </div>

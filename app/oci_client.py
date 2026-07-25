@@ -45,6 +45,11 @@ try:
     except ImportError:  # pragma: no cover
         ObjectStorageClient = object  # type: ignore
 
+    try:
+        from oci.compute_instance_agent import ComputeInstanceAgentClient
+    except ImportError:  # pragma: no cover
+        ComputeInstanceAgentClient = object  # type: ignore
+
     OCI_AVAILABLE = True
 except ImportError:  # pragma: no cover
     oci = None  # type: ignore
@@ -56,6 +61,7 @@ except ImportError:  # pragma: no cover
     MonitoringClient = object  # type: ignore
     UsageapiClient = object  # type: ignore
     ObjectStorageClient = object  # type: ignore
+    ComputeInstanceAgentClient = object  # type: ignore
     ServiceError = Exception  # type: ignore
     OCI_AVAILABLE = False
 
@@ -645,6 +651,44 @@ class OCIClientError(Exception):
     """Raised for user-visible OCI errors."""
 
 
+def build_grow_fs_script() -> str:
+    """Idempotent, online root-filesystem grow for a resized boot volume.
+
+    Detects the root device/partition, runs growpart, then resize2fs (ext4) or
+    xfs_growfs (xfs). Runs as root via the Oracle Cloud Agent (Run Command); no reboot.
+    """
+    return r"""#!/bin/bash
+# OCIBot: grow root filesystem to fill a resized boot volume (online, no reboot).
+set -u
+ROOT_SRC=$(findmnt -no SOURCE / 2>/dev/null)
+FSTYPE=$(findmnt -no FSTYPE / 2>/dev/null)
+DEV=$(readlink -f "$ROOT_SRC" 2>/dev/null || echo "$ROOT_SRC")
+if [ -z "$DEV" ]; then echo "无法确定根设备"; exit 1; fi
+DISK=""; PART=""
+if echo "$DEV" | grep -Eq '^/dev/nvme[0-9]+n[0-9]+p[0-9]+$'; then
+  DISK=$(echo "$DEV" | sed -E 's/p[0-9]+$//'); PART=$(echo "$DEV" | grep -oE '[0-9]+$')
+elif echo "$DEV" | grep -Eq '^/dev/[a-z]+[0-9]+$'; then
+  DISK=$(echo "$DEV" | sed -E 's/[0-9]+$//'); PART=$(echo "$DEV" | grep -oE '[0-9]+$')
+else
+  echo "无法解析磁盘/分区: $DEV"; exit 1
+fi
+echo "root=$DEV disk=$DISK part=$PART fstype=$FSTYPE"
+if ! command -v growpart >/dev/null 2>&1; then
+  (command -v apt-get >/dev/null 2>&1 && apt-get update -y && apt-get install -y cloud-guest-utils) \
+    || (command -v yum >/dev/null 2>&1 && yum install -y cloud-utils-growpart) \
+    || (command -v dnf >/dev/null 2>&1 && dnf install -y cloud-utils-growpart) || true
+fi
+growpart "$DISK" "$PART" || echo "growpart: 分区已是最大或无需扩展"
+if [ "$FSTYPE" = "xfs" ]; then
+  xfs_growfs / || xfs_growfs "$DEV"
+else
+  resize2fs "$DEV"
+fi
+echo "== 完成 =="
+df -h /
+"""
+
+
 class TenantSession:
     """One authenticated OCI session bound to a TenantConfig."""
 
@@ -663,6 +707,7 @@ class TenantSession:
         self._usage: Any = None
         self._object_storage: Any = None
         self._object_namespace: str = ""
+        self._instance_agent: Any = None
         self._config: dict = {}
         self._build()
 
@@ -703,6 +748,10 @@ class TenantSession:
                 self._object_storage = ObjectStorageClient(self._config, **retry_kw)
             except Exception:
                 self._object_storage = None
+            try:
+                self._instance_agent = ComputeInstanceAgentClient(self._config, **retry_kw)
+            except Exception:
+                self._instance_agent = None
             try:
                 # Usage API is often home-region only; prefer home region when known.
                 usage_cfg = dict(self._config)
@@ -771,6 +820,10 @@ class TenantSession:
     @property
     def object_storage(self) -> Any:
         return self._object_storage
+
+    @property
+    def instance_agent(self) -> Any:
+        return self._instance_agent
 
     def resolve_compartment(self) -> str:
         if self.tenant.compartment_ocid.strip():
@@ -2583,6 +2636,61 @@ class TenantSession:
             },
         )
 
+    def get_free_quota_usage(self, *, free_only_mode: bool = True, include_block: bool = True) -> OperationResult:
+        """Aggregate Always-Free usage (compute + storage) for the quota dashboard.
+
+        Reuses app.free_quota.build_quota_snapshot so the same caps/thresholds apply
+        everywhere. Returns the snapshot dict in ``.data``.
+        """
+        from app import free_quota
+
+        notes: list[str] = []
+        try:
+            instances = self.list_instances_tree(resolve_ips=False)
+        except Exception as exc:  # noqa: BLE001
+            instances = []
+            notes.append(f"实例读取失败：{exc}")
+
+        volumes: list[dict[str, Any]] = []
+        try:
+            bv = self.list_boot_volumes(include_subcompartments=True, include_attachments=True)
+            data = bv.data if isinstance(bv.data, dict) else {}
+            for v in data.get("volumes", []) or []:
+                volumes.append({**v, "kind": "boot"})
+        except Exception as exc:  # noqa: BLE001
+            notes.append(f"引导卷读取失败：{exc}")
+
+        if include_block:
+            try:
+                blk = self.list_block_volumes(include_subcompartments=True, include_attachments=True)
+                data = blk.data if isinstance(blk.data, dict) else {}
+                for v in data.get("volumes", []) or []:
+                    volumes.append({**v, "kind": "block"})
+            except Exception as exc:  # noqa: BLE001
+                notes.append(f"块存储卷读取失败：{exc}")
+
+        object_usage: dict[str, Any] = {}
+        try:
+            est = self.estimate_object_storage_usage()
+            if isinstance(est.data, dict):
+                object_usage = est.data
+                if est.message:
+                    notes.append(est.message)
+            if not est.ok and est.message:
+                notes.append(est.message)
+        except Exception as exc:  # noqa: BLE001
+            notes.append(f"对象存储读取失败：{exc}")
+
+        snapshot = free_quota.build_quota_snapshot(
+            instances=instances,
+            volumes=volumes,
+            free_only_mode=free_only_mode,
+            account_tier=getattr(self.tenant, "account_tier", "") or "",
+            notes=notes,
+            object_usage=object_usage,
+        )
+        return OperationResult(ok=True, message="", data=snapshot)
+
     def _find_boot_volume_id(self, instance_id: str, compartment_id: str, availability_domain: str, *, wait: bool = True, timeout: int = 150) -> str:
         """Find the boot volume OCID for an instance, optionally waiting for attachment."""
         deadline = time.monotonic() + (timeout if wait else 0)
@@ -2679,7 +2787,9 @@ class TenantSession:
                 parts.append(f"{int(vpus_per_gb)} VPUs/GB")
             return OperationResult(
                 ok=True,
-                message="引导卷已调整：" + " · ".join(parts) + "（生效需几分钟，扩容后系统会自动扩展分区）",
+                message="引导卷已调整："
+                + " · ".join(parts)
+                + "（控制面已更新；访客文件系统需 SSH 扩展或手动 growpart/resize2fs）",
                 data={"boot_volume_id": bv_id},
             )
         except ServiceError as exc:
@@ -3803,6 +3913,733 @@ class TenantSession:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
             return OperationResult(ok=False, message=str(exc))
+
+    # ------------------------------------------------------------------
+    # Block (data) volumes
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _volume_perf_label(vpu: int) -> str:
+        if vpu <= 10:
+            return "平衡"
+        if vpu <= 20:
+            return "较高性能"
+        return "超高性能"
+
+    @staticmethod
+    def _ts_iso(value: Any) -> str:
+        if value is None:
+            return ""
+        if hasattr(value, "isoformat"):
+            try:
+                return value.isoformat()
+            except Exception:
+                return str(value)
+        return str(value)
+
+    def list_block_volumes(
+        self,
+        *,
+        compartment_id: Optional[str] = None,
+        include_subcompartments: bool = True,
+        include_attachments: bool = True,
+    ) -> OperationResult:
+        """List block (data) volumes under a compartment subtree."""
+        root = (compartment_id or self.resolve_compartment()).strip()
+        comps: list[str] = [root]
+        if include_subcompartments:
+            try:
+                comps = [c["id"] for c in self.list_compartments(parent_id=root, subtree=True)]
+                if root not in comps:
+                    comps.insert(0, root)
+            except Exception:
+                comps = [root]
+
+        try:
+            ads = self.list_availability_domains()
+        except Exception:
+            ads = []
+        if not ads:
+            ads = [""]
+
+        volumes: list[dict] = []
+        seen: set[str] = set()
+        errors: list[str] = []
+
+        for cid in comps:
+            for ad in ads:
+                try:
+                    kwargs: dict[str, Any] = {"compartment_id": cid}
+                    if ad:
+                        kwargs["availability_domain"] = ad
+                    resp = oci.pagination.list_call_get_all_results(
+                        self.blockstorage.list_volumes,
+                        **kwargs,
+                    )
+                    for vol in resp.data or []:
+                        vid = getattr(vol, "id", "") or ""
+                        if not vid or vid in seen:
+                            continue
+                        state = str(getattr(vol, "lifecycle_state", "") or "")
+                        if state in {"TERMINATED", "TERMINATING"}:
+                            continue
+                        seen.add(vid)
+                        vpu = int(getattr(vol, "vpus_per_gb", 10) or 10)
+                        volumes.append(
+                            {
+                                "id": vid,
+                                "display_name": getattr(vol, "display_name", "") or vid[-12:],
+                                "size_in_gbs": int(getattr(vol, "size_in_gbs", 0) or 0),
+                                "vpus_per_gb": vpu,
+                                "performance_label": self._volume_perf_label(vpu),
+                                "lifecycle_state": state,
+                                "availability_domain": getattr(vol, "availability_domain", "") or ad,
+                                "compartment_id": getattr(vol, "compartment_id", "") or cid,
+                                "time_created": self._ts_iso(getattr(vol, "time_created", None)),
+                                "instance_id": "",
+                                "instance_name": "",
+                                "attachment_id": "",
+                                "attachment_state": "",
+                                "attachment_type": "",
+                                "kind": "block",
+                            }
+                        )
+                except ServiceError as exc:
+                    errors.append(_format_service_error(exc))
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(str(exc))
+
+        if include_attachments and volumes:
+            by_key: dict[tuple[str, str], list[dict]] = {}
+            for v in volumes:
+                key = (v.get("availability_domain") or "", v.get("compartment_id") or root)
+                by_key.setdefault(key, []).append(v)
+
+            attach_map: dict[str, dict[str, str]] = {}
+            for (ad, cid), _group in by_key.items():
+                if not ad:
+                    continue
+                try:
+                    atts = oci.pagination.list_call_get_all_results(
+                        self.compute.list_volume_attachments,
+                        ad,
+                        cid,
+                    ).data
+                except Exception:
+                    atts = []
+                for att in atts or []:
+                    vol_id = getattr(att, "volume_id", "") or ""
+                    if not vol_id:
+                        continue
+                    state = str(getattr(att, "lifecycle_state", "") or "")
+                    if state in {"DETACHED", "DETACHING"}:
+                        continue
+                    attach_map[vol_id] = {
+                        "instance_id": getattr(att, "instance_id", "") or "",
+                        "attachment_id": getattr(att, "id", "") or "",
+                        "attachment_state": state,
+                        "attachment_type": str(getattr(att, "attachment_type", "") or getattr(type(att), "__name__", "") or ""),
+                    }
+
+            name_cache: dict[str, str] = {}
+            for _vid, info in attach_map.items():
+                iid = info.get("instance_id") or ""
+                if not iid or iid in name_cache:
+                    continue
+                try:
+                    inst = self.compute.get_instance(iid).data
+                    name_cache[iid] = str(getattr(inst, "display_name", "") or iid[-12:])
+                except Exception:
+                    name_cache[iid] = iid[-12:]
+
+            for v in volumes:
+                info = attach_map.get(v["id"]) or {}
+                iid = info.get("instance_id") or ""
+                v["instance_id"] = iid
+                v["instance_name"] = name_cache.get(iid, "")
+                v["attachment_id"] = info.get("attachment_id") or ""
+                v["attachment_state"] = info.get("attachment_state") or ""
+                v["attachment_type"] = info.get("attachment_type") or ""
+
+        volumes.sort(
+            key=lambda x: (
+                0 if x.get("instance_id") else 1,
+                str(x.get("display_name") or "").lower(),
+            )
+        )
+        total_gb = sum(int(v.get("size_in_gbs") or 0) for v in volumes)
+        attached = sum(1 for v in volumes if v.get("instance_id"))
+        orphaned = len(volumes) - attached
+        msg = f"共 {len(volumes)} 个块卷 · 合计 {total_gb} GB · 已挂载 {attached} · 未挂载 {orphaned}"
+        if errors and not volumes:
+            return OperationResult(ok=False, message="; ".join(errors[:3]), data={"volumes": [], "summary": {}})
+        if errors:
+            msg += f"（部分 compartment 读取失败 {len(errors)} 处）"
+        return OperationResult(
+            ok=True,
+            message=msg,
+            data={
+                "volumes": volumes,
+                "summary": {
+                    "count": len(volumes),
+                    "total_gb": total_gb,
+                    "attached": attached,
+                    "orphaned": orphaned,
+                },
+                "errors": errors[:10],
+            },
+        )
+
+    def create_block_volume(
+        self,
+        *,
+        compartment_id: str,
+        availability_domain: str,
+        size_in_gbs: int,
+        display_name: str = "",
+        vpus_per_gb: int = 10,
+    ) -> OperationResult:
+        size_in_gbs = int(size_in_gbs)
+        vpus_per_gb = int(vpus_per_gb or 10)
+        if not 50 <= size_in_gbs <= 32768:
+            return OperationResult(ok=False, message="块卷大小必须在 50–32768 GB 之间")
+        if vpus_per_gb not in (10, 20) and not 30 <= vpus_per_gb <= 120:
+            return OperationResult(ok=False, message="性能必须为 10、20 或 30–120 VPUs/GB")
+        ad = (availability_domain or "").strip()
+        if not ad:
+            return OperationResult(ok=False, message="必须指定可用域")
+        try:
+            details = oci.core.models.CreateVolumeDetails(
+                compartment_id=(compartment_id or self.resolve_compartment()).strip(),
+                availability_domain=ad,
+                size_in_gbs=size_in_gbs,
+                display_name=(display_name or "").strip() or None,
+                vpus_per_gb=vpus_per_gb,
+            )
+            vol = self.blockstorage.create_volume(details).data
+            return OperationResult(
+                ok=True,
+                message=f"已创建块卷：{getattr(vol, 'display_name', '') or vol.id}",
+                data={
+                    "id": vol.id,
+                    "display_name": getattr(vol, "display_name", "") or "",
+                    "size_in_gbs": int(getattr(vol, "size_in_gbs", size_in_gbs) or size_in_gbs),
+                    "lifecycle_state": str(getattr(vol, "lifecycle_state", "") or ""),
+                    "availability_domain": getattr(vol, "availability_domain", "") or ad,
+                },
+            )
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=str(exc))
+
+    def delete_block_volume(self, volume_id: str) -> OperationResult:
+        volume_id = (volume_id or "").strip()
+        if not volume_id:
+            return OperationResult(ok=False, message="缺少 volume_id")
+        try:
+            vol = self.blockstorage.get_volume(volume_id).data
+            state = str(getattr(vol, "lifecycle_state", "") or "")
+            if state not in {"AVAILABLE", "FAULTY"}:
+                return OperationResult(ok=False, message=f"块卷状态为 {state}，无法删除（请先卸载）")
+            # Refuse if still attached
+            ad = getattr(vol, "availability_domain", "") or ""
+            cid = getattr(vol, "compartment_id", "") or self.resolve_compartment()
+            if ad:
+                try:
+                    atts = self.compute.list_volume_attachments(ad, cid, volume_id=volume_id).data or []
+                    live = [
+                        a
+                        for a in atts
+                        if str(getattr(a, "lifecycle_state", "") or "")
+                        not in {"DETACHED", "DETACHING", ""}
+                    ]
+                    if live:
+                        return OperationResult(ok=False, message="块卷仍挂载在实例上，请先卸载")
+                except Exception:
+                    pass
+            self.blockstorage.delete_volume(volume_id)
+            return OperationResult(ok=True, message="已删除块卷")
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=str(exc))
+
+    def update_block_volume(
+        self,
+        volume_id: str,
+        *,
+        size_in_gbs: Optional[int] = None,
+        vpus_per_gb: Optional[int] = None,
+    ) -> OperationResult:
+        volume_id = (volume_id or "").strip()
+        if not volume_id:
+            return OperationResult(ok=False, message="缺少 volume_id")
+        if size_in_gbs is None and vpus_per_gb is None:
+            return OperationResult(ok=False, message="未指定新的大小或性能")
+        if vpus_per_gb is not None and vpus_per_gb not in (10, 20) and not 30 <= int(vpus_per_gb) <= 120:
+            return OperationResult(ok=False, message="性能必须为 10、20 或 30–120 VPUs/GB")
+        if size_in_gbs is not None and not 50 <= int(size_in_gbs) <= 32768:
+            return OperationResult(ok=False, message="块卷大小必须在 50–32768 GB 之间")
+        try:
+            cur = self.blockstorage.get_volume(volume_id).data
+            cur_size = int(getattr(cur, "size_in_gbs", 0) or 0)
+            if size_in_gbs is not None and int(size_in_gbs) < cur_size:
+                return OperationResult(ok=False, message=f"块卷只能扩大（当前 {cur_size} GB）")
+            details = oci.core.models.UpdateVolumeDetails()
+            if size_in_gbs is not None:
+                details.size_in_gbs = int(size_in_gbs)
+            if vpus_per_gb is not None:
+                details.vpus_per_gb = int(vpus_per_gb)
+            self.blockstorage.update_volume(volume_id, details)
+            parts = []
+            if size_in_gbs is not None:
+                parts.append(f"{int(size_in_gbs)} GB")
+            if vpus_per_gb is not None:
+                parts.append(f"{int(vpus_per_gb)} VPUs/GB")
+            return OperationResult(
+                ok=True,
+                message="块卷已调整：" + " · ".join(parts),
+                data={"id": volume_id, "previous_size_in_gbs": cur_size},
+            )
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=str(exc))
+
+    def attach_volume(
+        self,
+        instance_id: str,
+        volume_id: str,
+        *,
+        type: str = "PARAVIRTUALIZED",
+        device: Optional[str] = None,
+    ) -> OperationResult:
+        instance_id = (instance_id or "").strip()
+        volume_id = (volume_id or "").strip()
+        if not instance_id or not volume_id:
+            return OperationResult(ok=False, message="缺少 instance_id 或 volume_id")
+        att_type = (type or "PARAVIRTUALIZED").strip().upper()
+        if att_type not in {"PARAVIRTUALIZED", "ISCSI"}:
+            return OperationResult(ok=False, message="挂载类型必须为 PARAVIRTUALIZED 或 ISCSI")
+        try:
+            inst = self.compute.get_instance(instance_id).data
+            compartment_id = getattr(inst, "compartment_id", "") or self.resolve_compartment()
+            if att_type == "ISCSI":
+                details = oci.core.models.AttachIScsiVolumeDetails(
+                    instance_id=instance_id,
+                    volume_id=volume_id,
+                    display_name=f"ocibot-{volume_id[-8:]}",
+                    device=(device or None),
+                )
+            else:
+                details = oci.core.models.AttachParavirtualizedVolumeDetails(
+                    instance_id=instance_id,
+                    volume_id=volume_id,
+                    display_name=f"ocibot-{volume_id[-8:]}",
+                    device=(device or None),
+                )
+            att = self.compute.attach_volume(details).data
+            return OperationResult(
+                ok=True,
+                message=f"已提交挂载（{att_type}）",
+                data={
+                    "attachment_id": getattr(att, "id", "") or "",
+                    "lifecycle_state": str(getattr(att, "lifecycle_state", "") or ""),
+                    "type": att_type,
+                    "compartment_id": compartment_id,
+                },
+            )
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=str(exc))
+
+    def detach_volume(self, attachment_id: str) -> OperationResult:
+        attachment_id = (attachment_id or "").strip()
+        if not attachment_id:
+            return OperationResult(ok=False, message="缺少 attachment_id")
+        try:
+            self.compute.detach_volume(attachment_id)
+            return OperationResult(ok=True, message="已提交卸载")
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=str(exc))
+
+    def list_volume_attachments(self, instance_id: str, compartment_id: str = "") -> OperationResult:
+        instance_id = (instance_id or "").strip()
+        if not instance_id:
+            return OperationResult(ok=False, message="缺少 instance_id")
+        try:
+            inst = self.compute.get_instance(instance_id).data
+            ad = getattr(inst, "availability_domain", "") or ""
+            cid = (compartment_id or getattr(inst, "compartment_id", "") or self.resolve_compartment()).strip()
+            atts = self.compute.list_volume_attachments(ad, cid, instance_id=instance_id).data or []
+            items = []
+            for a in atts:
+                state = str(getattr(a, "lifecycle_state", "") or "")
+                if state in {"DETACHED"}:
+                    continue
+                items.append(
+                    {
+                        "id": getattr(a, "id", "") or "",
+                        "volume_id": getattr(a, "volume_id", "") or "",
+                        "instance_id": getattr(a, "instance_id", "") or instance_id,
+                        "lifecycle_state": state,
+                        "attachment_type": str(
+                            getattr(a, "attachment_type", "") or getattr(type(a), "__name__", "") or ""
+                        ),
+                        "device": getattr(a, "device", "") or "",
+                        "time_created": self._ts_iso(getattr(a, "time_created", None)),
+                    }
+                )
+            return OperationResult(ok=True, message=f"{len(items)} 个附件", data={"attachments": items})
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=str(exc))
+
+    # ------------------------------------------------------------------
+    # Object Storage
+    # ------------------------------------------------------------------
+
+    def get_object_namespace(self) -> OperationResult:
+        if self.object_storage is None:
+            return OperationResult(ok=False, message="Object Storage 客户端不可用")
+        try:
+            if self._object_namespace:
+                return OperationResult(ok=True, message="", data={"namespace": self._object_namespace})
+            ns = self.object_storage.get_namespace().data
+            self._object_namespace = str(ns or "")
+            return OperationResult(ok=True, message="", data={"namespace": self._object_namespace})
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=str(exc))
+
+    def list_buckets(self, compartment_id: str = "") -> OperationResult:
+        if self.object_storage is None:
+            return OperationResult(ok=False, message="Object Storage 客户端不可用")
+        try:
+            ns_res = self.get_object_namespace()
+            if not ns_res.ok:
+                return ns_res
+            namespace = (ns_res.data or {}).get("namespace") or ""
+            cid = (compartment_id or self.resolve_compartment()).strip()
+            resp = oci.pagination.list_call_get_all_results(
+                self.object_storage.list_buckets,
+                namespace,
+                cid,
+            )
+            items = []
+            for b in resp.data or []:
+                items.append(
+                    {
+                        "name": getattr(b, "name", "") or "",
+                        "namespace": namespace,
+                        "compartment_id": getattr(b, "compartment_id", "") or cid,
+                        "time_created": self._ts_iso(getattr(b, "time_created", None)),
+                        "public_access_type": str(getattr(b, "public_access_type", "") or ""),
+                    }
+                )
+            items.sort(key=lambda x: str(x.get("name") or "").lower())
+            return OperationResult(
+                ok=True,
+                message=f"{len(items)} 个存储桶",
+                data={"namespace": namespace, "buckets": items},
+            )
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=str(exc))
+
+    def create_bucket(
+        self,
+        name: str,
+        compartment_id: str = "",
+        *,
+        public_access_type: str = "NoPublicAccess",
+    ) -> OperationResult:
+        if self.object_storage is None:
+            return OperationResult(ok=False, message="Object Storage 客户端不可用")
+        name = (name or "").strip()
+        if not name or not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9.\-_]{0,254}$", name):
+            return OperationResult(ok=False, message="存储桶名称无效")
+        try:
+            ns_res = self.get_object_namespace()
+            if not ns_res.ok:
+                return ns_res
+            namespace = (ns_res.data or {}).get("namespace") or ""
+            cid = (compartment_id or self.resolve_compartment()).strip()
+            access = (public_access_type or "NoPublicAccess").strip()
+            if access not in {"NoPublicAccess", "ObjectRead", "ObjectReadWithoutList"}:
+                access = "NoPublicAccess"
+            details = oci.object_storage.models.CreateBucketDetails(
+                name=name,
+                compartment_id=cid,
+                public_access_type=access,
+            )
+            b = self.object_storage.create_bucket(namespace, details).data
+            return OperationResult(
+                ok=True,
+                message=f"已创建存储桶：{name}",
+                data={"name": getattr(b, "name", name), "namespace": namespace, "compartment_id": cid},
+            )
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=str(exc))
+
+    def delete_bucket(self, name: str, namespace: str = "") -> OperationResult:
+        if self.object_storage is None:
+            return OperationResult(ok=False, message="Object Storage 客户端不可用")
+        name = (name or "").strip()
+        if not name:
+            return OperationResult(ok=False, message="缺少桶名")
+        try:
+            if not namespace:
+                ns_res = self.get_object_namespace()
+                if not ns_res.ok:
+                    return ns_res
+                namespace = (ns_res.data or {}).get("namespace") or ""
+            self.object_storage.delete_bucket(namespace, name)
+            return OperationResult(ok=True, message=f"已删除存储桶：{name}")
+        except ServiceError as exc:
+            msg = _format_service_error(exc)
+            if "BucketNotEmpty" in msg or "not empty" in msg.lower():
+                msg = f"存储桶非空，请先删除对象后再删桶（{msg}）"
+            return OperationResult(ok=False, message=msg)
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=str(exc))
+
+    def list_objects(
+        self,
+        bucket: str,
+        *,
+        prefix: str = "",
+        limit: int = 200,
+        namespace: str = "",
+    ) -> OperationResult:
+        if self.object_storage is None:
+            return OperationResult(ok=False, message="Object Storage 客户端不可用")
+        bucket = (bucket or "").strip()
+        if not bucket:
+            return OperationResult(ok=False, message="缺少桶名")
+        limit = max(1, min(int(limit or 200), 1000))
+        try:
+            if not namespace:
+                ns_res = self.get_object_namespace()
+                if not ns_res.ok:
+                    return ns_res
+                namespace = (ns_res.data or {}).get("namespace") or ""
+            kwargs: dict[str, Any] = {"limit": limit}
+            if prefix:
+                kwargs["prefix"] = prefix
+            resp = self.object_storage.list_objects(namespace, bucket, **kwargs)
+            data = resp.data
+            objects = []
+            for obj in getattr(data, "objects", None) or []:
+                size = int(getattr(obj, "size", 0) or 0)
+                objects.append(
+                    {
+                        "name": getattr(obj, "name", "") or "",
+                        "size": size,
+                        "size_gb": round(size / (1024**3), 6),
+                        "md5": getattr(obj, "md5", "") or "",
+                        "time_created": self._ts_iso(getattr(obj, "time_created", None)),
+                        "time_modified": self._ts_iso(getattr(obj, "time_modified", None)),
+                    }
+                )
+            next_start = getattr(data, "next_start_with", None) or ""
+            return OperationResult(
+                ok=True,
+                message=f"{len(objects)} 个对象",
+                data={
+                    "namespace": namespace,
+                    "bucket": bucket,
+                    "objects": objects,
+                    "next_start_with": next_start,
+                    "truncated": bool(next_start),
+                },
+            )
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=str(exc))
+
+    def delete_object(self, bucket: str, object_name: str, namespace: str = "") -> OperationResult:
+        if self.object_storage is None:
+            return OperationResult(ok=False, message="Object Storage 客户端不可用")
+        bucket = (bucket or "").strip()
+        object_name = (object_name or "").strip()
+        if not bucket or not object_name:
+            return OperationResult(ok=False, message="缺少桶名或对象名")
+        try:
+            if not namespace:
+                ns_res = self.get_object_namespace()
+                if not ns_res.ok:
+                    return ns_res
+                namespace = (ns_res.data or {}).get("namespace") or ""
+            self.object_storage.delete_object(namespace, bucket, object_name)
+            return OperationResult(ok=True, message=f"已删除对象：{object_name}")
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=str(exc))
+
+    def put_object(
+        self,
+        bucket: str,
+        object_name: str,
+        data: bytes,
+        *,
+        content_type: str = "application/octet-stream",
+        namespace: str = "",
+        max_bytes: int = 10 * 1024 * 1024,
+    ) -> OperationResult:
+        if self.object_storage is None:
+            return OperationResult(ok=False, message="Object Storage 客户端不可用")
+        bucket = (bucket or "").strip()
+        object_name = (object_name or "").strip()
+        if not bucket or not object_name:
+            return OperationResult(ok=False, message="缺少桶名或对象名")
+        raw = data if isinstance(data, (bytes, bytearray)) else bytes(data or b"")
+        if len(raw) > int(max_bytes):
+            return OperationResult(ok=False, message=f"对象超过上限 {int(max_bytes)} 字节")
+        try:
+            if not namespace:
+                ns_res = self.get_object_namespace()
+                if not ns_res.ok:
+                    return ns_res
+                namespace = (ns_res.data or {}).get("namespace") or ""
+            self.object_storage.put_object(
+                namespace,
+                bucket,
+                object_name,
+                raw,
+                content_type=content_type or "application/octet-stream",
+            )
+            return OperationResult(
+                ok=True,
+                message=f"已上传：{object_name}（{len(raw)} 字节）",
+                data={"name": object_name, "size": len(raw)},
+            )
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=str(exc))
+
+    def estimate_object_storage_usage(
+        self,
+        *,
+        compartment_id: str = "",
+        max_buckets: int = 50,
+        max_objects_per_bucket: int = 5000,
+        deadline_sec: float = 25.0,
+    ) -> OperationResult:
+        """Best-effort object storage size estimate for free-quota gauges."""
+        if self.object_storage is None:
+            return OperationResult(
+                ok=True,
+                message="Object Storage 客户端不可用，跳过对象用量",
+                data={"object_storage_gb_used": 0.0, "object_buckets": [], "bucket_count": 0},
+            )
+        started = time.monotonic()
+        notes: list[str] = []
+        try:
+            listed = self.list_buckets(compartment_id=compartment_id)
+            if not listed.ok:
+                return OperationResult(
+                    ok=False,
+                    message=listed.message or "列出存储桶失败",
+                    data={"object_storage_gb_used": 0.0, "object_buckets": [], "bucket_count": 0},
+                )
+            namespace = (listed.data or {}).get("namespace") or ""
+            buckets = list((listed.data or {}).get("buckets") or [])
+            if len(buckets) > max_buckets:
+                notes.append(f"仅统计前 {max_buckets}/{len(buckets)} 个存储桶")
+                buckets = buckets[:max_buckets]
+
+            details: list[dict[str, Any]] = []
+            total_bytes = 0
+            truncated = False
+            for b in buckets:
+                if time.monotonic() - started > deadline_sec:
+                    truncated = True
+                    notes.append("对象存储统计超时，结果为近似值")
+                    break
+                name = b.get("name") or ""
+                size_bytes = 0
+                obj_count = 0
+                start = None
+                pages = 0
+                while True:
+                    if time.monotonic() - started > deadline_sec:
+                        truncated = True
+                        break
+                    if obj_count >= max_objects_per_bucket:
+                        truncated = True
+                        break
+                    kwargs: dict[str, Any] = {"limit": min(1000, max_objects_per_bucket - obj_count)}
+                    if start:
+                        kwargs["start"] = start
+                    try:
+                        resp = self.object_storage.list_objects(namespace, name, **kwargs)
+                    except Exception as exc:  # noqa: BLE001
+                        notes.append(f"桶 {name} 列举失败：{exc}")
+                        break
+                    data = resp.data
+                    for obj in getattr(data, "objects", None) or []:
+                        size_bytes += int(getattr(obj, "size", 0) or 0)
+                        obj_count += 1
+                    start = getattr(data, "next_start_with", None) or None
+                    pages += 1
+                    if not start:
+                        break
+                    if pages > 20:
+                        truncated = True
+                        break
+                size_gb = round(size_bytes / (1024**3), 4)
+                total_bytes += size_bytes
+                details.append(
+                    {
+                        "name": name,
+                        "namespace": namespace,
+                        "compartment_id": b.get("compartment_id") or "",
+                        "approximate_size_gb": size_gb,
+                        "object_count": obj_count,
+                    }
+                )
+            total_gb = round(total_bytes / (1024**3), 4)
+            msg = ""
+            if notes:
+                msg = "；".join(notes)
+            if truncated and "近似" not in msg:
+                msg = (msg + "；" if msg else "") + "对象存储统计为近似值"
+            return OperationResult(
+                ok=True,
+                message=msg,
+                data={
+                    "object_storage_gb_used": total_gb,
+                    "object_buckets": details,
+                    "bucket_count": len(details),
+                    "truncated": truncated,
+                    "namespace": namespace,
+                },
+            )
+        except ServiceError as exc:
+            return OperationResult(
+                ok=False,
+                message=_format_service_error(exc),
+                data={"object_storage_gb_used": 0.0, "object_buckets": [], "bucket_count": 0},
+            )
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(
+                ok=False,
+                message=str(exc),
+                data={"object_storage_gb_used": 0.0, "object_buckets": [], "bucket_count": 0},
+            )
 
 
 class SessionManager:

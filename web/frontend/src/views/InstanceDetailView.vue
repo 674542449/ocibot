@@ -140,6 +140,7 @@
       <h3 style="margin: 0">串口 / VNC 控制台</h3>
       <p class="muted" style="margin: 0; font-size: 13px">
         创建控制台连接需要一条 SSH 公钥。创建后用返回的 SSH 命令连接串口或 VNC。
+        串口/VNC 控制台 ≠ 系统 SSH；浏览器内终端请用「WebSSH」页签。
       </p>
       <div class="field">
         <label>SSH 公钥</label>
@@ -399,6 +400,53 @@
           </select>
         </div>
       </div>
+      <div class="field" style="margin-top: 0.5rem">
+        <label class="row" style="gap: 0.5rem; font-size: 13px">
+          <input v-model="autoGrowFs" type="checkbox" style="width: auto" />
+          扩容后自动扩展文件系统（SSH）
+        </label>
+        <p class="muted" style="margin: 0.25rem 0 0; font-size: 12px">
+          仅在扩大容量时生效。OCI 控制面扩容后，通过 SSH 执行 growpart / resize2fs（或 xfs_growfs）。
+          凭证仅用于本次请求，不会保存。
+        </p>
+      </div>
+      <SshCredentialFields v-if="autoGrowFs" v-model="growCreds" />
+      <div v-if="fsGrowResult" class="card" style="padding: 0.75rem">
+        <div class="muted" style="font-size: 12px">最近一次扩容结果</div>
+        <div>
+          OCI：
+          <span class="badge" :class="fsGrowResult.oci_ok ? 'running' : 'err'">
+            {{ fsGrowResult.oci_ok ? '成功' : '失败' }}
+          </span>
+          · 文件系统：
+          <span
+            class="badge"
+            :class="
+              fsGrowResult.fs_ok === true
+                ? 'running'
+                : fsGrowResult.fs_ok === false
+                  ? 'err'
+                  : ''
+            "
+          >
+            {{
+              fsGrowResult.fs_ok === true
+                ? '已扩展'
+                : fsGrowResult.fs_ok === false
+                  ? '失败'
+                  : '未执行'
+            }}
+          </span>
+        </div>
+        <pre
+          v-if="fsGrowResult.stdout || fsGrowResult.stderr"
+          class="muted"
+          style="font-size: 11px; white-space: pre-wrap; max-height: 160px; overflow: auto"
+        >{{ fsGrowResult.stdout || '' }}{{ fsGrowResult.stderr ? '\n' + fsGrowResult.stderr : '' }}</pre>
+        <ul v-if="(fsGrowResult.hints || []).length" style="margin: 0.3rem 0 0; padding-left: 1.2rem; font-size: 12px">
+          <li v-for="(h, i) in fsGrowResult.hints" :key="i">{{ h }}</li>
+        </ul>
+      </div>
       <button class="primary" :disabled="bootBusy" @click="updateBoot">应用引导卷调整</button>
 
       <div style="border-top: 1px solid var(--border); padding-top: 0.75rem">
@@ -450,6 +498,9 @@
       <div style="border-top: 1px solid var(--border); padding-top: 0.75rem">
         <h4 style="margin: 0 0 0.5rem">修改 OCPU / 内存</h4>
         <template v-if="isFlexShape">
+          <p class="muted" style="margin: 0 0 0.5rem; font-size: 12px">
+            调整 A1.Flex 时，服务端会按 Always Free 剩余额度校验（免费/未知账号硬拦 4 OCPU / 24 GB 合计上限）。
+          </p>
           <div class="grid-2">
             <div class="field">
               <label>OCPU</label>
@@ -472,6 +523,15 @@
         </p>
       </div>
     </div>
+
+    <!-- WebSSH -->
+    <div v-if="tab === 'webssh'" class="card stack">
+      <h3 style="margin: 0">WebSSH 终端</h3>
+      <p class="muted" style="margin: 0; font-size: 13px">
+        通过浏览器 SSH 连接实例（默认 22 端口）。需要公网 IP 或宿主可路由的私网 IP；凭证不会保存。
+      </p>
+      <WebSshTerminal :tenant-id="tenantId" :instance-id="instanceId" />
+    </div>
   </div>
 </template>
 
@@ -480,6 +540,9 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import api, { type Instance } from '@/api/client'
 import { pickAndReadTextFile } from '@/utils/file'
+import { copyText } from '@/utils/toast'
+import WebSshTerminal from '@/components/WebSshTerminal.vue'
+import SshCredentialFields, { type SshCredModel } from '@/components/SshCredentialFields.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -491,10 +554,11 @@ const loading = ref(false)
 const acting = ref(false)
 const error = ref('')
 const msg = ref('')
-const tab = ref<'metrics' | 'console' | 'firewall' | 'network' | 'volume'>('metrics')
+const tab = ref<'metrics' | 'console' | 'webssh' | 'firewall' | 'network' | 'volume'>('metrics')
 const tabs = [
   { id: 'metrics' as const, label: '监控' },
   { id: 'console' as const, label: '控制台' },
+  { id: 'webssh' as const, label: 'WebSSH' },
   { id: 'firewall' as const, label: '防火墙' },
   { id: 'network' as const, label: '保留 IP' },
   { id: 'volume' as const, label: '引导卷/规格' },
@@ -710,20 +774,12 @@ function stateClass(state: string) {
 }
 
 async function copy(text: string) {
-  const v = (text || '').trim()
-  if (!v || v === '—') return
-  try {
-    await navigator.clipboard.writeText(v)
-    msg.value = `已复制：${v.length > 48 ? v.slice(0, 48) + '…' : v}`
-    error.value = ''
-  } catch {
-    error.value = '复制失败'
-  }
+  await copyText(text)
 }
 
 function copyIp(text?: string | null) {
   if (!text) return
-  copy(text)
+  void copyText(text, '已复制 IP')
 }
 
 function perfLabel(vpu: number) {
@@ -880,11 +936,16 @@ async function createConsole() {
 }
 async function deleteConsole(id: string) {
   if (!confirm('删除此控制台连接？')) return
-  await api.delete(
-    `/tenants/${tenantId.value}/instances/${instanceId.value}/console/${id}`,
-  )
-  msg.value = '已删除'
-  await loadConsole()
+  error.value = ''
+  try {
+    await api.delete(
+      `/tenants/${tenantId.value}/instances/${instanceId.value}/console/${id}`,
+    )
+    msg.value = '已删除'
+    await loadConsole()
+  } catch (e: any) {
+    error.value = e?.message || '删除失败'
+  }
 }
 
 // ---- firewall ----
@@ -963,6 +1024,15 @@ const bootInfo = ref<any>(null)
 const bootBusy = ref(false)
 const bootForm = reactive({ size_in_gbs: null as number | null, vpus_per_gb: 10 })
 const shapeForm = reactive({ ocpus: 1, memory_in_gbs: 6 })
+const autoGrowFs = ref(false)
+const growCreds = reactive<SshCredModel>({
+  username: 'ubuntu',
+  port: 22,
+  authMode: 'key',
+  privateKeyPem: '',
+  password: '',
+})
+const fsGrowResult = ref<any>(null)
 
 async function loadBoot() {
   bootBusy.value = true
@@ -984,16 +1054,32 @@ async function loadBoot() {
 async function updateBoot() {
   bootBusy.value = true
   error.value = ''
+  fsGrowResult.value = null
   try {
+    const payload: Record<string, any> = {
+      size_in_gbs: bootForm.size_in_gbs,
+      vpus_per_gb: bootForm.vpus_per_gb,
+      auto_grow_fs: !!autoGrowFs.value,
+    }
+    if (autoGrowFs.value) {
+      payload.ssh_username = growCreds.username || 'ubuntu'
+      payload.ssh_port = growCreds.port || 22
+      if (growCreds.authMode === 'key') {
+        payload.ssh_private_key_pem = growCreds.privateKeyPem
+        payload.ssh_password = null
+      } else {
+        payload.ssh_password = growCreds.password
+        payload.ssh_private_key_pem = null
+      }
+    }
     const { data } = await api.post(
       `/tenants/${tenantId.value}/instances/${instanceId.value}/boot-volume`,
-      {
-        size_in_gbs: bootForm.size_in_gbs,
-        vpus_per_gb: bootForm.vpus_per_gb,
-      },
+      payload,
     )
+    if (data.data) fsGrowResult.value = data.data
     if (data.ok) {
       msg.value = data.message
+      if (growCreds.authMode === 'password') growCreds.password = ''
       await loadBoot()
     } else error.value = data.message
   } catch (e: any) {
@@ -1146,6 +1232,16 @@ watch(tab, async (t) => {
 })
 
 onMounted(async () => {
+  try {
+    await loadInstance()
+    await loadMetrics()
+  } catch (e: any) {
+    error.value = e?.message || '加载失败'
+  }
+})
+
+// If the router reuses this component for a different instance, reload its data.
+watch([tenantId, instanceId], async () => {
   try {
     await loadInstance()
     await loadMetrics()

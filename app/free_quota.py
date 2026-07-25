@@ -14,6 +14,9 @@ FREE_A1_OCPU = 4.0
 FREE_A1_MEMORY_GB = 24.0
 FREE_E2_MICRO_COUNT = 2
 FREE_BLOCK_STORAGE_GB = 200.0
+FREE_OBJECT_STORAGE_GB = 20.0
+# Soft visibility only — ephemeral public IPs on free VMs are free; not a hard block.
+FREE_PUBLIC_IP_SOFT = 2
 
 # Default boot size assumed when the launch form leaves size empty (~Ubuntu image).
 DEFAULT_BOOT_GB_ASSUMED = 47
@@ -166,6 +169,34 @@ def summarize_storage(volumes: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def summarize_object_storage(buckets: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate approximate object-storage usage from bucket size dicts."""
+    total = 0.0
+    details: list[dict[str, Any]] = []
+    for b in buckets or []:
+        size = _as_float(
+            b.get("approximate_size_gb", b.get("size_in_gbs", b.get("size_gb"))),
+            0.0,
+        )
+        if size < 0:
+            size = 0.0
+        total += size
+        details.append(
+            {
+                "name": str(b.get("name") or b.get("id") or ""),
+                "namespace": str(b.get("namespace") or ""),
+                "compartment_id": str(b.get("compartment_id") or ""),
+                "approximate_size_gb": round(size, 4),
+                "object_count": _as_int(b.get("object_count"), 0),
+            }
+        )
+    return {
+        "object_storage_gb_used": round(total, 4),
+        "bucket_count": len(details),
+        "object_buckets": details,
+    }
+
+
 def build_quota_snapshot(
     *,
     instances: list[Any],
@@ -173,20 +204,31 @@ def build_quota_snapshot(
     free_only_mode: bool = True,
     account_tier: str = "",
     notes: Optional[list[str]] = None,
+    object_usage: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    """Combine instance + volume usage into a dashboard-friendly snapshot."""
+    """Combine instance + volume (+ optional object) usage into a dashboard snapshot."""
     compute = summarize_instances(instances)
     storage = summarize_storage(volumes)
+    object_usage = object_usage or {}
+    if "object_storage_gb_used" not in object_usage and object_usage.get("object_buckets") is not None:
+        object_usage = summarize_object_storage(list(object_usage.get("object_buckets") or []))
+    elif "object_storage_gb_used" not in object_usage and isinstance(object_usage.get("buckets"), list):
+        object_usage = summarize_object_storage(list(object_usage.get("buckets") or []))
+
     a1_ocpu_used = float(compute["a1_ocpu_used"])
     a1_mem_used = float(compute["a1_memory_gb_used"])
     e2_used = int(compute["e2_micro_count_used"])
     disk_used = float(storage["block_storage_gb_used"])
+    object_used = _as_float(object_usage.get("object_storage_gb_used"), 0.0)
+    public_ips = int(compute["public_ip_count"])
+    object_buckets = list(object_usage.get("object_buckets") or [])
 
-    def _bucket(used: float, limit: float) -> dict[str, Any]:
+    def _bucket(used: float, limit: float, *, soft: bool = False) -> dict[str, Any]:
         remaining = max(0.0, float(limit) - float(used))
         ratio = (float(used) / float(limit)) if limit else 0.0
         if used > limit:
-            status = "over"
+            # Soft caps (public IP) never contribute a hard "over" to overall.
+            status = "critical" if soft else "over"
         elif ratio >= 0.9:
             status = "critical"
         elif ratio >= 0.7:
@@ -199,6 +241,7 @@ def build_quota_snapshot(
             "remaining": round(remaining, 4),
             "ratio": round(min(ratio, 9.99), 4),
             "status": status,
+            "soft": bool(soft),
         }
 
     buckets = {
@@ -206,9 +249,14 @@ def build_quota_snapshot(
         "a1_memory_gb": _bucket(a1_mem_used, FREE_A1_MEMORY_GB),
         "e2_micro_count": _bucket(float(e2_used), float(FREE_E2_MICRO_COUNT)),
         "block_storage_gb": _bucket(disk_used, FREE_BLOCK_STORAGE_GB),
+        "object_storage_gb": _bucket(object_used, FREE_OBJECT_STORAGE_GB),
+        "public_ip_soft": _bucket(float(public_ips), float(FREE_PUBLIC_IP_SOFT), soft=True),
     }
+    # Hard overall ignores soft-only buckets.
     overall = "ok"
-    for b in buckets.values():
+    for key, b in buckets.items():
+        if b.get("soft"):
+            continue
         if b["status"] == "over":
             overall = "over"
             break
@@ -222,6 +270,8 @@ def build_quota_snapshot(
         f"A1 内存 {buckets['a1_memory_gb']['remaining']:g}/{FREE_A1_MEMORY_GB:g} GB 剩余",
         f"E2.Micro {int(buckets['e2_micro_count']['remaining'])}/{FREE_E2_MICRO_COUNT} 台剩余",
         f"块存储 {buckets['block_storage_gb']['remaining']:g}/{FREE_BLOCK_STORAGE_GB:g} GB 剩余",
+        f"对象存储 {buckets['object_storage_gb']['remaining']:g}/{FREE_OBJECT_STORAGE_GB:g} GB 剩余",
+        f"公网 IP {int(buckets['public_ip_soft']['remaining'])}/{FREE_PUBLIC_IP_SOFT}（软追踪）",
     ]
     return {
         "free_only_mode": bool(free_only_mode),
@@ -231,6 +281,8 @@ def build_quota_snapshot(
             "a1_memory_gb": FREE_A1_MEMORY_GB,
             "e2_micro_count": FREE_E2_MICRO_COUNT,
             "block_storage_gb": FREE_BLOCK_STORAGE_GB,
+            "object_storage_gb": FREE_OBJECT_STORAGE_GB,
+            "public_ip_soft": FREE_PUBLIC_IP_SOFT,
         },
         "usage": {
             "a1_ocpu": a1_ocpu_used,
@@ -239,7 +291,8 @@ def build_quota_snapshot(
             "block_storage_gb": disk_used,
             "boot_volume_gb": storage["boot_volume_gb_used"],
             "block_volume_gb": storage["block_volume_gb_used"],
-            "public_ip_count": compute["public_ip_count"],
+            "object_storage_gb": object_used,
+            "public_ip_count": public_ips,
             "instance_count": compute["instance_count"],
             "orphan_boot_count": storage["orphan_boot_count"],
         },
@@ -248,12 +301,15 @@ def build_quota_snapshot(
             "a1_memory_gb": buckets["a1_memory_gb"]["remaining"],
             "e2_micro_count": buckets["e2_micro_count"]["remaining"],
             "block_storage_gb": buckets["block_storage_gb"]["remaining"],
+            "object_storage_gb": buckets["object_storage_gb"]["remaining"],
+            "public_ip_soft": buckets["public_ip_soft"]["remaining"],
         },
         "buckets": buckets,
         "overall_status": overall,
         "summary_lines": lines,
         "instances": compute["instances"],
         "volumes": storage["volumes"],
+        "object_buckets": object_buckets,
         "notes": list(notes or []),
     }
 
@@ -503,6 +559,7 @@ def validate_boot_resize_against_quota(
     account_tier: str = "",
     usage: Optional[dict[str, Any]] = None,
 ) -> GuardResult:
+    """Validate boot/block volume size change against the free 200GB storage cap."""
     usage = usage or {}
     used = usage.get("usage") or usage
     disk_used = _as_float(used.get("block_storage_gb"), 0.0)
@@ -533,3 +590,7 @@ def validate_boot_resize_against_quota(
         warnings=warnings,
         projected={"block_storage_gb_after": round(after, 4)},
     )
+
+
+# Alias used by block-volume create/resize APIs (same 200GB Always Free cap).
+validate_block_volume_against_quota = validate_boot_resize_against_quota

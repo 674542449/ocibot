@@ -3,16 +3,7 @@ import axios from 'axios'
 const api = axios.create({
   baseURL: '/api',
   timeout: 120_000,
-  withCredentials: true,
-})
-
-api.interceptors.request.use((config) => {
-  // Prefer HttpOnly cookie; keep Bearer for backward compatibility during transition.
-  const token = localStorage.getItem('ocibot_token')
-  if (token) {
-    config.headers.Authorization = `Bearer ${token}`
-  }
-  return config
+  withCredentials: true, // auth is the HttpOnly cookie; always send/receive it
 })
 
 api.interceptors.response.use(
@@ -25,10 +16,13 @@ api.interceptors.response.use(
       err.message = detail.map((d: any) => d.msg || JSON.stringify(d)).join('; ')
     }
     if (err?.response?.status === 401) {
-      localStorage.removeItem('ocibot_token')
       localStorage.removeItem('ocibot_username')
-      if (!location.pathname.startsWith('/login')) {
-        location.href = '/login'
+      const url: string = err?.config?.url || ''
+      // Let the router guard handle the initial /auth/me probe; only hard-redirect
+      // on a genuine mid-session expiry, preserving where the user was.
+      if (!url.endsWith('/auth/me') && !location.pathname.startsWith('/login')) {
+        const redirect = encodeURIComponent(location.pathname + location.search)
+        location.href = `/login?redirect=${redirect}`
       }
     }
     return Promise.reject(err)
@@ -36,6 +30,14 @@ api.interceptors.response.use(
 )
 
 export default api
+
+/** Build a same-origin WebSocket URL for an /api/... path. */
+export function wsUrl(path: string): string {
+  const p = path.startsWith('/') ? path : `/${path}`
+  const base = p.startsWith('/api') ? p : `/api${p}`
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${proto}//${location.host}${base}`
+}
 
 export type TokenResponse = {
   access_token: string

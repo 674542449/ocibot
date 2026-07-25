@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -98,16 +98,22 @@ class Worker:
     def run_forever(self) -> None:
         init_db()
         log.info("Worker %s started (poll=%ss)", self.worker_id, self.settings.worker_poll_sec)
+        # Each phase runs in its own transaction so one phase failing (or a slow
+        # OCI call) cannot roll back another phase's committed work.
+        phases = (
+            ("beat", self.beat),
+            ("schedules", self.tick_schedules),
+            ("capacity", self.tick_capacity),
+            ("daily_checks", self.tick_daily_checks),
+        )
         while True:
-            try:
-                with SessionLocal() as db:
-                    self.beat(db)
-                    self.tick_schedules(db)
-                    self.tick_capacity(db)
-                    self.tick_daily_checks(db)
-                    db.commit()
-            except Exception:  # noqa: BLE001
-                log.exception("worker tick failed")
+            for name, phase in phases:
+                try:
+                    with SessionLocal() as db:
+                        phase(db)
+                        db.commit()
+                except Exception:  # noqa: BLE001
+                    log.exception("worker phase '%s' failed", name)
             time.sleep(max(1.0, float(self.settings.worker_poll_sec)))
 
     # ------------------------------------------------------------------
@@ -240,16 +246,17 @@ class Worker:
     # ------------------------------------------------------------------
     def tick_capacity(self, db: Session) -> None:
         now = _utcnow()
-        # Release stale locks
-        stale = db.scalars(
-            select(CapacityJob).where(
+        # Release stale locks durably (a crashed worker's lease expires here).
+        db.execute(
+            update(CapacityJob)
+            .where(
                 CapacityJob.locked_until.is_not(None),
                 CapacityJob.locked_until < now,
             )
-        ).all()
-        for j in stale:
-            j.locked_by = None
-            j.locked_until = None
+            .values(locked_by=None, locked_until=None)
+            .execution_options(synchronize_session=False)
+        )
+        db.commit()
 
         candidates = db.scalars(
             select(CapacityJob)
@@ -263,7 +270,7 @@ class Worker:
             .limit(20)
         ).all()
 
-        # Tenant concurrency: skip if another job for same tenant is locked
+        # Tenant concurrency: skip if another job for the same tenant is locked.
         locked_tenants = {
             j.tenant_id
             for j in db.scalars(
@@ -281,18 +288,32 @@ class Worker:
                 job.enabled = False
                 job.status = "failed"
                 job.last_error = job.last_error or "已达最大重试次数"
+                db.commit()
                 self._notify_capacity_end(db, job, reason="max_attempts")
+                db.commit()
                 continue
             cooldown = _as_utc(job.cooldown_until)
             if cooldown and cooldown > now:
                 continue
 
-            # Claim lock
-            lock_until = now + timedelta(minutes=10)
-            job.locked_by = self.worker_id
-            job.locked_until = lock_until
-            job.status = "running"
-            db.flush()
+            # Atomically claim the lease so a second worker cannot take the same job.
+            # Committed BEFORE any OCI call, so the lock is durable and visible across
+            # processes — per-tenant single-flight, crash-safe.
+            claim_at = _utcnow()
+            lock_until = claim_at + timedelta(minutes=10)
+            claimed = db.execute(
+                update(CapacityJob)
+                .where(
+                    CapacityJob.id == job.id,
+                    (CapacityJob.locked_until.is_(None)) | (CapacityJob.locked_until < claim_at),
+                )
+                .values(locked_by=self.worker_id, locked_until=lock_until, status="running")
+                .execution_options(synchronize_session=False)
+            ).rowcount
+            if not claimed:
+                continue
+            db.commit()
+            db.refresh(job)
             locked_tenants.add(job.tenant_id)
             self._busy_tenants.add(job.tenant_id)
             try:
@@ -301,7 +322,9 @@ class Worker:
                 self._busy_tenants.discard(job.tenant_id)
                 job.locked_by = None
                 job.locked_until = None
-                db.flush()
+                # Persist this attempt's result + lease release before the next job,
+                # so a crash cannot roll back a completed LaunchInstance outcome.
+                db.commit()
 
     @staticmethod
     def _attempt_plan(job: CapacityJob) -> tuple[str, Optional[dict[str, Any]], str]:
@@ -394,6 +417,55 @@ class Worker:
             cfg_label or "primary",
         )
 
+        # Re-check Always Free remaining before each LaunchInstance (usage may
+        # have changed since the job was enqueued). Hard block → fail the job
+        # instead of burning attempts / creating billable overage.
+        # If usage cannot be read (missing method / OCI blip), skip the check so
+        # already-queued retries are not killed by a transient read failure.
+        try:
+            from web.backend.quota_guard import check_launch_quota
+
+            if not hasattr(session, "get_free_quota_usage"):
+                log.warning("capacity quota check skipped job=%s (no get_free_quota_usage)", job.id)
+            else:
+                guard = check_launch_quota(
+                    session,
+                    account_tier=getattr(tenant, "account_tier", "") or "",
+                    shape=str(payload.get("shape") or ""),
+                    ocpus=payload.get("ocpus"),
+                    memory_in_gbs=payload.get("memory_in_gbs"),
+                    boot_volume_size_in_gbs=payload.get("boot_volume_size_in_gbs"),
+                    boot_volume_vpus_per_gb=payload.get("boot_volume_vpus_per_gb") or 10,
+                )
+                # Ignore pure "spec incomplete" issues here — the launch path will
+                # surface those; we only stop on real free-cap exhaustion / non-free shape.
+                hard_codes = {
+                    "non_free_shape",
+                    "a1_over_free_cap",
+                    "a1_insufficient",
+                    "e2_insufficient",
+                    "storage_over_free_cap",
+                }
+                hard_msgs = [
+                    i.message
+                    for i in (guard.issues or [])
+                    if getattr(i, "severity", "error") == "error"
+                    and getattr(i, "code", "") in hard_codes
+                ]
+                if hard_msgs:
+                    msg = "；".join(hard_msgs)
+                    self._log_attempt(
+                        db, job, ok=False, message=f"额度守卫：{msg}", ad=ad, config_label=cfg_label
+                    )
+                    job.enabled = False
+                    job.status = "failed"
+                    job.last_error = f"额度守卫：{msg}"
+                    job.next_run_at = None
+                    self._notify_capacity_end(db, job, reason=f"额度守卫：{msg}")
+                    return
+        except Exception as exc:  # noqa: BLE001
+            log.warning("capacity quota check job=%s skipped: %s", job.id, exc)
+
         try:
             result = session.launch_from_payload(payload, custom_user_data=custom_user_data)
         except Exception as exc:  # noqa: BLE001
@@ -425,6 +497,21 @@ class Worker:
                 db, job, ok=True, message=result.message or "创建成功", ad=ad, config_label=cfg_label
             )
             log.info("capacity SUCCESS job=%s instance=%s", job.id, inst_id or "?")
+            # Apply Always-Free boot VPU (fire-and-forget so the worker isn't blocked
+            # by hydration). Previously only the API immediate-attempt did this.
+            boot_vpu = int(payload.get("boot_volume_vpus_per_gb") or 10)
+            if inst_id and boot_vpu != 10:
+                try:
+                    from web.backend.launch_service import schedule_post_launch_adjustments
+
+                    schedule_post_launch_adjustments(
+                        session,
+                        instance_id=inst_id,
+                        compartment_id=str(payload.get("compartment_id") or ""),
+                        boot_vpu=boot_vpu,
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception("schedule boot vpu failed job=%s", job.id)
             display_name = str(payload.get("display_name") or "instance")
             shape = str(payload.get("shape") or "")
             notify_user(

@@ -45,9 +45,17 @@ const router = createRouter({
           component: () => import('@/views/AccountView.vue'),
         },
         {
+          path: 'storage',
+          name: 'storage',
+          component: () => import('@/views/StorageView.vue'),
+        },
+        {
           path: 'boot-volumes',
           name: 'boot-volumes',
-          component: () => import('@/views/BootVolumesView.vue'),
+          redirect: (to) => ({
+            name: 'storage',
+            query: { ...to.query, tab: (to.query.tab as string) || 'boot' },
+          }),
         },
         {
           path: 'backup',
