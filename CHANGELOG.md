@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.11 — 2026-07-26
+
+### 修复
+- 实例列表 / 详情不再展示冗长 OCID（仍可通过路由与复制接口使用）
+- **网络监控数据异常**：`NetworksBytesIn/Out` 改为 MQL `.rate()`（B/s），多 VNIC 同秒求和；前端按 B/s·KB/s·MB/s 显示
+
+### 升级
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 0.4.11
+```
+
+---
+
 ## 0.4.10 — 2026-07-26
 
 ### 修复

@@ -24,17 +24,6 @@
               instance.lifecycle_state
             }}</span>
           </div>
-          <div
-            class="muted copyable"
-            style="font-size: 11px; word-break: break-all"
-            title="单击复制 OCID"
-            role="button"
-            tabindex="0"
-            @click="copy(instance.id)"
-            @keydown.enter.prevent="copy(instance.id)"
-          >
-            {{ instance.id }}
-          </div>
         </div>
         <div>
           <div class="muted" style="font-size: 12px">Shape / 网络（单击 IP 可复制）</div>
@@ -115,7 +104,7 @@
         <div>
           <h3 style="margin: 0">监控</h3>
           <p class="muted" style="margin: 0.2rem 0 0; font-size: 12px">
-            鼠标移到曲线上可查看该时刻具体数值
+            鼠标移到曲线上可查看该时刻数值。网络为实时速率（B/s），需实例安装并启用计算监控代理。
           </p>
         </div>
         <div class="row">
@@ -905,10 +894,10 @@ function setSparkEl(key: string, el: unknown) {
 function metricLabel(k: string) {
   return (
     {
-      cpu: 'CPU %',
-      memory: '内存 %',
-      net_in: '网络入',
-      net_out: '网络出',
+      cpu: 'CPU 使用率',
+      memory: '内存使用率',
+      net_in: '网络入（速率）',
+      net_out: '网络出（速率）',
     } as Record<string, string>
   )[k]
 }
@@ -927,11 +916,16 @@ function formatMetricValue(v: number, key: string) {
   const n = Number(v)
   if (!Number.isFinite(n)) return '—'
   if (key.startsWith('net')) {
-    if (n > 1e6) return (n / 1e6).toFixed(2) + ' MB/s'
-    if (n > 1e3) return (n / 1e3).toFixed(1) + ' KB/s'
+    // Backend returns bytes/sec (MQL .rate() on NetworksBytes*).
+    const abs = Math.abs(n)
+    if (abs >= 1e9) return (n / 1e9).toFixed(2) + ' GB/s'
+    if (abs >= 1e6) return (n / 1e6).toFixed(2) + ' MB/s'
+    if (abs >= 1e3) return (n / 1e3).toFixed(1) + ' KB/s'
     return n.toFixed(0) + ' B/s'
   }
-  return n.toFixed(1) + '%'
+  // CPU / memory utilization percent
+  const pct = Math.max(0, Math.min(100, n))
+  return pct.toFixed(1) + '%'
 }
 
 function formatMetricTime(ts: string | null | undefined) {

@@ -3198,16 +3198,24 @@ class TenantSession:
             return OperationResult(ok=False, message=str(exc))
 
     def get_instance_metrics(self, instance_id: str, compartment_id: str, hours: int = 3) -> OperationResult:
-        """Fetch CPU / memory / network time series from the Monitoring service."""
+        """Fetch CPU / memory / network time series from the Monitoring service.
+
+        Network series are **bytes/sec** (MQL ``.rate()`` on cumulative counters).
+        CPU / memory are utilization percentages.
+        """
         from datetime import datetime, timedelta, timezone
 
         end = datetime.now(timezone.utc)
         start = end - timedelta(hours=max(1, int(hours)))
+        # CpuUtilization / MemoryUtilization: percent (0–100), use mean over 1m.
+        # NetworksBytesIn/Out: cumulative byte counters from the compute agent.
+        # `.mean()` on counters is meaningless (looks like huge B/s). `.rate()`
+        # yields average bytes/sec over each interval — what the UI expects.
         queries = {
             "cpu": 'CpuUtilization[1m]{resourceId = "%s"}.mean()' % instance_id,
             "memory": 'MemoryUtilization[1m]{resourceId = "%s"}.mean()' % instance_id,
-            "net_in": 'NetworksBytesIn[1m]{resourceId = "%s"}.mean()' % instance_id,
-            "net_out": 'NetworksBytesOut[1m]{resourceId = "%s"}.mean()' % instance_id,
+            "net_in": 'NetworksBytesIn[1m]{resourceId = "%s"}.rate()' % instance_id,
+            "net_out": 'NetworksBytesOut[1m]{resourceId = "%s"}.rate()' % instance_id,
         }
         series: dict[str, list] = {}
         any_data = False
@@ -3222,8 +3230,27 @@ class TenantSession:
                 resp = self.monitoring.summarize_metrics_data(compartment_id, details).data
                 points = []
                 if resp:
-                    for dp in getattr(resp[0], "aggregated_datapoints", None) or []:
-                        points.append((getattr(dp, "timestamp", None), float(getattr(dp, "value", 0) or 0)))
+                    # Multiple series can appear (e.g. multi-VNIC). Sum concurrent
+                    # datapoints at the same timestamp so the chart is total traffic.
+                    bucket: dict[str, float] = {}
+                    order: list = []
+                    for metric in resp:
+                        for dp in getattr(metric, "aggregated_datapoints", None) or []:
+                            ts = getattr(dp, "timestamp", None)
+                            val = float(getattr(dp, "value", 0) or 0)
+                            if not isinstance(val, float) or val != val:  # NaN
+                                continue
+                            # Clamp absurd negatives (counter resets) to 0 for rates.
+                            if key.startswith("net") and val < 0:
+                                val = 0.0
+                            key_ts = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+                            if key_ts not in bucket:
+                                order.append(ts)
+                                bucket[key_ts] = 0.0
+                            bucket[key_ts] += val
+                    for ts in order:
+                        key_ts = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+                        points.append((ts, bucket[key_ts]))
                     points.sort(key=lambda p: (p[0] is None, p[0]))
                 series[key] = points
                 any_data = any_data or bool(points)
@@ -3234,7 +3261,17 @@ class TenantSession:
         return OperationResult(
             ok=True,
             message="已获取监控数据" if any_data else "暂无监控数据（实例需启用计算代理 / 监控插件）",
-            data={"series": series, "hours": hours, "has_data": any_data},
+            data={
+                "series": series,
+                "hours": hours,
+                "has_data": any_data,
+                "units": {
+                    "cpu": "percent",
+                    "memory": "percent",
+                    "net_in": "bytes_per_sec",
+                    "net_out": "bytes_per_sec",
+                },
+            },
         )
 
     def detect_account_tier(self) -> OperationResult:

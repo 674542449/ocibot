@@ -83,7 +83,6 @@
               >
                 {{ ins.display_name }}
               </router-link>
-              <div class="muted" style="font-size: 11px; word-break: break-all">{{ ins.id }}</div>
             </td>
             <td>
               <span class="badge" :class="stateClass(ins.lifecycle_state)">{{ ins.lifecycle_state }}</span>
