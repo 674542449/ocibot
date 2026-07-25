@@ -144,7 +144,7 @@ key_file=~/.oci/oci_api_key.pem"
 
       <label class="choice muted">
         <input v-model="paste.test_connection" type="checkbox" />
-        <span>保存后自动测试连接</span>
+        <span>保存后自动测试连接（会请求 Oracle API，默认关闭）</span>
       </label>
 
       <div class="row">
@@ -345,7 +345,8 @@ const paste = reactive({
   private_key_pem: '',
   name: '',
   description: '',
-  test_connection: true,
+  // Default off: never hit Oracle unless the user explicitly opts in.
+  test_connection: false,
 })
 
 const form = reactive({
@@ -462,7 +463,7 @@ function resetPaste() {
   paste.private_key_pem = ''
   paste.name = ''
   paste.description = ''
-  paste.test_connection = true
+  paste.test_connection = false
   parsePreview.value = null
   showManual.value = false
   pasteKeyFile.value = ''

@@ -647,16 +647,22 @@ class Worker:
             log.exception("daily-check gate failed")
             return
         log.info("running daily checks (%s)", today)
+        # Password expiry is local DB only (no OCI). Budget checks hit Usage API —
+        # run them strictly one tenant at a time with a short pause to avoid
+        # multi-account bursts.
         tenants = db.scalars(select(Tenant).where(Tenant.enabled.is_(True))).all()
         for tenant in tenants:
-            try:
-                self._check_tenant_budget(db, tenant)
-            except Exception:  # noqa: BLE001
-                log.exception("budget check failed tenant=%s", tenant.id)
             try:
                 self._check_tenant_password_expiry(db, tenant, today)
             except Exception:  # noqa: BLE001
                 log.exception("password expiry check failed tenant=%s", tenant.id)
+            try:
+                self._check_tenant_budget(db, tenant)
+            except Exception:  # noqa: BLE001
+                log.exception("budget check failed tenant=%s", tenant.id)
+            # Gentle spacing between tenants that may call OCI Usage.
+            if float(tenant.budget_monthly_usd or 0.0) > 0:
+                time.sleep(1.5)
 
     def _check_tenant_budget(self, db: Session, tenant: Tenant) -> None:
         budget = float(tenant.budget_monthly_usd or 0.0)

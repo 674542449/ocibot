@@ -4,17 +4,17 @@
       <div>
         <h2>账号用量</h2>
         <p class="muted" style="margin: 0.2rem 0 0">
-          订阅等级 / 配额 / 费用
+          订阅等级 / 配额 / 费用 · 点击「刷新」才请求 Oracle
         </p>
       </div>
       <div class="page-tools">
-        <select v-model.number="days" @change="loadUsage">
+        <select v-model.number="days">
           <option :value="7">7 天</option>
           <option :value="30">30 天</option>
           <option :value="90">90 天</option>
         </select>
         <button class="primary" :disabled="loading || !tenantId" @click="loadAll">
-          {{ loading ? '加载中…' : '刷新' }}
+          {{ loading ? '加载中…' : '刷新用量' }}
         </button>
       </div>
     </div>
@@ -22,12 +22,15 @@
     <div class="card stack">
       <div class="field">
         <label>租户</label>
-        <select v-model="tenantId" @change="loadAll">
+        <select v-model="tenantId">
           <option disabled value="">选择租户</option>
           <option v-for="t in tenants" :key="t.id" :value="t.id">
             {{ t.name }} · {{ t.region }} · {{ tierLabel(t.account_tier) }}
           </option>
         </select>
+        <p class="muted" style="margin: 0.35rem 0 0; font-size: 12px">
+          切换租户不会自动请求 API；选定后请点右上角「刷新用量」。
+        </p>
       </div>
     </div>
 
@@ -416,7 +419,7 @@ async function loadAll() {
 onMounted(async () => {
   try {
     await loadTenants()
-    if (tenantId.value) await loadAll()
+    // Do not auto-hit Oracle on enter; user clicks 刷新 / 加载.
   } catch (e: any) {
     error.value = e?.message || '初始化失败'
   }

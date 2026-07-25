@@ -4,7 +4,7 @@
       <div>
         <h2>创建实例</h2>
         <p class="muted" style="margin: 0.2rem 0 0">
-          自动公网网络 · 免费套餐快捷配置
+          选择租户后点「加载配置」再创建 · 不自动请求 Oracle API
         </p>
       </div>
       <div class="page-tools">
@@ -64,7 +64,7 @@
       <div class="grid-2">
         <div class="field">
           <label>租户 *</label>
-          <select v-model="tenantId" @change="() => loadMeta()">
+          <select v-model="tenantId" @change="onTenantPicked">
             <option disabled value="">选择租户</option>
             <option v-for="t in tenants" :key="t.id" :value="t.id">{{ t.name }} · {{ t.region }}</option>
           </select>
@@ -73,6 +73,20 @@
           <label>显示名称</label>
           <input v-model="form.display_name" />
         </div>
+      </div>
+
+      <div class="row" style="margin-top: -0.25rem">
+        <button
+          type="button"
+          class="primary"
+          :disabled="!tenantId || loadingMeta"
+          @click="loadMeta(true)"
+        >
+          {{ loadingMeta ? '加载中…' : meta ? '重新加载配置' : '加载配置（镜像 / Shape / 网络）' }}
+        </button>
+        <span v-if="!meta && tenantId" class="muted" style="font-size: 12px">
+          为减少 API 调用，进入本页不会自动拉取租户元数据
+        </span>
       </div>
 
       <div v-if="loadingMeta" class="muted">正在加载镜像 / Shape / 网络…</div>
@@ -746,11 +760,21 @@ async function doLaunch() {
   }
 }
 
+function onTenantPicked() {
+  // Clear previous tenant's meta so we never create with stale AD/image/shape.
+  meta.value = null
+  form.availability_domain = ''
+  form.image_id = ''
+  form.shape = ''
+  presetHint.value = ''
+  // Do not auto-call Oracle — user clicks「加载配置」.
+}
+
 onMounted(async () => {
   try {
     await loadTenants()
     form.display_name = padName()
-    if (tenantId.value) await loadMeta()
+    // No automatic launch-meta fetch on enter.
   } catch (e: any) {
     error.value = e?.message || '初始化失败'
   }

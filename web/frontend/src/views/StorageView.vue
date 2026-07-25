@@ -430,7 +430,11 @@ async function refreshAll() {
 function onTenantChange() {
   activeBucket.value = ''
   objects.value = []
-  refreshAll()
+  // Clear previous tenant data; user must click 刷新 to hit OCI.
+  bootVolumes.value = []
+  blockVolumes.value = []
+  buckets.value = []
+  quota.value = null
   router.replace({ query: { ...route.query, tenant: tenantId.value, tab: tab.value } })
 }
 
@@ -649,7 +653,7 @@ watch(tab, (t) => {
 onMounted(async () => {
   try {
     await loadTenants()
-    if (tenantId.value) await refreshAll()
+    // No automatic multi-API fan-out on enter; user clicks 刷新.
   } catch (e: any) {
     error.value = e?.message || '初始化失败'
   }

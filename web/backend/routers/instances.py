@@ -67,7 +67,8 @@ def list_instances(
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
     include_subcompartments: bool = Query(True),
-    resolve_ips: bool = Query(True),
+    # Default False: IP resolution multiplies OCI calls; opt in from the UI.
+    resolve_ips: bool = Query(False),
     include_terminated: bool = Query(False),
 ) -> list[InstanceOut]:
     row = _tenant_or_404(db, user.id, tenant_id)
@@ -98,25 +99,15 @@ def list_all_instances(
     resolve_ips: bool = Query(False),
     include_terminated: bool = Query(False),
 ) -> list[InstanceOut]:
-    rows = db.scalars(
-        select(Tenant).where(Tenant.owner_id == user.id, Tenant.enabled.is_(True)).order_by(Tenant.name)
-    ).all()
-    out: list[InstanceOut] = []
-    errors: list[str] = []
-    for row in rows:
-        try:
-            session = get_session_for_row(row)
-            infos = session.list_instances_tree(resolve_ips=resolve_ips)
-            if not include_terminated:
-                infos = _visible_instances(infos)
-            out.extend(
-                InstanceOut(**instance_to_dict(i, tenant_id=row.id, tenant_name=row.name)) for i in infos
-            )
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"{row.name}: {exc}")
-    if not out and errors:
-        raise HTTPException(status_code=502, detail="; ".join(errors))
-    return out
+    """Disabled: multi-tenant fan-out against OCI is too expensive and easy to trigger by accident.
+
+    Use ``GET /tenants/{tenant_id}/instances`` for a single tenant at a time.
+    """
+    _ = (user, db, resolve_ips, include_terminated)
+    raise HTTPException(
+        status_code=400,
+        detail="已禁用「全部租户聚合」列表，请选择单个租户后再刷新实例，避免多账号同时请求 Oracle API",
+    )
 
 
 @router.get("/tenants/{tenant_id}/instances/{instance_id}", response_model=InstanceOut)

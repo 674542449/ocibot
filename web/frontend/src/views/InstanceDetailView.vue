@@ -863,8 +863,7 @@ async function loadInstance() {
   instance.value = data
   if (data.ocpus != null) shapeForm.ocpus = data.ocpus
   if (data.memory_in_gbs != null) shapeForm.memory_in_gbs = data.memory_in_gbs
-  // Prefetch boot volume for the volume tab summary
-  loadBoot().catch(() => {})
+  // Do not prefetch boot volume here — volume tab loads on demand.
 }
 
 // ---- metrics ----
@@ -1386,8 +1385,18 @@ watch(tab, async (t) => {
 
 onMounted(async () => {
   try {
+    // Only the instance summary is required to open the page.
+    // Metrics / console / firewall / volume load when the user opens that tab
+    // (or clicks 刷新全部), to avoid background Oracle polling.
     await loadInstance()
-    await loadMetrics()
+    if (tab.value === 'metrics') await loadMetrics()
+    else if (tab.value === 'console') await loadConsole()
+    else if (tab.value === 'firewall') await loadFirewall()
+    else if (tab.value === 'network') await loadReservedIps()
+    else if (tab.value === 'volume') {
+      await loadBoot()
+      await loadBackups()
+    }
   } catch (e: any) {
     error.value = e?.message || '加载失败'
   }

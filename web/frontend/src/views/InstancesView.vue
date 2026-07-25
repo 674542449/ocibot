@@ -4,7 +4,7 @@
       <div>
         <h2>实例</h2>
         <p class="muted" style="margin: 0.2rem 0 0">
-          搜索 / 导出 · 点名称进详情
+          选择租户后点击「刷新」加载 · 点名称进详情
         </p>
       </div>
       <div class="page-tools">
@@ -17,7 +17,7 @@
           <input v-model="resolveIps" type="checkbox" />
           <span>解析 IP</span>
         </label>
-        <button class="primary" :disabled="loading" @click="load">
+        <button class="primary" :disabled="loading || !tenantId" @click="load">
           {{ loading ? '加载中…' : '刷新' }}
         </button>
         <button type="button" :disabled="!filtered.length" @click="exportCsv">导出 CSV</button>
@@ -29,6 +29,9 @@
 
     <div v-if="error" class="error-box">{{ error }}</div>
     <div v-if="msg" class="success-box">{{ msg }}</div>
+    <div v-if="!loading && !loadedOnce && tenantId" class="card muted" style="font-size: 13px">
+      为减少 Oracle API 调用，进入本页<strong>不会自动拉取实例</strong>。选择租户后点击右上角「刷新」。
+    </div>
 
     <div v-if="selected.size > 0" class="card row batch-bar">
       <strong>已选 {{ selected.size }} 台</strong>
@@ -224,9 +227,11 @@ const route = useRoute()
 const tenants = ref<Tenant[]>([])
 const instances = ref<Instance[]>([])
 const tenantId = ref('')
-const resolveIps = ref(true)
+// Default off: listing without public/private IP resolution is much cheaper on OCI.
+const resolveIps = ref(false)
 const search = ref('')
 const loading = ref(false)
+const loadedOnce = ref(false)
 const acting = ref('')
 const error = ref('')
 const msg = ref('')
@@ -406,6 +411,7 @@ async function load() {
     // Discard out-of-order responses from a superseded tenant switch.
     if (seq !== loadSeq) return
     instances.value = res.data
+    loadedOnce.value = true
   } catch (e: any) {
     if (seq !== loadSeq) return
     error.value = e?.message || '加载失败'
@@ -497,20 +503,23 @@ async function terminate(ins: Instance) {
 
 let bootstrapped = false
 
-watch(tenantId, (id, prev) => {
-  if (!id) {
-    instances.value = []
-    return
+watch(tenantId, (id) => {
+  // Changing tenant clears the previous list; user must click 刷新 to hit OCI.
+  instances.value = []
+  loadedOnce.value = false
+  selected.clear()
+  if (!id && !tenants.value.length) {
+    error.value = '还没有租户。请先到「租户」页添加 API 配置。'
+  } else {
+    error.value = ''
   }
-  // During first mount, onMounted owns the initial load to avoid double OCI fetch
-  // when loadTenants assigns the default first tenant.
-  if (!bootstrapped) return
-  if (id !== prev) load()
 })
 
-// Toggling IP resolution must re-fetch the current tenant's instances.
+// Toggling IP resolution only applies on the next manual refresh.
 watch(resolveIps, () => {
-  if (bootstrapped && tenantId.value) load()
+  if (loadedOnce.value) {
+    msg.value = '已切换「解析 IP」；请点击「刷新」重新加载实例列表。'
+  }
 })
 
 onMounted(async () => {
@@ -520,7 +529,7 @@ onMounted(async () => {
     if (q && tenants.value.some((t) => t.id === q) && q !== tenantId.value) {
       tenantId.value = q
     }
-    if (tenantId.value) await load()
+    // Intentionally do NOT auto-call OCI list on enter.
   } catch (e: any) {
     error.value = e?.message || '初始化失败'
   } finally {

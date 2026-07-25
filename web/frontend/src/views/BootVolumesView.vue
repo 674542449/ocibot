@@ -6,14 +6,14 @@
         <p class="muted" style="margin: 0.2rem 0 0">容量与挂载实例</p>
       </div>
       <div class="page-tools">
-        <select v-model="tenantId" @change="load">
+        <select v-model="tenantId" @change="onTenantPicked">
           <option disabled value="">选择租户</option>
           <option v-for="t in tenants" :key="t.id" :value="t.id">
             {{ t.name }} · {{ t.region }}
           </option>
         </select>
         <label class="choice muted" style="flex: 0 0 auto">
-          <input v-model="includeSub" type="checkbox" @change="load" />
+          <input v-model="includeSub" type="checkbox" />
           <span>含子 Compartment</span>
         </label>
         <button class="primary" :disabled="loading || !tenantId" @click="load">
@@ -244,6 +244,13 @@ async function loadTenants() {
   else if (tenants.value[0]) tenantId.value = tenants.value[0].id
 }
 
+function onTenantPicked() {
+  volumes.value = []
+  summary.value = null
+  error.value = ''
+  msg.value = ''
+}
+
 async function load() {
   if (!tenantId.value) return
   loading.value = true
@@ -269,7 +276,7 @@ async function load() {
 onMounted(async () => {
   try {
     await loadTenants()
-    if (tenantId.value) await load()
+    // Manual refresh only — avoid surprise OCI list calls.
   } catch (e: any) {
     error.value = e?.message || '初始化失败'
   }
