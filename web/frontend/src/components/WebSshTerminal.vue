@@ -222,13 +222,21 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .term-host {
-  height: min(60vh, 520px);
+  height: min(55dvh, 520px);
+  min-height: 220px;
   width: 100%;
+  max-width: 100%;
   background: #0b1220;
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 4px;
   overflow: hidden;
+}
+@media (max-width: 600px) {
+  .term-host {
+    height: min(50dvh, 420px);
+    min-height: 180px;
+  }
 }
 .term-host :deep(.xterm) {
   height: 100%;

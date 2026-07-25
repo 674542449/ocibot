@@ -17,7 +17,7 @@ class Settings(BaseSettings):
 
     app_name: str = "OCIBot Web"
     # Bump when shipping user-visible panel features so operators can verify deploy.
-    app_version: str = "0.2.0"
+    app_version: str = "0.3.0"
     debug: bool = False
 
     # sqlite+pysqlite:////absolute/path.db  or  postgresql+psycopg://user:pass@host/db

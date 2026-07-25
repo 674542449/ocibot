@@ -1,11 +1,11 @@
 <template>
   <div class="stack">
-    <div class="row" style="justify-content: space-between">
+    <div class="page-head">
       <div>
-        <h2 style="margin: 0">实例详情</h2>
-        <p class="muted" style="margin: 0.2rem 0 0">{{ title }}</p>
+        <h2>实例详情</h2>
+        <p class="muted" style="margin: 0.2rem 0 0; word-break: break-all">{{ title }}</p>
       </div>
-      <div class="row">
+      <div class="page-tools">
         <button @click="refreshAll" :disabled="loading">刷新</button>
         <router-link to="/"><button type="button">返回列表</button></router-link>
       </div>
@@ -84,7 +84,7 @@
           </div>
         </div>
       </div>
-      <div class="row">
+      <div class="actions-row">
         <button :disabled="acting" @click="power('START')">开机</button>
         <button :disabled="acting" @click="power('SOFTSTOP')">关机</button>
         <button :disabled="acting" @click="power('SOFTRESET')">重启</button>
@@ -96,12 +96,13 @@
       </div>
     </div>
 
-    <!-- Tabs -->
-    <div class="row tab-row">
+    <!-- Tabs: horizontal scroll on narrow screens -->
+    <div class="tab-row" role="tablist">
       <button
         v-for="t in tabs"
         :key="t.id"
         type="button"
+        role="tab"
         :class="{ primary: tab === t.id }"
         @click="tab = t.id"
       >
@@ -1283,11 +1284,17 @@ watch([tenantId, instanceId], async () => {
   grid-template-columns: 1fr 1fr;
   gap: 0.75rem;
 }
+@media (max-width: 700px) {
+  .metrics-grid {
+    grid-template-columns: 1fr;
+  }
+}
 .metric-card {
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 0.5rem 0.65rem;
   background: var(--input-bg);
+  min-width: 0;
 }
 .spark {
   width: 100%;

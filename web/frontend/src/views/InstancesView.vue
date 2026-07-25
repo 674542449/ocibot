@@ -1,23 +1,19 @@
 <template>
   <div class="stack">
-    <div class="row" style="justify-content: space-between">
+    <div class="page-head">
       <div>
-        <h2 style="margin: 0">实例</h2>
+        <h2>实例</h2>
         <p class="muted" style="margin: 0.2rem 0 0">
-          搜索 / 导出 CSV · 点击名称进入详情（监控/控制台/防火墙/引导卷）
+          搜索 / 导出 · 点名称进详情
         </p>
       </div>
-      <div class="row">
-        <select v-model="tenantId" style="width: auto; min-width: 200px">
+      <div class="page-tools">
+        <select v-model="tenantId">
           <option value="">全部租户（聚合）</option>
           <option v-for="t in tenants" :key="t.id" :value="t.id">{{ t.name }} · {{ t.region }}</option>
         </select>
-        <input
-          v-model="search"
-          placeholder="搜索名称 / IP / OCID / Shape"
-          style="width: 220px"
-        />
-        <label class="row muted" style="font-size: 12px">
+        <input v-model="search" type="search" placeholder="搜索名称 / IP / OCID" />
+        <label class="row muted" style="font-size: 12px; flex: 0 0 auto">
           <input v-model="resolveIps" type="checkbox" style="width: auto" />
           解析 IP
         </label>
@@ -137,7 +133,7 @@
               >{{ ins.private_ip || '—' }}</span>
             </td>
             <td>
-              <div class="row">
+              <div class="actions-row">
                 <router-link :to="`/instances/${ins.tenant_id || tenantId}/${ins.id}`">
                   <button type="button">详情</button>
                 </router-link>
@@ -145,7 +141,7 @@
                 <button :disabled="acting === ins.id" @click="power(ins, 'SOFTSTOP')">关机</button>
                 <button :disabled="acting === ins.id" @click="power(ins, 'SOFTRESET')">重启</button>
                 <button :disabled="acting === ins.id" @click="rename(ins)">重命名</button>
-                <button :disabled="acting === ins.id" @click="replaceIp(ins)">换公网IP</button>
+                <button :disabled="acting === ins.id" @click="replaceIp(ins)">换IP</button>
                 <button class="danger" :disabled="acting === ins.id" @click="terminate(ins)">终止</button>
               </div>
             </td>

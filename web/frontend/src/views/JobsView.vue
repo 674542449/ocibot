@@ -1,26 +1,26 @@
 <template>
   <div class="stack">
-    <div>
-      <h2 style="margin: 0">任务中心</h2>
-      <p class="muted" style="margin: 0.2rem 0 0">
-        容量重试与定时开关机由后台 Worker 执行；抢机结果可在「设置」里配置推送通知
-      </p>
+    <div class="page-head">
+      <div>
+        <h2>任务中心</h2>
+        <p class="muted" style="margin: 0.2rem 0 0">
+          容量重试与定时开关机由后台 Worker 执行
+        </p>
+      </div>
+      <div class="page-tools">
+        <label class="row muted" style="font-size: 12px; flex: 0 0 auto">
+          <input v-model="autoRefresh" type="checkbox" style="width: auto" />
+          自动刷新
+        </label>
+        <button @click="load">刷新</button>
+      </div>
     </div>
 
     <div v-if="error" class="error-box">{{ error }}</div>
     <div v-if="msg" class="success-box">{{ msg }}</div>
 
     <div class="card stack">
-      <div class="row" style="justify-content: space-between">
-        <h3 style="margin: 0">容量重试</h3>
-        <div class="row">
-          <label class="row muted" style="font-size: 12px">
-            <input v-model="autoRefresh" type="checkbox" style="width: auto" />
-            自动刷新（5s）
-          </label>
-          <button @click="load">刷新</button>
-        </div>
-      </div>
+      <h3 style="margin: 0">容量重试</h3>
       <div class="table-wrap">
         <table>
           <thead>

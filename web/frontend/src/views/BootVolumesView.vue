@@ -1,20 +1,18 @@
 <template>
   <div class="stack">
-    <div class="row" style="justify-content: space-between">
+    <div class="page-head">
       <div>
-        <h2 style="margin: 0">引导卷</h2>
-        <p class="muted" style="margin: 0.2rem 0 0">
-          查看租户下全部引导卷数量、容量与挂载实例
-        </p>
+        <h2>引导卷</h2>
+        <p class="muted" style="margin: 0.2rem 0 0">容量与挂载实例</p>
       </div>
-      <div class="row">
-        <select v-model="tenantId" style="width: auto; min-width: 220px" @change="load">
+      <div class="page-tools">
+        <select v-model="tenantId" @change="load">
           <option disabled value="">选择租户</option>
           <option v-for="t in tenants" :key="t.id" :value="t.id">
             {{ t.name }} · {{ t.region }}
           </option>
         </select>
-        <label class="row muted" style="font-size: 12px">
+        <label class="row muted" style="font-size: 12px; flex: 0 0 auto">
           <input v-model="includeSub" type="checkbox" style="width: auto" @change="load" />
           含子 Compartment
         </label>
@@ -308,6 +306,11 @@ onMounted(async () => {
 @media (max-width: 900px) {
   .stats {
     grid-template-columns: 1fr 1fr;
+  }
+}
+@media (max-width: 420px) {
+  .stats {
+    grid-template-columns: 1fr;
   }
 }
 </style>

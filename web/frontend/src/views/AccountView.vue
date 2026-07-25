@@ -1,14 +1,14 @@
 <template>
   <div class="stack">
-    <div class="row" style="justify-content: space-between">
+    <div class="page-head">
       <div>
-        <h2 style="margin: 0">账号用量</h2>
+        <h2>账号用量</h2>
         <p class="muted" style="margin: 0.2rem 0 0">
-          订阅等级 / 配额 / 费用曲线（Usage API，需权限）
+          订阅等级 / 配额 / 费用
         </p>
       </div>
-      <div class="row">
-        <select v-model.number="days" style="width: auto" @change="loadUsage">
+      <div class="page-tools">
+        <select v-model.number="days" @change="loadUsage">
           <option :value="7">7 天</option>
           <option :value="30">30 天</option>
           <option :value="90">90 天</option>
@@ -444,7 +444,7 @@ onMounted(async () => {
 }
 .gauge-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 220px), 1fr));
   gap: 0.75rem;
 }
 .gauge-card {

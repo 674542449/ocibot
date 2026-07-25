@@ -2,7 +2,8 @@
 
 多租户 **Oracle Cloud Infrastructure** 实例管理面板 —— 自托管 Web 应用（FastAPI + Vue 3 + **PostgreSQL**）。
 
-> 早期桌面（Tkinter）版已移除；仓库仅保留网页版。共用 OCI 业务层在 `app/`。
+> 早期桌面（Tkinter）版已移除；仓库仅保留网页版。共用 OCI 业务层在 `app/`。  
+> 当前版本见 [CHANGELOG.md](CHANGELOG.md)（面板 `/api/health` 的 `version` 字段）。
 
 ---
 

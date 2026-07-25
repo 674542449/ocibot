@@ -1,11 +1,13 @@
 <template>
   <div class="stack">
-    <div class="row" style="justify-content: space-between">
+    <div class="page-head">
       <div>
-        <h2 style="margin: 0">审计日志</h2>
-        <p class="muted" style="margin: 0.2rem 0 0">危险操作与登录记录（本账号）</p>
+        <h2>审计日志</h2>
+        <p class="muted" style="margin: 0.2rem 0 0">危险操作与登录记录</p>
       </div>
-      <button class="primary" :disabled="loading" @click="load">{{ loading ? '加载中…' : '刷新' }}</button>
+      <div class="page-tools">
+        <button class="primary" :disabled="loading" @click="load">{{ loading ? '加载中…' : '刷新' }}</button>
+      </div>
     </div>
 
     <div v-if="error" class="error-box">{{ error }}</div>

@@ -1,13 +1,15 @@
 <template>
   <div class="stack">
-    <div class="row" style="justify-content: space-between">
+    <div class="page-head">
       <div>
-        <h2 style="margin: 0">创建实例</h2>
+        <h2>创建实例</h2>
         <p class="muted" style="margin: 0.2rem 0 0">
-          自动使用默认公网网络；快捷配置对齐桌面版免费套餐
+          自动公网网络 · 免费套餐快捷配置
         </p>
       </div>
-      <router-link to="/"><button type="button">返回实例列表</button></router-link>
+      <div class="page-tools">
+        <router-link to="/"><button type="button">返回实例列表</button></router-link>
+      </div>
     </div>
 
     <div v-if="error" class="error-box">{{ error }}</div>
@@ -23,7 +25,7 @@
         <table>
           <tbody>
             <tr v-for="row in confirmRows" :key="row[0]">
-              <th style="width: 180px">{{ row[0] }}</th>
+              <th class="confirm-k">{{ row[0] }}</th>
               <td style="word-break: break-all">{{ row[1] }}</td>
             </tr>
           </tbody>
@@ -704,3 +706,18 @@ onMounted(async () => {
   }
 })
 </script>
+
+<style scoped>
+.confirm-k {
+  width: 28%;
+  min-width: 5.5rem;
+  white-space: nowrap;
+}
+@media (max-width: 600px) {
+  .confirm-k {
+    width: 34%;
+    min-width: 4.5rem;
+    font-size: 12px;
+  }
+}
+</style>

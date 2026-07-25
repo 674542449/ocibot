@@ -93,15 +93,18 @@ async function submit() {
 <style scoped>
 .login-page {
   min-height: 100vh;
+  min-height: 100dvh;
   display: grid;
   place-items: center;
   padding: 1rem;
+  padding-top: max(1rem, env(safe-area-inset-top));
+  padding-bottom: max(1rem, env(safe-area-inset-bottom));
 }
 .login-card {
   width: min(420px, 100%);
 }
 h1 {
   margin: 0 0 0.25rem;
-  font-size: 1.5rem;
+  font-size: clamp(1.25rem, 5vw, 1.5rem);
 }
 </style>

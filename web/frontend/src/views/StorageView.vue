@@ -1,14 +1,14 @@
 <template>
   <div class="stack">
-    <div class="row" style="justify-content: space-between">
+    <div class="page-head">
       <div>
-        <h2 style="margin: 0">存储</h2>
+        <h2>存储</h2>
         <p class="muted" style="margin: 0.2rem 0 0">
-          引导卷 / 块卷 / 对象存储（Always Free 块存储合计 200GB，对象约 20GB）
+          引导卷 / 块卷 / 对象存储
         </p>
       </div>
-      <div class="row">
-        <select v-model="tenantId" style="width: auto; min-width: 220px" @change="onTenantChange">
+      <div class="page-tools">
+        <select v-model="tenantId" @change="onTenantChange">
           <option disabled value="">选择租户</option>
           <option v-for="t in tenants" :key="t.id" :value="t.id">
             {{ t.name }} · {{ t.region }}
@@ -44,10 +44,12 @@
       </div>
     </div>
 
-    <div class="row tabs">
+    <div class="tab-row" role="tablist">
       <button
         v-for="t in tabDefs"
         :key="t.id"
+        type="button"
+        role="tab"
         :class="{ primary: tab === t.id }"
         @click="tab = t.id"
       >
@@ -57,12 +59,12 @@
 
     <!-- Boot -->
     <div v-if="tab === 'boot'" class="stack">
-      <div class="row">
-        <label class="row muted" style="font-size: 12px">
+      <div class="page-tools">
+        <label class="row muted" style="font-size: 12px; flex: 0 0 auto">
           <input v-model="includeSub" type="checkbox" style="width: auto" @change="loadBoot" />
           含子 Compartment
         </label>
-        <input v-model="bootSearch" placeholder="搜索引导卷" style="max-width: 280px" />
+        <input v-model="bootSearch" type="search" placeholder="搜索引导卷" />
       </div>
       <div class="card table-wrap">
         <table>

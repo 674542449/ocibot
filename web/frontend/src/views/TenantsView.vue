@@ -1,13 +1,15 @@
 <template>
   <div class="stack">
-    <div class="row" style="justify-content: space-between">
+    <div class="page-head">
       <div>
-        <h2 style="margin: 0">租户 / API 配置</h2>
+        <h2>租户 / API 配置</h2>
         <p class="muted" style="margin: 0.2rem 0 0">
-          推荐直接粘贴 OCI 原始 config；私钥仅服务端加密存储
+          粘贴 OCI config；私钥仅服务端加密存储
         </p>
       </div>
-      <button class="primary" @click="openCreate">添加租户</button>
+      <div class="page-tools">
+        <button class="primary" @click="openCreate">添加租户</button>
+      </div>
     </div>
 
     <div v-if="error" class="error-box">{{ error }}</div>
