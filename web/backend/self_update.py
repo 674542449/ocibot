@@ -99,10 +99,7 @@ def _host_repo_on_host() -> str:
     detected = _detect_host_bind_source(str(_host_dir()))
     if detected and detected.startswith("/") and detected not in {"/host/ocibot"}:
         return detected
-    # Last resort: common install location
-    for candidate in ("/root/ocibot", "/opt/ocibot", "/home/ocibot/ocibot"):
-        # We cannot stat host paths from here unless mounted; still prefer env.
-        pass
+    # Last resort: common install location (cannot stat host paths from container).
     return env or detected or "/root/ocibot"
 
 
@@ -298,7 +295,7 @@ def check_for_update(db: Session) -> dict[str, Any]:
         remote = fetch_remote_head()
         st["remote"] = remote
         st["checked_at"] = _utcnow()
-        st["state"] = st.get("state") if st.get("state") in {"running"} else "idle"
+        st["state"] = "idle"
         st["message"] = f"远程 {remote.get('short_sha')} · {remote.get('message')}"
         st["last_error"] = ""
         _write_status(db, st)
@@ -336,27 +333,6 @@ def _disk_free_gb(path: str = "/") -> Optional[float]:
         return round((st.f_bavail * st.f_frsize) / (1024**3), 2)
     except Exception:
         return None
-
-
-def _ensure_cli_image() -> tuple[int, str]:
-    """Make sure docker:cli is available; try pull, accept local cache."""
-    code, out = _run_cmd(
-        ["docker", "image", "inspect", DOCKER_CLI_IMAGE, "--format", "{{.Id}}"],
-        timeout=30,
-    )
-    if code == 0 and out.strip():
-        return 0, f"cli image present: {out.strip()[:20]}\n"
-    code, out = _run_cmd(["docker", "pull", DOCKER_CLI_IMAGE], timeout=300)
-    if code == 0:
-        return 0, out
-    # One more inspect — partial pull / already tagged
-    code2, out2 = _run_cmd(
-        ["docker", "image", "inspect", DOCKER_CLI_IMAGE, "--format", "{{.Id}}"],
-        timeout=30,
-    )
-    if code2 == 0:
-        return 0, f"pull failed but local image ok\n{out}\n"
-    return code, out
 
 
 def _compose_env_flags(host_repo: str) -> list[str]:

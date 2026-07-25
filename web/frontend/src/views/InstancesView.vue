@@ -380,12 +380,8 @@ function copyIp(text?: string | null, ev?: Event) {
 async function loadTenants() {
   const { data } = await api.get<Tenant[]>('/tenants')
   tenants.value = data
-  // Default to the first tenant only — never auto-aggregate all tenants.
-  if (!tenantId.value && data.length) {
-    tenantId.value = data[0].id
-  }
-  // If current selection disappeared (deleted tenant), fall back to first.
-  if (tenantId.value && data.length && !data.some((t) => t.id === tenantId.value)) {
+  // Default to first tenant; if current selection was deleted, fall back.
+  if (data.length && (!tenantId.value || !data.some((t) => t.id === tenantId.value))) {
     tenantId.value = data[0].id
   }
 }
@@ -507,6 +503,11 @@ watch(tenantId, (id, prev) => {
     return
   }
   if (id !== prev) load()
+})
+
+// Toggling IP resolution must re-fetch the current tenant's instances.
+watch(resolveIps, () => {
+  if (tenantId.value) load()
 })
 
 onMounted(async () => {

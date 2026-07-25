@@ -1,15 +1,54 @@
 # OCIBot
 
-多租户 **Oracle Cloud Infrastructure** 实例管理面板 —— 自托管 Web 应用（FastAPI + Vue 3 + **PostgreSQL**）。
+自托管的 **Oracle Cloud Infrastructure（OCI）** 多租户管理面板。
 
-> 早期桌面（Tkinter）版已移除；仓库仅保留网页版。共用 OCI 业务层在 `app/`。  
-> 当前版本见 [CHANGELOG.md](CHANGELOG.md)（面板 `/api/health` 的 `version` 字段）。
+用于在一台服务器上统一管理多个 OCI 账号：创建与维护 Always Free / 付费实例、容量重试抢机、定时开关机、WebSSH、存储与防火墙，以及备份恢复。
+
+当前主线为 Web 版（FastAPI + Vue 3 + PostgreSQL）。面板版本以 `/api/health` 的 `version` 与 [CHANGELOG.md](CHANGELOG.md) 为准。
 
 ---
 
-## 一键安装（推荐 · Docker + PostgreSQL）
+## 功能
 
-**Linux / macOS**
+| 模块 | 能力 |
+|------|------|
+| 账号 | 注册 / 登录、HttpOnly Cookie 会话、可选 TOTP、管理员用户管理 |
+| 租户 | 多 OCI API 配置、私钥 Fernet 加密存库、连接测试、账号等级识别 |
+| 实例 | 列表 / 详情、电源操作、重命名、监控曲线、公网 IP / IPv6 |
+| 创建 | 免费套餐预设、自动默认网络、容量不足自动重试（Worker 执行） |
+| 终端 | 浏览器 WebSSH；串口 / VNC 控制台连接 |
+| 存储 | 引导卷扩容与备份、块存储、对象存储 |
+| 网络 | NSG 防火墙规则、保留公网 IP |
+| 任务 | 容量重试任务、定时开关机 |
+| 通知 | Telegram / Bark / ServerChan / Webhook / SMTP（含 SSRF 防护） |
+| 运维 | 加密租户备份、面板内一键更新（Docker 部署） |
+
+---
+
+## 架构
+
+```
+浏览器 (Vue 3 SPA)
+        │  HTTPS / Cookie
+        ▼
+   API 容器 (FastAPI + 静态前端)
+        │
+        ├── PostgreSQL
+        └── Worker 容器（容量重试 / 定时 / 通知）
+                │
+                ▼
+           Oracle Cloud API
+```
+
+- 生产推荐：`docker compose` 启动 `db` + `api` + `worker`
+- API 进程同时托管前端构建产物，单入口访问
+- OCI 私钥仅服务端加密存储，不回传浏览器
+
+---
+
+## 快速安装（推荐）
+
+### Linux / macOS
 
 ```bash
 export OCIBOT_REPO_URL=https://github.com/674542449/ocibot.git
@@ -17,70 +56,41 @@ export OCIBOT_BRANCH=main
 curl -fsSL https://raw.githubusercontent.com/674542449/ocibot/main/scripts/install.sh | bash
 ```
 
-**Windows（PowerShell + Docker Desktop）**
+### Windows（PowerShell + Docker Desktop）
 
 ```powershell
 $env:OCIBOT_REPO_URL = "https://github.com/674542449/ocibot.git"
 $env:OCIBOT_BRANCH = "main"
 irm https://raw.githubusercontent.com/674542449/ocibot/main/scripts/install.ps1 | iex
-# 或克隆后：
-#   .\scripts\install.ps1 install
 ```
 
-安装完成后打开 **http://127.0.0.1:8000** → **注册**首个账号（自动成为管理员）→ **租户**页粘贴 OCI API。
+安装完成后：
 
-### 一键更新
+1. 打开 `http://127.0.0.1:8000`
+2. **注册第一个账号**（自动成为管理员）
+3. 进入 **租户**，粘贴 OCI API 配置与私钥
+4. 在 **实例 / 创建实例** 开始使用
+
+### 更新
 
 ```bash
-# Linux/macOS（在安装目录或设置 OCIBOT_DIR）
+# 安装目录内
 ./scripts/install.sh update
 
 # Windows
 .\scripts\install.ps1 update
 ```
 
-脚本会：`git pull`（若是 clone）→ `docker compose up -d --build`，**保留 PostgreSQL 数据卷与 `web/.env` 密钥**。
+更新会拉取代码、重建镜像并滚动重启，**保留 PostgreSQL 数据卷与 `web/.env` 密钥**。  
+Docker 部署且已挂载仓库与 `docker.sock` 时，也可在管理员页使用「一键更新」。
 
 ### 常用命令
 
-| 命令 | 作用 |
+| 命令 | 说明 |
 |------|------|
-| `./scripts/install.sh status` | 容器状态 + 健康检查 |
-| `./scripts/install.sh uninstall` | 停服务（默认保留数据库卷） |
-| `OCIBOT_PURGE_DATA=1 ./scripts/install.sh uninstall` | 停服务并删库 |
-
----
-
-## 功能一览
-
-- 多用户账号（注册 / 登录 / JWT，**HttpOnly Cookie**，可选 **TOTP**）
-- 多租户 OCI API（私钥 Fernet 加密存库，永不下发浏览器）
-- 加密备份 / 恢复（密码 ZIP）
-- Always Free 仪表盘 + **创建 / 改规格 / 扩容额度守卫**
-- 实例列表 / 详情 / 电源 / 重命名 / 监控
-- 创建向导（免费套餐预设、自动网络、容量重试）
-- WebSSH 网页终端 + 串口/VNC 控制台
-- 引导卷扩容 + SSH 自动扩展文件系统
-- 块存储 / 对象存储管理
-- 防火墙 NSG、公网 IP / IPv6、引导卷备份
-- 任务中心（容量重试 / 定时开关机）与多渠道通知
-
----
-
-## 架构
-
-```
-浏览器 (Vue 3)
-    │  /api/*  (HttpOnly cookie)
-    ▼
-API  (uvicorn multi-worker)  ──►  PostgreSQL 16
-    │                                  ▲
-Worker (容量重试 / 定时 / 通知)  ──────┘
-    │
-Oracle Cloud API   (app/oci_client.py)
-```
-
-生产默认 **Docker Compose**：`db` + `api` + `worker`；API 同时托管前端静态资源。
+| `./scripts/install.sh status` | 容器状态与健康检查 |
+| `./scripts/install.sh uninstall` | 停止服务（默认保留数据卷） |
+| `OCIBOT_PURGE_DATA=1 ./scripts/install.sh uninstall` | 停止并删除数据卷 |
 
 ---
 
@@ -90,25 +100,58 @@ Oracle Cloud API   (app/oci_client.py)
 git clone https://github.com/674542449/ocibot.git
 cd ocibot
 cp web/.env.example web/.env
-# 编辑 web/.env：POSTGRES_PASSWORD / OCIBOT_MASTER_KEY / OCIBOT_JWT_SECRET
-# 生产建议：OCIBOT_REQUIRE_SECURE_SECRETS=1  OCIBOT_COOKIE_SECURE=1（HTTPS）
+# 编辑 web/.env，至少设置：
+#   POSTGRES_PASSWORD
+#   OCIBOT_MASTER_KEY
+#   OCIBOT_JWT_SECRET
 
+export OCIBOT_HOST_REPO="$(pwd -P)"   # 在线更新需要绝对路径
 docker compose up -d --build
-# http://127.0.0.1:8000
 ```
 
-性能相关环境变量（`web/.env` 或 compose）：
-
-| 变量 | 默认 | 说明 |
-|------|------|------|
-| `OCIBOT_API_WORKERS` | `2` | uvicorn 进程数 |
-| `OCIBOT_DB_POOL_SIZE` | `10` | SQLAlchemy 连接池 |
-| `OCIBOT_DB_MAX_OVERFLOW` | `20` | 池溢出连接 |
-| `OCIBOT_PORT` | `8000` | 宿主机端口 |
+访问：`http://127.0.0.1:8000`  
+健康检查：`curl -s http://127.0.0.1:8000/api/health`
 
 ---
 
-## 本地开发（SQLite 亦可）
+## 配置说明
+
+主要环境变量写在 `web/.env`（或 compose 环境）：
+
+| 变量 | 建议 | 说明 |
+|------|------|------|
+| `POSTGRES_PASSWORD` | 强随机 | 数据库密码 |
+| `OCIBOT_MASTER_KEY` | ≥24 位随机 | 加密 OCI 私钥 / TOTP 等 |
+| `OCIBOT_JWT_SECRET` | ≥24 位随机 | 签发会话 JWT |
+| `OCIBOT_REQUIRE_SECURE_SECRETS` | 生产 `1` | 拒绝使用内置弱密钥启动 |
+| `OCIBOT_COOKIE_SECURE` | HTTPS 下 `1` | 仅通过 HTTPS 发送登录 Cookie |
+| `OCIBOT_CORS_ORIGINS` | 精确来源列表 | 浏览器跨域白名单 |
+| `OCIBOT_ALLOW_OPEN_REGISTRATION` | 默认 `0` | 首用户后是否开放注册 |
+| `OCIBOT_TRUST_PROXY` | 默认 `0` | 是否信任 `X-Forwarded-For`（仅反代后开启） |
+| `OCIBOT_API_WORKERS` | 默认 `2` | API 进程数 |
+| `OCIBOT_PORT` | 默认 `8000` | 宿主机映射端口 |
+| `OCIBOT_UPDATE_ENABLED` | 默认 `1` | 面板内自更新开关 |
+| `OCIBOT_HOST_REPO` | 宿主机绝对路径 | 自更新绑定的代码目录 |
+
+安装脚本会生成随机密钥并默认开启 `OCIBOT_REQUIRE_SECURE_SECRETS=1`。
+
+---
+
+## 安全建议（上线前）
+
+1. 使用强随机 `OCIBOT_MASTER_KEY` / `OCIBOT_JWT_SECRET`，并设置 `OCIBOT_REQUIRE_SECURE_SECRETS=1`
+2. 前置 HTTPS 反代，设置 `OCIBOT_COOKIE_SECURE=1`
+3. 限制 `OCIBOT_CORS_ORIGINS` 为真实访问域名
+4. 首用户注册后保持关闭开放注册；需要加用户时再临时打开
+5. 仅在受信反代后开启 `OCIBOT_TRUST_PROXY=1`
+6. 管理员可挂载 `docker.sock` 做自更新：**管理员失陷 ≈ 宿主机失陷**；多管理员不可信时关闭 `OCIBOT_UPDATE_ENABLED`
+7. Webhook / Bark 目标已做私网与元数据地址拦截，仍建议只给受信用户开通知配置
+
+更细的审计说明见 [web/AUDIT.md](web/AUDIT.md)。
+
+---
+
+## 本地开发
 
 ```bash
 python -m venv .venv
@@ -116,64 +159,74 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# API
+# API（可使用 SQLite：不设 DATABASE_URL 时默认本地文件库）
 python -m uvicorn web.backend.main:app --reload --host 127.0.0.1 --port 8000
 
-# Worker（另开终端）
+# 另开终端：Worker
 python -m web.backend.worker
 
-# 前端
-cd web/frontend && npm install && npm run dev   # http://127.0.0.1:5173
+# 前端开发
+cd web/frontend
+npm install
+npm run dev
 ```
 
-开发默认 SQLite：`web_data/ocibot_web.db`。要连本机 PostgreSQL 时设置：
+测试：
 
 ```bash
-export DATABASE_URL=postgresql+psycopg://ocibot:pass@127.0.0.1:5432/ocibot
+python -m pytest tests -q
 ```
 
 ---
 
-## 安全要点
-
-- **私钥永不下发浏览器**；库中 Fernet 密文，密钥 = `OCIBOT_MASTER_KEY`（换 key 后旧密文失效）
-- 首个注册用户为管理员；之后默认关闭开放注册
-- 公网务必：HTTPS + `OCIBOT_COOKIE_SECURE=1` + 强随机密钥 + `OCIBOT_REQUIRE_SECURE_SECRETS=1`
-- 备份 `web/.env` 与 PostgreSQL 卷；可用面板「备份恢复」导出加密 ZIP
-
----
-
-## 项目结构
+## 目录结构
 
 ```
 ocibot/
-├── docker-compose.yml      # 生产：Postgres + API + Worker
-├── scripts/install.sh      # Linux/macOS 一键安装/更新
-├── scripts/install.ps1     # Windows 一键安装/更新
-├── app/                    # OCI 业务层
+├── app/                 # OCI 业务层（与 Web 共用）
 ├── web/
-│   ├── backend/            # FastAPI + worker
-│   ├── frontend/           # Vue 3
-│   ├── Dockerfile
+│   ├── backend/         # FastAPI、Worker、认证、通知、自更新
+│   ├── frontend/        # Vue 3 控制台
 │   └── .env.example
-├── tests/
+├── scripts/
+│   ├── install.sh       # Linux/macOS 安装与更新
+│   └── install.ps1      # Windows 安装与更新
+├── docker-compose.yml
+├── CHANGELOG.md
 └── README.md
 ```
 
 ---
 
-## 权限提示（OCI 策略）
+## 使用提示
 
-```
-Allow group <group> to manage instance-family in compartment <compute-compartment>
-Allow group <group> to manage virtual-network-family in compartment <network-compartment>
-Allow group <group> to manage volume-family in compartment <compute-compartment>
-Allow group <group> to manage object-family in compartment <compute-compartment>
-Allow group <group> to inspect compartments in tenancy
-```
+- **实例列表**默认显示第一个租户；可在下拉框切换，不再默认聚合全部租户
+- **密码到期提醒**是面板本地策略（可改天数，`0` 关闭），不会替你修改 Oracle 控制台密码
+- **容量重试**由 Worker 执行；侧栏会提示 Worker 是否在线
+- **备份恢复**导出加密 ZIP，导入只创建当前用户名下的新租户，不会覆盖他人数据
 
 ---
 
-## 许可证 / 免责
+## 故障排查
 
-电源、创建、终止与自动化重试会影响线上资源与账单。请遵守 Oracle 服务条款；勿绕过限流保护。
+| 现象 | 处理 |
+|------|------|
+| 页面打不开 | `./scripts/install.sh status`；`docker compose logs api --tail=100` |
+| 更新后版本不变 | `curl -s http://127.0.0.1:8000/api/health`；浏览器强刷；确认 `OCIBOT_HOST_REPO` 为绝对路径 |
+| 容量重试不跑 | 侧栏 Worker 离线提示；检查 worker 容器日志 |
+| 登录限流异常 | 直连部署保持 `OCIBOT_TRUST_PROXY=0`；反代需覆盖客户端 IP 头后再开启 |
+| 私钥解密失败 | `OCIBOT_MASTER_KEY` 被更换；需用旧密钥或重新导入租户 / 恢复备份 |
+
+---
+
+## 许可证与免责
+
+本项目按仓库内许可证条款提供。请遵守 Oracle Cloud 服务条款与当地法规；容量重试、自动操作等能力由使用者自行配置与承担风险。
+
+---
+
+## 链接
+
+- 仓库：<https://github.com/674542449/ocibot>
+- 变更记录：[CHANGELOG.md](CHANGELOG.md)
+- 安全审计摘记：[web/AUDIT.md](web/AUDIT.md)

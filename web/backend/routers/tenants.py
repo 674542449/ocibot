@@ -295,7 +295,8 @@ def update_tenant(
         # Reset daily notify flag so a new baseline can re-alert when due again.
         row.pwd_expiry_notified_on = ""
     if "password_expiry_days" in data and data["password_expiry_days"] is not None:
-        data["password_expiry_days"] = int(data["password_expiry_days"])
+        data["password_expiry_days"] = max(0, min(3650, int(data["password_expiry_days"])))
+        row.pwd_expiry_notified_on = ""
 
     for key, value in data.items():
         if value is not None or key == "password_changed_at":

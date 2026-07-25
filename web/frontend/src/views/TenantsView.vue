@@ -425,12 +425,22 @@ const editPolicyPreview = computed(() => {
   return `预览：到期 ${iso}（还剩 ${left} 天）`
 })
 
+function clampExpiryDays(raw: unknown): number {
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return 0
+  return Math.max(0, Math.min(3650, Math.trunc(n)))
+}
+
 function applyPolicyToTenant(t: Tenant, p: PasswordPolicy) {
   t.password_changed_at = p.password_changed_at
   t.password_expiry_days = p.password_expiry_days
   t.password_expires_on = p.password_expires_on
   t.password_days_left = p.password_days_left
   t.password_status = p.password_status
+}
+
+function replaceTenant(row: Tenant) {
+  tenants.value = tenants.value.map((x) => (x.id === row.id ? { ...row } : x))
 }
 
 function resetForm() {
@@ -597,6 +607,7 @@ async function saveManual() {
   msg.value = ''
   saving.value = true
   try {
+    const days = clampExpiryDays(form.password_expiry_days)
     if (editingId.value) {
       const payload: Record<string, unknown> = {
         name: form.name,
@@ -607,16 +618,14 @@ async function saveManual() {
         compartment_ocid: form.compartment_ocid,
         description: form.description,
         password_changed_at: form.password_changed_at || '',
-        password_expiry_days: Number(form.password_expiry_days || 0),
+        password_expiry_days: days,
         budget_monthly_usd: form.budget_monthly_usd,
       }
       if (form.private_key_pem.trim()) {
         payload.private_key_pem = form.private_key_pem
       }
       const { data } = await api.patch<Tenant>(`/tenants/${editingId.value}`, payload)
-      // Prefer server-computed countdown fields immediately.
-      const idx = tenants.value.findIndex((x) => x.id === editingId.value)
-      if (idx >= 0) tenants.value[idx] = data
+      replaceTenant(data)
       form.password_changed_at = (data.password_changed_at || '').slice(0, 10)
       form.password_expiry_days = data.password_expiry_days ?? 0
       msg.value =
@@ -634,7 +643,7 @@ async function saveManual() {
         compartment_ocid: form.compartment_ocid,
         description: form.description,
         password_changed_at: form.password_changed_at || '',
-        password_expiry_days: Number(form.password_expiry_days || 0),
+        password_expiry_days: days,
         budget_monthly_usd: form.budget_monthly_usd,
       })
       msg.value = '已添加'
@@ -689,8 +698,7 @@ async function markPasswordChanged(t: Tenant) {
       mark_changed_today: true,
     })
     applyPolicyToTenant(t, data)
-    // Keep list sorted identity stable; force array refresh for Vue.
-    tenants.value = tenants.value.map((x) => (x.id === t.id ? { ...x, ...t } : x))
+    replaceTenant(t)
     msg.value = `${t.name}: 已写入数据库（今天改密）· ${data.message || `到期 ${data.password_expires_on || '—'}`}`
   } catch (e: any) {
     error.value = e?.message || '更新密码策略失败'
@@ -709,10 +717,9 @@ async function savePasswordPolicyOnly() {
   msg.value = ''
   saving.value = true
   try {
-    const days = Number(form.password_expiry_days)
     const payload = {
       password_changed_at: form.password_changed_at || '',
-      password_expiry_days: Number.isFinite(days) ? Math.max(0, Math.min(3650, Math.trunc(days))) : 0,
+      password_expiry_days: clampExpiryDays(form.password_expiry_days),
     }
     const { data } = await api.patch<PasswordPolicy>(
       `/tenants/${editingId.value}/password-policy`,
@@ -723,7 +730,7 @@ async function savePasswordPolicyOnly() {
     const hit = tenants.value.find((x) => x.id === editingId.value)
     if (hit) {
       applyPolicyToTenant(hit, data)
-      tenants.value = tenants.value.map((x) => (x.id === hit.id ? { ...hit } : x))
+      replaceTenant(hit)
     }
     msg.value =
       data.password_expiry_days > 0

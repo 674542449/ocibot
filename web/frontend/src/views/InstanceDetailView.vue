@@ -924,12 +924,14 @@ function metricColor(k: string) {
 }
 
 function formatMetricValue(v: number, key: string) {
+  const n = Number(v)
+  if (!Number.isFinite(n)) return '—'
   if (key.startsWith('net')) {
-    if (v > 1e6) return (v / 1e6).toFixed(2) + ' MB/s'
-    if (v > 1e3) return (v / 1e3).toFixed(1) + ' KB/s'
-    return v.toFixed(0) + ' B/s'
+    if (n > 1e6) return (n / 1e6).toFixed(2) + ' MB/s'
+    if (n > 1e3) return (n / 1e3).toFixed(1) + ' KB/s'
+    return n.toFixed(0) + ' B/s'
   }
-  return v.toFixed(1) + '%'
+  return n.toFixed(1) + '%'
 }
 
 function formatMetricTime(ts: string | null | undefined) {
@@ -944,7 +946,9 @@ function formatMetricTime(ts: string | null | undefined) {
 }
 
 function sparkLayout(points: any[]) {
-  const vals = points.map((p) => Number(p?.[1] ?? 0))
+  const vals = points
+    .map((p) => Number(p?.[1] ?? 0))
+    .map((v) => (Number.isFinite(v) ? v : 0))
   if (!vals.length) {
     return { vals: [] as number[], max: 1, min: 0, span: 1 }
   }
@@ -978,10 +982,8 @@ function sparkPoints(points: any[]) {
 function sparkArea(points: any[]) {
   const line = sparkPoints(points)
   if (!line) return ''
-  const n = points.length
-  const x0 = 4
-  const x1 = (Math.max(n - 1, 1) / Math.max(n - 1, 1)) * (svgW - 8) + 4
-  return `${x0.toFixed(1)},${(svgH - 4).toFixed(1)} ${line} ${x1.toFixed(1)},${(svgH - 4).toFixed(1)}`
+  // Close the area path against the bottom of the sparkline viewport.
+  return `4,${(svgH - 4).toFixed(1)} ${line} ${(svgW - 4).toFixed(1)},${(svgH - 4).toFixed(1)}`
 }
 
 function lastValue(points: any[], key: string) {
