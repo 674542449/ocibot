@@ -141,10 +141,11 @@ def test_write_restart_script_contains_recovery(tmp_path):
     host.mkdir()
     path = self_update._write_restart_script(host, "/root/ocibot", "ocibot", "deadbeef")
     text = path.read_text(encoding="utf-8")
-    assert "force-recreate worker" in text
-    assert "force-recreate api" in text
+    assert "docker compose" in text
+    assert "build" in text
     assert "up -d" in text
     assert "deadbeef" in text
+    assert "OCIBOT_SKIP_GIT=1" in text
 
 
 def test_recover_stale_running():

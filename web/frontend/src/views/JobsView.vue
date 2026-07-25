@@ -8,9 +8,9 @@
         </p>
       </div>
       <div class="page-tools">
-        <label class="row muted" style="font-size: 12px; flex: 0 0 auto">
-          <input v-model="autoRefresh" type="checkbox" style="width: auto" />
-          自动刷新
+        <label class="choice muted" style="flex: 0 0 auto">
+          <input v-model="autoRefresh" type="checkbox" />
+          <span>自动刷新</span>
         </label>
         <button @click="load">刷新</button>
       </div>
@@ -139,10 +139,10 @@
         </div>
         <div v-if="schedForm.kind === 'weekly'" class="field">
           <label>星期</label>
-          <div class="row">
-            <label v-for="(w, i) in WEEKDAYS" :key="i" class="row muted" style="font-size: 13px">
-              <input v-model="schedForm.weekdays" type="checkbox" :value="i" style="width: auto" />
-              {{ w }}
+          <div class="choice-group">
+            <label v-for="(w, i) in WEEKDAYS" :key="i" class="choice muted">
+              <input v-model="schedForm.weekdays" type="checkbox" :value="i" />
+              <span>{{ w }}</span>
             </label>
           </div>
         </div>

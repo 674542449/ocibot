@@ -60,9 +60,9 @@
     <!-- Boot -->
     <div v-if="tab === 'boot'" class="stack">
       <div class="page-tools">
-        <label class="row muted" style="font-size: 12px; flex: 0 0 auto">
-          <input v-model="includeSub" type="checkbox" style="width: auto" @change="loadBoot" />
-          含子 Compartment
+        <label class="choice muted" style="flex: 0 0 auto">
+          <input v-model="includeSub" type="checkbox" @change="loadBoot" />
+          <span>含子 Compartment</span>
         </label>
         <input v-model="bootSearch" type="search" placeholder="搜索引导卷" />
       </div>

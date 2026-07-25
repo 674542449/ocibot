@@ -142,9 +142,9 @@ key_file=~/.oci/oci_api_key.pem"
         </div>
       </div>
 
-      <label class="row muted" style="font-size: 13px">
-        <input v-model="paste.test_connection" type="checkbox" style="width: auto" />
-        保存后自动测试连接
+      <label class="choice muted">
+        <input v-model="paste.test_connection" type="checkbox" />
+        <span>保存后自动测试连接</span>
       </label>
 
       <div class="row">
@@ -250,19 +250,23 @@ key_file=~/.oci/oci_api_key.pem"
 
       <div class="pwd-policy card-inset">
         <div class="pwd-policy-head">
-          <strong>Oracle 控制台密码有效期</strong>
-          <span class="muted" style="font-size: 12px">写入数据库；Worker 到期前提醒</span>
+          <strong>Oracle 控制台密码提醒</strong>
+          <span class="muted" style="font-size: 12px">仅本地提醒，不会替你改 Oracle 密码</span>
         </div>
         <div class="grid-2">
           <div class="field">
-            <label>密码最近修改日 (YYYY-MM-DD)</label>
+            <label>密码最近修改日</label>
             <input v-model="form.password_changed_at" type="date" />
           </div>
           <div class="field">
-            <label>有效天数（0=关闭提醒）</label>
+            <label>提醒周期（天）</label>
             <input v-model.number="form.password_expiry_days" type="number" min="0" max="3650" />
           </div>
         </div>
+        <p class="field-hint" style="margin: 0">
+          填 <strong>0</strong> = 关闭到期提醒（不强制 120 天）。Oracle 账号本身是否强制改密以官网策略为准；
+          这里只决定面板徽章与推送。修改后点「仅保存密码策略」或下方「保存」写入数据库。
+        </p>
         <p v-if="editPolicyPreview" class="muted" style="margin: 0; font-size: 13px">
           {{ editPolicyPreview }}
         </p>

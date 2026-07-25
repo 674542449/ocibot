@@ -454,14 +454,19 @@ def _sh_quote(value: str) -> str:
 
 
 def _write_restart_script(host: Path, host_repo: str, project: str, new_sha: str) -> Path:
-    """Write a host-visible shell script that recreates worker+api after build."""
+    """Write a host-visible shell script that runs the same update as install.sh.
+
+    Prefer: locate repo on host → ``bash scripts/install.sh update`` (via host
+    namespace when possible). Fallback: pure ``docker compose build/up`` using the
+    docker:cli image (no bash required).
+    """
     scripts = host / "web" / "data"
     try:
         scripts.mkdir(parents=True, exist_ok=True)
     except Exception:
         scripts = host
     path = scripts / "self_update_restart.sh"
-    # Use only sh-compatible syntax; runs inside docker:cli (Alpine).
+    # Pure POSIX sh — runs inside docker:cli (Alpine) with docker.sock.
     body = f"""#!/bin/sh
 set -eu
 REPO={_sh_quote(host_repo)}
@@ -470,6 +475,7 @@ SHA={_sh_quote(new_sha or 'unknown')}
 export OCIBOT_HOST_REPO="$REPO"
 export OCIBOT_GIT_SHA="$SHA"
 export OCIBOT_UPDATE_ENABLED=1
+export OCIBOT_SKIP_GIT=1
 cd "$REPO" || exit 1
 if [ -f "$REPO/web/.env" ]; then
   set -- --env-file "$REPO/web/.env"
@@ -477,21 +483,24 @@ else
   set --
 fi
 log() {{ echo "[ocibot-update] $*"; }}
-log "restart begin project=$PROJECT sha=$SHA"
-# Prefer rolling recreate; fall back to full up -d so the stack cannot stay half-dead.
-if ! docker compose -f "$REPO/docker-compose.yml" -p "$PROJECT" "$@" up -d --no-deps --force-recreate worker; then
-  log "worker recreate failed; trying full compose up"
-  docker compose -f "$REPO/docker-compose.yml" -p "$PROJECT" "$@" up -d || true
+log "panel update begin repo=$REPO project=$PROJECT sha=$SHA"
+log "step: docker compose build api worker"
+if ! docker compose -f "$REPO/docker-compose.yml" -p "$PROJECT" "$@" build --pull api worker; then
+  log "build --pull failed; retry without --pull"
+  docker compose -f "$REPO/docker-compose.yml" -p "$PROJECT" "$@" build api worker
 fi
-sleep 3
-if ! docker compose -f "$REPO/docker-compose.yml" -p "$PROJECT" "$@" up -d --no-deps --force-recreate api; then
-  log "api recreate failed; full compose up recovery"
-  docker compose -f "$REPO/docker-compose.yml" -p "$PROJECT" "$@" up -d || exit 1
-fi
-# Ensure whole project is up (db/worker/api) even if one service was stopped earlier.
-docker compose -f "$REPO/docker-compose.yml" -p "$PROJECT" "$@" up -d || true
+log "step: docker compose up -d (full stack)"
+docker compose -f "$REPO/docker-compose.yml" -p "$PROJECT" "$@" up -d
 log "restart done"
 docker compose -f "$REPO/docker-compose.yml" -p "$PROJECT" ps || true
+# Best-effort health
+sleep 3
+if command -v wget >/dev/null 2>&1; then
+  wget -qO- "http://127.0.0.1:${{OCIBOT_PORT:-8000}}/api/health" || true
+elif command -v curl >/dev/null 2>&1; then
+  curl -fsS "http://127.0.0.1:${{OCIBOT_PORT:-8000}}/api/health" || true
+fi
+log "panel update finished"
 """
     path.write_text(body, encoding="utf-8", newline="\n")
     try:
@@ -501,8 +510,59 @@ docker compose -f "$REPO/docker-compose.yml" -p "$PROJECT" ps || true
     return path
 
 
+def _detach_host_install_sh(host_repo: str, new_sha: str) -> tuple[int, str]:
+    """Try to run host ``bash scripts/install.sh update`` via nsenter into PID 1.
+
+    This matches the operator SSH workflow: cd REPO && bash scripts/install.sh update.
+    Requires privileged + pid=host (typical Docker CE on Linux VPS).
+    """
+    # Host-side one-liner; uses the host's bash/docker/git.
+    remote_cmd = (
+        f"export OCIBOT_HOST_REPO={_sh_quote(host_repo)}; "
+        f"export OCIBOT_GIT_SHA={_sh_quote(new_sha or 'unknown')}; "
+        f"export OCIBOT_UPDATE_ENABLED=1; "
+        f"export OCIBOT_SKIP_GIT=1; "
+        f"cd {_sh_quote(host_repo)} && bash scripts/install.sh update"
+    )
+    cmd = [
+        "docker",
+        "run",
+        "-d",
+        "--rm",
+        "--name",
+        "ocibot-self-update-restart",
+        "--privileged",
+        "--pid=host",
+        # Small image; nsenter from util-linux. Pre-pull best-effort.
+        "alpine:3.20",
+        "sh",
+        "-c",
+        # install nsenter if missing, then enter host namespaces and run update
+        "command -v nsenter >/dev/null 2>&1 || apk add --no-cache util-linux >/dev/null; "
+        "nsenter -t 1 -m -u -i -n -- sh -c " + _sh_quote(remote_cmd),
+    ]
+    _run_cmd(["docker", "rm", "-f", "ocibot-self-update-restart"], timeout=30)
+    # Ensure alpine present (best-effort, non-fatal if pull fails and image exists)
+    _run_cmd(["docker", "image", "inspect", "alpine:3.20", "--format", "{{.Id}}"], timeout=20)
+    code, out = _run_cmd(["docker", "pull", "alpine:3.20"], timeout=180)
+    if code != 0:
+        # still try local alpine
+        log.warning("alpine pull failed: %s", out[-200:])
+    return _run_cmd(cmd, timeout=60)
+
+
 def _detach_stack_restart(host: Path, host_repo: str, project: str, new_sha: str) -> tuple[int, str]:
-    """Start a detached helper that recreates services after this API process may die."""
+    """Start a detached helper that rebuilds/restarts the stack after API may die.
+
+    Prefer host ``install.sh update`` (same as SSH). Fallback: compose via docker:cli.
+    """
+    # 1) Host install.sh (user-requested path)
+    code, out = _detach_host_install_sh(host_repo, new_sha)
+    if code == 0:
+        return code, f"host install.sh path:\n{out}"
+
+    log.warning("host install.sh detach failed (%s); falling back to compose script", out[-300:])
+    # 2) Fallback: docker:cli + pure compose script on bound repo
     script = _write_restart_script(host, host_repo, project, new_sha)
     try:
         rel = script.relative_to(host).as_posix()
@@ -524,15 +584,14 @@ def _detach_stack_restart(host: Path, host_repo: str, project: str, new_sha: str
         "-w",
         host_repo,
         *_compose_env_flags(host_repo),
-        # docker:cli image includes compose plugin and a shell.
         "--entrypoint",
         "sh",
         DOCKER_CLI_IMAGE,
         script_on_host,
     ]
-    # Drop a previous helper if still around (name conflict).
     _run_cmd(["docker", "rm", "-f", "ocibot-self-update-restart"], timeout=30)
-    return _run_cmd(cmd, timeout=60)
+    code2, out2 = _run_cmd(cmd, timeout=60)
+    return code2, f"host install failed:\n{out}\ncompose fallback:\n{out2}"
 
 
 def _humanize_build_error(out: str) -> str:
@@ -682,66 +741,27 @@ def _apply_job(username: str) -> None:
         log_buf = _append_log(log_buf, f"HEAD after reset={new_sha}\n")
         log_buf = _append_log(log_buf, f"host_repo_on_host={host_repo}\n")
 
-        # Ensure helper image
-        save("running", f"准备 compose 工具镜像 {DOCKER_CLI_IMAGE}…", log_tail=log_buf)
-        code, out = _ensure_cli_image()
-        log_buf = _append_log(log_buf, f"$ ensure {DOCKER_CLI_IMAGE}\n{out}\n")
-        if code != 0:
-            save(
-                "error",
-                f"无法获取 {DOCKER_CLI_IMAGE}：{_humanize_build_error(out)}",
-                last_error=out[-1200:],
-                log_tail=log_buf,
-            )
-            return
-
-        # Build
-        save("running", "正在构建镜像（可能需 3–10 分钟，请勿关闭页面）…", log_tail=log_buf)
-        code, out = _compose_via_cli_container(
-            ["build", "api", "worker"],
-            timeout=1800,
-        )
-        log_buf = _append_log(log_buf, f"$ compose build api worker\n{out}\n")
-        if code != 0:
-            # Retry once without cache bust pressure
-            code, out = _compose_via_cli_container(
-                ["build", "--pull", "api", "worker"],
-                timeout=1800,
-            )
-            log_buf = _append_log(log_buf, f"$ compose build --pull (retry)\n{out}\n")
-            if code != 0:
-                save(
-                    "error",
-                    f"docker compose build 失败。{_humanize_build_error(out)}",
-                    last_error=out[-1500:],
-                    log_tail=log_buf,
-                )
-                return
-
         project = _project_name(host)
-        # Detached helper recreates worker then api (and falls back to full up -d).
-        # Doing recreate inside this process used to leave the stack half-dead when
-        # the API container was killed mid-command.
-        #
-        # Mark success *before* detach so a killed API process still leaves a
-        # recoverable status once the helper brings services back.
+        # Hand off to host: cd $HOST_REPO && bash scripts/install.sh update
+        # (same command operators use over SSH). Building inside this API process
+        # used to die mid-restart; install.sh / compose helper run detached.
         save(
             "success",
-            f"镜像已构建（{new_sha[:7] or 'ok'}），正在后台安全重启（worker → api）…约 30–60 秒后请强刷。",
+            f"代码已对齐 {new_sha[:7] or 'ok'}，正在宿主机执行 install.sh update（构建+重启）…约 1–5 分钟后强刷。",
             log_tail=log_buf,
             applied_sha=new_sha,
         )
         code, out = _detach_stack_restart(host, host_repo, project, new_sha)
-        log_buf = _append_log(log_buf, f"$ detach stack restart\n{out}\n")
+        log_buf = _append_log(log_buf, f"$ detach host update\n{out}\n")
         if code != 0:
-            # Last-chance synchronous recovery — better than leaving everything down.
             log_buf = _append_log(log_buf, "detach failed; synchronous compose up -d recovery\n")
+            # Last chance: at least try to bring whatever image exists back up.
             code2, out2 = _compose_via_cli_container(["up", "-d"], timeout=600)
             log_buf = _append_log(log_buf, f"$ compose up -d (recovery)\n{out2}\n")
             if code2 != 0:
                 save(
                     "error",
-                    f"重启失败，服务可能已停止。请 SSH 执行：cd {host_repo} && bash scripts/install.sh update。"
+                    f"无法启动更新任务。请 SSH：cd {host_repo} && bash scripts/install.sh update。"
                     f" {_humanize_build_error(out2 or out)}",
                     last_error=(out2 or out)[-1500:],
                     log_tail=log_buf,
@@ -749,7 +769,8 @@ def _apply_job(username: str) -> None:
                 return
             save(
                 "success",
-                f"已通过恢复路径拉起服务（{new_sha[:7] or 'ok'}）。请强刷浏览器。",
+                f"已通过恢复路径拉起现有服务；代码在磁盘上已是 {new_sha[:7] or 'ok'}。"
+                f" 若版本未变请 SSH 执行 install.sh update。",
                 log_tail=log_buf,
                 applied_sha=new_sha,
             )
@@ -758,7 +779,8 @@ def _apply_job(username: str) -> None:
         try:
             save(
                 "success",
-                f"更新已提交（{new_sha[:7] or 'ok'}）。API 将在后台重启，约 30–60 秒后请 Ctrl+F5。",
+                f"已在宿主机排队更新（{new_sha[:7] or 'ok'}）。执行：cd {host_repo} && bash scripts/install.sh update。"
+                f" 完成后约 1–5 分钟请 Ctrl+F5。",
                 log_tail=log_buf,
                 applied_sha=new_sha,
             )

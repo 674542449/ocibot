@@ -14,7 +14,9 @@
         <div style="min-width: 0; flex: 1">
           <h3 style="margin: 0">🔄 系统更新</h3>
           <p class="muted" style="margin: 0.25rem 0 0; font-size: 12px">
-            从 GitHub 拉取最新代码并重建 Docker 容器（保留数据库与密钥）。
+            定位宿主机仓库目录，执行与 SSH 相同的
+            <code>bash scripts/install.sh update</code>
+            （拉代码 + 构建 + 重启，保留数据库与密钥）。
           </p>
         </div>
         <div class="row update-actions">
@@ -120,15 +122,14 @@
 
     <div class="card stack">
       <h3 style="margin: 0">面板设置</h3>
-      <div class="row">
-        <label class="row" style="gap: 0.4rem">
+      <div class="choice-group">
+        <label class="choice">
           <input
             v-model="allowOpenRegistration"
             type="checkbox"
-            style="width: auto"
             @change="saveSettings"
           />
-          允许开放注册
+          <span>允许开放注册</span>
         </label>
         <span class="muted" style="font-size: 12px">
           （来源：{{ settingsSource === 'db' ? '面板设置' : '环境变量默认值' }}）关闭后仅现有用户可登录

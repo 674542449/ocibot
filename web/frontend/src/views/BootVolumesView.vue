@@ -12,9 +12,9 @@
             {{ t.name }} · {{ t.region }}
           </option>
         </select>
-        <label class="row muted" style="font-size: 12px; flex: 0 0 auto">
-          <input v-model="includeSub" type="checkbox" style="width: auto" @change="load" />
-          含子 Compartment
+        <label class="choice muted" style="flex: 0 0 auto">
+          <input v-model="includeSub" type="checkbox" @change="load" />
+          <span>含子 Compartment</span>
         </label>
         <button class="primary" :disabled="loading || !tenantId" @click="load">
           {{ loading ? '加载中…' : '刷新' }}

@@ -13,9 +13,9 @@
           <option v-for="t in tenants" :key="t.id" :value="t.id">{{ t.name }} · {{ t.region }}</option>
         </select>
         <input v-model="search" type="search" placeholder="搜索名称 / IP / OCID" />
-        <label class="row muted" style="font-size: 12px; flex: 0 0 auto">
-          <input v-model="resolveIps" type="checkbox" style="width: auto" />
-          解析 IP
+        <label class="choice muted" style="flex: 0 0 auto">
+          <input v-model="resolveIps" type="checkbox" />
+          <span>解析 IP</span>
         </label>
         <button class="primary" :disabled="loading" @click="load">
           {{ loading ? '加载中…' : '刷新' }}
@@ -46,7 +46,6 @@
             <th style="width: 34px">
               <input
                 type="checkbox"
-                style="width: auto"
                 :checked="allSelected"
                 title="全选当前列表"
                 @change="toggleSelectAll"
@@ -71,7 +70,6 @@
             <td>
               <input
                 type="checkbox"
-                style="width: auto"
                 :checked="selected.has(selKey(ins))"
                 @change="toggleSelect(ins)"
               />

@@ -224,7 +224,9 @@ sync_repo_to_origin() {
 do_update() {
   ensure_docker
   ensure_repo
-  if [ -d "$REPO_DIR/.git" ]; then
+  if [ "${OCIBOT_SKIP_GIT:-0}" = "1" ]; then
+    log "跳过 git 同步（OCIBOT_SKIP_GIT=1，代码已由面板拉取）"
+  elif [ -d "$REPO_DIR/.git" ]; then
     sync_repo_to_origin
   else
     warn "目录无 .git，仅重建当前文件树（不会拉 GitHub 新代码）"

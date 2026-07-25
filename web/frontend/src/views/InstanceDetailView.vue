@@ -420,9 +420,9 @@
         </div>
       </div>
       <div class="field" style="margin-top: 0.5rem">
-        <label class="row" style="gap: 0.5rem; font-size: 13px">
-          <input v-model="autoGrowFs" type="checkbox" style="width: auto" />
-          扩容后自动扩展文件系统（SSH）
+        <label class="choice">
+          <input v-model="autoGrowFs" type="checkbox" />
+          <span>扩容后自动扩展文件系统（SSH）</span>
         </label>
         <p class="muted" style="margin: 0.25rem 0 0; font-size: 12px">
           仅在扩大容量时生效。OCI 控制面扩容后，通过 SSH 执行 growpart / resize2fs（或 xfs_growfs）。

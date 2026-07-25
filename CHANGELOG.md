@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.7 — 2026-07-26
+
+### UI
+- 全局修正 checkbox / radio 与文字不在同一水平线的问题（`.choice` 布局）
+- 「开放 Guest 防火墙」改为通俗文案：**允许外网直接访问（放宽防火墙）**，并附说明
+- 租户密码策略文案：明确 **0=关闭提醒**，可自行取消 120 天；保存写入数据库
+
+### 在线更新
+- 面板更新改为：**定位 `OCIBOT_HOST_REPO` → 执行与 SSH 相同的 `bash scripts/install.sh update`**
+- `install.sh` 支持 `OCIBOT_SKIP_GIT=1`（代码已由面板拉取时跳过二次 git）
+- 若宿主机 nsenter 路径不可用，回退到仓库内 `docker compose build && up -d`
+
+### 升级
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 0.4.7
+```
+
+---
+
 ## 0.4.6 — 2026-07-26
 
 ### 安全加固

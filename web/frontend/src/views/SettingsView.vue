@@ -83,10 +83,10 @@
 
         <div class="field">
           <label>推送事件</label>
-          <div class="row">
-            <label v-for="ev in EVENTS" :key="ev.key" class="row muted" style="font-size: 13px">
-              <input v-model="addEvents" type="checkbox" :value="ev.key" style="width: auto" />
-              {{ ev.label }}
+          <div class="choice-group">
+            <label v-for="ev in EVENTS" :key="ev.key" class="choice muted">
+              <input v-model="addEvents" type="checkbox" :value="ev.key" />
+              <span>{{ ev.label }}</span>
             </label>
           </div>
         </div>

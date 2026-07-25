@@ -32,7 +32,7 @@
         </table>
       </div>
       <p class="muted" style="margin: 0; font-size: 12px; color: #fbbf24">
-        ⚠ 将开放 Guest 防火墙与实例 NSG 相关规则；容量重试会持续调用 LaunchInstance，请确认间隔与次数。
+        ⚠ 若勾选了「允许外网直接访问」，系统会放宽云端安全组与系统内防火墙；容量重试会持续调用创建接口，请确认间隔与次数。
         服务端会按 Always Free 额度拦截超额创建（免费/未知账号硬拦；已付费账号仅警告）。
       </p>
       <div v-if="quotaPreview" class="card" style="padding: 0.65rem; font-size: 12px">
@@ -166,9 +166,15 @@
 
       <div class="field">
         <label>Root 登录方式</label>
-        <div class="row">
-          <label class="row" style="gap: 0.35rem"><input v-model="form.auth_mode" type="radio" value="key" style="width:auto" /> root + SSH 公钥</label>
-          <label class="row" style="gap: 0.35rem"><input v-model="form.auth_mode" type="radio" value="password" style="width:auto" /> root + 密码</label>
+        <div class="choice-group">
+          <label class="choice">
+            <input v-model="form.auth_mode" type="radio" value="key" />
+            <span>root + SSH 公钥</span>
+          </label>
+          <label class="choice">
+            <input v-model="form.auth_mode" type="radio" value="password" />
+            <span>root + 密码</span>
+          </label>
         </div>
       </div>
 
@@ -189,10 +195,26 @@
         </div>
       </div>
 
-      <div class="row">
-        <label class="row muted" style="font-size: 13px"><input v-model="form.assign_public_ip" type="checkbox" style="width:auto" /> 分配公网 IPv4</label>
-        <label class="row muted" style="font-size: 13px"><input v-model="form.assign_ipv6_ip" type="checkbox" style="width:auto" /> 分配 IPv6</label>
-        <label class="row muted" style="font-size: 13px"><input v-model="form.open_guest_firewall" type="checkbox" style="width:auto" /> 开放 Guest 防火墙</label>
+      <div class="field">
+        <label>网络与访问</label>
+        <div class="choice-group">
+          <label class="choice muted">
+            <input v-model="form.assign_public_ip" type="checkbox" />
+            <span>分配公网 IPv4</span>
+          </label>
+          <label class="choice muted">
+            <input v-model="form.assign_ipv6_ip" type="checkbox" />
+            <span>分配 IPv6</span>
+          </label>
+          <label class="choice muted">
+            <input v-model="form.open_guest_firewall" type="checkbox" />
+            <span>允许外网直接访问（放宽防火墙）</span>
+          </label>
+        </div>
+        <p class="field-hint">
+          勾选后会放宽云端安全组，并尽量关闭系统内防火墙（ufw/iptables），方便 SSH / 网页直连。
+          公网环境下风险更高，不需要外网访问时可取消勾选。
+        </p>
       </div>
 
       <details>
@@ -209,14 +231,16 @@
       </details>
 
       <div class="stack" style="border-top: 1px solid var(--border); padding-top: 0.75rem">
-        <label class="row muted" style="font-size: 13px">
-          <input v-model="form.as_retry" type="checkbox" style="width:auto" :disabled="form.auth_mode !== 'key'" />
-          容量不足时加入自动重试（仅密钥模式，合规限速）
-        </label>
-        <label class="row muted" style="font-size: 13px">
-          <input v-model="form.retry_all_ads" type="checkbox" style="width:auto" :disabled="!form.as_retry" />
-          重试时轮询区域全部可用域（{{ ads.length }} 个）
-        </label>
+        <div class="choice-group">
+          <label class="choice muted">
+            <input v-model="form.as_retry" type="checkbox" :disabled="form.auth_mode !== 'key'" />
+            <span>容量不足时加入自动重试（仅密钥模式，合规限速）</span>
+          </label>
+          <label class="choice muted">
+            <input v-model="form.retry_all_ads" type="checkbox" :disabled="!form.as_retry" />
+            <span>重试时轮询区域全部可用域（{{ ads.length }} 个）</span>
+          </label>
+        </div>
         <div class="grid-2" v-if="form.as_retry">
           <div class="field">
             <label>重试间隔秒（≥60）</label>
@@ -250,7 +274,7 @@
       </div>
 
       <p class="muted" style="font-size: 12px; margin: 0">
-        ⚠ 将开放 Guest 防火墙与实例 NSG 相关规则，公网暴露风险请自行确认。Compartment / VCN / Subnet 使用账号默认网络（与桌面版一致）。
+        ⚠ 若勾选了「允许外网直接访问」，外网更容易连上这台机器，请自行确认风险。Compartment / VCN / Subnet 使用账号默认网络。
       </p>
 
       <div class="row">
@@ -565,7 +589,7 @@ const confirmRows = computed(() => {
     ['登录', auth],
     ['公网 IPv4', form.assign_public_ip ? '是' : '否'],
     ['IPv6', form.assign_ipv6_ip ? '是' : '否'],
-    ['开放 Guest 防火墙', form.open_guest_firewall ? '是' : '否'],
+    ['允许外网直接访问', form.open_guest_firewall ? '是' : '否'],
     [
       '容量重试',
       form.as_retry
