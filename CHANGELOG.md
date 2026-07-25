@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.4 — 2026-07-26
+
+### 修复 · install.sh `cd: /root/ocibot\\n/root/ocibot`
+- 根因：`export_build_env` 写成 `cd && pwd -P || cd && pwd`，shell 优先级导致 **pwd 执行两次**，`REPO_DIR` 变成带换行的双路径
+- 现改为分步解析 `pwd -P`，失败再回退 `pwd`，并去掉 CR/LF
+- `compose()` 增加目录有效性检查
+
+### 服务器（你现在卡住时直接跑）
+```bash
+cd /root/ocibot
+cp -a web/.env /tmp/ocibot.env.bak
+# 先手动拉脚本修复（若 update 仍因旧脚本失败）：
+curl -fsSL https://raw.githubusercontent.com/674542449/ocibot/main/scripts/install.sh -o scripts/install.sh
+chmod +x scripts/install.sh
+cp -a /tmp/ocibot.env.bak web/.env
+export OCIBOT_HOST_REPO=/root/ocibot
+bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 0.4.4
+```
+
+---
+
 ## 0.4.3 — 2026-07-26
 
 ### 修复 · 在线更新 build 失败（加强）

@@ -115,14 +115,34 @@ EOF
 }
 
 compose() {
-  (cd "$REPO_DIR" && $COMPOSE "$@")
+  # Guard against corrupted REPO_DIR (e.g. embedded newlines from old bug).
+  local dir
+  dir="$(printf '%s' "$REPO_DIR" | tr -d '\r\n')"
+  if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+    die "REPO_DIR 无效：$REPO_DIR"
+  fi
+  (cd "$dir" && $COMPOSE "$@")
 }
 
 export_build_env() {
   # Absolute host path is required for in-panel self-update (docker run -v).
   # Resolve REPO_DIR to a real absolute path so containers bind the same location.
-  local abs
-  abs="$(cd "$REPO_DIR" && pwd -P 2>/dev/null || cd "$REPO_DIR" && pwd)"
+  #
+  # NOTE: do NOT write `cd && pwd -P || cd && pwd` — shell precedence makes the
+  # final `pwd` always run, producing a path with an embedded newline
+  # ("/root/ocibot\n/root/ocibot") which breaks `cd` later.
+  local abs=""
+  if [ -d "$REPO_DIR" ]; then
+    abs="$(cd "$REPO_DIR" && pwd -P 2>/dev/null)" || true
+    if [ -z "$abs" ]; then
+      abs="$(cd "$REPO_DIR" && pwd)" || true
+    fi
+  fi
+  # Strip CR/LF/spaces that can sneak in from command substitution.
+  abs="$(printf '%s' "$abs" | tr -d '\r\n' | head -c 512)"
+  if [ -z "$abs" ] || [ ! -d "$abs" ]; then
+    die "无法解析安装目录绝对路径（REPO_DIR=$REPO_DIR）"
+  fi
   REPO_DIR="$abs"
   export OCIBOT_HOST_REPO="$abs"
   export OCIBOT_UPDATE_ENABLED="${OCIBOT_UPDATE_ENABLED:-1}"
@@ -131,6 +151,7 @@ export_build_env() {
   if [ -d "$REPO_DIR/.git" ] && command -v git >/dev/null 2>&1; then
     export OCIBOT_GIT_SHA
     OCIBOT_GIT_SHA="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+    OCIBOT_GIT_SHA="$(printf '%s' "$OCIBOT_GIT_SHA" | tr -d '\r\n')"
   else
     export OCIBOT_GIT_SHA="${OCIBOT_GIT_SHA:-unknown}"
   fi
