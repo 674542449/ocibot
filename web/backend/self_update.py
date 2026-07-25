@@ -285,38 +285,6 @@ def fetch_remote_head(timeout: float = 15.0) -> dict[str, Any]:
     }
 
 
-def get_status(db: Session) -> dict[str, Any]:
-    local = local_build_info()
-    caps = capabilities()
-    st = _read_status_raw(db)
-    remote = st.get("remote") if isinstance(st.get("remote"), dict) else None
-    local_sha = (local.get("git_sha") or "").strip()
-    remote_sha = str((remote or {}).get("sha") or "").strip()
-    update_available = False
-    if remote_sha and local_sha and local_sha not in {"unknown", "None"}:
-        update_available = not (
-            remote_sha.startswith(local_sha) or local_sha.startswith(remote_sha[:7])
-        )
-    elif remote_sha and local_sha in {"unknown", "None", ""}:
-        update_available = True
-
-    return {
-        "enabled": caps["enabled"],
-        "capabilities": caps,
-        "local": local,
-        "remote": remote,
-        "update_available": update_available,
-        "state": st.get("state") or "idle",
-        "message": st.get("message") or "",
-        "log_tail": st.get("log_tail") or "",
-        "started_at": st.get("started_at") or "",
-        "finished_at": st.get("finished_at") or "",
-        "checked_at": st.get("checked_at") or "",
-        "triggered_by": st.get("triggered_by") or "",
-        "last_error": st.get("last_error") or "",
-    }
-
-
 def check_for_update(db: Session) -> dict[str, Any]:
     st = _read_status_raw(db)
     if st.get("state") == "running":
@@ -386,6 +354,65 @@ def _ensure_cli_image() -> tuple[int, str]:
     return code, out
 
 
+def _compose_env_flags(host_repo: str) -> list[str]:
+    """Env for helper containers. Never inject empty secrets (empty overrides defaults)."""
+    flags: list[str] = [
+        "-e",
+        f"OCIBOT_HOST_REPO={host_repo}",
+        "-e",
+        f"OCIBOT_GIT_SHA={os.environ.get('OCIBOT_GIT_SHA') or 'unknown'}",
+        "-e",
+        f"OCIBOT_PORT={os.environ.get('OCIBOT_PORT') or '8000'}",
+        "-e",
+        f"OCIBOT_API_WORKERS={os.environ.get('OCIBOT_API_WORKERS') or '2'}",
+        "-e",
+        "OCIBOT_UPDATE_ENABLED=1",
+        "-e",
+        f"OCIBOT_UPDATE_BRANCH={_branch()}",
+        "-e",
+        f"OCIBOT_UPDATE_REPO={_repo()}",
+        "-e",
+        f"OCIBOT_DOCKER_CLI_IMAGE={DOCKER_CLI_IMAGE}",
+    ]
+    for key in (
+        "POSTGRES_PASSWORD",
+        "OCIBOT_CORS_ORIGINS",
+        "OCIBOT_MASTER_KEY",
+        "OCIBOT_JWT_SECRET",
+        "OCIBOT_REQUIRE_SECURE_SECRETS",
+        "OCIBOT_COOKIE_SECURE",
+        "OCIBOT_COOKIE_SAMESITE",
+        "OCIBOT_DB_POOL_SIZE",
+        "OCIBOT_DB_MAX_OVERFLOW",
+        "OCIBOT_WORKER_ID",
+    ):
+        val = os.environ.get(key)
+        if val is not None and str(val).strip() != "":
+            flags.extend(["-e", f"{key}={val}"])
+    return flags
+
+
+def _compose_base_args(host_repo: str, project: str) -> list[str]:
+    """compose argv prefix: always load web/.env so POSTGRES_PASSWORD is not lost."""
+    args = [
+        "compose",
+        "-f",
+        f"{host_repo}/docker-compose.yml",
+        "-p",
+        project,
+    ]
+    # Inside the API container the repo is at OCIBOT_HOST_DIR (/host/ocibot).
+    # Inside the helper container the same files appear at host_repo.
+    env_candidates = (
+        _host_dir() / "web" / ".env",
+        Path("/host/ocibot/web/.env"),
+        Path(host_repo) / "web" / ".env",
+    )
+    if any(p.is_file() for p in env_candidates):
+        args.extend(["--env-file", f"{host_repo}/web/.env"])
+    return args
+
+
 def _compose_via_cli_container(args: list[str], *, timeout: int = 1200) -> tuple[int, str]:
     """Run ``docker compose`` using docker:cli with host socket + same-path repo bind."""
     host_repo = _host_repo_on_host()
@@ -399,37 +426,6 @@ def _compose_via_cli_container(args: list[str], *, timeout: int = 1200) -> tuple
     except Exception:
         pass
 
-    env_flags: list[str] = [
-        "-e",
-        f"OCIBOT_HOST_REPO={host_repo}",
-        "-e",
-        f"OCIBOT_GIT_SHA={os.environ.get('OCIBOT_GIT_SHA', 'unknown')}",
-        "-e",
-        f"OCIBOT_PORT={os.environ.get('OCIBOT_PORT', '8000')}",
-        "-e",
-        f"OCIBOT_API_WORKERS={os.environ.get('OCIBOT_API_WORKERS', '2')}",
-        "-e",
-        "OCIBOT_UPDATE_ENABLED=1",
-        "-e",
-        f"OCIBOT_UPDATE_BRANCH={_branch()}",
-        "-e",
-        f"OCIBOT_UPDATE_REPO={_repo()}",
-    ]
-    # Pass through secrets needed for compose interpolation / rebuild
-    for key in (
-        "POSTGRES_PASSWORD",
-        "OCIBOT_CORS_ORIGINS",
-        "OCIBOT_MASTER_KEY",
-        "OCIBOT_JWT_SECRET",
-        "OCIBOT_REQUIRE_SECURE_SECRETS",
-        "OCIBOT_COOKIE_SECURE",
-        "OCIBOT_DB_POOL_SIZE",
-        "OCIBOT_DB_MAX_OVERFLOW",
-    ):
-        val = os.environ.get(key)
-        if val is not None and val != "":
-            env_flags.extend(["-e", f"{key}={val}"])
-
     cmd = [
         "docker",
         "run",
@@ -440,16 +436,98 @@ def _compose_via_cli_container(args: list[str], *, timeout: int = 1200) -> tuple
         f"{host_repo}:{host_repo}",
         "-w",
         host_repo,
-        *env_flags,
+        *_compose_env_flags(host_repo),
         DOCKER_CLI_IMAGE,
-        "compose",
-        "-f",
-        f"{host_repo}/docker-compose.yml",
-        "-p",
-        project,
+        *_compose_base_args(host_repo, project),
         *args,
     ]
     return _run_cmd(cmd, timeout=timeout)
+
+
+def _sh_quote(value: str) -> str:
+    return "'" + str(value).replace("'", "'\"'\"'") + "'"
+
+
+def _write_restart_script(host: Path, host_repo: str, project: str, new_sha: str) -> Path:
+    """Write a host-visible shell script that recreates worker+api after build."""
+    scripts = host / "web" / "data"
+    try:
+        scripts.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        scripts = host
+    path = scripts / "self_update_restart.sh"
+    # Use only sh-compatible syntax; runs inside docker:cli (Alpine).
+    body = f"""#!/bin/sh
+set -eu
+REPO={_sh_quote(host_repo)}
+PROJECT={_sh_quote(project)}
+SHA={_sh_quote(new_sha or 'unknown')}
+export OCIBOT_HOST_REPO="$REPO"
+export OCIBOT_GIT_SHA="$SHA"
+export OCIBOT_UPDATE_ENABLED=1
+cd "$REPO" || exit 1
+if [ -f "$REPO/web/.env" ]; then
+  set -- --env-file "$REPO/web/.env"
+else
+  set --
+fi
+log() {{ echo "[ocibot-update] $*"; }}
+log "restart begin project=$PROJECT sha=$SHA"
+# Prefer rolling recreate; fall back to full up -d so the stack cannot stay half-dead.
+if ! docker compose -f "$REPO/docker-compose.yml" -p "$PROJECT" "$@" up -d --no-deps --force-recreate worker; then
+  log "worker recreate failed; trying full compose up"
+  docker compose -f "$REPO/docker-compose.yml" -p "$PROJECT" "$@" up -d || true
+fi
+sleep 3
+if ! docker compose -f "$REPO/docker-compose.yml" -p "$PROJECT" "$@" up -d --no-deps --force-recreate api; then
+  log "api recreate failed; full compose up recovery"
+  docker compose -f "$REPO/docker-compose.yml" -p "$PROJECT" "$@" up -d || exit 1
+fi
+# Ensure whole project is up (db/worker/api) even if one service was stopped earlier.
+docker compose -f "$REPO/docker-compose.yml" -p "$PROJECT" "$@" up -d || true
+log "restart done"
+docker compose -f "$REPO/docker-compose.yml" -p "$PROJECT" ps || true
+"""
+    path.write_text(body, encoding="utf-8", newline="\n")
+    try:
+        path.chmod(0o755)
+    except Exception:
+        pass
+    return path
+
+
+def _detach_stack_restart(host: Path, host_repo: str, project: str, new_sha: str) -> tuple[int, str]:
+    """Start a detached helper that recreates services after this API process may die."""
+    script = _write_restart_script(host, host_repo, project, new_sha)
+    try:
+        rel = script.relative_to(host).as_posix()
+    except ValueError:
+        rel = "web/data/self_update_restart.sh"
+    script_on_host = f"{host_repo.rstrip('/')}/{rel}"
+
+    cmd = [
+        "docker",
+        "run",
+        "-d",
+        "--rm",
+        "--name",
+        "ocibot-self-update-restart",
+        "-v",
+        "/var/run/docker.sock:/var/run/docker.sock",
+        "-v",
+        f"{host_repo}:{host_repo}",
+        "-w",
+        host_repo,
+        *_compose_env_flags(host_repo),
+        # docker:cli image includes compose plugin and a shell.
+        "--entrypoint",
+        "sh",
+        DOCKER_CLI_IMAGE,
+        script_on_host,
+    ]
+    # Drop a previous helper if still around (name conflict).
+    _run_cmd(["docker", "rm", "-f", "ocibot-self-update-restart"], timeout=30)
+    return _run_cmd(cmd, timeout=60)
 
 
 def _humanize_build_error(out: str) -> str:
@@ -635,64 +713,47 @@ def _apply_job(username: str) -> None:
                 )
                 return
 
-        # Restart worker first
-        save("running", "正在滚动重启 worker…", log_tail=log_buf)
-        code, out = _compose_via_cli_container(
-            ["up", "-d", "--no-deps", "--force-recreate", "worker"],
-            timeout=300,
-        )
-        log_buf = _append_log(log_buf, f"$ compose up worker\n{out}\n")
-        if code != 0:
-            save("error", f"worker 启动失败。{_humanize_build_error(out)}", last_error=out[-800:], log_tail=log_buf)
-            return
-
-        # Mark success before recreating api (this process will die).
+        project = _project_name(host)
+        # Detached helper recreates worker then api (and falls back to full up -d).
+        # Doing recreate inside this process used to leave the stack half-dead when
+        # the API container was killed mid-command.
+        #
+        # Mark success *before* detach so a killed API process still leaves a
+        # recoverable status once the helper brings services back.
         save(
             "success",
-            f"镜像已就绪（{new_sha[:7] or 'ok'}），正在重启 API…请约 30 秒后 Ctrl+F5 强刷。",
+            f"镜像已构建（{new_sha[:7] or 'ok'}），正在后台安全重启（worker → api）…约 30–60 秒后请强刷。",
             log_tail=log_buf,
             applied_sha=new_sha,
         )
+        code, out = _detach_stack_restart(host, host_repo, project, new_sha)
+        log_buf = _append_log(log_buf, f"$ detach stack restart\n{out}\n")
+        if code != 0:
+            # Last-chance synchronous recovery — better than leaving everything down.
+            log_buf = _append_log(log_buf, "detach failed; synchronous compose up -d recovery\n")
+            code2, out2 = _compose_via_cli_container(["up", "-d"], timeout=600)
+            log_buf = _append_log(log_buf, f"$ compose up -d (recovery)\n{out2}\n")
+            if code2 != 0:
+                save(
+                    "error",
+                    f"重启失败，服务可能已停止。请 SSH 执行：cd {host_repo} && bash scripts/install.sh update。"
+                    f" {_humanize_build_error(out2 or out)}",
+                    last_error=(out2 or out)[-1500:],
+                    log_tail=log_buf,
+                )
+                return
+            save(
+                "success",
+                f"已通过恢复路径拉起服务（{new_sha[:7] or 'ok'}）。请强刷浏览器。",
+                log_tail=log_buf,
+                applied_sha=new_sha,
+            )
+            return
 
-        # Detached helper recreates api so this container can exit cleanly.
-        project = _project_name(host)
-        kick = [
-            "docker",
-            "run",
-            "-d",
-            "--rm",
-            "-v",
-            "/var/run/docker.sock:/var/run/docker.sock",
-            "-v",
-            f"{host_repo}:{host_repo}",
-            "-w",
-            host_repo,
-            "-e",
-            f"OCIBOT_HOST_REPO={host_repo}",
-            "-e",
-            f"OCIBOT_GIT_SHA={new_sha or 'unknown'}",
-            "-e",
-            f"POSTGRES_PASSWORD={os.environ.get('POSTGRES_PASSWORD', '')}",
-            "-e",
-            f"OCIBOT_PORT={os.environ.get('OCIBOT_PORT', '8000')}",
-            DOCKER_CLI_IMAGE,
-            "compose",
-            "-f",
-            f"{host_repo}/docker-compose.yml",
-            "-p",
-            project,
-            "up",
-            "-d",
-            "--no-deps",
-            "--force-recreate",
-            "api",
-        ]
-        code, out = _run_cmd(kick, timeout=60)
-        log_buf = _append_log(log_buf, f"$ detach compose up api\n{out}\n")
         try:
             save(
                 "success",
-                f"更新已提交（{new_sha[:7] or 'ok'}）。API 重启中，请稍后强刷浏览器。",
+                f"更新已提交（{new_sha[:7] or 'ok'}）。API 将在后台重启，约 30–60 秒后请 Ctrl+F5。",
                 log_tail=log_buf,
                 applied_sha=new_sha,
             )
@@ -705,6 +766,93 @@ def _apply_job(username: str) -> None:
         global _worker
         with _lock:
             _worker = None
+
+
+def _worker_alive_unlocked() -> bool:
+    global _worker
+    return _worker is not None and _worker.is_alive()
+
+
+def _status_age_sec(st: dict[str, Any]) -> Optional[float]:
+    started = str(st.get("started_at") or "")
+    if not started:
+        return None
+    try:
+        ts = datetime.fromisoformat(started.replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - ts).total_seconds()
+    except Exception:
+        return None
+
+
+def _recover_stale_running(
+    st: dict[str, Any],
+    *,
+    max_age_sec: int = 45 * 60,
+    worker_alive: Optional[bool] = None,
+) -> dict[str, Any]:
+    """If a previous update left state=running but no worker lives, clear it."""
+    if st.get("state") != "running":
+        return st
+    if worker_alive is None:
+        with _lock:
+            alive = _worker_alive_unlocked()
+    else:
+        alive = worker_alive
+    if alive:
+        return st
+    age = _status_age_sec(st)
+    # No started_at → treat as stale. Otherwise only after max_age_sec.
+    if age is not None and age <= max_age_sec:
+        return st
+    st = dict(st)
+    st["state"] = "error"
+    st["message"] = (
+        "上次更新似乎中断（进程已退出）。若页面打不开请 SSH：bash scripts/install.sh update"
+    )
+    st["last_error"] = st.get("last_error") or "stale_running"
+    if not st.get("finished_at"):
+        st["finished_at"] = _utcnow()
+    return st
+
+
+def get_status(db: Session) -> dict[str, Any]:
+    local = local_build_info()
+    caps = capabilities()
+    st = _read_status_raw(db)
+    recovered = _recover_stale_running(st)
+    if recovered.get("state") != st.get("state"):
+        try:
+            _write_status(db, recovered)
+            st = recovered
+        except Exception:
+            st = recovered
+    remote = st.get("remote") if isinstance(st.get("remote"), dict) else None
+    local_sha = (local.get("git_sha") or "").strip()
+    remote_sha = str((remote or {}).get("sha") or "").strip()
+    update_available = False
+    if remote_sha and local_sha and local_sha not in {"unknown", "None"}:
+        update_available = not (
+            remote_sha.startswith(local_sha) or local_sha.startswith(remote_sha[:7])
+        )
+    elif remote_sha and local_sha in {"unknown", "None", ""}:
+        update_available = True
+
+    return {
+        "enabled": caps["enabled"],
+        "capabilities": caps,
+        "local": local,
+        "remote": remote,
+        "update_available": update_available,
+        "state": st.get("state") or "idle",
+        "message": st.get("message") or "",
+        "log_tail": st.get("log_tail") or "",
+        "started_at": st.get("started_at") or "",
+        "finished_at": st.get("finished_at") or "",
+        "checked_at": st.get("checked_at") or "",
+        "triggered_by": st.get("triggered_by") or "",
+        "last_error": st.get("last_error") or "",
+        "applied_sha": st.get("applied_sha") or "",
+    }
 
 
 def start_update(db: Session, *, username: str) -> dict[str, Any]:
@@ -723,8 +871,16 @@ def start_update(db: Session, *, username: str) -> dict[str, Any]:
     global _worker
     with _lock:
         st = _read_status_raw(db)
-        if st.get("state") == "running" or (_worker is not None and _worker.is_alive()):
+        alive = _worker_alive_unlocked()
+        # Clear abandoned "running" markers (API was killed mid-update).
+        recovered = _recover_stale_running(st, max_age_sec=20 * 60, worker_alive=alive)
+        if recovered.get("state") != st.get("state"):
+            st = recovered
+            _write_status(db, st)
+
+        if alive or st.get("state") == "running":
             raise RuntimeError("已有更新任务正在进行")
+
         try:
             remote = fetch_remote_head()
             st["remote"] = remote
@@ -737,6 +893,7 @@ def start_update(db: Session, *, username: str) -> dict[str, Any]:
         st["finished_at"] = ""
         st["triggered_by"] = username
         st["last_error"] = ""
+        st["log_tail"] = ""
         _write_status(db, st)
         t = threading.Thread(target=_apply_job, args=(username,), name="ocibot-self-update", daemon=True)
         _worker = t

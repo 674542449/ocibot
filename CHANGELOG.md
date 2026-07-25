@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.4.5 — 2026-07-26
+
+### 修复 · 在线更新后服务挂掉 / 更新未完成
+- **根因**：重启 API 时可能注入空的 `POSTGRES_PASSWORD`、缺少 `web/.env`，以及在 API 进程内同步 recreate 时被自己杀掉，栈停在半死状态
+- compose 一律带 `--env-file web/.env`；不再传入空密钥环境变量
+- **构建完成后**由独立 `docker:cli` 容器跑重启脚本：`worker → api`，失败则 `compose up -d` 全量拉起
+- 状态机：中断遗留的 `running` 会在超时后自动标为 error，避免「更新中」卡死无法重试
+- 后台重启失败时同步走 `compose up -d` 恢复路径，并给出 SSH 修复提示
+
+### 服务器已挂时（先恢复）
+```bash
+cd /root/ocibot || cd ~/ocibot
+cp -a web/.env /tmp/ocibot.env.bak 2>/dev/null || true
+export OCIBOT_HOST_REPO="$(pwd -P)"
+# 拉最新修复（若 git 可用）
+git fetch origin main && git reset --hard origin/main
+cp -a /tmp/ocibot.env.bak web/.env 2>/dev/null || true
+bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 期望 0.4.5
+```
+
+之后面板「一键更新」应可在重启后自动回血。
+
+---
+
 ## 0.4.4 — 2026-07-26
 
 ### 修复 · install.sh `cd: /root/ocibot\\n/root/ocibot`
