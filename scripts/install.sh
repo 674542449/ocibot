@@ -187,7 +187,7 @@ case "$cmd" in
 环境变量:
   OCIBOT_REPO_URL   git clone 地址（远程一键安装时必填）
   OCIBOT_DIR        安装目录（默认 \$HOME/ocibot）
-  OCIBOT_BRANCH     分支（默认 master）
+  OCIBOT_BRANCH     分支（默认 main）
   OCIBOT_PORT       映射端口（默认 8000，需与 web/.env 一致）
   OCIBOT_PURGE_DATA 卸载时删库（=1）
 EOF
