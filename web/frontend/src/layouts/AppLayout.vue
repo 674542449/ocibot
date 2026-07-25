@@ -21,6 +21,9 @@
         </router-link>
       </nav>
       <div class="sidebar-foot stack">
+        <div v-if="buildLabel" class="muted small build-label" :title="buildFull">
+          构建 {{ buildLabel }}
+        </div>
         <button type="button" @click="toggleTheme">
           {{ theme === 'light' ? '🌙 暗色模式' : '☀️ 亮色模式' }}
         </button>
@@ -62,7 +65,7 @@ const navItems = computed<NavItem[]>(() => {
     { to: '/audit', label: '审计日志', match: 'exact' },
     { to: '/settings', label: '设置', match: 'exact' },
   ]
-  if (auth.isAdmin) items.push({ to: '/admin', label: '用户管理', match: 'exact' })
+  if (auth.isAdmin) items.push({ to: '/admin', label: '用户管理 / 更新', match: 'exact' })
   return items
 })
 
@@ -82,6 +85,8 @@ function isNavActive(item: NavItem): boolean {
 const workerAlive = ref(true)
 const workerChecked = ref(false)
 const heartbeatText = ref('从未收到心跳')
+const buildLabel = ref('')
+const buildFull = ref('')
 let timer: number | undefined
 
 const theme = ref(localStorage.getItem('ocibot_theme') || 'dark')
@@ -104,6 +109,11 @@ async function checkWorker() {
       heartbeatText.value = '从未收到心跳'
     } else {
       heartbeatText.value = `上次心跳 ${Math.round(data.heartbeat_age_sec)} 秒前`
+    }
+    if (data.app_version || data.git_sha) {
+      const sha = String(data.git_sha || '')
+      buildLabel.value = sha && sha !== 'unknown' ? sha.slice(0, 7) : data.app_version || ''
+      buildFull.value = `app ${data.app_version || '—'} · git ${sha || 'unknown'}`
     }
     workerChecked.value = true
   } catch {
@@ -190,6 +200,10 @@ html[data-theme='light'] .nav a.nav-active {
 }
 .sidebar-foot {
   margin-top: auto;
+}
+.build-label {
+  font-size: 11px;
+  word-break: break-all;
 }
 .main {
   min-width: 0;

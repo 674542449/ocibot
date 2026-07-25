@@ -44,10 +44,15 @@ def system_status(
             alive = heartbeat_age <= stale_after
         except ValueError:
             pass
+    import os
+
+    git_sha = (os.environ.get("OCIBOT_GIT_SHA") or "").strip() or "unknown"
     return {
         "worker_alive": alive,
         "worker_id": worker_id,
         "heartbeat_age_sec": heartbeat_age,
         "stale_after_sec": stale_after,
         "server_time": now.isoformat(),
+        "app_version": settings.app_version,
+        "git_sha": git_sha,
     }

@@ -27,6 +27,7 @@ services:
       dockerfile: web/Dockerfile
       args:
         OCIBOT_GIT_SHA: ${OCIBOT_GIT_SHA:-unknown}
+        FRONTEND_CACHE_BUST: ${OCIBOT_GIT_SHA:-unknown}
     env_file:
       - .env
     environment:

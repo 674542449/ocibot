@@ -1,45 +1,36 @@
 <template>
   <div class="stack">
     <div>
-      <h2 style="margin: 0">用户管理</h2>
+      <h2 style="margin: 0">用户管理 · 系统更新</h2>
       <p class="muted" style="margin: 0.2rem 0 0">仅管理员可见。第一位注册的用户自动成为管理员。</p>
     </div>
 
     <div v-if="error" class="error-box">{{ error }}</div>
     <div v-if="msg" class="success-box" style="white-space: pre-wrap">{{ msg }}</div>
 
-    <div class="card stack">
-      <h3 style="margin: 0">面板设置</h3>
-      <div class="row">
-        <label class="row" style="gap: 0.4rem">
-          <input
-            v-model="allowOpenRegistration"
-            type="checkbox"
-            style="width: auto"
-            @change="saveSettings"
-          />
-          允许开放注册
-        </label>
-        <span class="muted" style="font-size: 12px">
-          （来源：{{ settingsSource === 'db' ? '面板设置' : '环境变量默认值' }}）关闭后仅现有用户可登录
-        </span>
-      </div>
-    </div>
-
-    <div class="card stack">
-      <div class="row" style="justify-content: space-between; align-items: flex-start">
-        <div>
-          <h3 style="margin: 0">系统更新</h3>
+    <!-- System update first — most asked-for admin action -->
+    <div class="card stack update-card">
+      <div class="row" style="justify-content: space-between; align-items: flex-start; gap: 0.75rem">
+        <div style="min-width: 0; flex: 1">
+          <h3 style="margin: 0">🔄 系统更新</h3>
           <p class="muted" style="margin: 0.25rem 0 0; font-size: 12px">
-            从 GitHub 拉取最新代码并重建 Docker 容器（保留数据库与密钥）。仅管理员。
+            从 GitHub 拉取最新代码并重建 Docker 容器（保留数据库与密钥）。
           </p>
         </div>
-        <div class="row">
-          <button :disabled="updateBusy || updateRunning" @click="checkUpdate">
+        <div class="row update-actions">
+          <button
+            type="button"
+            class="primary"
+            style="min-width: 7rem; font-weight: 700"
+            :disabled="updateBusy || updateRunning"
+            @click="checkUpdate"
+          >
             {{ updateBusy && !updateRunning ? '检查中…' : '检查更新' }}
           </button>
           <button
+            type="button"
             class="primary"
+            style="min-width: 7rem"
             :disabled="updateBusy || updateRunning || !canApplyUpdate"
             @click="applyUpdate"
           >
@@ -125,6 +116,24 @@
           >
         </details>
       </template>
+    </div>
+
+    <div class="card stack">
+      <h3 style="margin: 0">面板设置</h3>
+      <div class="row">
+        <label class="row" style="gap: 0.4rem">
+          <input
+            v-model="allowOpenRegistration"
+            type="checkbox"
+            style="width: auto"
+            @change="saveSettings"
+          />
+          允许开放注册
+        </label>
+        <span class="muted" style="font-size: 12px">
+          （来源：{{ settingsSource === 'db' ? '面板设置' : '环境变量默认值' }}）关闭后仅现有用户可登录
+        </span>
+      </div>
     </div>
 
     <div class="card table-wrap">
@@ -403,3 +412,21 @@ onBeforeUnmount(() => {
   stopUpdatePoll()
 })
 </script>
+
+<style scoped>
+.update-card {
+  border: 1px solid #3b82f6aa;
+  box-shadow: 0 0 0 1px #3b82f622;
+}
+.update-actions {
+  flex-shrink: 0;
+}
+@media (max-width: 700px) {
+  .update-actions {
+    width: 100%;
+  }
+  .update-actions button {
+    flex: 1;
+  }
+}
+</style>

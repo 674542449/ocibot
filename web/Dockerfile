@@ -6,7 +6,9 @@ WORKDIR /src
 COPY web/frontend/package.json web/frontend/package-lock.json* ./
 RUN npm ci --ignore-scripts || npm install --ignore-scripts
 COPY web/frontend ./
-RUN npm run build
+# Bust layer cache when only source files change under some builders.
+ARG FRONTEND_CACHE_BUST=1
+RUN echo "frontend_cache_bust=${FRONTEND_CACHE_BUST}" && npm run build
 
 FROM python:3.12-slim
 
