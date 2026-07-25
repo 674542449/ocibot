@@ -14,7 +14,8 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# curl: healthcheck; git: in-panel self-update (host repo); docker CLI: compose via socket
+# curl + git only. Compose runs via `docker run docker:cli` against the mounted
+# host socket (static docker binary has no compose plugin).
 ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \

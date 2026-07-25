@@ -2,9 +2,11 @@
 
 Designed for the install.sh / docker-compose production layout:
 
-- API container may mount the host repo at OCIBOT_HOST_DIR (default /host/ocibot)
+- API container mounts the host repo at OCIBOT_HOST_DIR (default /host/ocibot)
 - and the Docker socket at /var/run/docker.sock
-- Apply runs: git pull + docker compose up -d --build on the host project
+- Apply runs on the host via: docker run --rm -v /var/run/docker.sock ...
+  docker:cli  (has the compose plugin). Plain `docker` static binary inside the
+  API image does NOT include `docker compose`, which caused build failures.
 
 Status is stored in AppMeta so multi-worker API processes share progress.
 """
@@ -14,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -31,9 +34,10 @@ log = logging.getLogger("ocibot.update")
 
 KEY_UPDATE_STATUS = "self_update_status"
 
-# Defaults match the public repo; override via env.
 DEFAULT_REPO = "674542449/ocibot"
 DEFAULT_BRANCH = "main"
+# Official image that bundles the compose plugin (multi-arch).
+DOCKER_CLI_IMAGE = (os.environ.get("OCIBOT_DOCKER_CLI_IMAGE") or "docker:27-cli").strip()
 
 _lock = threading.Lock()
 _worker: Optional[threading.Thread] = None
@@ -56,8 +60,12 @@ def _host_dir() -> Path:
     return Path(raw)
 
 
+def _host_repo_on_host() -> str:
+    """Absolute path of the repo *on the Docker host* (for -v binds)."""
+    return (os.environ.get("OCIBOT_HOST_REPO") or str(_host_dir())).strip() or "/host/ocibot"
+
+
 def update_enabled() -> bool:
-    """Opt-in. install.sh / compose sets OCIBOT_UPDATE_ENABLED=1."""
     v = (os.environ.get("OCIBOT_UPDATE_ENABLED") or "0").strip().lower()
     return v in {"1", "true", "yes", "on"}
 
@@ -89,7 +97,6 @@ def local_build_info() -> dict[str, str]:
     settings = get_settings()
     sha = (os.environ.get("OCIBOT_GIT_SHA") or "").strip()
     if not sha or sha in {"unknown", "None"}:
-        # Dev / non-docker: try git describe in repo root
         try:
             root = Path(__file__).resolve().parents[2]
             out = subprocess.check_output(
@@ -109,28 +116,46 @@ def local_build_info() -> dict[str, str]:
     }
 
 
+def _docker_works() -> bool:
+    if not shutil.which("docker"):
+        return False
+    if not Path("/var/run/docker.sock").exists():
+        return False
+    code, _ = _run_cmd(["docker", "version", "--format", "{{.Server.Version}}"], timeout=15)
+    return code == 0
+
+
 def capabilities() -> dict[str, Any]:
     host = _host_dir()
     sock = Path("/var/run/docker.sock")
-    docker_bin = shutil.which("docker") or ""
-    git_bin = shutil.which("git") or ""
+    docker_bin = bool(shutil.which("docker"))
+    git_bin = bool(shutil.which("git"))
     compose_file = host / "docker-compose.yml"
+    docker_ok = False
+    try:
+        docker_ok = _docker_works()
+    except Exception:
+        docker_ok = False
+    can = bool(
+        update_enabled()
+        and host.is_dir()
+        and compose_file.is_file()
+        and sock.exists()
+        and docker_bin
+        and git_bin
+        and docker_ok
+    )
     return {
         "enabled": update_enabled(),
         "host_dir": str(host),
         "host_dir_exists": host.is_dir(),
         "compose_file_exists": compose_file.is_file(),
         "docker_sock": sock.exists(),
-        "docker_bin": bool(docker_bin),
-        "git_bin": bool(git_bin),
-        "can_apply": bool(
-            update_enabled()
-            and host.is_dir()
-            and compose_file.is_file()
-            and sock.exists()
-            and docker_bin
-            and git_bin
-        ),
+        "docker_bin": docker_bin,
+        "git_bin": git_bin,
+        "docker_daemon": docker_ok,
+        "compose_via": "docker:cli-container",
+        "can_apply": can,
     }
 
 
@@ -146,7 +171,6 @@ def _github_headers() -> dict[str, str]:
 
 
 def fetch_remote_head(timeout: float = 15.0) -> dict[str, Any]:
-    """Return latest commit on the configured branch (public GitHub API)."""
     repo = _repo()
     branch = _branch()
     url = f"https://api.github.com/repos/{repo}/commits/{branch}"
@@ -187,7 +211,6 @@ def get_status(db: Session) -> dict[str, Any]:
             remote_sha.startswith(local_sha) or local_sha.startswith(remote_sha[:7])
         )
     elif remote_sha and local_sha in {"unknown", "None", ""}:
-        # Cannot compare precisely; still surface remote info.
         update_available = True
 
     return {
@@ -196,7 +219,7 @@ def get_status(db: Session) -> dict[str, Any]:
         "local": local,
         "remote": remote,
         "update_available": update_available,
-        "state": st.get("state") or "idle",  # idle|checking|running|success|error
+        "state": st.get("state") or "idle",
         "message": st.get("message") or "",
         "log_tail": st.get("log_tail") or "",
         "started_at": st.get("started_at") or "",
@@ -249,25 +272,72 @@ def _run_cmd(cmd: list[str], *, cwd: Optional[str] = None, timeout: int = 600) -
         return 1, str(exc)
 
 
-def _compose_cmd(host: Path) -> list[str]:
-    """Prefer `docker compose` plugin; fall back to docker-compose binary."""
-    code, _ = _run_cmd(["docker", "compose", "version"], timeout=20)
-    if code == 0:
-        return ["docker", "compose", "-f", str(host / "docker-compose.yml")]
-    if shutil.which("docker-compose"):
-        return ["docker-compose", "-f", str(host / "docker-compose.yml")]
-    return ["docker", "compose", "-f", str(host / "docker-compose.yml")]
-
-
-def _append_log(existing: str, chunk: str, limit: int = 12000) -> str:
+def _append_log(existing: str, chunk: str, limit: int = 16000) -> str:
     text = (existing or "") + chunk
     if len(text) > limit:
         return text[-limit:]
     return text
 
 
+def _project_name(host: Path) -> str:
+    # Prefer explicit name from compose file.
+    try:
+        text = (host / "docker-compose.yml").read_text(encoding="utf-8", errors="ignore")
+        m = re.search(r"(?m)^name:\s*([A-Za-z0-9_-]+)\s*$", text)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    # Fallback: directory name (compose default)
+    return host.name or "ocibot"
+
+
+def _compose_via_cli_container(host: Path, args: list[str], *, timeout: int = 1200) -> tuple[int, str]:
+    """Run `docker compose ...` using the official docker:cli image.
+
+    The API image only ships a static docker client (no compose plugin). Spawning
+    docker:cli with the host socket + host repo bind gives a reliable compose.
+    """
+    host_repo = _host_repo_on_host()
+    project = _project_name(host)
+    # Ensure the helper image exists (best-effort pull; offline cache ok).
+    _run_cmd(["docker", "pull", DOCKER_CLI_IMAGE], timeout=180)
+    cmd = [
+        "docker",
+        "run",
+        "--rm",
+        "-v",
+        "/var/run/docker.sock:/var/run/docker.sock",
+        "-v",
+        f"{host_repo}:{host_repo}",
+        "-w",
+        host_repo,
+        "-e",
+        f"OCIBOT_HOST_REPO={host_repo}",
+        "-e",
+        f"OCIBOT_GIT_SHA={os.environ.get('OCIBOT_GIT_SHA', 'unknown')}",
+        "-e",
+        f"POSTGRES_PASSWORD={os.environ.get('POSTGRES_PASSWORD', '')}",
+        "-e",
+        f"OCIBOT_PORT={os.environ.get('OCIBOT_PORT', '8000')}",
+        "-e",
+        f"OCIBOT_CORS_ORIGINS={os.environ.get('OCIBOT_CORS_ORIGINS', '')}",
+        "-e",
+        f"OCIBOT_API_WORKERS={os.environ.get('OCIBOT_API_WORKERS', '2')}",
+        "-e",
+        "OCIBOT_UPDATE_ENABLED=1",
+        DOCKER_CLI_IMAGE,
+        "compose",
+        "-f",
+        f"{host_repo}/docker-compose.yml",
+        "-p",
+        project,
+        *args,
+    ]
+    return _run_cmd(cmd, timeout=timeout)
+
+
 def _apply_job(username: str) -> None:
-    """Background thread body. Opens its own DB session."""
     from web.backend.db import SessionLocal
 
     host = _host_dir()
@@ -301,23 +371,15 @@ def _apply_job(username: str) -> None:
             _write_status(db, st)
 
     try:
-        caps_ok = (
-            update_enabled()
-            and host.is_dir()
-            and (host / "docker-compose.yml").is_file()
-            and Path("/var/run/docker.sock").exists()
-            and shutil.which("docker")
-            and shutil.which("git")
-        )
-        if not caps_ok:
+        caps = capabilities()
+        if not caps.get("can_apply"):
             save(
                 "error",
-                "当前部署未启用在线更新（需要 OCIBOT_UPDATE_ENABLED=1、挂载宿主机仓库与 docker.sock、镜像内含 git/docker）",
-                last_error="capabilities",
+                "当前部署未启用在线更新（需要 OCIBOT_UPDATE_ENABLED=1、挂载宿主机仓库与 docker.sock、docker 可用）",
+                last_error=json.dumps(caps, ensure_ascii=False),
             )
             return
 
-        # 1) git fetch + hard reset on host repo (same policy as install.sh update)
         branch = _branch()
         code, out = _run_cmd(["git", "-C", str(host), "rev-parse", "--short", "HEAD"], timeout=20)
         log_buf = _append_log(log_buf, f"local HEAD before: {out}\n")
@@ -338,7 +400,6 @@ def _apply_job(username: str) -> None:
                 save("error", "git fetch 失败", last_error=out[-800:], log_tail=log_buf)
                 return
 
-        # Preserve .env across hard reset
         env_src = host / "web" / ".env"
         env_bak = Path(f"/tmp/ocibot.env.backup.{os.getpid()}")
         if env_src.is_file():
@@ -360,7 +421,7 @@ def _apply_job(username: str) -> None:
         if code != 0:
             save(
                 "error",
-                "git reset 失败，请 SSH 上服务器手动：git fetch && git reset --hard origin/main",
+                "git reset 失败，请 SSH：git fetch && git reset --hard origin/main",
                 last_error=out[-800:],
                 log_tail=log_buf,
             )
@@ -375,57 +436,109 @@ def _apply_job(username: str) -> None:
             except Exception as exc:  # noqa: BLE001
                 log_buf = _append_log(log_buf, f"[warn] restore .env failed: {exc}\n")
 
+        # Refresh OCIBOT_GIT_SHA for the upcoming build
         code, out = _run_cmd(["git", "-C", str(host), "rev-parse", "HEAD"], timeout=20)
         new_sha = out.strip() if code == 0 else ""
+        if new_sha:
+            os.environ["OCIBOT_GIT_SHA"] = new_sha
         log_buf = _append_log(log_buf, f"HEAD after reset={new_sha}\n")
+        log_buf = _append_log(log_buf, f"host_repo_on_host={_host_repo_on_host()}\n")
 
-        # 2) docker compose build + up
-        compose = _compose_cmd(host)
-        save("running", "正在构建镜像（可能需几分钟）…", log_tail=log_buf)
-        code, out = _run_cmd(
-            [*compose, "build", "--pull", "api", "worker"],
-            cwd=str(host),
-            timeout=1200,
+        # Build images with docker:cli (has compose plugin)
+        save("running", "正在构建镜像（首次可能较慢，请耐心等待）…", log_tail=log_buf)
+        code, out = _compose_via_cli_container(
+            host,
+            ["build", "--pull", "api", "worker"],
+            timeout=1800,
         )
-        log_buf = _append_log(log_buf, f"$ compose build\n{out}\n")
+        log_buf = _append_log(log_buf, f"$ compose build --pull\n{out}\n")
         if code != 0:
-            code, out = _run_cmd(
-                [*compose, "build", "api", "worker"],
-                cwd=str(host),
-                timeout=1200,
+            code, out = _compose_via_cli_container(
+                host,
+                ["build", "api", "worker"],
+                timeout=1800,
             )
-            log_buf = _append_log(log_buf, f"$ compose build (retry)\n{out}\n")
+            log_buf = _append_log(log_buf, f"$ compose build (retry no --pull)\n{out}\n")
             if code != 0:
                 save(
                     "error",
-                    "docker compose build 失败",
-                    last_error=out[-800:],
+                    "docker compose build 失败（详见日志）。常见原因：镜像源/网络、磁盘不足、架构不匹配。",
+                    last_error=out[-1200:],
                     log_tail=log_buf,
                 )
                 return
 
-        save("running", "正在启动新容器…", log_tail=log_buf)
-        code, out = _run_cmd(
-            [*compose, "up", "-d"],
-            cwd=str(host),
+        # Recreate only worker first, then api last — recreating api kills this process.
+        save("running", "正在滚动重启 worker…", log_tail=log_buf)
+        code, out = _compose_via_cli_container(
+            host,
+            ["up", "-d", "--no-deps", "worker"],
             timeout=300,
         )
-        log_buf = _append_log(log_buf, f"$ compose up -d\n{out}\n")
+        log_buf = _append_log(log_buf, f"$ compose up worker\n{out}\n")
         if code != 0:
             save(
                 "error",
-                "docker compose up 失败",
+                "worker 启动失败",
                 last_error=out[-800:],
                 log_tail=log_buf,
             )
             return
 
+        # Mark success BEFORE recreating api (this container will be replaced).
         save(
             "success",
-            f"更新完成（{new_sha[:7] or 'ok'}）。请强制刷新浏览器（Ctrl+F5）。",
+            f"镜像已构建（{new_sha[:7] or 'ok'}），正在重启 API…请 30 秒后强制刷新（Ctrl+F5）。",
             log_tail=log_buf,
             applied_sha=new_sha,
         )
+
+        # Detach: kick api recreate and exit. Use a sibling container so the
+        # command survives after this API process is killed.
+        host_repo = _host_repo_on_host()
+        project = _project_name(host)
+        kick = [
+            "docker",
+            "run",
+            "-d",
+            "--rm",
+            "-v",
+            "/var/run/docker.sock:/var/run/docker.sock",
+            "-v",
+            f"{host_repo}:{host_repo}",
+            "-w",
+            host_repo,
+            "-e",
+            f"OCIBOT_HOST_REPO={host_repo}",
+            "-e",
+            f"OCIBOT_GIT_SHA={new_sha or 'unknown'}",
+            "-e",
+            f"POSTGRES_PASSWORD={os.environ.get('POSTGRES_PASSWORD', '')}",
+            "-e",
+            f"OCIBOT_PORT={os.environ.get('OCIBOT_PORT', '8000')}",
+            DOCKER_CLI_IMAGE,
+            "compose",
+            "-f",
+            f"{host_repo}/docker-compose.yml",
+            "-p",
+            project,
+            "up",
+            "-d",
+            "--no-deps",
+            "api",
+        ]
+        code, out = _run_cmd(kick, timeout=60)
+        log_buf = _append_log(log_buf, f"$ detach compose up api\n{out}\n")
+        # Best-effort final log write (may not complete if we die instantly).
+        try:
+            save(
+                "success",
+                f"更新已提交（{new_sha[:7] or 'ok'}）。API 正在重启，请稍后刷新。",
+                log_tail=log_buf,
+                applied_sha=new_sha,
+            )
+        except Exception:
+            pass
     except Exception as exc:  # noqa: BLE001
         log.exception("self-update failed")
         save("error", f"更新异常：{exc}", last_error=str(exc), log_tail=log_buf)
@@ -441,7 +554,7 @@ def start_update(db: Session, *, username: str) -> dict[str, Any]:
     caps = capabilities()
     if not caps.get("can_apply"):
         raise RuntimeError(
-            "缺少更新条件：需要宿主机仓库挂载、docker.sock、以及镜像内 git/docker。"
+            "缺少更新条件：需要宿主机仓库挂载、docker.sock、以及可用的 docker 守护进程。"
             f" 详情：{json.dumps(caps, ensure_ascii=False)}"
         )
 
@@ -450,7 +563,6 @@ def start_update(db: Session, *, username: str) -> dict[str, Any]:
         st = _read_status_raw(db)
         if st.get("state") == "running" or (_worker is not None and _worker.is_alive()):
             raise RuntimeError("已有更新任务正在进行")
-        # Refresh remote tip best-effort before apply
         try:
             remote = fetch_remote_head()
             st["remote"] = remote

@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.1 — 2026-07-26
+
+### 修复 · 在线更新 `docker compose build` 失败
+- 根因：API 镜像内的静态 `docker` **没有 compose 插件**，`docker compose build` 必然失败
+- 现改为通过 `docker run --rm docker:27-cli` 执行 compose（官方镜像自带插件）
+- 构建时注入宿主机路径 `OCIBOT_HOST_REPO`，正确挂载代码目录
+- **先重启 worker，再分离重启 api**，避免更新进程把自己杀掉导致中断
+- 能力检测增加 `docker_daemon`；失败日志保留更多尾部输出
+
+### 升级（服务器）
+```bash
+cd ~/ocibot
+# 先命令行升到本修复（旧版网页更新仍会失败）
+git fetch origin main && git reset --hard origin/main
+# 保留密钥
+# （若 reset 掉了 .env，从备份拷回 web/.env）
+bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # version 0.4.1
+```
+之后即可在「用户管理 → 系统更新」使用一键更新。
+
+---
+
 ## 0.4.0 — 2026-07-26
 
 ### UI · 字节系控制台风格

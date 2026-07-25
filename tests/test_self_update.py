@@ -49,6 +49,8 @@ def test_get_status_idle(monkeypatch):
             "docker_sock": True,
             "docker_bin": True,
             "git_bin": True,
+            "docker_daemon": True,
+            "compose_via": "docker:cli-container",
             "can_apply": True,
         },
     )
