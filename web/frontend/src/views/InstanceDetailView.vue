@@ -91,7 +91,6 @@
         <button :disabled="acting" @click="doRename">重命名</button>
         <button :disabled="acting" @click="doReplaceIp">换公网IP</button>
         <button :disabled="acting" @click="doIpv6">分配 IPv6</button>
-        <button :disabled="acting" @click="doCreateImage">制作镜像</button>
         <button class="danger" :disabled="acting" @click="doTerminate">终止</button>
       </div>
     </div>
@@ -484,7 +483,7 @@
           </div>
         </div>
         <p class="muted" style="margin: 0.3rem 0 0.5rem; font-size: 12px">
-          Always Free 含 5 个卷备份名额。恢复思路：可先用「制作镜像」把系统做成自定义镜像，在创建向导中选择重装。
+          Always Free 含 5 个卷备份名额。实例「制作镜像」已关闭；可用引导卷备份做数据保护。
         </p>
         <div class="table-wrap">
           <table>
@@ -748,28 +747,7 @@ async function deleteBackup(b: BootBackup) {
   }
 }
 
-// ---- custom image ----
-async function doCreateImage() {
-  const name = prompt(
-    '自定义镜像名称（制作期间实例会短暂进入 CREATING_IMAGE 状态）',
-    `${instance.value?.display_name || 'instance'}-image`,
-  )
-  if (!name) return
-  acting.value = true
-  error.value = ''
-  try {
-    const { data } = await api.post(
-      `/tenants/${tenantId.value}/instances/${instanceId.value}/create-image`,
-      { display_name: name.trim() },
-    )
-    if (data.ok) msg.value = data.message
-    else error.value = data.message
-  } catch (e: any) {
-    error.value = e?.message || '创建镜像失败'
-  } finally {
-    acting.value = false
-  }
-}
+// custom image feature disabled
 
 const title = computed(
   () => instance.value?.display_name || instanceId.value.slice(0, 18) + '…',

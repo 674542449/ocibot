@@ -627,21 +627,12 @@ def create_custom_image(
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> PowerActionResult:
-    row = _row(db, user.id, tenant_id)
-    try:
-        session = get_session_for_row(row)
-        info = session.get_instance(instance_id, resolve_ips=False)
-        result = session.create_custom_image(instance_id, info.compartment_id, body.display_name)
-        write_audit(
-            db,
-            owner_id=user.id,
-            action="image.create",
-            target=instance_id,
-            detail={"tenant_id": tenant_id, "ok": result.ok, "message": result.message},
-        )
-        return PowerActionResult(**op_result_dict(result))
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    # Feature disabled by product decision — keep route for old clients with a clear error.
+    _ = (tenant_id, instance_id, body, user, db)
+    raise HTTPException(
+        status_code=403,
+        detail="实例「制作镜像」功能已关闭。如需系统备份，请使用引导卷备份。",
+    )
 
 
 @router.get("/tenants/{tenant_id}/custom-images")

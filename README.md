@@ -62,7 +62,7 @@ irm https://raw.githubusercontent.com/674542449/ocibot/main/scripts/install.ps1 
 - WebSSH 网页终端 + 串口/VNC 控制台
 - 引导卷扩容 + SSH 自动扩展文件系统
 - 块存储 / 对象存储管理
-- 防火墙 NSG、公网 IP / IPv6、备份、自定义镜像
+- 防火墙 NSG、公网 IP / IPv6、引导卷备份
 - 任务中心（容量重试 / 定时开关机）与多渠道通知
 
 ---

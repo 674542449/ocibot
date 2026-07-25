@@ -112,7 +112,7 @@
           <select v-model="osFamily" @change="onOsFamilyChange">
             <option value="ubuntu">Ubuntu</option>
             <option value="oracle_linux">Oracle Linux</option>
-            <option value="custom">自定义镜像（从实例制作）</option>
+            <option value="custom">自定义镜像（已有镜像）</option>
           </select>
         </div>
         <div class="field">
@@ -446,7 +446,7 @@ function onOsFamilyChange() {
     form.image_id = ''
     error.value =
       osFamily.value === 'custom'
-        ? '该租户还没有自定义镜像。可在实例详情页「制作自定义镜像」。'
+        ? '该租户还没有自定义镜像。制作镜像功能已关闭；可改用官方 Ubuntu / Oracle Linux。'
         : '该系统未找到可用镜像'
     return
   }
