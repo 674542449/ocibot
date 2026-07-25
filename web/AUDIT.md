@@ -69,12 +69,25 @@ business layer that the web backend imports. Changes in this pass:
 | HTTPS | Ops | Terminate TLS at a reverse proxy / Tunnel and set `OCIBOT_COOKIE_SECURE=1`. |
 | Rate-limit store is in-process | Low | Login/register throttle is per-process; behind multiple workers add a reverse-proxy rate limit. |
 | Root password tag visibility | Inherited | Returned once on create; hashed into cloud-init, not stored in plaintext. |
-| Outbound webhook/SMTP targets | Low | Notification channels fetch user-supplied URLs (SSRF is inherent to the feature; keep the panel non-public). |
+| Outbound webhook/SMTP targets | Mitigated (0.4.6) | User-supplied webhook/Bark/SMTP hosts are DNS-resolved and blocked if private/loopback/link-local/metadata; no redirect following; `trust_env=False`. |
+| X-Forwarded-For trust | Mitigated (0.4.6) | Default `OCIBOT_TRUST_PROXY=0`. Enable only behind a proxy that overwrites client IP headers. |
+| WebSSH query JWT | Fixed (0.4.6) | Query-string tokens removed; cookie or Authorization Bearer only. |
+| First-admin race | Mitigated (0.4.6) | PostgreSQL advisory lock + re-count; unique username constraint remains. |
+
+## Pass 3 — security hardening (0.4.6, 2026-07-26)
+
+- SSRF guards: `web/backend/url_safety.py` used by notify webhook/Bark/SMTP validation and send path
+- Login timing pad + untrusted proxy IP default
+- Backup import inflate/tenant caps; ignore `owner_id` from archive
+- Baseline security headers + SPA path `..` rejection
+- GitHub self-update: repo/branch allowlist, no env proxy
 
 ## Security checklist before public deploy
 
 - [ ] Strong `OCIBOT_MASTER_KEY`, `OCIBOT_JWT_SECRET` (optionally `OCIBOT_REQUIRE_SECURE_SECRETS=1`)
 - [ ] `OCIBOT_ALLOW_OPEN_REGISTRATION=0` (default) — open only transiently when adding users
 - [ ] HTTPS + `OCIBOT_COOKIE_SECURE=1`, bind API behind a reverse proxy
+- [ ] If behind reverse proxy: `OCIBOT_TRUST_PROXY=1` and ensure proxy **overwrites** `X-Forwarded-For`
 - [ ] Restrict `OCIBOT_CORS_ORIGINS`
 - [ ] Keep the worker on a private host only
+- [ ] Admin self-update mounts docker.sock — treat admin compromise as host compromise; disable with `OCIBOT_UPDATE_ENABLED=0` if multi-admin untrusted
