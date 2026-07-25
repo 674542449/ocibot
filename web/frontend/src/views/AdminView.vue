@@ -415,8 +415,9 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .update-card {
-  border: 1px solid #3b82f6aa;
-  box-shadow: 0 0 0 1px #3b82f622;
+  border: 1px solid var(--accent-soft-2);
+  box-shadow: var(--shadow-sm);
+  background: linear-gradient(180deg, var(--accent-soft) 0%, var(--panel) 48%);
 }
 .update-actions {
   flex-shrink: 0;

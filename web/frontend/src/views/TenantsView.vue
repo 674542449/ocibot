@@ -607,14 +607,14 @@ onMounted(async () => {
   border: 1px solid var(--border);
 }
 .parse-box.ok {
-  background: #14532d44;
-  border-color: #166534;
-  color: #bbf7d0;
+  background: var(--ok-soft);
+  border-color: transparent;
+  color: #0a6e22;
 }
 .parse-box.bad {
-  background: #7f1d1d44;
-  border-color: #991b1b;
-  color: #fecaca;
+  background: var(--danger-soft);
+  border-color: transparent;
+  color: var(--danger);
 }
 .manual-block {
   border-top: 1px solid var(--border);
@@ -623,8 +623,11 @@ onMounted(async () => {
 }
 code {
   font-size: 12px;
-  background: #0b1220;
+  background: var(--panel-2);
   padding: 0.05rem 0.3rem;
   border-radius: 4px;
+}
+html[data-theme='dark'] .parse-box.ok {
+  color: var(--ok);
 }
 </style>

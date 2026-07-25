@@ -226,11 +226,12 @@ onBeforeUnmount(() => {
   min-height: 220px;
   width: 100%;
   max-width: 100%;
-  background: #0b1220;
+  background: #0d1117;
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 4px;
   overflow: hidden;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
 }
 @media (max-width: 600px) {
   .term-host {

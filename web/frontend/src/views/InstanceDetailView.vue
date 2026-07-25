@@ -863,10 +863,10 @@ function metricLabel(k: string) {
 function metricColor(k: string) {
   return (
     {
-      cpu: '#3b82f6',
-      memory: '#a855f7',
-      net_in: '#22c55e',
-      net_out: '#f59e0b',
+      cpu: '#3370ff',
+      memory: '#6b4eff',
+      net_in: '#00b42a',
+      net_out: '#ff7d00',
     } as Record<string, string>
   )[k]
 }
@@ -1310,12 +1310,12 @@ watch([tenantId, instanceId], async () => {
 }
 .copyable {
   cursor: copy;
-  border-bottom: 1px dashed #64748b;
+  border-bottom: 1px dashed var(--border-strong);
   user-select: none;
 }
 .copyable:hover {
-  color: #93c5fd;
-  border-bottom-color: #93c5fd;
+  color: var(--accent);
+  border-bottom-color: var(--accent);
 }
 .copyable.empty {
   cursor: default;

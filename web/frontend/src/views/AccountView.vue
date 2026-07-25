@@ -428,7 +428,7 @@ onMounted(async () => {
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 0.5rem;
-  background: #0b1220;
+  background: var(--panel-2);
 }
 .bar-chart {
   width: 100%;
@@ -437,7 +437,7 @@ onMounted(async () => {
 }
 .gauge-track {
   height: 10px;
-  background: #1e293b;
+  background: var(--border);
   border-radius: 6px;
   overflow: hidden;
   margin-top: 4px;
@@ -451,7 +451,8 @@ onMounted(async () => {
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 0.75rem;
-  background: var(--panel-2);
+  background: var(--panel);
+  box-shadow: var(--shadow-sm);
 }
 .gauge-fill {
   height: 100%;
@@ -462,20 +463,20 @@ onMounted(async () => {
   padding: 2px 10px;
   border-radius: 999px;
   font-size: 12px;
-  font-weight: 700;
-  color: #0b1220;
+  font-weight: 650;
+  color: #fff;
 }
 .st-ok {
-  background: #22c55e;
+  background: var(--ok);
 }
 .st-warn {
-  background: #f59e0b;
+  background: var(--warn);
 }
 .st-critical {
-  background: #f97316;
+  background: #f5319d;
 }
 .st-over {
-  background: #ef4444;
+  background: var(--danger);
   color: #fff;
 }
 .badge.st-ok {

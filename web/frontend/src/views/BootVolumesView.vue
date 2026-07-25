@@ -290,18 +290,18 @@ onMounted(async () => {
   font-weight: 700;
 }
 .stat-num.ok {
-  color: #86efac;
+  color: var(--ok);
 }
 .stat-num.warn {
-  color: #fde68a;
+  color: var(--warn);
 }
 .copyable {
   cursor: copy;
-  border-bottom: 1px dashed #64748b;
+  border-bottom: 1px dashed var(--border-strong);
   user-select: none;
 }
 .copyable:hover {
-  color: #93c5fd;
+  color: var(--accent);
 }
 @media (max-width: 900px) {
   .stats {

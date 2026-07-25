@@ -1,14 +1,19 @@
 <template>
   <div class="login-page">
-    <form class="card login-card stack" @submit.prevent="submit">
-      <div>
-        <h1>OCIBot Web</h1>
-        <p class="muted">Oracle Cloud 多租户实例管理面板（网页版）</p>
+    <form class="login-card stack" @submit.prevent="submit">
+      <div class="login-brand">
+        <div class="logo">O</div>
+        <div>
+          <h1>OCIBot</h1>
+          <p class="muted">Oracle Cloud 多租户实例管理</p>
+        </div>
       </div>
 
-      <div class="tabs row">
-        <button type="button" :class="{ primary: mode === 'login' }" @click="mode = 'login'">登录</button>
-        <button type="button" :class="{ primary: mode === 'register' }" @click="mode = 'register'">
+      <div class="mode-tabs">
+        <button type="button" :class="{ active: mode === 'login' }" @click="mode = 'login'">
+          登录
+        </button>
+        <button type="button" :class="{ active: mode === 'register' }" @click="mode = 'register'">
           注册
         </button>
       </div>
@@ -29,17 +34,22 @@
       </div>
       <div v-if="needTotp" class="field">
         <label>两步验证码（6 位）</label>
-        <input v-model="totpCode" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" />
+        <input
+          v-model="totpCode"
+          inputmode="numeric"
+          autocomplete="one-time-code"
+          placeholder="123456"
+        />
       </div>
 
       <div v-if="error" class="error-box">{{ error }}</div>
       <div v-if="hint" class="success-box">{{ hint }}</div>
 
-      <button class="primary" type="submit" :disabled="loading">
+      <button class="primary submit" type="submit" :disabled="loading">
         {{ loading ? '请稍候…' : mode === 'login' ? '登录' : '创建账号' }}
       </button>
-      <p class="muted" style="font-size: 12px">
-        首次使用请注册本地管理员账号。OCI API 私钥仅保存在服务端（加密存储），不会进入浏览器本地。
+      <p class="muted tip">
+        首次注册自动成为管理员。OCI 私钥仅服务端加密存储，不会进入浏览器。
       </p>
     </form>
   </div>
@@ -96,15 +106,84 @@ async function submit() {
   min-height: 100dvh;
   display: grid;
   place-items: center;
-  padding: 1rem;
-  padding-top: max(1rem, env(safe-area-inset-top));
-  padding-bottom: max(1rem, env(safe-area-inset-bottom));
+  padding: 1.25rem;
+  padding-top: max(1.25rem, env(safe-area-inset-top));
+  padding-bottom: max(1.25rem, env(safe-area-inset-bottom));
+  background:
+    radial-gradient(900px 420px at 10% -10%, #d6e4ff88, transparent),
+    radial-gradient(700px 380px at 100% 0%, #e8deff66, transparent),
+    var(--bg);
 }
+
 .login-card {
   width: min(420px, 100%);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 1.5rem 1.4rem 1.35rem;
+  box-shadow: var(--shadow-md);
 }
+
+.login-brand {
+  display: flex;
+  gap: 0.85rem;
+  align-items: center;
+}
+
+.logo {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  font-weight: 700;
+  color: #fff;
+  background: linear-gradient(135deg, #3370ff, #6b4eff);
+  box-shadow: 0 6px 16px rgba(51, 112, 255, 0.35);
+  flex-shrink: 0;
+}
+
 h1 {
-  margin: 0 0 0.25rem;
-  font-size: clamp(1.25rem, 5vw, 1.5rem);
+  margin: 0;
+  font-size: clamp(1.25rem, 4.5vw, 1.45rem);
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+
+.mode-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.25rem;
+  padding: 0.25rem;
+  background: var(--panel-2);
+  border-radius: 10px;
+  border: 1px solid var(--border);
+}
+
+.mode-tabs button {
+  border: none;
+  box-shadow: none;
+  background: transparent;
+  color: var(--text-secondary);
+  min-height: 36px;
+  font-weight: 560;
+}
+
+.mode-tabs button.active {
+  background: var(--panel);
+  color: var(--accent);
+  box-shadow: var(--shadow-sm);
+}
+
+.submit {
+  width: 100%;
+  min-height: 42px;
+  font-weight: 600;
+}
+
+.tip {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.55;
 }
 </style>
