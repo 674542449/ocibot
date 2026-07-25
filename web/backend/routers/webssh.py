@@ -68,10 +68,13 @@ async def _release_slot(user_id: str, instance_id: str) -> None:
 
 
 def _user_from_websocket(websocket: WebSocket) -> Any:
+    # Cookie only — never accept JWT from query string (leaks via logs/Referer).
     token = websocket.cookies.get(COOKIE_NAME) or ""
-    # Optional query token for non-cookie clients (not preferred).
     if not token:
-        token = (websocket.query_params.get("token") or "").strip()
+        # Optional Authorization: Bearer for non-browser clients (not in query).
+        auth_header = (websocket.headers.get("authorization") or "").strip()
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
     if not token:
         raise PermissionError("未登录")
     try:

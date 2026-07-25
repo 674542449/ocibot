@@ -116,6 +116,33 @@ def create_app() -> FastAPI:
     def health() -> HealthOut:
         return HealthOut(status="ok", version=settings.app_version, app=settings.app_name)
 
+    @app.middleware("http")
+    async def security_headers(request, call_next):
+        response = await call_next(request)
+        # Baseline browser hardening for the SPA + API.
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "same-origin")
+        response.headers.setdefault(
+            "Permissions-Policy",
+            "camera=(), microphone=(), geolocation=(), payment=()",
+        )
+        # CSP: SPA is same-origin; allow inline styles from Vue scoped + xterm.
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; "
+            "base-uri 'self'; "
+            "frame-ancestors 'none'; "
+            "object-src 'none'; "
+            "img-src 'self' data: blob:; "
+            "font-src 'self' data:; "
+            "style-src 'self' 'unsafe-inline'; "
+            "script-src 'self'; "
+            "connect-src 'self' ws: wss:; "
+            "form-action 'self'",
+        )
+        return response
+
     if _DIST_DIR.is_dir() and (_DIST_DIR / "index.html").is_file():
         app.mount("/assets", StaticFiles(directory=_DIST_DIR / "assets"), name="assets")
 
@@ -126,14 +153,18 @@ def create_app() -> FastAPI:
             if full_path.startswith("api"):
                 return JSONResponse({"detail": "Not Found"}, status_code=404)
             # Serve real files (favicon etc.); everything else falls back to the SPA.
+            # Reject path traversal even if StaticFiles would.
+            if ".." in full_path.split("/"):
+                return JSONResponse({"detail": "Not Found"}, status_code=404)
             candidate = (_DIST_DIR / full_path).resolve()
-            if (
-                full_path
-                and candidate.is_file()
-                and _DIST_DIR.resolve() in candidate.parents
-            ):
+            dist_root = _DIST_DIR.resolve()
+            try:
+                candidate.relative_to(dist_root)
+            except ValueError:
+                return FileResponse(dist_root / "index.html")
+            if full_path and candidate.is_file():
                 return FileResponse(candidate)
-            return FileResponse(_DIST_DIR / "index.html")
+            return FileResponse(dist_root / "index.html")
 
         log.info("serving frontend from %s", _DIST_DIR)
 

@@ -260,8 +260,13 @@ def _github_headers() -> dict[str, str]:
 def fetch_remote_head(timeout: float = 15.0) -> dict[str, Any]:
     repo = _repo()
     branch = _branch()
+    # Strict allowlist: owner/name only.
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo or ""):
+        raise RuntimeError(f"非法仓库名：{repo}")
+    if not re.fullmatch(r"[A-Za-z0-9._/-]+", branch or "") or ".." in branch:
+        raise RuntimeError(f"非法分支名：{branch}")
     url = f"https://api.github.com/repos/{repo}/commits/{branch}"
-    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+    with httpx.Client(timeout=timeout, follow_redirects=True, trust_env=False) as client:
         r = client.get(url, headers=_github_headers())
         if r.status_code == 404:
             raise RuntimeError(f"仓库或分支不存在：{repo}@{branch}")

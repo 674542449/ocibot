@@ -36,11 +36,26 @@ from web.backend.schemas import (
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
+# Precomputed bcrypt hash used only to equalize login timing when the username
+# does not exist (never a valid password for a real account).
+_DUMMY_PASSWORD_HASH = hash_password("ocibot-timing-pad-not-a-real-password")
+
 
 def _client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for") or ""
-    if forwarded:
-        return forwarded.split(",")[0].strip() or "unknown"
+    """Best-effort client IP for rate limiting.
+
+    X-Forwarded-For is only trusted when OCIBOT_TRUST_PROXY=1 (deploy behind a
+    reverse proxy that strips/forges the header). Otherwise a client can spoof
+    the header to evade the login rate limiter.
+    """
+    settings = get_settings()
+    if settings.trust_proxy:
+        forwarded = request.headers.get("x-forwarded-for") or ""
+        if forwarded:
+            return forwarded.split(",")[0].strip() or "unknown"
+        real_ip = (request.headers.get("x-real-ip") or "").strip()
+        if real_ip:
+            return real_ip
     if request.client:
         return request.client.host or "unknown"
     return "unknown"
@@ -95,18 +110,33 @@ def register(
     if existing:
         raise HTTPException(status_code=400, detail="用户名已存在")
 
-    user_count = db.scalar(select(func.count()).select_from(User)) or 0
+    # Serialize first-admin bootstrap on PostgreSQL so two concurrent empty-DB
+    # registers cannot both become admin. On SQLite this is a no-op and we
+    # re-check the count immediately before insert.
+    try:
+        from sqlalchemy import text
+
+        if not get_settings().is_sqlite:
+            db.execute(text("SELECT pg_advisory_xact_lock(87201401)"))
+    except Exception:
+        # Non-PG or lock unavailable — still re-check count below.
+        pass
+
+    user_count = int(db.scalar(select(func.count()).select_from(User)) or 0)
     if user_count > 0 and not open_registration_allowed(db):
         raise HTTPException(status_code=403, detail="已关闭开放注册，请联系管理员")
 
-    # First registered user becomes the panel administrator.
     user = User(
         username=username,
         password_hash=hash_password(body.password),
         is_admin=(user_count == 0),
     )
-    db.add(user)
-    db.commit()
+    try:
+        db.add(user)
+        db.commit()
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        raise HTTPException(status_code=400, detail="用户名已存在或注册冲突，请重试") from exc
     db.refresh(user)
 
     write_audit(db, owner_id=user.id, action="auth.register", target=user.username, detail=f"ip={ip}")
@@ -133,7 +163,10 @@ def login(
         )
 
     user = db.scalar(select(User).where(User.username == username))
-    if user is None or not verify_password(body.password, user.password_hash):
+    # Always run bcrypt verify to reduce username-enumeration timing skew.
+    stored_hash = user.password_hash if user is not None else _DUMMY_PASSWORD_HASH
+    password_ok = verify_password(body.password, stored_hash)
+    if user is None or not password_ok:
         write_audit(db, owner_id=None, action="auth.login_failed", target=username, detail=f"ip={ip}")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码错误")
     if not user.is_active:

@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.6 — 2026-07-26
+
+### 安全加固
+- **Webhook / Bark SSRF**：校验 URL 协议与主机，解析 DNS 后拒绝私网/回环/链路本地/云元数据；禁止跟随重定向与信任环境代理
+- **SMTP 主机**：同样拒绝内网目标
+- **登录限流**：默认不信任 `X-Forwarded-For`（需 `OCIBOT_TRUST_PROXY=1` 且前置代理覆盖该头）
+- **登录时序**：用户名不存在时仍走 bcrypt，降低枚举差异
+- **WebSSH**：移除 query-string JWT（防日志/Referer 泄露），仅 cookie / Authorization Bearer
+- **备份导入**：限制租户数量与解压后大小，忽略归档内 `owner_id`
+- **HTTP 安全头**：`CSP` / `X-Frame-Options` / `nosniff` / `Referrer-Policy`
+- **自更新 GitHub 请求**：仓库名/分支名白名单；`trust_env=False`
+
+### 升级
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 0.4.6
+```
+
+---
+
 ## 0.4.5 — 2026-07-26
 
 ### 修复 · 在线更新后服务挂掉 / 更新未完成

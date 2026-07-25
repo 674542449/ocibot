@@ -17,7 +17,7 @@ class Settings(BaseSettings):
 
     app_name: str = "OCIBot Web"
     # Bump when shipping user-visible panel features so operators can verify deploy.
-    app_version: str = "0.4.5"
+    app_version: str = "0.4.6"
     debug: bool = False
 
     # sqlite+pysqlite:////absolute/path.db  or  postgresql+psycopg://user:pass@host/db
@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     # After that, registration is closed unless an admin re-opens it (env here or
     # the DB override at /api/admin/settings, which wins when set).
     allow_open_registration: bool = Field(default=False, alias="OCIBOT_ALLOW_OPEN_REGISTRATION")
+
+    # Trust X-Forwarded-For / X-Real-IP for rate-limit client IP. Enable only when
+    # the panel sits behind a reverse proxy that overwrites these headers.
+    trust_proxy: bool = Field(default=False, alias="OCIBOT_TRUST_PROXY")
 
     # Reject requests when still using built-in dev secrets (optional hard fail).
     require_secure_secrets: bool = Field(default=False, alias="OCIBOT_REQUIRE_SECURE_SECRETS")

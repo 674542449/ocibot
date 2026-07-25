@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 
 from web.backend.crypto_util import decrypt_text, encrypt_text
 from web.backend.models import NotificationChannel
+from web.backend.url_safety import assert_safe_outbound_url, validate_public_http_url
 
 log = logging.getLogger("ocibot.notify")
 
@@ -28,6 +29,12 @@ CHANNEL_KINDS = ("telegram", "bark", "serverchan", "webhook", "smtp")
 EVENT_KEYS = ("capacity", "schedule", "budget", "password_expiry")
 
 _HTTP_TIMEOUT = 15.0
+# Outbound client: no env proxy (avoid surprising proxy SSRF), no redirects to internal.
+_HTTP_CLIENT_KW = {
+    "timeout": _HTTP_TIMEOUT,
+    "follow_redirects": False,
+    "trust_env": False,
+}
 
 
 def encode_channel_config(config: dict[str, Any]) -> str:
@@ -79,10 +86,22 @@ def validate_channel_config(kind: str, config: dict[str, Any]) -> None:
     missing = [f for f in required[kind] if not str(config.get(f) or "").strip()]
     if missing:
         raise ValueError(f"{kind} 渠道缺少字段: {', '.join(missing)}")
-    if kind in {"webhook", "bark"}:
-        url = str(config.get("url") or config.get("server") or "").strip()
-        if url and not (url.startswith("http://") or url.startswith("https://")):
-            raise ValueError("URL 必须以 http:// 或 https:// 开头")
+    if kind == "webhook":
+        config["url"] = validate_public_http_url(str(config.get("url") or ""))
+    if kind == "bark":
+        server = str(config.get("server") or "https://api.day.app").strip()
+        config["server"] = validate_public_http_url(server or "https://api.day.app")
+    if kind == "smtp":
+        host = str(config.get("host") or "").strip()
+        # Block obvious cloud-metadata / loopback SMTP abuse.
+        from web.backend.url_safety import hostname_is_blocked, resolve_and_check_host
+
+        if hostname_is_blocked(host):
+            raise ValueError(f"SMTP 主机不允许为内网/本地地址：{host}")
+        try:
+            resolve_and_check_host(host)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
 
 
 def send_to_channel(kind: str, config: dict[str, Any], title: str, body: str) -> tuple[bool, str]:
@@ -107,8 +126,11 @@ def send_to_channel(kind: str, config: dict[str, Any], title: str, body: str) ->
 def _send_telegram(config: dict[str, Any], title: str, body: str) -> tuple[bool, str]:
     token = str(config.get("bot_token") or "").strip()
     chat_id = str(config.get("chat_id") or "").strip()
+    # Token is path-sensitive; reject weird characters that could alter the path.
+    if not token or any(c in token for c in "/?# \t\r\n"):
+        return False, "invalid bot_token"
     text = f"*{title}*\n{body}" if title else body
-    with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
+    with httpx.Client(**_HTTP_CLIENT_KW) as client:
         resp = client.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
@@ -127,8 +149,12 @@ def _send_telegram(config: dict[str, Any], title: str, body: str) -> tuple[bool,
 
 def _send_bark(config: dict[str, Any], title: str, body: str) -> tuple[bool, str]:
     server = str(config.get("server") or "https://api.day.app").strip().rstrip("/")
+    try:
+        assert_safe_outbound_url(server)
+    except ValueError as exc:
+        return False, str(exc)
     key = str(config.get("device_key") or "").strip()
-    with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
+    with httpx.Client(**_HTTP_CLIENT_KW) as client:
         resp = client.post(
             f"{server}/push",
             json={"device_key": key, "title": title or "OCIBot", "body": body, "group": "ocibot"},
@@ -140,7 +166,9 @@ def _send_bark(config: dict[str, Any], title: str, body: str) -> tuple[bool, str
 
 def _send_serverchan(config: dict[str, Any], title: str, body: str) -> tuple[bool, str]:
     key = str(config.get("send_key") or "").strip()
-    with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
+    if not key or any(c in key for c in "/?# \t\r\n"):
+        return False, "invalid send_key"
+    with httpx.Client(**_HTTP_CLIENT_KW) as client:
         resp = client.post(
             f"https://sctapi.ftqq.com/{key}.send",
             data={"title": (title or "OCIBot")[:32], "desp": body},
@@ -152,11 +180,15 @@ def _send_serverchan(config: dict[str, Any], title: str, body: str) -> tuple[boo
 
 def _send_webhook(config: dict[str, Any], title: str, body: str) -> tuple[bool, str]:
     url = str(config.get("url") or "").strip()
+    try:
+        assert_safe_outbound_url(url)
+    except ValueError as exc:
+        return False, str(exc)
     headers = {}
     secret = str(config.get("secret") or "").strip()
     if secret:
         headers["X-OCIBot-Secret"] = secret
-    with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
+    with httpx.Client(**_HTTP_CLIENT_KW) as client:
         resp = client.post(url, json={"title": title, "body": body, "source": "ocibot-web"}, headers=headers)
         if 200 <= resp.status_code < 300:
             return True, "sent"

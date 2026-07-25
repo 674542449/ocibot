@@ -127,7 +127,13 @@ async def import_encrypted_zip(
             member = "tenants.json" if "tenants.json" in names else (names[0] if names else "")
             if not member:
                 raise HTTPException(status_code=400, detail="备份文件为空")
+            # Guard zip-bomb: refuse members larger than 5 MiB uncompressed.
+            info = zf.getinfo(member)
+            if int(getattr(info, "file_size", 0) or 0) > 5 * 1024 * 1024:
+                raise HTTPException(status_code=400, detail="备份内容过大（解压后上限 5MB）")
             raw = zf.read(member)
+            if len(raw) > 5 * 1024 * 1024:
+                raise HTTPException(status_code=400, detail="备份内容过大（解压后上限 5MB）")
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -139,27 +145,33 @@ async def import_encrypted_zip(
         raise HTTPException(status_code=400, detail="备份内容格式无效") from exc
 
     items = data.get("tenants", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+    if not isinstance(items, list):
+        raise HTTPException(status_code=400, detail="备份内容格式无效")
+    if len(items) > 200:
+        raise HTTPException(status_code=400, detail="单次备份租户过多（上限 200）")
     imported_ids: list[str] = []
     for item in items:
         if not isinstance(item, dict):
             continue
+        # Never honor attacker-chosen owner/id from the archive.
+        item.pop("owner_id", None)
         # Validate via TenantConfig
         try:
             cfg = TenantConfig(
                 id=str(uuid4()),
-                name=str(item.get("name") or item.get("profile") or "导入租户"),
+                name=str(item.get("name") or item.get("profile") or "导入租户")[:128],
                 user_ocid=str(item.get("user_ocid") or item.get("user") or ""),
                 tenancy_ocid=str(item.get("tenancy_ocid") or item.get("tenancy") or ""),
                 fingerprint=str(item.get("fingerprint") or ""),
                 region=str(item.get("region") or "ap-tokyo-1"),
                 private_key_pem=str(item.get("private_key_pem") or item.get("key_content") or ""),
                 compartment_ocid=str(item.get("compartment_ocid") or item.get("compartment_id") or ""),
-                description=str(item.get("description") or ""),
+                description=str(item.get("description") or "")[:512],
                 enabled=bool(item.get("enabled", True)),
-                color=str(item.get("color") or "#3B82F6"),
-                password_changed_at=str(item.get("password_changed_at") or ""),
+                color=str(item.get("color") or "#3B82F6")[:32],
+                password_changed_at=str(item.get("password_changed_at") or "")[:64],
                 password_expiry_days=int(item.get("password_expiry_days") or 120),
-                account_tier=str(item.get("account_tier") or ""),
+                account_tier=str(item.get("account_tier") or "")[:16],
             )
             errors = cfg.validate()
             if errors:
