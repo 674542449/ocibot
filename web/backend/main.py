@@ -144,7 +144,24 @@ def create_app() -> FastAPI:
         return response
 
     if _DIST_DIR.is_dir() and (_DIST_DIR / "index.html").is_file():
-        app.mount("/assets", StaticFiles(directory=_DIST_DIR / "assets"), name="assets")
+        assets_dir = _DIST_DIR / "assets"
+        if assets_dir.is_dir():
+            app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+        # Root-level static files from Vite public/ (favicon, logo, etc.)
+        @app.get("/favicon.svg", include_in_schema=False)
+        def favicon_svg() -> Response:
+            path = _DIST_DIR / "favicon.svg"
+            if path.is_file():
+                return FileResponse(path, media_type="image/svg+xml")
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
+
+        @app.get("/logo.svg", include_in_schema=False)
+        def logo_svg() -> Response:
+            path = _DIST_DIR / "logo.svg"
+            if path.is_file():
+                return FileResponse(path, media_type="image/svg+xml")
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
 
         @app.get("/{full_path:path}", include_in_schema=False)
         def spa(full_path: str) -> Response:

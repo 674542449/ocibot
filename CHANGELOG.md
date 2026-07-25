@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.12 — 2026-07-26
+
+### 体验
+- 系统更新「更新日志」以中文摘要展示（git/docker/compose 常见输出翻译）
+- 新增站点 Logo / Favicon（侧栏、登录页、浏览器标签）
+
+### 升级
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 0.4.12
+```
+
+---
+
 ## 0.4.11 — 2026-07-26
 
 ### 修复

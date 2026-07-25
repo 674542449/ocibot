@@ -2,7 +2,7 @@
   <div class="login-page">
     <form class="login-card stack" @submit.prevent="submit">
       <div class="login-brand">
-        <div class="logo">O</div>
+        <img class="logo-img" src="/logo.svg" width="44" height="44" alt="OCIBot" />
         <div>
           <h1>OCIBot</h1>
           <p class="muted">Oracle Cloud 多租户实例管理</p>
@@ -128,6 +128,15 @@ async function submit() {
   display: flex;
   gap: 0.85rem;
   align-items: center;
+}
+
+.logo-img {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  display: block;
+  box-shadow: 0 6px 16px rgba(51, 112, 255, 0.35);
+  flex-shrink: 0;
 }
 
 .logo {

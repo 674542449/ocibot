@@ -20,7 +20,7 @@
 
     <aside class="sidebar">
       <div class="brand">
-        <div class="logo">O</div>
+        <img class="logo-img" src="/logo.svg" width="36" height="36" alt="OCIBot" />
         <div class="brand-text">
           <div class="title">OCIBot</div>
           <div class="muted small truncate">
@@ -275,6 +275,16 @@ onBeforeUnmount(() => {
 .brand-text {
   min-width: 0;
   flex: 1;
+}
+
+.logo-img {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  flex-shrink: 0;
+  display: block;
+  box-shadow: 0 4px 12px rgba(51, 112, 255, 0.35);
+  background: transparent;
 }
 
 .logo {
