@@ -239,7 +239,7 @@ onBeforeUnmount(() => {
   grid-template-columns: var(--sidebar-w) 1fr;
   min-height: 100vh;
   min-height: 100dvh;
-  background: var(--bg);
+  background: transparent;
 }
 
 .mobile-topbar,
@@ -251,7 +251,7 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   background: var(--panel);
-  border-right: 1px solid var(--border);
+  border-right: 1px solid var(--glass-border);
   position: sticky;
   top: 0;
   height: 100vh;
@@ -259,6 +259,9 @@ onBeforeUnmount(() => {
   max-height: 100dvh;
   overflow: hidden;
   z-index: 20;
+  backdrop-filter: blur(22px) saturate(1.4);
+  -webkit-backdrop-filter: blur(22px) saturate(1.4);
+  box-shadow: var(--glass-highlight), 4px 0 24px rgba(15, 23, 42, 0.04);
 }
 
 .brand {
@@ -332,18 +335,19 @@ onBeforeUnmount(() => {
 .nav a {
   color: var(--text-secondary);
   padding: 0.55rem 0.7rem;
-  border-radius: 8px;
-  border: none;
+  border-radius: 12px;
+  border: 1px solid transparent;
   min-height: 40px;
   display: flex;
   align-items: center;
   gap: 0.55rem;
   font-weight: 500;
-  transition: background 0.12s ease, color 0.12s ease;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease,
+    box-shadow 0.12s ease;
 }
 
 .nav a:hover {
-  background: var(--panel-2);
+  background: rgba(255, 255, 255, 0.45);
   color: var(--text);
 }
 
@@ -351,6 +355,8 @@ onBeforeUnmount(() => {
   background: var(--accent-soft);
   color: var(--accent);
   font-weight: 600;
+  border-color: rgba(51, 112, 255, 0.12);
+  box-shadow: var(--glass-highlight);
 }
 
 .nav-ico {
@@ -444,11 +450,11 @@ onBeforeUnmount(() => {
     position: sticky;
     top: 0;
     z-index: 40;
-    background: color-mix(in srgb, var(--panel) 92%, transparent);
-    border-bottom: 1px solid var(--border);
+    background: color-mix(in srgb, var(--panel) 78%, transparent);
+    border-bottom: 1px solid var(--glass-border);
     padding: 0.4rem 0.55rem;
     padding-top: max(0.4rem, env(safe-area-inset-top));
-    backdrop-filter: blur(12px);
+    backdrop-filter: blur(18px) saturate(1.35);
   }
 
   .mobile-brand {

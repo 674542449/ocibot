@@ -112,7 +112,12 @@
     <!-- Metrics -->
     <div v-if="tab === 'metrics'" class="card stack">
       <div class="row" style="justify-content: space-between">
-        <h3 style="margin: 0">监控</h3>
+        <div>
+          <h3 style="margin: 0">监控</h3>
+          <p class="muted" style="margin: 0.2rem 0 0; font-size: 12px">
+            鼠标移到曲线上可查看该时刻具体数值
+          </p>
+        </div>
         <div class="row">
           <select v-model.number="metricHours" style="width: auto" @change="loadMetrics">
             <option :value="1">1 小时</option>
@@ -126,18 +131,72 @@
       </div>
       <p class="muted" style="margin: 0; font-size: 12px">{{ metricsMsg }}</p>
       <div class="metrics-grid">
-        <div v-for="key in metricKeys" :key="key" class="metric-card">
-          <div class="muted" style="font-size: 12px">{{ metricLabel(key) }}</div>
-          <svg :viewBox="`0 0 ${svgW} ${svgH}`" class="spark">
-            <polyline
-              fill="none"
-              :stroke="metricColor(key)"
-              stroke-width="2"
-              :points="sparkPoints(metricsSeries[key] || [])"
-            />
-          </svg>
-          <div class="muted" style="font-size: 11px">
-            点 {{ (metricsSeries[key] || []).length }} · 末值
+        <div
+          v-for="key in metricKeys"
+          :key="key"
+          class="metric-card"
+          @mousemove="onMetricHover($event, key)"
+          @mouseleave="clearMetricHover(key)"
+          @touchstart.passive="onMetricHover($event, key)"
+          @touchmove.passive="onMetricHover($event, key)"
+          @touchend="clearMetricHover(key)"
+        >
+          <div class="metric-head">
+            <span class="muted" style="font-size: 12px">{{ metricLabel(key) }}</span>
+            <strong class="metric-live">{{ hoverText(key) }}</strong>
+          </div>
+          <div class="spark-wrap" :ref="(el) => setSparkEl(key, el)">
+            <svg :viewBox="`0 0 ${svgW} ${svgH}`" class="spark" preserveAspectRatio="none">
+              <defs>
+                <linearGradient :id="`g-${key}`" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" :stop-color="metricColor(key)" stop-opacity="0.35" />
+                  <stop offset="100%" :stop-color="metricColor(key)" stop-opacity="0.02" />
+                </linearGradient>
+              </defs>
+              <polygon
+                v-if="(metricsSeries[key] || []).length > 1"
+                :fill="`url(#g-${key})`"
+                :points="sparkArea(metricsSeries[key] || [])"
+              />
+              <polyline
+                fill="none"
+                :stroke="metricColor(key)"
+                stroke-width="2.2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                :points="sparkPoints(metricsSeries[key] || [])"
+              />
+              <circle
+                v-if="metricHover[key]"
+                :cx="metricHover[key]!.x"
+                :cy="metricHover[key]!.y"
+                r="4"
+                :fill="metricColor(key)"
+                stroke="#fff"
+                stroke-width="1.5"
+              />
+              <line
+                v-if="metricHover[key]"
+                :x1="metricHover[key]!.x"
+                :x2="metricHover[key]!.x"
+                y1="4"
+                :y2="svgH - 4"
+                :stroke="metricColor(key)"
+                stroke-opacity="0.35"
+                stroke-dasharray="3 3"
+              />
+            </svg>
+            <div
+              v-if="metricHover[key]"
+              class="metric-tip"
+              :style="{ left: metricHover[key]!.tipLeft }"
+            >
+              <div class="tip-val">{{ metricHover[key]!.valueText }}</div>
+              <div class="tip-time">{{ metricHover[key]!.timeText }}</div>
+            </div>
+          </div>
+          <div class="muted metric-foot">
+            {{ (metricsSeries[key] || []).length }} 个采样 · 最新
             {{ lastValue(metricsSeries[key] || [], key) }}
           </div>
         </div>
@@ -826,7 +885,22 @@ const metricsMsg = ref('')
 const metricsSeries = ref<Record<string, [string | null, number][]>>({})
 const metricKeys = ['cpu', 'memory', 'net_in', 'net_out']
 const svgW = 320
-const svgH = 80
+const svgH = 96
+
+type MetricHover = {
+  x: number
+  y: number
+  tipLeft: string
+  valueText: string
+  timeText: string
+  index: number
+}
+const metricHover = ref<Record<string, MetricHover | null>>({})
+const sparkEls: Record<string, HTMLElement | null> = {}
+
+function setSparkEl(key: string, el: unknown) {
+  sparkEls[key] = (el as HTMLElement) || null
+}
 
 function metricLabel(k: string) {
   return (
@@ -848,29 +922,109 @@ function metricColor(k: string) {
     } as Record<string, string>
   )[k]
 }
-function sparkPoints(points: any[]) {
-  const vals = points.map((p) => Number(p?.[1] ?? 0))
-  if (!vals.length) return ''
-  const max = Math.max(...vals, 1)
-  const min = Math.min(...vals, 0)
-  const span = Math.max(max - min, 1e-9)
-  return vals
-    .map((v, i) => {
-      const x = (i / Math.max(vals.length - 1, 1)) * (svgW - 8) + 4
-      const y = svgH - 6 - ((v - min) / span) * (svgH - 12)
-      return `${x.toFixed(1)},${y.toFixed(1)}`
-    })
-    .join(' ')
-}
-function lastValue(points: any[], key: string) {
-  if (!points.length) return '—'
-  const v = Number(points[points.length - 1]?.[1] ?? 0)
+
+function formatMetricValue(v: number, key: string) {
   if (key.startsWith('net')) {
     if (v > 1e6) return (v / 1e6).toFixed(2) + ' MB/s'
     if (v > 1e3) return (v / 1e3).toFixed(1) + ' KB/s'
     return v.toFixed(0) + ' B/s'
   }
   return v.toFixed(1) + '%'
+}
+
+function formatMetricTime(ts: string | null | undefined) {
+  if (!ts) return '—'
+  try {
+    const d = new Date(ts)
+    if (Number.isNaN(d.getTime())) return String(ts).slice(0, 19)
+    return d.toLocaleString()
+  } catch {
+    return String(ts).slice(0, 19)
+  }
+}
+
+function sparkLayout(points: any[]) {
+  const vals = points.map((p) => Number(p?.[1] ?? 0))
+  if (!vals.length) {
+    return { vals: [] as number[], max: 1, min: 0, span: 1 }
+  }
+  const max = Math.max(...vals, 1)
+  const min = Math.min(...vals, 0)
+  const span = Math.max(max - min, 1e-9)
+  return { vals, max, min, span }
+}
+
+function sparkXY(points: any[], index: number) {
+  const { vals, min, span } = sparkLayout(points)
+  if (!vals.length) return { x: 0, y: svgH / 2 }
+  const i = Math.max(0, Math.min(index, vals.length - 1))
+  const x = (i / Math.max(vals.length - 1, 1)) * (svgW - 8) + 4
+  const y = svgH - 8 - ((vals[i] - min) / span) * (svgH - 16)
+  return { x, y }
+}
+
+function sparkPoints(points: any[]) {
+  const { vals, min, span } = sparkLayout(points)
+  if (!vals.length) return ''
+  return vals
+    .map((v, i) => {
+      const x = (i / Math.max(vals.length - 1, 1)) * (svgW - 8) + 4
+      const y = svgH - 8 - ((v - min) / span) * (svgH - 16)
+      return `${x.toFixed(1)},${y.toFixed(1)}`
+    })
+    .join(' ')
+}
+
+function sparkArea(points: any[]) {
+  const line = sparkPoints(points)
+  if (!line) return ''
+  const n = points.length
+  const x0 = 4
+  const x1 = (Math.max(n - 1, 1) / Math.max(n - 1, 1)) * (svgW - 8) + 4
+  return `${x0.toFixed(1)},${(svgH - 4).toFixed(1)} ${line} ${x1.toFixed(1)},${(svgH - 4).toFixed(1)}`
+}
+
+function lastValue(points: any[], key: string) {
+  if (!points.length) return '—'
+  const v = Number(points[points.length - 1]?.[1] ?? 0)
+  return formatMetricValue(v, key)
+}
+
+function hoverText(key: string) {
+  const h = metricHover.value[key]
+  if (h) return h.valueText
+  return lastValue(metricsSeries.value[key] || [], key)
+}
+
+function clearMetricHover(key: string) {
+  metricHover.value = { ...metricHover.value, [key]: null }
+}
+
+function onMetricHover(ev: MouseEvent | TouchEvent, key: string) {
+  const el = sparkEls[key]
+  const points = metricsSeries.value[key] || []
+  if (!el || points.length === 0) return
+  const rect = el.getBoundingClientRect()
+  let clientX = 0
+  if ('touches' in ev && ev.touches.length) clientX = ev.touches[0].clientX
+  else if ('clientX' in ev) clientX = (ev as MouseEvent).clientX
+  const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / Math.max(rect.width, 1)))
+  const index = Math.round(ratio * Math.max(points.length - 1, 0))
+  const { x, y } = sparkXY(points, index)
+  const raw = points[index] || []
+  const value = Number(raw?.[1] ?? 0)
+  const tipPct = Math.min(86, Math.max(8, (x / svgW) * 100))
+  metricHover.value = {
+    ...metricHover.value,
+    [key]: {
+      x,
+      y,
+      tipLeft: `${tipPct}%`,
+      valueText: formatMetricValue(value, key),
+      timeText: formatMetricTime(raw?.[0] ?? null),
+      index,
+    },
+  }
 }
 
 async function loadMetrics() {
@@ -890,6 +1044,7 @@ async function loadMetrics() {
       )
     }
     metricsSeries.value = out
+    metricHover.value = {}
   } catch (e: any) {
     metricsMsg.value = e?.message || '加载监控失败'
   } finally {
@@ -1260,7 +1415,7 @@ watch([tenantId, instanceId], async () => {
 .metrics-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 0.75rem;
+  gap: 0.85rem;
 }
 @media (max-width: 700px) {
   .metrics-grid {
@@ -1268,16 +1423,75 @@ watch([tenantId, instanceId], async () => {
   }
 }
 .metric-card {
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 0.5rem 0.65rem;
-  background: var(--input-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: 14px;
+  padding: 0.7rem 0.8rem 0.55rem;
+  background: rgba(255, 255, 255, 0.45);
   min-width: 0;
+  box-shadow: var(--glass-highlight);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  position: relative;
+}
+html[data-theme='dark'] .metric-card {
+  background: rgba(255, 255, 255, 0.04);
+}
+.metric-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin-bottom: 0.35rem;
+}
+.metric-live {
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+.spark-wrap {
+  position: relative;
+  width: 100%;
+  cursor: crosshair;
 }
 .spark {
   width: 100%;
-  height: 80px;
+  height: 96px;
   display: block;
+}
+.metric-tip {
+  position: absolute;
+  top: 0.25rem;
+  transform: translateX(-50%);
+  pointer-events: none;
+  z-index: 2;
+  padding: 0.3rem 0.5rem;
+  border-radius: 10px;
+  background: rgba(29, 33, 41, 0.82);
+  color: #fff;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.18);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  white-space: nowrap;
+  text-align: center;
+  min-width: 4.5rem;
+}
+html[data-theme='dark'] .metric-tip {
+  background: rgba(15, 18, 28, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+.tip-val {
+  font-size: 13px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+.tip-time {
+  font-size: 10px;
+  opacity: 0.78;
+  margin-top: 0.1rem;
+}
+.metric-foot {
+  font-size: 11px;
+  margin-top: 0.25rem;
 }
 .ip-lines {
   font-size: 13px;

@@ -32,10 +32,12 @@
 
     <div v-if="selected.size > 0" class="card row batch-bar">
       <strong>已选 {{ selected.size }} 台</strong>
-      <button :disabled="batchBusy" @click="batchPower('START')">批量开机</button>
-      <button :disabled="batchBusy" @click="batchPower('SOFTSTOP')">批量关机</button>
-      <button :disabled="batchBusy" @click="batchPower('SOFTRESET')">批量重启</button>
-      <button :disabled="batchBusy" @click="selected.clear()">取消选择</button>
+      <div class="btn-group">
+        <button type="button" class="ghost" :disabled="batchBusy" @click="batchPower('START')">批量开机</button>
+        <button type="button" class="ghost" :disabled="batchBusy" @click="batchPower('SOFTSTOP')">批量关机</button>
+        <button type="button" class="ghost" :disabled="batchBusy" @click="batchPower('SOFTRESET')">批量重启</button>
+        <button type="button" class="ghost" :disabled="batchBusy" @click="selected.clear()">取消选择</button>
+      </div>
       <span v-if="batchBusy" class="muted" style="font-size: 12px">{{ batchProgress }}</span>
     </div>
 
@@ -131,16 +133,64 @@
               >{{ ins.private_ip || '—' }}</span>
             </td>
             <td>
-              <div class="actions-row">
+              <div class="btn-group" role="group" :aria-label="`${ins.display_name} 操作`">
                 <router-link :to="`/instances/${ins.tenant_id || tenantId}/${ins.id}`">
-                  <button type="button">详情</button>
+                  <button type="button" class="ghost" title="查看详情">详情</button>
                 </router-link>
-                <button :disabled="acting === ins.id" @click="power(ins, 'START')">开机</button>
-                <button :disabled="acting === ins.id" @click="power(ins, 'SOFTSTOP')">关机</button>
-                <button :disabled="acting === ins.id" @click="power(ins, 'SOFTRESET')">重启</button>
-                <button :disabled="acting === ins.id" @click="rename(ins)">重命名</button>
-                <button :disabled="acting === ins.id" @click="replaceIp(ins)">换IP</button>
-                <button class="danger" :disabled="acting === ins.id" @click="terminate(ins)">终止</button>
+                <button
+                  type="button"
+                  class="ghost"
+                  :disabled="acting === ins.id"
+                  title="开机"
+                  @click="power(ins, 'START')"
+                >
+                  开机
+                </button>
+                <button
+                  type="button"
+                  class="ghost"
+                  :disabled="acting === ins.id"
+                  title="软关机"
+                  @click="power(ins, 'SOFTSTOP')"
+                >
+                  关机
+                </button>
+                <button
+                  type="button"
+                  class="ghost"
+                  :disabled="acting === ins.id"
+                  title="软重启"
+                  @click="power(ins, 'SOFTRESET')"
+                >
+                  重启
+                </button>
+                <button
+                  type="button"
+                  class="ghost"
+                  :disabled="acting === ins.id"
+                  title="重命名"
+                  @click="rename(ins)"
+                >
+                  重命名
+                </button>
+                <button
+                  type="button"
+                  class="ghost"
+                  :disabled="acting === ins.id"
+                  title="更换临时公网 IP"
+                  @click="replaceIp(ins)"
+                >
+                  换IP
+                </button>
+                <button
+                  type="button"
+                  class="danger"
+                  :disabled="acting === ins.id"
+                  title="终止实例"
+                  @click="terminate(ins)"
+                >
+                  终止
+                </button>
               </div>
             </td>
           </tr>
@@ -158,6 +208,10 @@
   position: sticky;
   top: 0.5rem;
   z-index: 5;
+  gap: 0.75rem;
+}
+.batch-bar strong {
+  font-size: 13px;
 }
 </style>
 
