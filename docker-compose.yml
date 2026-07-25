@@ -50,14 +50,17 @@ services:
       OCIBOT_DB_MAX_OVERFLOW: ${OCIBOT_DB_MAX_OVERFLOW:-20}
       OCIBOT_REQUIRE_SECURE_SECRETS: ${OCIBOT_REQUIRE_SECURE_SECRETS:-0}
       # In-panel self-update (admin). Requires mounts below.
+      # OCIBOT_HOST_REPO must be the absolute path on the *host* (set by install.sh).
       OCIBOT_UPDATE_ENABLED: ${OCIBOT_UPDATE_ENABLED:-1}
       OCIBOT_UPDATE_REPO: ${OCIBOT_UPDATE_REPO:-674542449/ocibot}
       OCIBOT_UPDATE_BRANCH: ${OCIBOT_UPDATE_BRANCH:-main}
       OCIBOT_HOST_DIR: /host/ocibot
+      OCIBOT_HOST_REPO: ${OCIBOT_HOST_REPO:-/root/ocibot}
       OCIBOT_GIT_SHA: ${OCIBOT_GIT_SHA:-unknown}
+      OCIBOT_DOCKER_CLI_IMAGE: ${OCIBOT_DOCKER_CLI_IMAGE:-docker:27-cli}
     volumes:
-      # Host repo (git pull) + Docker socket (compose rebuild). Socket is powerful — keep admin-only.
-      - ${OCIBOT_HOST_REPO:-.}:/host/ocibot
+      # Same absolute path on host and in helper containers (critical for self-update).
+      - ${OCIBOT_HOST_REPO:-/root/ocibot}:/host/ocibot
       - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "${OCIBOT_PORT:-8000}:8000"

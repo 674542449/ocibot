@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.4.3 — 2026-07-26
+
+### 修复 · 在线更新 build 失败（加强）
+- **正确解析宿主机仓库绝对路径**（`/proc/self/mountinfo` + `OCIBOT_HOST_REPO`），避免 bind 到错误目录
+- compose 通过 `docker run docker:27-cli` 执行（自带 compose 插件）
+- 构建前检查磁盘空间、预拉 cli 镜像；失败时给出可读中文原因
+- 从 `web/.env` 注入 `POSTGRES_PASSWORD` 等变量，避免 compose 插值缺参
+- install.sh 导出**绝对路径** `OCIBOT_HOST_REPO`，并预拉 `docker:27-cli`
+- compose 默认挂载改为 `${OCIBOT_HOST_REPO:-/root/ocibot}`（不再用相对 `.`）
+
+### 服务器请先命令行升到本版
+```bash
+cd ~/ocibot
+cp -a web/.env /tmp/ocibot.env.bak
+git fetch origin main && git reset --hard origin/main
+cp -a /tmp/ocibot.env.bak web/.env
+# 确认绝对路径
+export OCIBOT_HOST_REPO="$(pwd -P)"
+bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 0.4.3
+```
+
+若仍失败，把管理页「更新日志」全文发出来。
+
+---
+
 ## 0.4.2 — 2026-07-26
 
 ### 变更

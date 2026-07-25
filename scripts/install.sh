@@ -119,15 +119,26 @@ compose() {
 }
 
 export_build_env() {
-  # Pass host absolute path + current commit into compose (self-update + version badge).
-  export OCIBOT_HOST_REPO="$REPO_DIR"
+  # Absolute host path is required for in-panel self-update (docker run -v).
+  # Resolve REPO_DIR to a real absolute path so containers bind the same location.
+  local abs
+  abs="$(cd "$REPO_DIR" && pwd -P 2>/dev/null || cd "$REPO_DIR" && pwd)"
+  REPO_DIR="$abs"
+  export OCIBOT_HOST_REPO="$abs"
   export OCIBOT_UPDATE_ENABLED="${OCIBOT_UPDATE_ENABLED:-1}"
   export OCIBOT_UPDATE_BRANCH="${OCIBOT_UPDATE_BRANCH:-$BRANCH}"
+  export OCIBOT_DOCKER_CLI_IMAGE="${OCIBOT_DOCKER_CLI_IMAGE:-docker:27-cli}"
   if [ -d "$REPO_DIR/.git" ] && command -v git >/dev/null 2>&1; then
     export OCIBOT_GIT_SHA
     OCIBOT_GIT_SHA="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
   else
     export OCIBOT_GIT_SHA="${OCIBOT_GIT_SHA:-unknown}"
+  fi
+  log "OCIBOT_HOST_REPO=$OCIBOT_HOST_REPO"
+  # Pre-pull helper image used by in-panel updates (best-effort).
+  if command -v docker >/dev/null 2>&1; then
+    docker pull "$OCIBOT_DOCKER_CLI_IMAGE" >/dev/null 2>&1 || \
+      warn "预拉取 $OCIBOT_DOCKER_CLI_IMAGE 失败（在线更新时会再试）"
   fi
 }
 
