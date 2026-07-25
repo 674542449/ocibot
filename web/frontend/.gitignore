@@ -1,0 +1,8 @@
+# OCIBot Web — frontend (Vue 3 + Vite + TypeScript)
+
+node_modules
+dist
+.DS_Store
+*.local
+.env
+.env.*

@@ -1,0 +1,1213 @@
+<template>
+  <div class="stack">
+    <div class="row" style="justify-content: space-between">
+      <div>
+        <h2 style="margin: 0">实例详情</h2>
+        <p class="muted" style="margin: 0.2rem 0 0">{{ title }}</p>
+      </div>
+      <div class="row">
+        <button @click="refreshAll" :disabled="loading">刷新</button>
+        <router-link to="/"><button type="button">返回列表</button></router-link>
+      </div>
+    </div>
+
+    <div v-if="error" class="error-box">{{ error }}</div>
+    <div v-if="msg" class="success-box">{{ msg }}</div>
+
+    <div class="card stack" v-if="instance">
+      <div class="grid-2">
+        <div>
+          <div class="muted" style="font-size: 12px">名称 / 状态</div>
+          <div style="font-weight: 700">
+            {{ instance.display_name }}
+            <span class="badge" :class="stateClass(instance.lifecycle_state)">{{
+              instance.lifecycle_state
+            }}</span>
+          </div>
+          <div
+            class="muted copyable"
+            style="font-size: 11px; word-break: break-all"
+            title="双击复制 OCID"
+            @dblclick="copy(instance.id)"
+          >
+            {{ instance.id }}
+          </div>
+        </div>
+        <div>
+          <div class="muted" style="font-size: 12px">Shape / 网络（双击 IP 可复制）</div>
+          <div>
+            {{ instance.shape }}
+            <span v-if="instance.free_tier_tag" class="badge">{{ instance.free_tier_tag }}</span>
+          </div>
+          <div class="ip-lines">
+            <div>
+              公网
+              <span
+                class="copyable"
+                :class="{ empty: !instance.public_ip }"
+                title="双击复制"
+                @dblclick="copyIp(instance.public_ip)"
+                >{{ instance.public_ip || '—' }}</span
+              >
+            </div>
+            <div>
+              私网
+              <span
+                class="copyable"
+                :class="{ empty: !instance.private_ip }"
+                title="双击复制"
+                @dblclick="copyIp(instance.private_ip)"
+                >{{ instance.private_ip || '—' }}</span
+              >
+            </div>
+            <div v-if="instance.ipv6_addresses?.length">
+              IPv6
+              <span
+                v-for="ip6 in instance.ipv6_addresses"
+                :key="ip6"
+                class="copyable ipv6-chip"
+                title="双击复制"
+                @dblclick="copyIp(ip6)"
+                >{{ ip6 }}</span
+              >
+            </div>
+            <div v-else class="muted" style="font-size: 12px">IPv6 —</div>
+          </div>
+        </div>
+      </div>
+      <div class="row">
+        <button :disabled="acting" @click="power('START')">开机</button>
+        <button :disabled="acting" @click="power('SOFTSTOP')">关机</button>
+        <button :disabled="acting" @click="power('SOFTRESET')">重启</button>
+        <button :disabled="acting" @click="doRename">重命名</button>
+        <button :disabled="acting" @click="doReplaceIp">换公网IP</button>
+        <button :disabled="acting" @click="doIpv6">分配 IPv6</button>
+        <button :disabled="acting" @click="doCreateImage">制作镜像</button>
+        <button class="danger" :disabled="acting" @click="doTerminate">终止</button>
+      </div>
+    </div>
+
+    <!-- Tabs -->
+    <div class="row tab-row">
+      <button
+        v-for="t in tabs"
+        :key="t.id"
+        type="button"
+        :class="{ primary: tab === t.id }"
+        @click="tab = t.id"
+      >
+        {{ t.label }}
+      </button>
+    </div>
+
+    <!-- Metrics -->
+    <div v-if="tab === 'metrics'" class="card stack">
+      <div class="row" style="justify-content: space-between">
+        <h3 style="margin: 0">监控</h3>
+        <div class="row">
+          <select v-model.number="metricHours" style="width: auto" @change="loadMetrics">
+            <option :value="1">1 小时</option>
+            <option :value="3">3 小时</option>
+            <option :value="6">6 小时</option>
+            <option :value="12">12 小时</option>
+            <option :value="24">24 小时</option>
+          </select>
+          <button @click="loadMetrics" :disabled="loadingMetrics">刷新</button>
+        </div>
+      </div>
+      <p class="muted" style="margin: 0; font-size: 12px">{{ metricsMsg }}</p>
+      <div class="metrics-grid">
+        <div v-for="key in metricKeys" :key="key" class="metric-card">
+          <div class="muted" style="font-size: 12px">{{ metricLabel(key) }}</div>
+          <svg :viewBox="`0 0 ${svgW} ${svgH}`" class="spark">
+            <polyline
+              fill="none"
+              :stroke="metricColor(key)"
+              stroke-width="2"
+              :points="sparkPoints(metricsSeries[key] || [])"
+            />
+          </svg>
+          <div class="muted" style="font-size: 11px">
+            点 {{ (metricsSeries[key] || []).length }} · 末值
+            {{ lastValue(metricsSeries[key] || [], key) }}
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Console -->
+    <div v-if="tab === 'console'" class="card stack">
+      <h3 style="margin: 0">串口 / VNC 控制台</h3>
+      <p class="muted" style="margin: 0; font-size: 13px">
+        创建控制台连接需要一条 SSH 公钥。创建后用返回的 SSH 命令连接串口或 VNC。
+      </p>
+      <div class="field">
+        <label>SSH 公钥</label>
+        <div class="row" style="margin-bottom: 0.4rem">
+          <button type="button" @click="pickConsoleKey">选择 .pub…</button>
+        </div>
+        <textarea v-model="consoleKey" rows="3" spellcheck="false"></textarea>
+      </div>
+      <div class="row">
+        <button class="primary" :disabled="consoleBusy" @click="createConsole">
+          {{ consoleBusy ? '创建中…' : '创建控制台连接' }}
+        </button>
+        <button :disabled="consoleBusy" @click="loadConsole">刷新列表</button>
+      </div>
+      <div v-for="c in consoleList" :key="c.id" class="card" style="padding: 0.75rem">
+        <div class="row" style="justify-content: space-between">
+          <span class="badge">{{ c.lifecycle_state || '—' }}</span>
+          <button class="danger" @click="deleteConsole(c.id)">删除</button>
+        </div>
+        <div class="field" style="margin-top: 0.5rem">
+          <label>Serial SSH</label>
+          <textarea readonly rows="2" :value="c.serial"></textarea>
+          <button style="margin-top: 0.25rem" @click="copy(c.serial)">复制</button>
+        </div>
+        <div class="field">
+          <label>VNC SSH</label>
+          <textarea readonly rows="2" :value="c.vnc"></textarea>
+          <button style="margin-top: 0.25rem" @click="copy(c.vnc)">复制</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Firewall -->
+    <div v-if="tab === 'firewall'" class="card stack">
+      <div class="row" style="justify-content: space-between">
+        <h3 style="margin: 0">防火墙 (NSG)</h3>
+        <div class="row">
+          <button @click="loadFirewall">刷新</button>
+          <button class="danger" :disabled="fwBusy" @click="openAllFirewall">一键全开放</button>
+        </div>
+      </div>
+      <p class="muted" style="margin: 0; font-size: 12px">{{ fwMsg }}</p>
+      <div v-for="g in fwGroups" :key="g.id" class="card" style="padding: 0.75rem">
+        <div style="font-weight: 600">
+          {{ g.display_name }}
+          <span v-if="g.is_managed" class="badge">managed</span>
+        </div>
+        <div class="muted" style="font-size: 11px; word-break: break-all">{{ g.id }}</div>
+        <div class="table-wrap" style="margin-top: 0.5rem">
+          <table>
+            <thead>
+              <tr>
+                <th>方向</th>
+                <th>协议</th>
+                <th>CIDR</th>
+                <th>端口</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="r in g.rules || []" :key="r.id">
+                <td>{{ r.direction_label || r.direction }}</td>
+                <td>{{ r.protocol_label || r.protocol }}</td>
+                <td>{{ r.cidr }}</td>
+                <td>{{ r.port }}</td>
+                <td>
+                  <button class="danger" @click="deleteRule(g.id, r.id)">删</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="grid-2" style="margin-top: 0.5rem">
+          <div class="field">
+            <label>方向</label>
+            <select v-model="ruleForm.direction">
+              <option value="INGRESS">入站</option>
+              <option value="EGRESS">出站</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>协议</label>
+            <select v-model="ruleForm.protocol">
+              <option value="all">全部</option>
+              <option value="6">TCP</option>
+              <option value="17">UDP</option>
+              <option value="1">ICMP</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>CIDR</label>
+            <input v-model="ruleForm.cidr" />
+          </div>
+          <div class="field">
+            <label>端口（TCP/UDP）</label>
+            <input v-model.number="ruleForm.port_min" type="number" placeholder="例如 22" />
+          </div>
+        </div>
+        <button class="primary" style="margin-top: 0.4rem" @click="addRule(g.id)">添加规则</button>
+      </div>
+    </div>
+
+    <!-- Reserved IP -->
+    <div v-if="tab === 'network'" class="card stack">
+      <div class="row" style="justify-content: space-between">
+        <div>
+          <h3 style="margin: 0">保留公网 IP</h3>
+          <p class="muted" style="margin: 0.2rem 0 0; font-size: 12px">
+            保留 IP 与实例解绑后不会丢失，可再次绑定；绑定时会释放实例当前的临时（EPHEMERAL）公网 IP。
+          </p>
+        </div>
+        <div class="row">
+          <button :disabled="ripBusy" @click="loadReservedIps">刷新</button>
+          <button class="primary" :disabled="ripBusy" @click="createReservedIp">新建保留 IP</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>IP 地址</th>
+              <th>名称</th>
+              <th>状态</th>
+              <th>绑定</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-if="reservedIps.length === 0">
+              <td colspan="5" class="muted">该区域暂无保留 IP。「新建保留 IP」后即可绑定到实例。</td>
+            </tr>
+            <tr v-for="ip in reservedIps" :key="ip.id">
+              <td class="copyable" title="双击复制" @dblclick="copy(ip.ip_address)">{{ ip.ip_address }}</td>
+              <td>{{ ip.display_name || '—' }}</td>
+              <td><span class="badge">{{ ip.lifecycle_state }}</span></td>
+              <td>
+                <span class="badge" :class="ip.assigned ? 'running' : ''">
+                  {{ ip.assigned ? '已绑定' : '未绑定' }}
+                </span>
+              </td>
+              <td>
+                <div class="row">
+                  <button v-if="!ip.assigned" :disabled="ripBusy" @click="attachReservedIp(ip)">
+                    绑定到本实例
+                  </button>
+                  <button v-if="ip.assigned" :disabled="ripBusy" @click="detachReservedIp(ip)">解绑</button>
+                  <button v-if="!ip.assigned" class="danger" :disabled="ripBusy" @click="deleteReservedIp(ip)">
+                    删除
+                  </button>
+                </div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Boot / Shape -->
+    <div v-if="tab === 'volume'" class="card stack">
+      <div class="row" style="justify-content: space-between">
+        <h3 style="margin: 0">引导卷管理</h3>
+        <button @click="loadBoot" :disabled="bootBusy">{{ bootBusy ? '读取中…' : '刷新状态' }}</button>
+      </div>
+
+      <div v-if="bootInfo" class="boot-status card" style="padding: 0.75rem">
+        <div class="grid-2">
+          <div>
+            <div class="muted" style="font-size: 12px">配置容量</div>
+            <div style="font-size: 1.4rem; font-weight: 700">{{ bootInfo.size_in_gbs }} GB</div>
+            <div class="muted" style="font-size: 12px">OCI 控制面配置大小（非系统内已用空间）</div>
+          </div>
+          <div>
+            <div class="muted" style="font-size: 12px">性能</div>
+            <div style="font-size: 1.1rem; font-weight: 600">
+              {{ bootInfo.vpus_per_gb }} VPUs/GB
+              <span class="badge">{{ bootInfo.performance_label || perfLabel(bootInfo.vpus_per_gb) }}</span>
+            </div>
+          </div>
+          <div>
+            <div class="muted" style="font-size: 12px">生命周期</div>
+            <div>
+              <span class="badge" :class="bootStateClass(bootInfo.lifecycle_state)">{{
+                bootInfo.lifecycle_state || '—'
+              }}</span>
+            </div>
+          </div>
+          <div>
+            <div class="muted" style="font-size: 12px">Hydration（镜像数据同步）</div>
+            <div>
+              <span
+                class="badge"
+                :class="
+                  bootInfo.is_hydrated === true
+                    ? 'running'
+                    : bootInfo.is_hydrated === false
+                      ? 'warn'
+                      : ''
+                "
+              >
+                {{
+                  bootInfo.is_hydrated === true
+                    ? '已完成'
+                    : bootInfo.is_hydrated === false
+                      ? '同步中'
+                      : '未知'
+                }}
+              </span>
+            </div>
+          </div>
+          <div>
+            <div class="muted" style="font-size: 12px">名称</div>
+            <div>{{ bootInfo.display_name || '—' }}</div>
+          </div>
+          <div>
+            <div class="muted" style="font-size: 12px">可用域</div>
+            <div>{{ bootInfo.availability_domain || '—' }}</div>
+          </div>
+          <div style="grid-column: 1 / -1">
+            <div class="muted" style="font-size: 12px">引导卷 OCID（双击复制）</div>
+            <div
+              class="copyable"
+              style="font-size: 12px; word-break: break-all"
+              title="双击复制"
+              @dblclick="copy(bootInfo.boot_volume_id)"
+            >
+              {{ bootInfo.boot_volume_id }}
+            </div>
+          </div>
+          <div v-if="bootInfo.time_created" style="grid-column: 1 / -1">
+            <div class="muted" style="font-size: 12px">创建时间</div>
+            <div style="font-size: 12px">{{ formatTime(bootInfo.time_created) }}</div>
+          </div>
+        </div>
+        <p class="muted" style="margin: 0.6rem 0 0; font-size: 12px">
+          {{ bootInfo.usage_note || '无法通过 API 读取系统内磁盘已用/剩余空间；请登录系统用 df 查看。' }}
+        </p>
+      </div>
+      <div v-else class="muted" style="font-size: 13px">
+        {{ bootBusy ? '正在读取引导卷…' : '尚未加载引导卷信息，点「刷新状态」。' }}
+      </div>
+
+      <h4 style="margin: 0.25rem 0 0">调整引导卷</h4>
+      <div class="grid-2">
+        <div class="field">
+          <label>新大小 GB（≥ 当前且 ≥50，只能扩大）</label>
+          <input v-model.number="bootForm.size_in_gbs" type="number" min="50" />
+        </div>
+        <div class="field">
+          <label>性能 VPUs/GB</label>
+          <select v-model.number="bootForm.vpus_per_gb">
+            <option :value="10">10 平衡</option>
+            <option :value="20">20 较高</option>
+            <option :value="30">30 超高</option>
+            <option :value="60">60</option>
+            <option :value="90">90</option>
+            <option :value="120">120</option>
+          </select>
+        </div>
+      </div>
+      <button class="primary" :disabled="bootBusy" @click="updateBoot">应用引导卷调整</button>
+
+      <div style="border-top: 1px solid var(--border); padding-top: 0.75rem">
+        <div class="row" style="justify-content: space-between">
+          <h4 style="margin: 0">引导卷备份</h4>
+          <div class="row">
+            <button :disabled="backupBusy" @click="loadBackups">刷新</button>
+            <button
+              class="primary"
+              :disabled="backupBusy || !bootInfo?.boot_volume_id"
+              @click="createBackup"
+            >
+              创建备份
+            </button>
+          </div>
+        </div>
+        <p class="muted" style="margin: 0.3rem 0 0.5rem; font-size: 12px">
+          Always Free 含 5 个卷备份名额。恢复思路：可先用「制作镜像」把系统做成自定义镜像，在创建向导中选择重装。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>类型</th>
+                <th>状态</th>
+                <th>大小</th>
+                <th>创建时间</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-if="backups.length === 0">
+                <td colspan="6" class="muted">暂无备份</td>
+              </tr>
+              <tr v-for="b in backups" :key="b.id">
+                <td>{{ b.display_name || b.id.slice(-12) }}</td>
+                <td>{{ b.type }}</td>
+                <td><span class="badge">{{ b.lifecycle_state }}</span></td>
+                <td>{{ b.unique_size_in_gbs ?? b.size_in_gbs ?? '—' }} GB</td>
+                <td class="muted" style="font-size: 12px">{{ formatTime(b.time_created) }}</td>
+                <td><button class="danger" :disabled="backupBusy" @click="deleteBackup(b)">删除</button></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div style="border-top: 1px solid var(--border); padding-top: 0.75rem">
+        <h4 style="margin: 0 0 0.5rem">修改 OCPU / 内存</h4>
+        <template v-if="isFlexShape">
+          <div class="grid-2">
+            <div class="field">
+              <label>OCPU</label>
+              <input v-model.number="shapeForm.ocpus" type="number" min="1" step="1" />
+            </div>
+            <div class="field">
+              <label>内存 GB</label>
+              <input v-model.number="shapeForm.memory_in_gbs" type="number" min="1" step="1" />
+            </div>
+          </div>
+          <button class="primary" :disabled="acting" @click="updateShape">应用规格</button>
+        </template>
+        <p v-else class="muted" style="margin: 0; font-size: 13px">
+          当前 Shape <code>{{ instance?.shape || '—' }}</code> 为固定规格，
+          <strong>不允许修改 OCPU / 内存</strong>。
+          <template v-if="isE2Micro">
+            （VM.Standard.E2.1.Micro 固定 1 OCPU / 1 GB）
+          </template>
+          仅 <code>*.Flex</code>（如 A1.Flex）支持调整。
+        </p>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import api, { type Instance } from '@/api/client'
+import { pickAndReadTextFile } from '@/utils/file'
+
+const route = useRoute()
+const router = useRouter()
+const tenantId = computed(() => String(route.params.tenantId || ''))
+const instanceId = computed(() => String(route.params.instanceId || ''))
+
+const instance = ref<Instance | null>(null)
+const loading = ref(false)
+const acting = ref(false)
+const error = ref('')
+const msg = ref('')
+const tab = ref<'metrics' | 'console' | 'firewall' | 'network' | 'volume'>('metrics')
+const tabs = [
+  { id: 'metrics' as const, label: '监控' },
+  { id: 'console' as const, label: '控制台' },
+  { id: 'firewall' as const, label: '防火墙' },
+  { id: 'network' as const, label: '保留 IP' },
+  { id: 'volume' as const, label: '引导卷/规格' },
+]
+
+// ---- reserved public IPs ----
+type ReservedIp = {
+  id: string
+  ip_address: string
+  display_name: string
+  lifecycle_state: string
+  assigned: boolean
+}
+const reservedIps = ref<ReservedIp[]>([])
+const ripBusy = ref(false)
+
+async function loadReservedIps() {
+  ripBusy.value = true
+  try {
+    const { data } = await api.get(`/tenants/${tenantId.value}/reserved-ips`)
+    reservedIps.value = data.items || []
+  } catch (e: any) {
+    error.value = e?.message || '加载保留 IP 失败'
+  } finally {
+    ripBusy.value = false
+  }
+}
+
+async function createReservedIp() {
+  const name = prompt('保留 IP 名称（可选）', '') ?? ''
+  ripBusy.value = true
+  error.value = ''
+  try {
+    const { data } = await api.post(`/tenants/${tenantId.value}/reserved-ips`, {
+      display_name: name,
+    })
+    if (data.ok) msg.value = data.message
+    else error.value = data.message
+    await loadReservedIps()
+  } catch (e: any) {
+    error.value = e?.message || '创建失败'
+  } finally {
+    ripBusy.value = false
+  }
+}
+
+async function attachReservedIp(ip: ReservedIp) {
+  if (
+    !confirm(
+      `将保留 IP ${ip.ip_address} 绑定到本实例？实例当前的临时公网 IP 会被释放（地址不可找回）。`,
+    )
+  )
+    return
+  ripBusy.value = true
+  error.value = ''
+  try {
+    const { data } = await api.post(
+      `/tenants/${tenantId.value}/instances/${instanceId.value}/reserved-ip/attach`,
+      { public_ip_id: ip.id },
+    )
+    if (data.ok) msg.value = data.message
+    else error.value = data.message
+    await Promise.all([loadReservedIps(), loadInstance()])
+  } catch (e: any) {
+    error.value = e?.message || '绑定失败'
+  } finally {
+    ripBusy.value = false
+  }
+}
+
+async function detachReservedIp(ip: ReservedIp) {
+  if (!confirm(`解绑保留 IP ${ip.ip_address}？地址会保留，可再次绑定。绑定它的实例会暂时没有公网 IPv4。`))
+    return
+  ripBusy.value = true
+  error.value = ''
+  try {
+    const { data } = await api.post(`/tenants/${tenantId.value}/reserved-ips/${ip.id}/detach`)
+    if (data.ok) msg.value = data.message
+    else error.value = data.message
+    await Promise.all([loadReservedIps(), loadInstance()])
+  } catch (e: any) {
+    error.value = e?.message || '解绑失败'
+  } finally {
+    ripBusy.value = false
+  }
+}
+
+async function deleteReservedIp(ip: ReservedIp) {
+  if (!confirm(`删除保留 IP ${ip.ip_address}？删除后该地址彻底释放。`)) return
+  ripBusy.value = true
+  error.value = ''
+  try {
+    const { data } = await api.delete(`/tenants/${tenantId.value}/reserved-ips/${ip.id}`)
+    if (data.ok) msg.value = data.message
+    else error.value = data.message
+    await loadReservedIps()
+  } catch (e: any) {
+    error.value = e?.message || '删除失败'
+  } finally {
+    ripBusy.value = false
+  }
+}
+
+// ---- boot volume backups ----
+type BootBackup = {
+  id: string
+  display_name: string
+  type: string
+  lifecycle_state: string
+  size_in_gbs: number | null
+  unique_size_in_gbs: number | null
+  time_created: string
+}
+const backups = ref<BootBackup[]>([])
+const backupBusy = ref(false)
+
+async function loadBackups() {
+  if (!bootInfo.value?.boot_volume_id) return
+  backupBusy.value = true
+  try {
+    const { data } = await api.get(`/tenants/${tenantId.value}/boot-volume-backups`, {
+      params: { boot_volume_id: bootInfo.value.boot_volume_id },
+    })
+    backups.value = data.items || []
+  } catch (e: any) {
+    error.value = e?.message || '加载备份失败'
+  } finally {
+    backupBusy.value = false
+  }
+}
+
+async function createBackup() {
+  if (!bootInfo.value?.boot_volume_id) return
+  const name = prompt('备份名称', `backup-${new Date().toISOString().slice(0, 10)}`)
+  if (name == null) return
+  backupBusy.value = true
+  error.value = ''
+  try {
+    const { data } = await api.post(`/tenants/${tenantId.value}/boot-volume-backups`, {
+      boot_volume_id: bootInfo.value.boot_volume_id,
+      display_name: name,
+      backup_type: 'INCREMENTAL',
+    })
+    if (data.ok) msg.value = data.message
+    else error.value = data.message
+    await loadBackups()
+  } catch (e: any) {
+    error.value = e?.message || '创建备份失败'
+  } finally {
+    backupBusy.value = false
+  }
+}
+
+async function deleteBackup(b: BootBackup) {
+  if (!confirm(`删除备份「${b.display_name || b.id.slice(-12)}」？不可恢复。`)) return
+  backupBusy.value = true
+  error.value = ''
+  try {
+    const { data } = await api.delete(`/tenants/${tenantId.value}/boot-volume-backups/${b.id}`)
+    if (data.ok) msg.value = data.message
+    else error.value = data.message
+    await loadBackups()
+  } catch (e: any) {
+    error.value = e?.message || '删除失败'
+  } finally {
+    backupBusy.value = false
+  }
+}
+
+// ---- custom image ----
+async function doCreateImage() {
+  const name = prompt(
+    '自定义镜像名称（制作期间实例会短暂进入 CREATING_IMAGE 状态）',
+    `${instance.value?.display_name || 'instance'}-image`,
+  )
+  if (!name) return
+  acting.value = true
+  error.value = ''
+  try {
+    const { data } = await api.post(
+      `/tenants/${tenantId.value}/instances/${instanceId.value}/create-image`,
+      { display_name: name.trim() },
+    )
+    if (data.ok) msg.value = data.message
+    else error.value = data.message
+  } catch (e: any) {
+    error.value = e?.message || '创建镜像失败'
+  } finally {
+    acting.value = false
+  }
+}
+
+const title = computed(
+  () => instance.value?.display_name || instanceId.value.slice(0, 18) + '…',
+)
+
+const isFlexShape = computed(() => {
+  const shape = String(instance.value?.shape || '').toLowerCase()
+  if (!shape) return false
+  if (shape.includes('e2.1.micro') || shape.endsWith('.micro')) return false
+  return shape.endsWith('.flex') || shape.includes('.flex.')
+})
+
+const isE2Micro = computed(() => /e2\.1\.micro/i.test(String(instance.value?.shape || '')))
+
+function stateClass(state: string) {
+  const s = (state || '').toUpperCase()
+  if (s === 'RUNNING') return 'running'
+  if (s === 'STOPPED') return 'stopped'
+  if (s.includes('STOP') || s.includes('START') || s === 'PROVISIONING') return 'warn'
+  if (s.includes('TERMINAT')) return 'err'
+  return ''
+}
+
+async function copy(text: string) {
+  const v = (text || '').trim()
+  if (!v || v === '—') return
+  try {
+    await navigator.clipboard.writeText(v)
+    msg.value = `已复制：${v.length > 48 ? v.slice(0, 48) + '…' : v}`
+    error.value = ''
+  } catch {
+    error.value = '复制失败'
+  }
+}
+
+function copyIp(text?: string | null) {
+  if (!text) return
+  copy(text)
+}
+
+function perfLabel(vpu: number) {
+  const n = Number(vpu || 10)
+  if (n <= 10) return '平衡'
+  if (n <= 20) return '较高性能'
+  return '超高性能'
+}
+
+function bootStateClass(state: string) {
+  const s = (state || '').toUpperCase()
+  if (s === 'AVAILABLE') return 'running'
+  if (s === 'PROVISIONING' || s === 'RESTORING') return 'warn'
+  if (s.includes('FAULT') || s.includes('TERMINAT')) return 'err'
+  return ''
+}
+
+function formatTime(v: string) {
+  if (!v) return '—'
+  try {
+    return new Date(v).toLocaleString()
+  } catch {
+    return v
+  }
+}
+
+async function loadInstance() {
+  const { data } = await api.get<Instance>(
+    `/tenants/${tenantId.value}/instances/${instanceId.value}`,
+  )
+  instance.value = data
+  if (data.ocpus != null) shapeForm.ocpus = data.ocpus
+  if (data.memory_in_gbs != null) shapeForm.memory_in_gbs = data.memory_in_gbs
+  // Prefetch boot volume for the volume tab summary
+  loadBoot().catch(() => {})
+}
+
+// ---- metrics ----
+const metricHours = ref(3)
+const loadingMetrics = ref(false)
+const metricsMsg = ref('')
+const metricsSeries = ref<Record<string, [string | null, number][]>>({})
+const metricKeys = ['cpu', 'memory', 'net_in', 'net_out']
+const svgW = 320
+const svgH = 80
+
+function metricLabel(k: string) {
+  return (
+    {
+      cpu: 'CPU %',
+      memory: '内存 %',
+      net_in: '网络入',
+      net_out: '网络出',
+    } as Record<string, string>
+  )[k]
+}
+function metricColor(k: string) {
+  return (
+    {
+      cpu: '#3b82f6',
+      memory: '#a855f7',
+      net_in: '#22c55e',
+      net_out: '#f59e0b',
+    } as Record<string, string>
+  )[k]
+}
+function sparkPoints(points: any[]) {
+  const vals = points.map((p) => Number(p?.[1] ?? 0))
+  if (!vals.length) return ''
+  const max = Math.max(...vals, 1)
+  const min = Math.min(...vals, 0)
+  const span = Math.max(max - min, 1e-9)
+  return vals
+    .map((v, i) => {
+      const x = (i / Math.max(vals.length - 1, 1)) * (svgW - 8) + 4
+      const y = svgH - 6 - ((v - min) / span) * (svgH - 12)
+      return `${x.toFixed(1)},${y.toFixed(1)}`
+    })
+    .join(' ')
+}
+function lastValue(points: any[], key: string) {
+  if (!points.length) return '—'
+  const v = Number(points[points.length - 1]?.[1] ?? 0)
+  if (key.startsWith('net')) {
+    if (v > 1e6) return (v / 1e6).toFixed(2) + ' MB/s'
+    if (v > 1e3) return (v / 1e3).toFixed(1) + ' KB/s'
+    return v.toFixed(0) + ' B/s'
+  }
+  return v.toFixed(1) + '%'
+}
+
+async function loadMetrics() {
+  loadingMetrics.value = true
+  try {
+    const { data } = await api.get(
+      `/tenants/${tenantId.value}/instances/${instanceId.value}/metrics`,
+      { params: { hours: metricHours.value } },
+    )
+    metricsMsg.value = data.message || ''
+    const series = data.data?.series || {}
+    // normalize to array of [ts, value]
+    const out: Record<string, any[]> = {}
+    for (const k of metricKeys) {
+      out[k] = (series[k] || []).map((p: any) =>
+        Array.isArray(p) ? p : [p?.timestamp ?? null, Number(p?.value ?? 0)],
+      )
+    }
+    metricsSeries.value = out
+  } catch (e: any) {
+    metricsMsg.value = e?.message || '加载监控失败'
+  } finally {
+    loadingMetrics.value = false
+  }
+}
+
+// ---- console ----
+const consoleKey = ref('')
+const consoleList = ref<any[]>([])
+const consoleBusy = ref(false)
+
+async function loadConsole() {
+  const { data } = await api.get(
+    `/tenants/${tenantId.value}/instances/${instanceId.value}/console`,
+  )
+  consoleList.value = data.connections || []
+}
+async function pickConsoleKey() {
+  const text = await pickAndReadTextFile('.pub,.txt,text/plain')
+  if (text == null) return
+  if (/PRIVATE KEY/i.test(text)) {
+    error.value = '请选择公钥，不要选私钥'
+    return
+  }
+  consoleKey.value = text.trim().split(/\r?\n/).filter(Boolean)[0] || ''
+}
+async function createConsole() {
+  error.value = ''
+  msg.value = ''
+  consoleBusy.value = true
+  try {
+    const { data } = await api.post(
+      `/tenants/${tenantId.value}/instances/${instanceId.value}/console`,
+      { ssh_public_key: consoleKey.value },
+    )
+    if (data.ok) {
+      msg.value = data.message || '控制台已就绪'
+      await loadConsole()
+    } else error.value = data.message || '创建失败'
+  } catch (e: any) {
+    error.value = e?.message || '创建失败'
+  } finally {
+    consoleBusy.value = false
+  }
+}
+async function deleteConsole(id: string) {
+  if (!confirm('删除此控制台连接？')) return
+  await api.delete(
+    `/tenants/${tenantId.value}/instances/${instanceId.value}/console/${id}`,
+  )
+  msg.value = '已删除'
+  await loadConsole()
+}
+
+// ---- firewall ----
+const fwGroups = ref<any[]>([])
+const fwMsg = ref('')
+const fwBusy = ref(false)
+const ruleForm = reactive({
+  direction: 'INGRESS',
+  protocol: '6',
+  cidr: '0.0.0.0/0',
+  port_min: 22 as number | null,
+})
+
+async function loadFirewall() {
+  const { data } = await api.get(
+    `/tenants/${tenantId.value}/instances/${instanceId.value}/firewall`,
+  )
+  fwMsg.value = data.message || ''
+  fwGroups.value = data.data?.groups || []
+}
+async function openAllFirewall() {
+  if (!confirm('将清空关联 NSG 规则并全开放，确认？')) return
+  fwBusy.value = true
+  error.value = ''
+  try {
+    const { data } = await api.post(
+      `/tenants/${tenantId.value}/instances/${instanceId.value}/firewall/open-all`,
+    )
+    if (data.ok) msg.value = data.message
+    else error.value = data.message
+    await loadFirewall()
+  } catch (e: any) {
+    error.value = e?.message || '操作失败'
+  } finally {
+    fwBusy.value = false
+  }
+}
+async function addRule(nsgId: string) {
+  error.value = ''
+  try {
+    const { data } = await api.post(
+      `/tenants/${tenantId.value}/instances/${instanceId.value}/firewall/rules`,
+      {
+        nsg_id: nsgId,
+        direction: ruleForm.direction,
+        protocol: ruleForm.protocol,
+        cidr: ruleForm.cidr,
+        port_min: ruleForm.protocol === 'all' || ruleForm.protocol === '1' ? null : ruleForm.port_min,
+        port_max: ruleForm.protocol === 'all' || ruleForm.protocol === '1' ? null : ruleForm.port_min,
+      },
+    )
+    if (data.ok) msg.value = data.message
+    else error.value = data.message
+    await loadFirewall()
+  } catch (e: any) {
+    error.value = e?.message || '添加失败'
+  }
+}
+async function deleteRule(nsgId: string, ruleId: string) {
+  if (!confirm('删除该规则？')) return
+  try {
+    const { data } = await api.post(
+      `/tenants/${tenantId.value}/instances/${instanceId.value}/firewall/delete-rules`,
+      { nsg_id: nsgId, rule_ids: [ruleId] },
+    )
+    if (data.ok) msg.value = data.message
+    else error.value = data.message
+    await loadFirewall()
+  } catch (e: any) {
+    error.value = e?.message || '删除失败'
+  }
+}
+
+// ---- boot / shape ----
+const bootInfo = ref<any>(null)
+const bootBusy = ref(false)
+const bootForm = reactive({ size_in_gbs: null as number | null, vpus_per_gb: 10 })
+const shapeForm = reactive({ ocpus: 1, memory_in_gbs: 6 })
+
+async function loadBoot() {
+  bootBusy.value = true
+  try {
+    const { data } = await api.get(
+      `/tenants/${tenantId.value}/instances/${instanceId.value}/boot-volume`,
+    )
+    if (data.ok) {
+      bootInfo.value = data.data
+      bootForm.size_in_gbs = data.data.size_in_gbs
+      bootForm.vpus_per_gb = data.data.vpus_per_gb
+    } else error.value = data.message
+  } catch (e: any) {
+    error.value = e?.message || '读取失败'
+  } finally {
+    bootBusy.value = false
+  }
+}
+async function updateBoot() {
+  bootBusy.value = true
+  error.value = ''
+  try {
+    const { data } = await api.post(
+      `/tenants/${tenantId.value}/instances/${instanceId.value}/boot-volume`,
+      {
+        size_in_gbs: bootForm.size_in_gbs,
+        vpus_per_gb: bootForm.vpus_per_gb,
+      },
+    )
+    if (data.ok) {
+      msg.value = data.message
+      await loadBoot()
+    } else error.value = data.message
+  } catch (e: any) {
+    error.value = e?.message || '调整失败'
+  } finally {
+    bootBusy.value = false
+  }
+}
+async function updateShape() {
+  if (!isFlexShape.value) {
+    error.value = '当前 Shape 为固定规格，不允许修改 OCPU / 内存'
+    return
+  }
+  acting.value = true
+  error.value = ''
+  try {
+    const { data } = await api.post(
+      `/tenants/${tenantId.value}/instances/${instanceId.value}/shape`,
+      {
+        ocpus: shapeForm.ocpus,
+        memory_in_gbs: shapeForm.memory_in_gbs,
+      },
+    )
+    if (data.ok) {
+      msg.value = data.message
+      await loadInstance()
+    } else error.value = data.message
+  } catch (e: any) {
+    error.value = e?.message || '修改失败'
+  } finally {
+    acting.value = false
+  }
+}
+
+// ---- power helpers ----
+async function power(action: string) {
+  acting.value = true
+  error.value = ''
+  try {
+    const { data } = await api.post(
+      `/tenants/${tenantId.value}/instances/${instanceId.value}/power`,
+      { action },
+    )
+    msg.value = data.message
+    await loadInstance()
+  } catch (e: any) {
+    error.value = e?.message || '操作失败'
+  } finally {
+    acting.value = false
+  }
+}
+async function doRename() {
+  const name = prompt('新名称', instance.value?.display_name || '')
+  if (!name?.trim()) return
+  acting.value = true
+  try {
+    const { data } = await api.post(
+      `/tenants/${tenantId.value}/instances/${instanceId.value}/rename`,
+      { display_name: name.trim() },
+    )
+    msg.value = data.message
+    await loadInstance()
+  } catch (e: any) {
+    error.value = e?.message || '失败'
+  } finally {
+    acting.value = false
+  }
+}
+async function doReplaceIp() {
+  if (!confirm('更换临时公网 IPv4？')) return
+  acting.value = true
+  try {
+    const { data } = await api.post(
+      `/tenants/${tenantId.value}/instances/${instanceId.value}/public-ip/replace`,
+    )
+    if (data.ok) msg.value = data.message
+    else error.value = data.message
+    await loadInstance()
+  } catch (e: any) {
+    error.value = e?.message || '失败'
+  } finally {
+    acting.value = false
+  }
+}
+async function doIpv6() {
+  acting.value = true
+  try {
+    const { data } = await api.post(
+      `/tenants/${tenantId.value}/instances/${instanceId.value}/ipv6`,
+    )
+    if (data.ok) msg.value = data.message
+    else error.value = data.message
+    await loadInstance()
+  } catch (e: any) {
+    error.value = e?.message || '失败'
+  } finally {
+    acting.value = false
+  }
+}
+async function doTerminate() {
+  if (!confirm('确认终止该实例？')) return
+  acting.value = true
+  try {
+    const { data } = await api.post(
+      `/tenants/${tenantId.value}/instances/${instanceId.value}/terminate`,
+      { preserve_boot_volume: false },
+    )
+    msg.value = data.message
+    setTimeout(() => router.push('/'), 800)
+  } catch (e: any) {
+    error.value = e?.message || '失败'
+  } finally {
+    acting.value = false
+  }
+}
+
+async function refreshAll() {
+  loading.value = true
+  error.value = ''
+  try {
+    await loadInstance()
+    if (tab.value === 'metrics') await loadMetrics()
+    if (tab.value === 'console') await loadConsole()
+    if (tab.value === 'firewall') await loadFirewall()
+    if (tab.value === 'network') await loadReservedIps()
+    if (tab.value === 'volume') {
+      await loadBoot()
+      await loadBackups()
+    }
+  } catch (e: any) {
+    error.value = e?.message || '加载失败'
+  } finally {
+    loading.value = false
+  }
+}
+
+watch(tab, async (t) => {
+  try {
+    if (t === 'metrics') await loadMetrics()
+    if (t === 'console') await loadConsole()
+    if (t === 'firewall') await loadFirewall()
+    if (t === 'network') await loadReservedIps()
+    if (t === 'volume') {
+      await loadBoot()
+      await loadBackups()
+    }
+  } catch (e: any) {
+    error.value = e?.message || '加载失败'
+  }
+})
+
+onMounted(async () => {
+  try {
+    await loadInstance()
+    await loadMetrics()
+  } catch (e: any) {
+    error.value = e?.message || '加载失败'
+  }
+})
+</script>
+
+<style scoped>
+.tab-row {
+  gap: 0.4rem;
+}
+.metrics-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+}
+.metric-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.5rem 0.65rem;
+  background: var(--input-bg);
+}
+.spark {
+  width: 100%;
+  height: 80px;
+  display: block;
+}
+.ip-lines {
+  font-size: 13px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  margin-top: 0.25rem;
+}
+.copyable {
+  cursor: copy;
+  border-bottom: 1px dashed #64748b;
+  user-select: none;
+}
+.copyable:hover {
+  color: #93c5fd;
+  border-bottom-color: #93c5fd;
+}
+.copyable.empty {
+  cursor: default;
+  border-bottom: none;
+  color: var(--muted);
+}
+.ipv6-chip {
+  display: inline-block;
+  margin-left: 0.35rem;
+  margin-top: 0.15rem;
+  font-size: 12px;
+}
+.boot-status {
+  background: var(--input-bg);
+}
+@media (max-width: 800px) {
+  .metrics-grid {
+    grid-template-columns: 1fr;
+  }
+}
+</style>

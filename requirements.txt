@@ -1,0 +1,5 @@
+oci>=2.182.0
+cryptography>=42.0.0
+passlib>=1.7.4
+pyzipper>=0.3.6
+windnd>=1.0.7; platform_system=="Windows"

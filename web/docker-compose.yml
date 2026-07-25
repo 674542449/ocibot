@@ -1,0 +1,56 @@
+# OCIBot Web — production-style stack (single API image serves the built SPA)
+# Usage:
+#   1. copy web/.env.example to web/.env and edit secrets
+#   2. docker compose -f web/docker-compose.yml up -d --build
+#   3. open http://<host>:8000  (frontend is served by the API container)
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ocibot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ocibot_dev_pass}
+      POSTGRES_DB: ocibot
+    volumes:
+      - ocibot_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ocibot -d ocibot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ..
+      dockerfile: web/Dockerfile
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://ocibot:${POSTGRES_PASSWORD:-ocibot_dev_pass}@db:5432/ocibot
+      OCIBOT_CORS_ORIGINS: ${OCIBOT_CORS_ORIGINS:-http://localhost:8000,http://127.0.0.1:8000}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ..
+      dockerfile: web/Dockerfile
+    command: ["python", "-m", "web.backend.worker"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://ocibot:${POSTGRES_PASSWORD:-ocibot_dev_pass}@db:5432/ocibot
+      OCIBOT_WORKER_ID: worker-1
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  ocibot_pg:

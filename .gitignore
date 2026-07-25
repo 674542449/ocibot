@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+.build-venv/
+venv/
+env/
+
+# Build artifacts
+dist/
+build/
+
+# Node
+node_modules/
+web/frontend/dist/
+
+# Local data & secrets (NEVER commit)
+web_data/
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.secret
+*.salt
+.env
+web/.env
+*.pem
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
