@@ -154,20 +154,6 @@
 </template>
 
 <style scoped>
-.copyable {
-  cursor: copy;
-  border-bottom: 1px dashed #64748b;
-  user-select: none;
-}
-.copyable:hover {
-  color: #93c5fd;
-  border-bottom-color: #93c5fd;
-}
-.copyable.empty {
-  cursor: default;
-  border-bottom: none;
-  color: var(--muted);
-}
 .batch-bar {
   position: sticky;
   top: 0.5rem;

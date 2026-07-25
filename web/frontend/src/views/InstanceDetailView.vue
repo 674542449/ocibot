@@ -1283,27 +1283,18 @@ watch([tenantId, instanceId], async () => {
   font-size: 13px;
   display: flex;
   flex-direction: column;
-  gap: 0.2rem;
+  gap: 0.35rem;
   margin-top: 0.25rem;
 }
-.copyable {
-  cursor: copy;
-  border-bottom: 1px dashed var(--border-strong);
-  user-select: none;
-}
-.copyable:hover {
-  color: var(--accent);
-  border-bottom-color: var(--accent);
-}
-.copyable.empty {
-  cursor: default;
-  border-bottom: none;
-  color: var(--muted);
+.ip-lines > div {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.5rem;
 }
 .ipv6-chip {
-  display: inline-block;
-  margin-left: 0.35rem;
-  margin-top: 0.15rem;
+  margin-left: 0;
+  margin-top: 0;
   font-size: 12px;
 }
 .boot-status {

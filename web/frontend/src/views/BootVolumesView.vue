@@ -295,14 +295,6 @@ onMounted(async () => {
 .stat-num.warn {
   color: var(--warn);
 }
-.copyable {
-  cursor: copy;
-  border-bottom: 1px dashed var(--border-strong);
-  user-select: none;
-}
-.copyable:hover {
-  color: var(--accent);
-}
 @media (max-width: 900px) {
   .stats {
     grid-template-columns: 1fr 1fr;
