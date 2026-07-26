@@ -372,22 +372,26 @@ async function loadTenants() {
   if (t === 'boot' || t === 'block' || t === 'object') tab.value = t
 }
 
-// Request-sequence guard (same pattern as InstancesView.load). Without it a
-// slow response for tenant A could land after the user switched to tenant B and
-// repopulate the page with A's volumes/buckets — and because bucket and object
-// actions are addressed by NAME, the next click would then be sent to tenant B
-// for a resource that only exists in A.
-let loadSeq = 0
+// Request-sequence guard. Without it a slow response for tenant A could land
+// after the user switched to tenant B and repopulate the page with A's
+// volumes/buckets — and because bucket and object actions are addressed by NAME,
+// the next click would then be sent to tenant B for a resource that only exists
+// in A.
+//
+// The counter is PER LOADER. A single shared counter is wrong here: refreshAll()
+// starts all four loaders at once, so each one bumped the same counter and every
+// response except the last-started loader's was discarded as stale.
+const loadSeq: Record<string, number> = {}
 
-function beginLoad(): { stale: () => boolean } {
-  const seq = ++loadSeq
+function beginLoad(key: string): { stale: () => boolean } {
+  const seq = (loadSeq[key] = (loadSeq[key] || 0) + 1)
   const wanted = tenantId.value
-  return { stale: () => seq !== loadSeq || tenantId.value !== wanted }
+  return { stale: () => seq !== loadSeq[key] || tenantId.value !== wanted }
 }
 
 async function loadQuota() {
   if (!tenantId.value) return
-  const guard = beginLoad()
+  const guard = beginLoad('quota')
   try {
     const { data } = await api.get(`/tenants/${tenantId.value}/free-quota`)
     if (guard.stale()) return
@@ -400,7 +404,7 @@ async function loadQuota() {
 
 async function loadBoot() {
   if (!tenantId.value) return
-  const guard = beginLoad()
+  const guard = beginLoad('boot')
   const { data } = await api.get(`/tenants/${tenantId.value}/boot-volumes`, {
     params: { include_subcompartments: includeSub.value },
   })
@@ -410,7 +414,7 @@ async function loadBoot() {
 
 async function loadBlock() {
   if (!tenantId.value) return
-  const guard = beginLoad()
+  const guard = beginLoad('block')
   const { data } = await api.get(`/tenants/${tenantId.value}/block-volumes`, {
     params: { include_subcompartments: true },
   })
@@ -428,7 +432,7 @@ async function loadBlock() {
 
 async function loadBuckets() {
   if (!tenantId.value) return
-  const guard = beginLoad()
+  const guard = beginLoad('buckets')
   const { data } = await api.get(`/tenants/${tenantId.value}/object-storage/buckets`)
   if (guard.stale()) return
   buckets.value = data.data?.buckets || []
