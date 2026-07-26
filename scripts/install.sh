@@ -83,10 +83,58 @@ ensure_repo() {
   git clone --branch "$BRANCH" --depth 1 "$REPO_URL" "$REPO_DIR"
 }
 
+# Compose reads ${VAR} interpolation from a .env in the PROJECT directory, not
+# from a service's env_file. Without this link the random POSTGRES_PASSWORD in
+# web/.env was never seen by compose, so ${POSTGRES_PASSWORD:-ocibot_dev_pass}
+# silently fell back to the built-in default for every install.
+link_root_env() {
+  local target="$REPO_DIR/web/.env"
+  local link="$REPO_DIR/.env"
+  [ -f "$target" ] || return 0
+  if [ -L "$link" ]; then
+    return 0
+  fi
+  if [ -e "$link" ]; then
+    warn "$link 已存在且不是符号链接，跳过（compose 插值将使用它）"
+    return 0
+  fi
+  ln -s "web/.env" "$link" 2>/dev/null || cp -a "$target" "$link"
+  log "已关联 .env → web/.env（compose 变量插值）"
+}
+
+# Make the database role match web/.env. POSTGRES_PASSWORD only takes effect at
+# initdb, so a volume created before the link above kept the default password;
+# this ALTER is idempotent and converges both cases. Runs inside the container as
+# the local superuser, so it does not need the current password.
+sync_db_password() {
+  local envf="$REPO_DIR/web/.env"
+  [ -f "$envf" ] || return 0
+  local pw
+  pw="$(grep -E '^POSTGRES_PASSWORD=' "$envf" | head -n1 | cut -d= -f2-)"
+  [ -n "$pw" ] || return 0
+  local i
+  for i in $(seq 1 20); do
+    if compose exec -T db pg_isready -U ocibot -d ocibot >/dev/null 2>&1; then
+      break
+    fi
+    sleep 2
+  done
+  # Single-quoted SQL literal; escape any embedded quote.
+  local esc
+  esc="$(printf '%s' "$pw" | sed "s/'/''/g")"
+  if compose exec -T db psql -U ocibot -d ocibot -v ON_ERROR_STOP=1 \
+      -c "ALTER USER ocibot WITH PASSWORD '$esc';" >/dev/null 2>&1; then
+    log "数据库密码已与 web/.env 对齐"
+  else
+    warn "无法同步数据库密码（数据库可能未就绪）；如 api 连不上库请手动执行 ALTER USER"
+  fi
+}
+
 ensure_env() {
   local envf="$REPO_DIR/web/.env"
   if [ -f "$envf" ]; then
     log "保留已有 web/.env"
+    link_root_env
     return
   fi
   log "生成 web/.env（随机密钥）"
@@ -111,6 +159,7 @@ OCIBOT_DB_MAX_OVERFLOW=20
 OCIBOT_PORT=8000
 EOF
   chmod 600 "$envf" || true
+  link_root_env
   warn "已写入随机密钥到 web/.env —— 请备份该文件；丢失 OCIBOT_MASTER_KEY 将无法解密租户私钥"
 }
 
@@ -169,6 +218,8 @@ do_install() {
   ensure_env
   export_build_env
   log "构建并启动（PostgreSQL + API + Worker）…"
+  compose up -d --build db
+  sync_db_password
   compose up -d --build
   log "等待健康检查…"
   local i
@@ -244,6 +295,11 @@ do_update() {
   log "重新构建并滚动更新（无缓存前端层）…"
   # --pull refreshes base images; build runs with current tree after hard reset.
   compose build --pull api worker || compose build api worker
+  # Bring the database up and align its password BEFORE the api starts, otherwise
+  # an install whose volume predates the .env link would hand api the new password
+  # while the role still has the old one.
+  compose up -d db
+  sync_db_password
   compose up -d
   log "更新完成。请验证："
   log "  curl -fsS http://127.0.0.1:${OCIBOT_PORT:-8000}/api/health"

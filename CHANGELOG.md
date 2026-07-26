@@ -35,10 +35,40 @@
 - 登录后跳转只接受站内路径
 - `AdminView.vue` 日志翻译表类型错误（vue-tsc 报错，vite 不做类型检查所以此前未暴露）
 
+### 第二轮（并行审计复查，13 个 agent）
+上一轮的修复被独立复查，发现三处真实缺陷并已修正：
+
+- **请求体上限可被 `chunked` 绕过**：只检查 `Content-Length` 是不够的，40MB 会被完整落盘；
+  而且 FastAPI 在依赖注入**之前**解析 multipart，所以未认证即可触发，同一手法还能让单个
+  请求驻留约 1GB 表单字段。改为按**实际收到的字节**计数的纯 ASGI 中间件
+- **`_client_ip` 取 XFF 最左项**：nginx 标准的 `$proxy_add_x_forwarded_for` 是追加而非替换，
+  最左项仍由客户端控制，`TRUST_PROXY=1` 时限流照样能绕；现统一使用 `request.client.host`
+- **IDNA 编码器不一致导致 SSRF**：`getaddrinfo` 用 IDNA2003、httpx 用 IDNA2008，
+  `evilß.example.com` 校验的是 `evilss.example.com` 却连向 `xn--evil-yna.example.com`
+
+同时修复：
+- **`POSTGRES_PASSWORD` 一直是默认值**：compose 的 `${VAR}` 插值只读项目根目录的 `.env`，
+  不读 `env_file`，所以 `install.sh` 生成的随机密码从未生效。现在会自动建立
+  `.env → web/.env` 链接，并在更新时幂等地 `ALTER USER` 对齐（先起 db、改密码、再起 api）
+- **`docker-compose.yml` 的 `environment:` 覆盖 `env_file:`**：`OCIBOT_REQUIRE_SECURE_SECRETS` 等
+  5 个键重复声明，导致 `web/.env` 里的值被静默丢弃，生产密钥守卫从未生效
+- 粘贴 OCI 配置的正则回溯（ReDoS）：108KB 占用 2.3s GIL，现 0.26ms（约 8700 倍）
+- `account_tier` 只要不是已知值就**关闭免费额度硬上限**，已反转为仅 `paid` 放开
+- 恢复已停止的容量重试任务会绕过"每租户仅一个"限制，导致两个任务竞争 LaunchInstance
+- 解密后的 OCI 私钥曾写入系统临时目录且不清理，改为内存内 `key_content`
+- 创建实例后 800ms 自动跳转会**销毁一次性 root 密码**，改为需手动确认已保存
+- `list_images` 算出 Ubuntu 过滤结果却丢弃、`list_objects` 缺 `fields` 导致用量恒为 0、
+  换公网 IP 在解绑超时后误报成功并返回旧地址
+- SSH 公钥与启动脚本只挡 `\n`，`\r`/`\x85`/U+2028/U+2029 也是 YAML 换行，可注入 cloud-init
+- 限流字典无上界、`LoginRequest.username` 无长度限制
+- `install.sh update` 的 `git clean -fd` 会删除未跟踪的运维文件（需 `OCIBOT_CLEAN_UNTRACKED=1` 才执行）
+- 自更新用 `docker run -d` 的退出码判断成功（它只代表容器启动了）
+
 ### 测试
 - 新增 `tests/test_web_hardening.py`、`test_upload_limits.py`、
-  `test_schedule_single_fire.py`、`test_capacity_job_create.py`，并扩充 `test_url_safety.py`
-- 共 204 passed / 1 skipped
+  `test_schedule_single_fire.py`、`test_capacity_job_create.py`、`test_audit_pass2.py`，
+  并扩充 `test_url_safety.py`
+- 共 236 passed / 1 skipped（原 153）
 
 ### 升级
 ```bash

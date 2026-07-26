@@ -105,6 +105,10 @@ cp web/.env.example web/.env
 #   OCIBOT_MASTER_KEY
 #   OCIBOT_JWT_SECRET
 
+# 必须：compose 的 ${VAR} 插值只读项目根目录的 .env，不读服务的 env_file。
+# 少了这一步，POSTGRES_PASSWORD 会回退到内置默认密码。
+ln -s web/.env .env
+
 export OCIBOT_HOST_REPO="$(pwd -P)"   # 在线更新需要绝对路径
 docker compose up -d --build
 ```
