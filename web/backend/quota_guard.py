@@ -20,13 +20,37 @@ def free_only_for_tier(account_tier: str = "") -> bool:
     return (account_tier or "").strip().lower() != "paid"
 
 
+def usage_snapshot(session: Any, *, free_only_mode: bool = True) -> dict[str, Any]:
+    """Public alias — the worker takes its own snapshot to decide whether to defer."""
+    return _usage_snapshot(session, free_only_mode=free_only_mode)
+
+
 def _usage_snapshot(session: Any, *, free_only_mode: bool = True) -> dict[str, Any]:
+    """Always-Free usage snapshot, flagged when the underlying reads were partial.
+
+    An exception — or a snapshot the OCI layer marked ``read_incomplete`` — used to
+    come back as ``{}``, which the validators read as "nothing in use, full quota
+    free". That is the wrong direction for a guard whose whole job is to stop
+    accidental Oracle charges, so the flag is preserved for callers to act on.
+    """
     try:
         result = session.get_free_quota_usage(free_only_mode=free_only_mode)
-        return result.data if isinstance(result.data, dict) else {}
+        data = result.data if isinstance(result.data, dict) else {}
+        if not data:
+            return {"read_incomplete": True}
+        return data
     except Exception:
-        # Fail open on read errors would bill users; fail closed for free/unknown.
-        return {}
+        return {"read_incomplete": True}
+
+
+def _blocked_by_incomplete_read(usage: dict[str, Any], free_only_mode: bool) -> Optional[str]:
+    """Reason to refuse, or None. Only hard-capped (non-paid) accounts are blocked."""
+    if not free_only_mode or not usage.get("read_incomplete"):
+        return None
+    return (
+        "无法完整读取 Always Free 用量（Oracle API 报错或限流），"
+        "为避免超额产生费用已阻止本次操作，请稍后重试"
+    )
 
 
 def check_launch_quota(
@@ -83,6 +107,9 @@ def enforce_launch_quota(
         free_only_for_tier(account_tier) if free_only_mode is None else bool(free_only_mode)
     )
     usage = _usage_snapshot(session, free_only_mode=effective_free_only)
+    blocked = _blocked_by_incomplete_read(usage, effective_free_only)
+    if blocked:
+        raise HTTPException(status_code=503, detail=blocked)
     guard = check_launch_quota(
         session,
         account_tier=account_tier,
@@ -138,6 +165,9 @@ def enforce_shape_resize_quota(
     if free_only_mode is None:
         free_only_mode = free_only_for_tier(tier)
     usage = _usage_snapshot(session, free_only_mode=bool(free_only_mode))
+    blocked = _blocked_by_incomplete_read(usage, bool(free_only_mode))
+    if blocked:
+        raise HTTPException(status_code=503, detail=blocked)
     tier = str(usage.get("account_tier") or tier or "")
     guard = free_quota.validate_shape_resize_against_quota(
         shape=shape,

@@ -719,6 +719,8 @@ class TenantSession:
         self._object_namespace: str = ""
         self._instance_agent: Any = None
         self._config: dict = {}
+        # Per-compartment scan errors from the most recent list_instances_tree call.
+        self._last_tree_errors: list[str] = []
         self._build()
 
     def _build(self) -> None:
@@ -1110,6 +1112,10 @@ class TenantSession:
                 seen.add(it.id)
                 all_items.append(it)
 
+        # Record partial failures so quota accounting can tell "nothing there" apart
+        # from "some compartments could not be read". Without this a throttled scan
+        # produced an undercount that looked like plenty of free capacity.
+        self._last_tree_errors = list(errors)
         if not all_items and errors and len(compartments) == 1:
             # Surface the only compartment's error instead of empty silent list
             raise OCIClientError(errors[0])
@@ -2651,28 +2657,47 @@ class TenantSession:
         from app import free_quota
 
         notes: list[str] = []
+        # Tracks whether any read that feeds a *cap* (compute / block storage) came
+        # back incomplete. Deliberately separate from `notes`, which also carries
+        # benign informational messages such as the object-storage approximation
+        # warning — gating on "any notes" would block legitimate launches.
+        read_incomplete = False
+
+        self._last_tree_errors = []
         try:
             instances = self.list_instances_tree(resolve_ips=False)
+            if self._last_tree_errors:
+                read_incomplete = True
+                notes.append(f"部分区间实例读取失败（{len(self._last_tree_errors)} 处）")
         except Exception as exc:  # noqa: BLE001
             instances = []
+            read_incomplete = True
             notes.append(f"实例读取失败：{exc}")
 
         volumes: list[dict[str, Any]] = []
         try:
             bv = self.list_boot_volumes(include_subcompartments=True, include_attachments=True)
             data = bv.data if isinstance(bv.data, dict) else {}
+            if not bv.ok or (data.get("errors") or []):
+                read_incomplete = True
+                notes.append("引导卷读取不完整")
             for v in data.get("volumes", []) or []:
                 volumes.append({**v, "kind": "boot"})
         except Exception as exc:  # noqa: BLE001
+            read_incomplete = True
             notes.append(f"引导卷读取失败：{exc}")
 
         if include_block:
             try:
                 blk = self.list_block_volumes(include_subcompartments=True, include_attachments=True)
                 data = blk.data if isinstance(blk.data, dict) else {}
+                if not blk.ok or (data.get("errors") or []):
+                    read_incomplete = True
+                    notes.append("块存储卷读取不完整")
                 for v in data.get("volumes", []) or []:
                     volumes.append({**v, "kind": "block"})
             except Exception as exc:  # noqa: BLE001
+                read_incomplete = True
                 notes.append(f"块存储卷读取失败：{exc}")
 
         object_usage: dict[str, Any] = {}
@@ -2695,6 +2720,9 @@ class TenantSession:
             notes=notes,
             object_usage=object_usage,
         )
+        # Consumed by web.backend.quota_guard to fail closed instead of treating an
+        # undercount as free headroom.
+        snapshot["read_incomplete"] = bool(read_incomplete)
         return OperationResult(ok=True, message="", data=snapshot)
 
     def _find_boot_volume_id(self, instance_id: str, compartment_id: str, availability_domain: str, *, wait: bool = True, timeout: int = 150) -> str:

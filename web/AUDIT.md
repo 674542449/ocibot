@@ -53,6 +53,31 @@ break out; capacity retries keep the durable committed lease, 60s floor, 429
 backoff and `NoneRetryStrategy` on `LaunchInstance`; no `v-html`/`innerHTML`
 anywhere in the SPA and no token in `localStorage`.
 
+### Pass 6 — remaining deferred items closed (0.4.14)
+
+- **SSH host key verification.** Previously `known_hosts=None` everywhere, i.e.
+  none at all. Now trust-on-first-use, keyed on the **instance OCID** so routine
+  IP rotation (the original reason for skipping it) is not mistaken for an
+  attack. The probe uses `asyncssh.get_server_host_key()`, which performs only
+  the key exchange — the ordering is the security property: verifying after
+  `connect()` would already have handed the credentials to an impostor. The
+  authenticated connection then pins the verified key via `known_hosts=([key],
+  [], [])`. A legitimate rebuild is handled by
+  `DELETE /api/tenants/{tid}/instances/{iid}/host-key` and a button in the UI.
+  Mismatches are audited (`webssh.hostkey_mismatch`).
+- **Quota guard no longer fails open.** `get_free_quota_usage` now reports
+  `read_incomplete` when a read that feeds a *cap* was partial — including
+  `list_instances_tree`'s per-compartment failures (previously swallowed) and the
+  `errors` list on the volume responses (previously unread). API paths return 503;
+  the worker defers the attempt **without consuming one**, so a transient blip
+  cannot kill a long-running capacity job. Paid accounts are unaffected.
+  Note: gating on "any notes present" would be wrong — the object-storage
+  estimator writes notes on success too (`仅统计前 50/N 个存储桶`).
+- **Self-update concurrency.** `threading.Lock` cannot exclude a second API
+  worker process; the status row is now locked with `SELECT ... FOR UPDATE` in the
+  same transaction that sets `running`, and `fetch_remote_head()` moved out of the
+  critical section.
+
 ### Known remaining gap
 
 **DNS rebinding on outbound notifications.** `resolve_and_check_host()` validates

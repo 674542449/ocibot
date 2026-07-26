@@ -26,6 +26,12 @@ from web.backend.ssh_bridge import (
     resolve_instance_ssh_target,
     validate_ssh_auth,
 )
+from web.backend.ssh_hostkey import (
+    LEARNED,
+    known_hosts_for,
+    probe_host_key,
+    verify_host_key,
+)
 
 log = logging.getLogger("ocibot.webssh")
 
@@ -251,11 +257,74 @@ async def webssh_endpoint(websocket: WebSocket, tenant_id: str, instance_id: str
 
         import asyncssh
 
+        # Verify the host key BEFORE authenticating. probe_host_key() runs only the
+        # SSH handshake, so on a mismatch we abort without ever transmitting the
+        # user's password or private key.
+        try:
+            server_key = await probe_host_key(host, port)
+        except Exception as exc:  # noqa: BLE001
+            await _send_json(
+                websocket, {"type": "error", "message": f"无法读取 SSH 主机密钥：{exc}"}
+            )
+            await websocket.close(code=4502)
+            return
+
+        def _check():
+            with SessionLocal() as db:
+                return verify_host_key(
+                    db,
+                    owner_id=user.id,
+                    instance_id=instance_id,
+                    port=port,
+                    server_key=server_key,
+                    host=host,
+                    tenant_id=tenant_id,
+                )
+
+        hostkey = await asyncio.to_thread(_check)
+        if not hostkey.ok:
+            with SessionLocal() as db:
+                write_audit(
+                    db,
+                    owner_id=user.id,
+                    action="webssh.hostkey_mismatch",
+                    target=instance_id,
+                    detail={
+                        "tenant_id": tenant_id,
+                        "host": host,
+                        "expected": hostkey.expected,
+                        "actual": hostkey.fingerprint,
+                    },
+                )
+            await _send_json(
+                websocket,
+                {
+                    "type": "error",
+                    "message": hostkey.message(),
+                    "code": "hostkey_mismatch",
+                    "expected_fingerprint": hostkey.expected,
+                    "actual_fingerprint": hostkey.fingerprint,
+                },
+            )
+            await websocket.close(code=4495)
+            return
+        if hostkey.verdict == LEARNED:
+            await _send_json(
+                websocket,
+                {
+                    "type": "hostkey",
+                    "message": hostkey.message(),
+                    "fingerprint": hostkey.fingerprint,
+                },
+            )
+
         connect_kwargs: dict[str, Any] = {
             "host": host,
             "port": port,
             "username": auth["username"],
-            "known_hosts": None,
+            # Pin the exact key we just verified so the authenticated connection
+            # cannot land on a different host than the probe did.
+            "known_hosts": known_hosts_for(server_key),
             "login_timeout": 30,
         }
         if auth["private_key_pem"]:

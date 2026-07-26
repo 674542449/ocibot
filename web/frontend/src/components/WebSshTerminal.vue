@@ -8,7 +8,15 @@
         </button>
       </div>
       <p v-if="status" class="muted" style="margin: 0; font-size: 12px">{{ status }}</p>
-      <div v-if="error" class="error-box">{{ error }}</div>
+      <p v-if="hostKeyNote" class="muted" style="margin: 0; font-size: 12px">{{ hostKeyNote }}</p>
+      <div v-if="error" class="error-box" style="white-space: pre-line">{{ error }}</div>
+      <!-- Host key changed: offer the deliberate reset needed after a rebuild. -->
+      <div v-if="hostKeyMismatch" class="row" style="gap: 0.5rem; flex-wrap: wrap">
+        <button type="button" :disabled="resetting" @click="resetHostKey">
+          {{ resetting ? '重置中…' : '重置主机密钥并重试' }}
+        </button>
+        <span class="muted" style="font-size: 12px">仅在你确认自己重装/重建了该实例时使用</span>
+      </div>
     </div>
     <div v-else class="stack">
       <div class="row" style="justify-content: space-between">
@@ -26,7 +34,7 @@ import { nextTick, onBeforeUnmount, reactive, ref } from 'vue'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
-import { wsUrl } from '@/api/client'
+import api, { wsUrl } from '@/api/client'
 import SshCredentialFields, { type SshCredModel } from '@/components/SshCredentialFields.vue'
 
 const props = defineProps<{
@@ -47,6 +55,26 @@ const phase = ref<'form' | 'connecting' | 'live'>('form')
 const busy = ref(false)
 const error = ref('')
 const status = ref('')
+// Host key state (trust on first use). A mismatch is surfaced with an explicit
+// reset action rather than being silently accepted.
+const hostKeyNote = ref('')
+const hostKeyMismatch = ref(false)
+const resetting = ref(false)
+
+async function resetHostKey() {
+  resetting.value = true
+  try {
+    await api.delete(`/tenants/${props.tenantId}/instances/${props.instanceId}/host-key`)
+    hostKeyMismatch.value = false
+    error.value = ''
+    hostKeyNote.value = '已重置主机密钥记录，正在重新连接…'
+    await connect()
+  } catch (e: any) {
+    error.value = e?.message || '重置主机密钥失败'
+  } finally {
+    resetting.value = false
+  }
+}
 
 let term: Terminal | null = null
 let fit: FitAddon | null = null
@@ -139,6 +167,7 @@ function sendAuth() {
 async function connect() {
   error.value = ''
   status.value = ''
+  hostKeyMismatch.value = false
   authSent = false
   if (creds.authMode === 'key' && !creds.privateKeyPem.trim()) {
     error.value = '请粘贴或选择 SSH 私钥'
@@ -174,10 +203,15 @@ async function connect() {
             status.value = `已连接 ${msg.username}@${msg.host}`
             return
           }
+          if (msg.type === 'hostkey') {
+            hostKeyNote.value = msg.message || ''
+            return
+          }
           if (msg.type === 'error') {
             error.value = msg.message || 'WebSSH 错误'
             busy.value = false
-            status.value = msg.message || ''
+            status.value = msg.code === 'hostkey_mismatch' ? '主机密钥校验失败' : msg.message || ''
+            if (msg.code === 'hostkey_mismatch') hostKeyMismatch.value = true
             if (phase.value !== 'live') {
               // stay on terminal view so user sees error, or bounce to form
               phase.value = 'form'

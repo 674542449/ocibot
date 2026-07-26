@@ -247,6 +247,7 @@ def grow_filesystem_over_ssh(
     retries: int = 3,
     retry_delay_sec: float = 8.0,
     timeout: float = 120.0,
+    known_hosts: Any = None,
 ) -> SshExecResult:
     """Upload-free: pipe grow script via bash -s over SSH, with short retries."""
     from app.fs_grow import build_grow_script
@@ -267,7 +268,9 @@ def grow_filesystem_over_ssh(
             "host": host,
             "port": int(port or 22),
             "username": user,
-            "known_hosts": None,
+            # Caller passes the verified host key; None only when verification is
+            # genuinely unavailable.
+            "known_hosts": known_hosts,
             "login_timeout": 30.0,
         }
         if private_key_pem:

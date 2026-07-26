@@ -64,11 +64,33 @@
 - `install.sh update` 的 `git clean -fd` 会删除未跟踪的运维文件（需 `OCIBOT_CLEAN_UNTRACKED=1` 才执行）
 - 自更新用 `docker run -d` 的退出码判断成功（它只代表容器启动了）
 
+### 第三轮（补齐此前搁置的三项）
+
+- **WebSSH / 引导卷扩容现在校验 SSH 主机密钥**（此前 `known_hosts=None`，完全不校验，
+  任何能在该地址应答的一方都能冒充实例并拿到你输入的 SSH 凭据）
+  - 首次连接记录指纹（TOFU），之后不符即**在发送任何凭据之前**中止
+  - 用 `asyncssh.get_server_host_key()` 只做密钥交换，不认证 —— 这是安全性的关键：
+    若在 `connect()` 之后才检查，凭据已经交给冒充方了
+  - 指纹按**实例 OCID** 记录而非 IP，所以换公网 IP / 停开机不会误报
+    （这正是当初跳过校验的理由）
+  - 重装系统后指纹会合法变化：实例详情页提供「重置主机密钥」，并有
+    `GET/DELETE /api/tenants/{tid}/instances/{iid}/host-key`
+- **额度读取不完整时不再 fail-open**：此前每个子查询各自 try/except，限流或报错会得到
+  一份"用量为 0"的快照，校验器读成"额度全空"从而放行，可能产生真实费用。
+  现在 `get_free_quota_usage` 会标记 `read_incomplete`（含 `list_instances_tree` 的
+  分区间部分失败、以及卷列表的 `errors`），API 侧返回 503 拒绝，
+  Worker 侧**推迟本次尝试且不消耗次数**（不会因为一次抖动就杀掉长跑的抢机任务）。
+  付费账号不受影响 —— 它本就不受硬上限约束
+  - 仅根据"是否有 notes"判断是不行的：对象存储的近似统计在**成功时**也会写 notes
+- **自更新并发锁不再只在单进程内有效**：`threading.Lock` 挡不住 `OCIBOT_API_WORKERS=2`
+  的另一个进程。改为在写入 `running` 的同一事务里用 `SELECT ... FOR UPDATE` 复查状态行
+  （SQLite 上是空操作，但那种部署本就是单进程），并把网络请求移出临界区
+
 ### 测试
 - 新增 `tests/test_web_hardening.py`、`test_upload_limits.py`、
-  `test_schedule_single_fire.py`、`test_capacity_job_create.py`、`test_audit_pass2.py`，
-  并扩充 `test_url_safety.py`
-- 共 236 passed / 1 skipped（原 153）
+  `test_schedule_single_fire.py`、`test_capacity_job_create.py`、`test_audit_pass2.py`、
+  `test_ssh_hostkey.py`、`test_quota_fail_closed.py`，并扩充 `test_url_safety.py`
+- 共 258 passed / 1 skipped（原 153）
 
 ### 升级
 ```bash

@@ -6,17 +6,23 @@ from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.oci_client import FirewallRuleSpec
 from web.backend.audit import write_audit
 from web.backend.auth import get_current_user
 from web.backend.db import get_db
-from web.backend.models import User
+from web.backend.models import SshHostKey, User
 from web.backend.oci_bridge import get_owned_tenant, get_session_for_row, op_result_dict
 from web.backend.schemas import PowerActionResult
+from web.backend.ssh_hostkey import check_instance_host_key, forget_host_key, known_hosts_for
 
 router = APIRouter(tags=["instance-ops"])
+
+
+class _HostKeyRefused(Exception):
+    """Internal signal: host key check failed, details already recorded."""
 
 
 class ConsoleCreateRequest(BaseModel):
@@ -356,6 +362,25 @@ def boot_volume_update(
         if oci_ok and body.auto_grow_fs and ssh_auth and size_changing:
             try:
                 target = resolve_instance_ssh_target(session, instance_id)
+                # Verify the host key before the SSH credentials are used, same as
+                # WebSSH. A mismatch aborts instead of handing the key/password to
+                # whatever answered on that address.
+                hostkey = check_instance_host_key(
+                    db,
+                    owner_id=user.id,
+                    tenant_id=tenant_id,
+                    instance_id=instance_id,
+                    host=target.host,
+                    port=int(ssh_auth["port"]),
+                )
+                if not hostkey.ok:
+                    # Reported as a failed FS-grow rather than raising: the OCI
+                    # resize above already succeeded, and a 4xx here would hide
+                    # that from the caller.
+                    data["fs_ok"] = False
+                    data["hints"] = [hostkey.message()]
+                    message = (message or "引导卷已调整") + "；文件系统扩展已中止：SSH 主机密钥不匹配"
+                    raise _HostKeyRefused()
                 grow = grow_filesystem_over_ssh(
                     target.host,
                     port=ssh_auth["port"],
@@ -365,6 +390,7 @@ def boot_volume_update(
                     retries=3,
                     retry_delay_sec=8.0,
                     timeout=120.0,
+                    known_hosts=known_hosts_for(hostkey.server_key),
                 )
                 data["fs_ok"] = bool(grow.ok)
                 data["stdout"] = truncate_output(grow.stdout)
@@ -379,6 +405,8 @@ def boot_volume_update(
                     hints.append("可稍后在实例内手动执行: sudo growpart <disk> <part> && sudo resize2fs <dev>")
                     data["hints"] = hints
                     message = (message or "引导卷已调整") + f"；文件系统扩展失败：{grow.message}"
+            except _HostKeyRefused:
+                pass  # data/message already describe the refusal
             except Exception as exc:  # noqa: BLE001
                 data["fs_ok"] = False
                 data["hints"] = [
@@ -413,6 +441,68 @@ def boot_volume_update(
         raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# SSH host key (trust on first use)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/tenants/{tenant_id}/instances/{instance_id}/host-key")
+def get_host_key(
+    tenant_id: str,
+    instance_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    """The remembered SSH host key fingerprint(s) for this instance."""
+    _row(db, user.id, tenant_id)  # ownership
+    rows = db.scalars(
+        select(SshHostKey).where(
+            SshHostKey.owner_id == user.id, SshHostKey.instance_id == instance_id
+        )
+    ).all()
+    return {
+        "ok": True,
+        "items": [
+            {
+                "port": r.port,
+                "fingerprint": r.fingerprint,
+                "key_type": r.key_type,
+                "last_host": r.last_host,
+                "created_at": r.created_at.isoformat() if r.created_at else "",
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.delete("/tenants/{tenant_id}/instances/{instance_id}/host-key")
+def reset_host_key(
+    tenant_id: str,
+    instance_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    """Forget the remembered host key so the next connection re-learns it.
+
+    Needed after a legitimate rebuild/reinstall, which changes the host key. Only
+    ever affects the caller's own record.
+    """
+    _row(db, user.id, tenant_id)  # ownership
+    removed = forget_host_key(db, owner_id=user.id, instance_id=instance_id)
+    write_audit(
+        db,
+        owner_id=user.id,
+        action="webssh.hostkey_reset",
+        target=instance_id,
+        detail={"tenant_id": tenant_id, "removed": removed},
+    )
+    return {
+        "ok": True,
+        "removed": removed,
+        "message": "已重置主机密钥记录，下次连接会重新记录指纹" if removed else "没有需要重置的记录",
+    }
 
 
 # ---------------------------------------------------------------------------

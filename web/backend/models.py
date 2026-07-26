@@ -208,6 +208,38 @@ class NotificationChannel(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
 
 
+class SshHostKey(Base):
+    """Remembered SSH host key fingerprint per instance (trust on first use).
+
+    Keyed by instance OCID rather than IP on purpose: an instance's public IP
+    changes routinely (ephemeral IP replacement, stop/start), and keying on the
+    address would make every rotation look like an attack. The OS identity — and
+    therefore the host key — survives those changes.
+    """
+
+    __tablename__ = "ssh_host_keys"
+    __table_args__ = (
+        UniqueConstraint("owner_id", "instance_id", "port", name="uq_ssh_host_key_target"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    owner_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    tenant_id: Mapped[str] = mapped_column(String(36), default="")
+    instance_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    port: Mapped[int] = mapped_column(Integer, default=22, nullable=False)
+    # "SHA256:..." as reported by asyncssh / ssh-keygen -lf
+    fingerprint: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    key_type: Mapped[str] = mapped_column(String(64), default="")
+    # Last address this key was seen on — informational only, never used for matching.
+    last_host: Mapped[str] = mapped_column(String(128), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
 class AppMeta(Base):
     """Simple key-value for bootstrap flags."""
 

@@ -428,6 +428,32 @@ class Worker:
             except Exception:  # noqa: BLE001
                 log.exception("decrypt user_data failed job=%s (continuing without it)", job.id)
 
+        # Quota re-check runs BEFORE the attempt counter moves, so deferring on an
+        # unreadable quota does not burn attempts during an Oracle API outage.
+        tier = getattr(tenant, "account_tier", "") or ""
+        try:
+            from web.backend.quota_guard import free_only_for_tier, usage_snapshot
+
+            if hasattr(session, "get_free_quota_usage") and free_only_for_tier(tier):
+                snapshot = usage_snapshot(session, free_only_mode=True)
+                if snapshot.get("read_incomplete"):
+                    # Do NOT launch on an undercount — a partial read looks like
+                    # free headroom and could create billable overage. Reschedule
+                    # instead of failing the job, so a transient blip does not kill
+                    # a long-running retry.
+                    delay = max(MIN_RETRY_INTERVAL_SEC, interval)
+                    job.next_run_at = now + timedelta(seconds=delay)
+                    job.status = "idle"
+                    job.last_error = "额度读取不完整，已推迟本次尝试"
+                    log.warning(
+                        "capacity deferred job=%s (quota read incomplete), next_in=%ss",
+                        job.id,
+                        delay,
+                    )
+                    return
+        except Exception as exc:  # noqa: BLE001
+            log.warning("capacity quota pre-read job=%s skipped: %s", job.id, exc)
+
         job.attempts = int(job.attempts or 0) + 1
         job.last_attempt_at = now
         log.info(
@@ -443,8 +469,6 @@ class Worker:
         # Re-check Always Free remaining before each LaunchInstance (usage may
         # have changed since the job was enqueued). Hard block → fail the job
         # instead of burning attempts / creating billable overage.
-        # If usage cannot be read (missing method / OCI blip), skip the check so
-        # already-queued retries are not killed by a transient read failure.
         try:
             from web.backend.quota_guard import check_launch_quota
 
@@ -453,7 +477,7 @@ class Worker:
             else:
                 guard = check_launch_quota(
                     session,
-                    account_tier=getattr(tenant, "account_tier", "") or "",
+                    account_tier=tier,
                     shape=str(payload.get("shape") or ""),
                     ocpus=payload.get("ocpus"),
                     memory_in_gbs=payload.get("memory_in_gbs"),

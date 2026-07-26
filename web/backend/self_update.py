@@ -922,6 +922,14 @@ def start_update(db: Session, *, username: str) -> dict[str, Any]:
             f" 详情：{json.dumps(caps, ensure_ascii=False)}"
         )
 
+    # Network call OUTSIDE the critical section so the mutual-exclusion window is
+    # as short as possible.
+    remote: Optional[dict[str, Any]] = None
+    try:
+        remote = fetch_remote_head()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("pre-update check failed: %s", exc)
+
     global _worker
     with _lock:
         st = _read_status_raw(db)
@@ -935,12 +943,33 @@ def start_update(db: Session, *, username: str) -> dict[str, Any]:
         if alive or st.get("state") == "running":
             raise RuntimeError("已有更新任务正在进行")
 
-        try:
-            remote = fetch_remote_head()
+        # threading.Lock only covers THIS process, and the API runs
+        # OCIBOT_API_WORKERS (default 2) of them, so two admins hitting apply at
+        # once could both start a helper container. Re-read the status row with a
+        # row lock inside the same transaction that flips it to "running", making
+        # the DB row the real mutex. On SQLite with_for_update() is a no-op, but
+        # that deployment is single-process anyway.
+        if not get_settings().is_sqlite:
+            try:
+                from sqlalchemy import select
+
+                from web.backend.models import AppMeta
+
+                locked = db.scalar(
+                    select(AppMeta).where(AppMeta.key == KEY_UPDATE_STATUS).with_for_update()
+                )
+                if locked is not None:
+                    current = json.loads(locked.value or "{}")
+                    if isinstance(current, dict) and current.get("state") == "running":
+                        raise RuntimeError("已有更新任务正在进行")
+            except RuntimeError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.warning("update row lock unavailable: %s", exc)
+
+        if remote is not None:
             st["remote"] = remote
             st["checked_at"] = _utcnow()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("pre-update check failed: %s", exc)
         st["state"] = "running"
         st["message"] = "已排队更新…"
         st["started_at"] = _utcnow()

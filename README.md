@@ -158,6 +158,9 @@ docker compose up -d --build
    **管理员失陷 ≈ 宿主机 root 失陷**；仅在所有管理员可信时设 `OCIBOT_UPDATE_ENABLED=1`
 7. Webhook / Bark / SMTP 目标已拦截私网、元数据、NAT64/6to4 等地址，仍建议只给受信用户开通知配置
    - 已知残留风险：DNS rebinding（校验与连接之间 DNS 可变）；详见 [web/AUDIT.md](web/AUDIT.md)
+8. **WebSSH 会校验主机密钥**（首次连接记录指纹，之后不符即拒绝，且在发送任何凭据之前）。
+   指纹按**实例 OCID** 记录，所以换公网 IP 不会误报。重装系统后需在实例详情页
+   「重置主机密钥」再连接
 
 更细的审计说明见 [web/AUDIT.md](web/AUDIT.md)。
 
