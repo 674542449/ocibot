@@ -180,6 +180,70 @@ def test_forget_allows_relearning_after_rebuild():
     assert _verify(owner_id, tenant_id, "SHA256:NEW").verdict == LEARNED
 
 
+def test_concurrent_first_connect_does_not_error():
+    """Two tabs connecting for the first time both see no row and both insert.
+
+    The unique constraint rejects the loser, which surfaced as an internal error on
+    a legitimate action. The loser must fall back to the winner's stored key.
+    """
+    owner_id, tenant_id = _seed()
+    from web.backend.models import SshHostKey as HK
+
+    with SessionLocal() as db_a, SessionLocal() as db_b:
+        # Both sessions read first (no row yet), then both write.
+        assert db_a.query(HK).count() == 0
+        assert db_b.query(HK).count() == 0
+        first = verify_host_key(
+            db_a,
+            owner_id=owner_id,
+            instance_id="ocid1.instance.oc1..race",
+            port=22,
+            server_key=_FakeKey("SHA256:AAAA"),
+            host="1.2.3.4",
+            tenant_id=tenant_id,
+        )
+        second = verify_host_key(
+            db_b,
+            owner_id=owner_id,
+            instance_id="ocid1.instance.oc1..race",
+            port=22,
+            server_key=_FakeKey("SHA256:AAAA"),
+            host="1.2.3.4",
+            tenant_id=tenant_id,
+        )
+    assert first.ok is True
+    # Same key, so the loser resolves to trusted rather than blowing up.
+    assert second.ok is True, f"second connect failed: {second.verdict} {second.expected}"
+    with SessionLocal() as db:
+        assert db.query(HK).count() == 1
+
+
+def test_concurrent_first_connect_with_different_keys_still_refuses():
+    """If the racing connections see DIFFERENT keys, the loser must not be trusted."""
+    owner_id, tenant_id = _seed()
+    with SessionLocal() as db_a, SessionLocal() as db_b:
+        verify_host_key(
+            db_a,
+            owner_id=owner_id,
+            instance_id="ocid1.instance.oc1..race2",
+            port=22,
+            server_key=_FakeKey("SHA256:GOOD"),
+            host="1.2.3.4",
+            tenant_id=tenant_id,
+        )
+        loser = verify_host_key(
+            db_b,
+            owner_id=owner_id,
+            instance_id="ocid1.instance.oc1..race2",
+            port=22,
+            server_key=_FakeKey("SHA256:EVIL"),
+            host="1.2.3.4",
+            tenant_id=tenant_id,
+        )
+    assert loser.ok is False
+    assert loser.verdict == MISMATCH
+
+
 def test_known_hosts_pins_only_the_verified_key():
     key = _FakeKey("SHA256:AAAA")
     trusted, cas, revoked = known_hosts_for(key)

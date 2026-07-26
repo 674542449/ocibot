@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from web.backend.models import SshHostKey
@@ -128,11 +129,32 @@ def verify_host_key(
                 last_host=host or "",
             )
         )
-        db.commit()
-        log.info("hostkey learned instance=%s fp=%s", instance_id, fingerprint)
-        return HostKeyCheck(
-            verdict=LEARNED, fingerprint=fingerprint, key_type=key_type, server_key=server_key
-        )
+        try:
+            db.commit()
+        except IntegrityError:
+            # Two first-time connections raced (two tabs, or a double click) and
+            # both saw no row. The unique constraint on
+            # (owner_id, instance_id, port) rejects the loser, which would other-
+            # wise surface as an internal error on a perfectly legitimate action.
+            # Re-read and treat the winner's row as authoritative.
+            db.rollback()
+            row = db.scalar(
+                select(SshHostKey).where(
+                    SshHostKey.owner_id == owner_id,
+                    SshHostKey.instance_id == instance_id,
+                    SshHostKey.port == int(port or 22),
+                )
+            )
+            if row is None:
+                # Constraint fired but nothing is there — do not guess, fail closed.
+                return HostKeyCheck(
+                    verdict=MISMATCH, fingerprint=fingerprint, expected="(主机密钥记录写入冲突)"
+                )
+        else:
+            log.info("hostkey learned instance=%s fp=%s", instance_id, fingerprint)
+            return HostKeyCheck(
+                verdict=LEARNED, fingerprint=fingerprint, key_type=key_type, server_key=server_key
+            )
 
     if row.fingerprint != fingerprint:
         log.warning(
