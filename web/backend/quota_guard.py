@@ -10,9 +10,14 @@ from app import free_quota
 
 
 def free_only_for_tier(account_tier: str = "") -> bool:
-    """Paid accounts may overage (with warnings); free/unknown stay hard-capped."""
-    tier = (account_tier or "").strip().lower()
-    return tier in {"", "free", "unknown"}
+    """Paid accounts may overage (with warnings); everything else stays hard-capped.
+
+    Inverted deliberately: an allowlist of free-ish values meant any unrecognized
+    string (a typo, or a value carried in from an imported backup) silently
+    disabled the Always-Free hard caps and let a launch run up real charges. Only
+    an explicit "paid" opts out.
+    """
+    return (account_tier or "").strip().lower() != "paid"
 
 
 def _usage_snapshot(session: Any, *, free_only_mode: bool = True) -> dict[str, Any]:
@@ -34,12 +39,19 @@ def check_launch_quota(
     boot_volume_size_in_gbs: Any = None,
     boot_volume_vpus_per_gb: Any = 10,
     free_only_mode: Optional[bool] = None,
+    usage: Optional[dict[str, Any]] = None,
 ) -> free_quota.GuardResult:
-    """Return a GuardResult without raising (for worker / soft checks)."""
+    """Return a GuardResult without raising (for worker / soft checks).
+
+    ``usage`` lets a caller reuse one snapshot across several checks; each
+    snapshot is a full tenancy enumeration against the OCI API, so validating a
+    primary config plus five fallbacks used to cost six of them.
+    """
     tier = (account_tier or "").strip()
     if free_only_mode is None:
         free_only_mode = free_only_for_tier(tier)
-    usage = _usage_snapshot(session, free_only_mode=bool(free_only_mode))
+    if usage is None:
+        usage = _usage_snapshot(session, free_only_mode=bool(free_only_mode))
     tier = str(usage.get("account_tier") or tier or "")
     return free_quota.validate_launch_against_quota(
         shape=shape,
@@ -66,6 +78,11 @@ def enforce_launch_quota(
     fallback_configs: Optional[list[dict[str, Any]]] = None,
 ) -> free_quota.GuardResult:
     """Validate a launch (or capacity-retry primary config). Raises HTTP 400 if blocked."""
+    # One snapshot for the primary config and every fallback below.
+    effective_free_only = (
+        free_only_for_tier(account_tier) if free_only_mode is None else bool(free_only_mode)
+    )
+    usage = _usage_snapshot(session, free_only_mode=effective_free_only)
     guard = check_launch_quota(
         session,
         account_tier=account_tier,
@@ -75,6 +92,7 @@ def enforce_launch_quota(
         boot_volume_size_in_gbs=boot_volume_size_in_gbs,
         boot_volume_vpus_per_gb=boot_volume_vpus_per_gb,
         free_only_mode=free_only_mode,
+        usage=usage,
     )
     if not guard.ok:
         raise HTTPException(
@@ -94,6 +112,7 @@ def enforce_launch_quota(
             boot_volume_size_in_gbs=boot_volume_size_in_gbs,
             boot_volume_vpus_per_gb=boot_volume_vpus_per_gb,
             free_only_mode=free_only_mode,
+            usage=usage,
         )
         if not fb_guard.ok:
             raise HTTPException(

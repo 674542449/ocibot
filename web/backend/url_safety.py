@@ -5,7 +5,7 @@ from __future__ import annotations
 import ipaddress
 import socket
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 
 # Hard-blocked hostnames (cloud metadata & common internal names).
@@ -131,7 +131,9 @@ def resolve_and_check_host(host: str) -> None:
     register outbound targets, redirects are never followed, and the send path
     re-validates.
     """
-    h = (host or "").strip().lower().rstrip(".")
+    # Normalize IDN to the same A-label the HTTP client will dial, so this check
+    # and the actual connection cannot resolve two different names.
+    h = normalize_host_ascii(host)
     if hostname_is_blocked(h):
         raise ValueError(f"禁止访问内网/本地地址：{host}")
     # Strip brackets for IPv6 literals already handled above
@@ -150,6 +152,32 @@ def resolve_and_check_host(host: str) -> None:
             continue
         if _is_blocked_ip(ip):
             raise ValueError(f"禁止访问内网/本地地址：{host} → {addr}")
+
+
+def normalize_host_ascii(host: str) -> str:
+    """Return the exact A-label httpx will connect to.
+
+    socket.getaddrinfo() encodes a non-ASCII hostname with CPython's legacy
+    'idna' codec (IDNA2003 + nameprep), while httpx encodes with the idna package
+    (IDNA2008, uts46). Those disagree: 'evilß.example.com' resolves as
+    'evilss.example.com' during validation but httpx connects to
+    'xn--evil-yna.example.com' — a different host entirely, so the SSRF check
+    could be passed by one name while another is dialled. Normalize to httpx's
+    form up front so both steps see the same name.
+    """
+    h = (host or "").strip().lower().rstrip(".")
+    if not h or h.isascii():
+        return h
+    try:
+        import idna
+
+        # Mirror httpx's encode_host exactly: idna.encode(host.lower()) with no
+        # uts46 mapping (verified in httpx/_urlparse.py). Enabling uts46 here
+        # would accept codepoints httpx then refuses, i.e. validate a name that
+        # never gets dialled.
+        return idna.encode(h).decode("ascii")
+    except Exception as exc:  # noqa: BLE001 - idna.IDNAError and friends
+        raise ValueError(f"主机名无效（国际化域名无法编码）：{host}") from exc
 
 
 def validate_public_http_url(url: str, *, allow_http: bool = True) -> str:
@@ -174,8 +202,16 @@ def validate_public_http_url(url: str, *, allow_http: bool = True) -> str:
     port = parsed.port
     if port is not None and port in _BLOCKED_PORTS:
         raise ValueError(f"禁止使用端口 {port}")
-    resolve_and_check_host(host)
-    return raw
+    ascii_host = normalize_host_ascii(host)
+    resolve_and_check_host(ascii_host)
+    if ascii_host == host:
+        return raw
+    # Persist/return the punycode form so send-time re-validation and httpx both
+    # act on the same name that was checked here.
+    netloc = f"[{ascii_host}]" if ":" in ascii_host else ascii_host
+    if port is not None:
+        netloc = f"{netloc}:{port}"
+    return urlunparse(parsed._replace(netloc=netloc))
 
 
 def assert_safe_outbound_url(url: str) -> None:

@@ -15,6 +15,24 @@
     <div v-if="error" class="error-box">{{ error }}</div>
     <div v-if="msg" class="success-box">{{ msg }}</div>
 
+    <!-- One-time root password: shown until the user confirms they saved it.
+         The server never returns it again, so this must not auto-dismiss. -->
+    <div v-if="pendingPassword" class="card stack password-reveal">
+      <h3 style="margin: 0">请立即保存 root 密码</h3>
+      <p class="muted" style="margin: 0; font-size: 13px">
+        该密码仅显示一次，服务端不保存明文。离开本页后无法再次查看。
+      </p>
+      <div class="row" style="gap: 0.5rem; align-items: center; flex-wrap: wrap">
+        <code class="password-value">{{ pendingPassword }}</code>
+        <button type="button" @click="copyPassword">复制</button>
+      </div>
+      <div class="row">
+        <button class="primary" type="button" @click="dismissPassword">
+          我已保存密码，返回实例列表
+        </button>
+      </div>
+    </div>
+
     <!-- Confirm step -->
     <div v-if="confirmOpen" class="card stack confirm-panel">
       <h3 style="margin: 0">确认创建配置</h3>
@@ -305,6 +323,7 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import api, { type Tenant } from '@/api/client'
 import { pickAndReadTextFile } from '@/utils/file'
+import { copyText } from '@/utils/toast'
 
 type ShapeInfo = {
   shape: string
@@ -346,6 +365,18 @@ const submitting = ref(false)
 const confirmOpen = ref(false)
 const error = ref('')
 const msg = ref('')
+// Held until the user acknowledges it; the API returns the generated root
+// password exactly once and never exposes it again.
+const pendingPassword = ref('')
+
+async function copyPassword() {
+  await copyText(pendingPassword.value, 'root 密码已复制')
+}
+
+function dismissPassword() {
+  pendingPassword.value = ''
+  router.push({ path: '/', query: { tenant: tenantId.value } }).catch(() => {})
+}
 const presetHint = ref('')
 const sshFile = ref('')
 const quotaPreview = ref<any>(null)
@@ -722,15 +753,20 @@ async function doLaunch() {
     confirmOpen.value = false
     if (data.ok) {
       msg.value = data.message || '创建已提交'
-      if (data.root_password) {
-        msg.value += ` · root 密码：${data.root_password}（请立即保存，仅显示一次）`
-      }
       if (data.instance_id) {
         msg.value += ` · 实例 ${String(data.instance_id).slice(-12)}`
       }
       if (data.capacity_job_id) msg.value += ` · 任务 ${data.capacity_job_id.slice(0, 8)}…`
       // A queued capacity-retry job (no instance yet) → task centre; else the list.
       const queuedRetry = !!data.capacity_job_id && !data.instance_id
+      if (data.root_password) {
+        // The server returns this exactly once (it is only hashed into cloud-init,
+        // never stored in plaintext). Auto-navigating unmounted this view 800ms
+        // later and destroyed the only copy, so hold it here and let the user
+        // leave once they have saved it.
+        pendingPassword.value = data.root_password
+        return
+      }
       window.setTimeout(() => {
         if (queuedRetry) {
           router.push({ path: '/jobs' }).catch(() => {})
@@ -789,6 +825,19 @@ onMounted(async () => {
 }
 .warn-text {
   color: var(--warn) !important;
+}
+.password-reveal {
+  border: 1px solid var(--warn);
+}
+.password-value {
+  font-size: 15px;
+  font-weight: 600;
+  padding: 0.35rem 0.6rem;
+  border-radius: 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  user-select: all;
+  word-break: break-all;
 }
 @media (max-width: 600px) {
   .confirm-k {

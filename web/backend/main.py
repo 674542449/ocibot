@@ -18,6 +18,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from web.backend.body_limit import BodySizeLimitMiddleware
 from web.backend.config import get_settings
 from web.backend.db import SessionLocal, init_db
 from web.backend.routers import (
@@ -102,6 +103,11 @@ def create_app() -> FastAPI:
         version=settings.app_version,
         lifespan=lifespan,
     )
+    # Largest request body accepted anywhere. The biggest legitimate payload is a
+    # 20MB backup ZIP. Enforced on bytes actually received, not just on a declared
+    # Content-Length, so a chunked body cannot stream unbounded data to the disk
+    # spool before any route-level check runs.
+    app.add_middleware(BodySizeLimitMiddleware, max_bytes=32 * 1024 * 1024)
     app.add_middleware(GZipMiddleware, minimum_size=500)
     app.add_middleware(
         CORSMiddleware,
@@ -127,26 +133,6 @@ def create_app() -> FastAPI:
     @app.get("/api/health", response_model=HealthOut, tags=["system"])
     def health() -> HealthOut:
         return HealthOut(status="ok", version=settings.app_version, app=settings.app_name)
-
-    # Largest request body accepted anywhere. The biggest legitimate payload is a
-    # 20MB backup ZIP; this bound stops a huge upload from being buffered to the
-    # container's disk before any route-level check can reject it.
-    _MAX_BODY_BYTES = 32 * 1024 * 1024
-
-    @app.middleware("http")
-    async def limit_body_size(request, call_next):
-        raw_len = request.headers.get("content-length")
-        if raw_len:
-            try:
-                declared = int(raw_len)
-            except ValueError:
-                return JSONResponse({"detail": "Content-Length 无效"}, status_code=400)
-            if declared > _MAX_BODY_BYTES:
-                return JSONResponse(
-                    {"detail": f"请求体过大（上限 {_MAX_BODY_BYTES // (1024 * 1024)}MB）"},
-                    status_code=413,
-                )
-        return await call_next(request)
 
     @app.middleware("http")
     async def security_headers(request, call_next):

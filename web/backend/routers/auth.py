@@ -42,20 +42,19 @@ _DUMMY_PASSWORD_HASH = hash_password("ocibot-timing-pad-not-a-real-password")
 
 
 def _client_ip(request: Request) -> str:
-    """Best-effort client IP for rate limiting.
+    """Client IP used as the rate-limit bucket key.
 
-    X-Forwarded-For is only trusted when OCIBOT_TRUST_PROXY=1 (deploy behind a
-    reverse proxy that strips/forges the header). Otherwise a client can spoof
-    the header to evade the login rate limiter.
+    Deliberately does NOT parse X-Forwarded-For itself. Taking the leftmost entry
+    is wrong whenever the proxy *appends* instead of replacing (nginx's canonical
+    ``$proxy_add_x_forwarded_for``, Caddy, cloudflared): the leftmost element is
+    then client-supplied, so a forged value produced a fresh bucket per request
+    and the login limiter could still be bypassed with OCIBOT_TRUST_PROXY=1.
+
+    ``request.client.host`` is authoritative instead: run.py enables uvicorn's
+    ProxyHeadersMiddleware only when OCIBOT_TRUST_PROXY=1, and only for peers in
+    OCIBOT_FORWARDED_ALLOW_IPS, and that middleware already walks the header
+    right-to-left skipping trusted hops. One parser, one policy.
     """
-    settings = get_settings()
-    if settings.trust_proxy:
-        forwarded = request.headers.get("x-forwarded-for") or ""
-        if forwarded:
-            return forwarded.split(",")[0].strip() or "unknown"
-        real_ip = (request.headers.get("x-real-ip") or "").strip()
-        if real_ip:
-            return real_ip
     if request.client:
         return request.client.host or "unknown"
     return "unknown"

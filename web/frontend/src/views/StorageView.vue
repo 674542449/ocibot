@@ -372,29 +372,49 @@ async function loadTenants() {
   if (t === 'boot' || t === 'block' || t === 'object') tab.value = t
 }
 
+// Request-sequence guard (same pattern as InstancesView.load). Without it a
+// slow response for tenant A could land after the user switched to tenant B and
+// repopulate the page with A's volumes/buckets — and because bucket and object
+// actions are addressed by NAME, the next click would then be sent to tenant B
+// for a resource that only exists in A.
+let loadSeq = 0
+
+function beginLoad(): { stale: () => boolean } {
+  const seq = ++loadSeq
+  const wanted = tenantId.value
+  return { stale: () => seq !== loadSeq || tenantId.value !== wanted }
+}
+
 async function loadQuota() {
   if (!tenantId.value) return
+  const guard = beginLoad()
   try {
     const { data } = await api.get(`/tenants/${tenantId.value}/free-quota`)
+    if (guard.stale()) return
     quota.value = data.data || null
   } catch {
+    if (guard.stale()) return
     quota.value = null
   }
 }
 
 async function loadBoot() {
   if (!tenantId.value) return
+  const guard = beginLoad()
   const { data } = await api.get(`/tenants/${tenantId.value}/boot-volumes`, {
     params: { include_subcompartments: includeSub.value },
   })
+  if (guard.stale()) return
   bootVolumes.value = data.data?.volumes || []
 }
 
 async function loadBlock() {
   if (!tenantId.value) return
+  const guard = beginLoad()
   const { data } = await api.get(`/tenants/${tenantId.value}/block-volumes`, {
     params: { include_subcompartments: true },
   })
+  if (guard.stale()) return
   blockVolumes.value = data.data?.volumes || []
   // Pre-fill AD from first volume or boot
   if (!createForm.availability_domain) {
@@ -408,7 +428,9 @@ async function loadBlock() {
 
 async function loadBuckets() {
   if (!tenantId.value) return
+  const guard = beginLoad()
   const { data } = await api.get(`/tenants/${tenantId.value}/object-storage/buckets`)
+  if (guard.stale()) return
   buckets.value = data.data?.buckets || []
   objectNs.value = data.data?.namespace || ''
 }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 import uuid
 from typing import Any, Optional
@@ -153,10 +154,14 @@ def normalize_fallback_configs(
         if not isinstance(item, dict):
             raise ValueError("降级配置格式无效")
         try:
+            # OverflowError: float() on a huge JSON integer (e.g. 10**400) raised
+            # out of here as an unhandled 500 instead of the intended 400.
             fb_ocpus = float(item.get("ocpus"))
             fb_mem = float(item.get("memory_in_gbs"))
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError("降级配置的 OCPU / 内存必须为数字") from exc
+        if not (math.isfinite(fb_ocpus) and math.isfinite(fb_mem)):
+            raise ValueError("降级配置的 OCPU / 内存必须为数字")
         if not (0 < fb_ocpus <= 64) or not (1 <= fb_mem <= 1024):
             raise ValueError("降级配置数值超出合理范围")
         fallback_configs.append({"ocpus": fb_ocpus, "memory_in_gbs": fb_mem})

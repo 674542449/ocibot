@@ -208,6 +208,25 @@ def resume_capacity_job(
         raise HTTPException(status_code=404, detail="任务不存在")
     if row.status == "success":
         raise HTTPException(status_code=400, detail="任务已成功，请新建任务")
+    # Same one-active-retry-per-tenant rule the create paths enforce. Resuming
+    # skipped it, so stopping job A, creating job B, then resuming A left two
+    # active jobs racing LaunchInstance for the same tenant.
+    conflict = db.scalar(
+        select(CapacityJob)
+        .where(
+            CapacityJob.tenant_id == row.tenant_id,
+            CapacityJob.owner_id == user.id,
+            CapacityJob.id != row.id,
+            CapacityJob.enabled.is_(True),
+            CapacityJob.status.in_(("idle", "running")),
+        )
+        .limit(1)
+    )
+    if conflict is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="该租户已有进行中的容量重试任务，请先在任务中心停止或删除后再恢复",
+        )
     row.enabled = True
     row.status = "idle"
     row.next_run_at = datetime.now(timezone.utc)

@@ -209,10 +209,18 @@ sync_repo_to_origin() {
   local remote_sha
   remote_sha="$(git -C "$REPO_DIR" rev-parse --short "origin/$BRANCH")"
   log "远程 origin/$BRANCH: $remote_sha"
-  # Discard local commits/dirty tracked files; untracked junk outside .env is left alone.
+  # Discard local commits/dirty tracked files. `reset --hard` already realigns
+  # every tracked file, which is all this function promises — a `git clean -fd`
+  # here additionally deleted UNTRACKED operator files such as
+  # docker-compose.override.yml, TLS certs or helper scripts kept in the repo
+  # directory. Opt in with OCIBOT_CLEAN_UNTRACKED=1 if you really want that.
   git -C "$REPO_DIR" checkout -B "$BRANCH" "origin/$BRANCH"
   git -C "$REPO_DIR" reset --hard "origin/$BRANCH"
-  git -C "$REPO_DIR" clean -fd --exclude=web/.env --exclude=web_data || true
+  if [ "${OCIBOT_CLEAN_UNTRACKED:-0}" = "1" ]; then
+    warn "OCIBOT_CLEAN_UNTRACKED=1：将删除以下未跟踪文件"
+    git -C "$REPO_DIR" clean -nd --exclude=web/.env --exclude=web_data || true
+    git -C "$REPO_DIR" clean -fd --exclude=web/.env --exclude=web_data || true
+  fi
   if [ -f "/tmp/ocibot.env.backup.$$" ]; then
     mkdir -p "$REPO_DIR/web"
     mv -f "/tmp/ocibot.env.backup.$$" "$REPO_DIR/web/.env"

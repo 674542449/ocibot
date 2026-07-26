@@ -3,26 +3,38 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Optional
 
 from app.config_store import parse_oci_api_text
 
-_PEM_RE = re.compile(
-    r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"
-    r".*?"
-    r"-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
-    re.DOTALL | re.IGNORECASE,
-)
+# Marker-only patterns, matched independently. A single regex spanning BEGIN..END
+# with a ".*?" body backtracks quadratically: text with many BEGIN markers and no
+# END marker cost ~2.3s of GIL-held CPU per 108KB (4x per doubling), stalling
+# every other request in the process. Locating the two markers separately makes
+# extraction linear in the input length.
+_PEM_BEGIN_RE = re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----", re.IGNORECASE)
+_PEM_END_RE = re.compile(r"-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----", re.IGNORECASE)
+
+
+def _pem_span(text: str, start: int = 0) -> Optional[tuple[int, int]]:
+    """Half-open span of the next complete PEM block at or after ``start``."""
+    begin = _PEM_BEGIN_RE.search(text, start)
+    if begin is None:
+        return None
+    end = _PEM_END_RE.search(text, begin.end())
+    if end is None:
+        return None
+    return begin.start(), end.end()
 
 
 def extract_private_key_pem(text: str) -> str:
     """Return the first PEM private key block found in free text, or empty."""
     if not text:
         return ""
-    m = _PEM_RE.search(text)
-    if not m:
+    span = _pem_span(text)
+    if span is None:
         return ""
-    block = m.group(0).strip()
+    block = text[span[0] : span[1]].strip()
     # Normalize line endings
     return block.replace("\r\n", "\n").replace("\r", "\n")
 
@@ -31,7 +43,15 @@ def strip_private_key_pem(text: str) -> str:
     """Remove PEM blocks so configparser is not confused by key material."""
     if not text:
         return ""
-    return _PEM_RE.sub("", text)
+    out: list[str] = []
+    pos = 0
+    while True:
+        span = _pem_span(text, pos)
+        if span is None:
+            out.append(text[pos:])
+            return "".join(out)
+        out.append(text[pos : span[0]])
+        pos = span[1]
 
 
 def _looks_like_placeholder_ocid(value: str) -> bool:

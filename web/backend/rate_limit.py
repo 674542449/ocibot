@@ -26,7 +26,21 @@ class SlidingWindowLimiter:
                 retry = max(0.0, self.window_sec - (now - q[0]))
                 return False, retry
             q.append(now)
+            self._evict_expired(cutoff)
             return True, 0.0
+
+    def _evict_expired(self, cutoff: float) -> None:
+        """Drop buckets that fully aged out.
+
+        Without this the dict only ever grew: every distinct key seen (one per
+        attacker-chosen username, for instance) kept an empty deque forever.
+        Amortized — only runs a full sweep once the map gets large.
+        """
+        if len(self._hits) < 1024:
+            return
+        stale = [k for k, hits in self._hits.items() if not hits or hits[-1] < cutoff]
+        for k in stale:
+            self._hits.pop(k, None)
 
 
 # 10 attempts / 5 minutes per IP+username bucket; also IP-only 30/5min

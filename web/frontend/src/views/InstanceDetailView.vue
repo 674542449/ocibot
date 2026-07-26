@@ -1053,10 +1053,16 @@ const consoleList = ref<any[]>([])
 const consoleBusy = ref(false)
 
 async function loadConsole() {
-  const { data } = await api.get(
-    `/tenants/${tenantId.value}/instances/${instanceId.value}/console`,
-  )
-  consoleList.value = data.connections || []
+  // Surface failures instead of leaving a stale list on screen with no hint that
+  // the refresh failed (the sibling loaders already do this).
+  try {
+    const { data } = await api.get(
+      `/tenants/${tenantId.value}/instances/${instanceId.value}/console`,
+    )
+    consoleList.value = data.connections || []
+  } catch (e: any) {
+    error.value = e?.message || '加载控制台连接失败'
+  }
 }
 async function pickConsoleKey() {
   const text = await pickAndReadTextFile('.pub,.txt,text/plain')
@@ -1112,11 +1118,15 @@ const ruleForm = reactive({
 })
 
 async function loadFirewall() {
-  const { data } = await api.get(
-    `/tenants/${tenantId.value}/instances/${instanceId.value}/firewall`,
-  )
-  fwMsg.value = data.message || ''
-  fwGroups.value = data.data?.groups || []
+  try {
+    const { data } = await api.get(
+      `/tenants/${tenantId.value}/instances/${instanceId.value}/firewall`,
+    )
+    fwMsg.value = data.message || ''
+    fwGroups.value = data.data?.groups || []
+  } catch (e: any) {
+    error.value = e?.message || '加载防火墙规则失败'
+  }
 }
 async function openAllFirewall() {
   if (!confirm('将清空关联 NSG 规则并全开放，确认？')) return

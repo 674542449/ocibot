@@ -17,9 +17,12 @@ class RegisterRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    username: str
-    password: str
-    totp_code: str = ""  # required when the account has 2FA enabled
+    # Bounded like RegisterRequest: the username becomes part of the in-memory
+    # rate-limit bucket key, so an unbounded value let unauthenticated requests
+    # grow that dict without limit.
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(max_length=1024)
+    totp_code: str = Field(default="", max_length=16)  # required when the account has 2FA enabled
 
 
 class ChangePasswordRequest(BaseModel):
@@ -77,7 +80,9 @@ class TenantCreate(BaseModel):
 class TenantPasteImport(BaseModel):
     """Paste ~/.oci/config style text (+ optional PEM in the same blob or separate field)."""
 
-    api_text: str = Field(min_length=1, description="OCI config / API key=value text")
+    # Bounded: a real ~/.oci/config plus a PEM is a few KB, and the PEM scan cost
+    # grows with input length.
+    api_text: str = Field(min_length=1, max_length=64_000, description="OCI config / API key=value text")
     private_key_pem: str = ""
     name: str = ""
     description: str = ""

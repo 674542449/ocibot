@@ -233,7 +233,11 @@ def sanitize_launch_payload(payload: dict, *, for_retry: bool = False) -> dict:
         raise ValueError("缺少启动参数：" + ", ".join(missing))
     if auth_mode == "key":
         key = str(clean.get("ssh_public_key") or "").strip()
-        if "\n" in key:
+        # splitlines() also splits on \r, \x0b, \x0c, \x1c-\x1e, \x85, U+2028 and
+        # U+2029 — a bare "\n" check let those through, and cloud-init's YAML
+        # treats several of them as line breaks, so the key field could inject
+        # extra cloud-config into the persisted launch payload.
+        if len(key.splitlines()) > 1:
             raise ValueError("每次只能填写一条 SSH 公钥")
         if not re.match(r"^(ssh-(?:rsa|ed25519)|ecdsa-sha2-[^ ]+)\s+\S+", key):
             raise ValueError("SSH 公钥格式无效")
@@ -437,7 +441,13 @@ def build_root_cloud_init(
                 "      systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || service ssh restart 2>/dev/null || true",
             ]
         )
-    script = (custom_boot_script or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    # Normalize every character YAML treats as a line break (\r\n, \r, \x85,
+    # U+2028, U+2029, ...) — replacing only \r\n and \r left those in place, and
+    # a crafted script could then escape the write_files block scalar and inject
+    # its own cloud-config keys.
+    script = "\n".join((custom_boot_script or "").splitlines()).strip()
+    if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", script):
+        raise ValueError("启动脚本包含不支持的控制字符")
     if script:
         script_lines = script.split("\n")
         if not script_lines[0].startswith("#!"):
@@ -712,25 +722,18 @@ class TenantSession:
         self._build()
 
     def _build(self) -> None:
-        # Write private key to a temp file (oci SDK expects a path)
-        fd, name = tempfile.mkstemp(prefix="ocibot_key_", suffix=".pem")
-        path = Path(name)
+        # Keep the decrypted key in memory only. It used to be written to a temp
+        # file, which left plaintext OCI API keys in the system temp directory for
+        # any session that was not closed cleanly (and chmod 0600 is close to a
+        # no-op on Windows). The SDK accepts the PEM directly via key_content.
         try:
-            with open(fd, "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(self.tenant.private_key_pem.strip() + "\n")
-            try:
-                import os
-
-                os.chmod(path, 0o600)
-            except OSError:
-                pass
-            self._key_file = path
+            self._key_file = None
             self._config = {
                 "user": self.tenant.user_ocid.strip(),
                 "fingerprint": self.tenant.fingerprint.strip(),
                 "tenancy": self.tenant.tenancy_ocid.strip(),
                 "region": self.tenant.region.strip(),
-                "key_file": str(path),
+                "key_content": self.tenant.private_key_pem.strip() + "\n",
             }
             # Validate config early
             oci.config.validate_config(self._config)
@@ -1206,7 +1209,10 @@ class TenantSession:
                     filtered = [_img_item(img) for img in resp3.data if _is_ubuntu(img)]
                 except Exception:
                     pass
-            items = _latest_lts_ubuntu_images(items)
+            # Use the Ubuntu-filtered list; passing `items` here discarded the
+            # filter entirely, so non-Ubuntu images leaked into ubuntu_only
+            # results. `or items` keeps the never-hide-everything fallback.
+            items = _latest_lts_ubuntu_images(filtered or items)
 
         # Prefer newest Ubuntu versions first (already TIMECREATED DESC)
         return items[:200]
@@ -4046,6 +4052,15 @@ class TenantSession:
                     public_ip = self.network.get_public_ip_by_private_ip_id(lookup).data
                 except ServiceError:
                     raise
+                # If the lookup returns the address we were replacing, the create
+                # did NOT succeed — the old IP is simply still bound (the unbind
+                # wait timed out). Reporting ok with the old address claimed a
+                # rotation that never happened.
+                if (
+                    getattr(public_ip, "id", None) == network.public_ip_id
+                    or (old_ip and getattr(public_ip, "ip_address", None) == old_ip)
+                ):
+                    raise
             return OperationResult(
                 ok=True,
                 message=f"公网 IPv4 已更换：{old_ip or '无'} → {public_ip.ip_address}",
@@ -4852,7 +4867,13 @@ class TenantSession:
                 if not ns_res.ok:
                     return ns_res
                 namespace = (ns_res.data or {}).get("namespace") or ""
-            kwargs: dict[str, Any] = {"limit": limit}
+            # ObjectSummary.size (and the timestamps) are only populated when
+            # requested; without `fields` every object came back with size=None,
+            # so the object-storage usage gauge always read 0 bytes.
+            kwargs: dict[str, Any] = {
+                "limit": limit,
+                "fields": "name,size,md5,timeCreated,timeModified",
+            }
             if prefix:
                 kwargs["prefix"] = prefix
             resp = self.object_storage.list_objects(namespace, bucket, **kwargs)

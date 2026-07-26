@@ -106,7 +106,7 @@ def export_encrypted_zip(
 def import_encrypted_zip(
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
-    password: Annotated[str, Form()],
+    password: Annotated[str, Form(max_length=512)],
     file: UploadFile = File(...),
 ) -> RestoreResult:
     """Restore tenants from an AES ZIP.
@@ -157,6 +157,10 @@ def import_encrypted_zip(
         raise HTTPException(status_code=400, detail="备份内容格式无效")
     if len(items) > 200:
         raise HTTPException(status_code=400, detail="单次备份租户过多（上限 200）")
+    def _clean_tier(raw: Any) -> str:
+        tier = str(raw or "").strip().lower()
+        return tier if tier in {"free", "paid"} else ""
+
     def _expiry_days(raw: Any) -> int:
         """Archive-supplied value clamped to the Integer column's safe range."""
         try:
@@ -187,7 +191,10 @@ def import_encrypted_zip(
                 color=str(item.get("color") or "#3B82F6")[:32],
                 password_changed_at=str(item.get("password_changed_at") or "")[:64],
                 password_expiry_days=_expiry_days(item.get("password_expiry_days") or 120),
-                account_tier=str(item.get("account_tier") or "")[:16],
+                # Normalize at ingest: an arbitrary string from the archive used to
+                # flow into the quota guard, where anything unrecognized turned the
+                # Always-Free caps off.
+                account_tier=_clean_tier(item.get("account_tier")),
             )
             errors = cfg.validate()
             if errors:

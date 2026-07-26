@@ -19,6 +19,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 12
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
 
   api:
@@ -31,12 +33,12 @@ services:
     env_file:
       - .env
     environment:
+      # Keys here override .env — keep this list minimal (see the root
+      # docker-compose.yml for why).
       DATABASE_URL: postgresql+psycopg://ocibot:${POSTGRES_PASSWORD:-ocibot_dev_pass}@db:5432/ocibot
-      OCIBOT_CORS_ORIGINS: ${OCIBOT_CORS_ORIGINS:-http://localhost:8000,http://127.0.0.1:8000}
-      OCIBOT_API_WORKERS: ${OCIBOT_API_WORKERS:-2}
-      OCIBOT_DB_POOL_SIZE: ${OCIBOT_DB_POOL_SIZE:-10}
-      OCIBOT_DB_MAX_OVERFLOW: ${OCIBOT_DB_MAX_OVERFLOW:-20}
-      OCIBOT_UPDATE_ENABLED: ${OCIBOT_UPDATE_ENABLED:-1}
+      # Opt-in: enabling it lets an admin session drive the mounted docker.sock,
+      # which is equivalent to host root.
+      OCIBOT_UPDATE_ENABLED: ${OCIBOT_UPDATE_ENABLED:-0}
       OCIBOT_UPDATE_REPO: ${OCIBOT_UPDATE_REPO:-674542449/ocibot}
       OCIBOT_UPDATE_BRANCH: ${OCIBOT_UPDATE_BRANCH:-main}
       OCIBOT_HOST_DIR: /host/ocibot
@@ -55,6 +57,8 @@ services:
       timeout: 5s
       retries: 8
       start_period: 30s
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
 
   worker:
@@ -74,6 +78,8 @@ services:
         condition: service_healthy
       api:
         condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
 
 volumes:

@@ -500,11 +500,13 @@ def _detach_host_install_sh(host_repo: str, new_sha: str) -> tuple[int, str]:
         f"export OCIBOT_SKIP_GIT=1; "
         f"cd {_sh_quote(host_repo)} && bash scripts/install.sh update"
     )
+    # No --rm: `docker run -d` returns 0 as soon as the container STARTS, so its
+    # exit code says nothing about whether the update succeeded. Keeping the
+    # container lets get_status() inspect its real exit code and logs afterwards.
     cmd = [
         "docker",
         "run",
         "-d",
-        "--rm",
         "--name",
         "ocibot-self-update-restart",
         "--privileged",
@@ -818,10 +820,59 @@ def _recover_stale_running(
     return st
 
 
+def _helper_container_outcome() -> tuple[str, int, str]:
+    """(status, exit_code, log_tail) of the detached update helper, if it still exists."""
+    code, out = _run_cmd(
+        [
+            "docker",
+            "inspect",
+            "-f",
+            "{{.State.Status}} {{.State.ExitCode}}",
+            "ocibot-self-update-restart",
+        ],
+        timeout=20,
+    )
+    if code != 0:
+        return "", 0, ""
+    parts = (out or "").strip().split()
+    status = parts[0] if parts else ""
+    try:
+        exit_code = int(parts[1]) if len(parts) > 1 else 0
+    except ValueError:
+        exit_code = 0
+    logs = ""
+    if status == "exited" and exit_code != 0:
+        _, logs = _run_cmd(
+            ["docker", "logs", "--tail", "200", "ocibot-self-update-restart"], timeout=30
+        )
+    return status, exit_code, logs or ""
+
+
 def get_status(db: Session) -> dict[str, Any]:
     local = local_build_info()
     caps = capabilities()
     st = _read_status_raw(db)
+    # The helper is launched detached, so "started successfully" was reported even
+    # when the build/restart it performs failed. Reconcile against the container's
+    # real exit code once the code on disk is still not what we applied.
+    if st.get("state") == "success" and st.get("applied_sha"):
+        applied = str(st.get("applied_sha") or "")
+        current = str(local.get("git_sha") or "")
+        if current and not applied.startswith(current) and not current.startswith(applied[:7]):
+            status, exit_code, logs = _helper_container_outcome()
+            if status == "exited" and exit_code != 0:
+                st["state"] = "error"
+                st["last_error"] = f"更新容器退出码 {exit_code}"
+                st["message"] = (
+                    f"宿主机更新任务失败（退出码 {exit_code}）。"
+                    f"请 SSH 执行：cd {caps.get('host_repo_on_host')} && bash scripts/install.sh update"
+                )
+                if logs:
+                    st["log_tail"] = _append_log(str(st.get("log_tail") or ""), "\n" + logs)
+                try:
+                    _write_status(db, st)
+                except Exception:  # noqa: BLE001
+                    pass
     recovered = _recover_stale_running(st)
     if recovered.get("state") != st.get("state"):
         try:
