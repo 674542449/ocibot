@@ -262,6 +262,11 @@ onBeforeUnmount(() => {
   backdrop-filter: blur(22px) saturate(1.4);
   -webkit-backdrop-filter: blur(22px) saturate(1.4);
   box-shadow: var(--glass-highlight), 4px 0 24px rgba(15, 23, 42, 0.04);
+  color: var(--text);
+}
+
+:global(html[data-theme='dark']) .sidebar {
+  box-shadow: var(--glass-highlight), 4px 0 24px rgba(0, 0, 0, 0.35);
 }
 
 .brand {
@@ -361,12 +366,22 @@ onBeforeUnmount(() => {
   color: var(--text);
 }
 
+:global(html[data-theme='dark']) .nav a:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+}
+
 .nav a.nav-active {
   background: var(--accent-soft);
   color: var(--accent);
   font-weight: 600;
   border-color: rgba(51, 112, 255, 0.12);
   box-shadow: var(--glass-highlight);
+}
+
+:global(html[data-theme='dark']) .nav a.nav-active {
+  border-color: rgba(91, 145, 255, 0.28);
+  color: #9ec0ff;
 }
 
 .nav-ico {

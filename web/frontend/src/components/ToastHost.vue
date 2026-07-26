@@ -83,8 +83,17 @@ onBeforeUnmount(() => {
   border-color: transparent;
   color: var(--accent);
 }
-html[data-theme='dark'] .toast-ok {
-  color: var(--ok);
+:global(html[data-theme='dark']) .toast-ok {
+  color: #7dffa8;
+  border-color: rgba(61, 214, 140, 0.22);
+}
+:global(html[data-theme='dark']) .toast-err {
+  color: #ffb0ad;
+  border-color: rgba(255, 123, 118, 0.22);
+}
+:global(html[data-theme='dark']) .toast-info {
+  color: #9ec0ff;
+  border-color: rgba(91, 145, 255, 0.22);
 }
 @keyframes toast-in {
   from {

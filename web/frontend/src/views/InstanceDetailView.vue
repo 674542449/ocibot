@@ -1431,15 +1431,13 @@ watch([tenantId, instanceId], async () => {
   border: 1px solid var(--glass-border);
   border-radius: 14px;
   padding: 0.7rem 0.8rem 0.55rem;
-  background: rgba(255, 255, 255, 0.45);
+  background: color-mix(in srgb, var(--panel) 70%, transparent);
   min-width: 0;
   box-shadow: var(--glass-highlight);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
   position: relative;
-}
-html[data-theme='dark'] .metric-card {
-  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
 }
 .metric-head {
   display: flex;
@@ -1471,18 +1469,15 @@ html[data-theme='dark'] .metric-card {
   z-index: 2;
   padding: 0.3rem 0.5rem;
   border-radius: 10px;
-  background: rgba(29, 33, 41, 0.82);
+  background: rgba(20, 22, 28, 0.92);
   color: #fff;
-  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.18);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.28);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
   white-space: nowrap;
   text-align: center;
   min-width: 4.5rem;
-}
-html[data-theme='dark'] .metric-tip {
-  background: rgba(15, 18, 28, 0.9);
-  border: 1px solid rgba(255, 255, 255, 0.08);
 }
 .tip-val {
   font-size: 13px;

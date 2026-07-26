@@ -110,9 +110,10 @@ async function submit() {
   padding-top: max(1.25rem, env(safe-area-inset-top));
   padding-bottom: max(1.25rem, env(safe-area-inset-bottom));
   background:
-    radial-gradient(900px 420px at 10% -10%, #d6e4ff88, transparent),
-    radial-gradient(700px 380px at 100% 0%, #e8deff66, transparent),
+    radial-gradient(900px 420px at 10% -10%, var(--bg-glow-1), transparent),
+    radial-gradient(700px 380px at 100% 0%, var(--bg-glow-2), transparent),
     var(--bg);
+  color: var(--text);
 }
 
 .login-card {

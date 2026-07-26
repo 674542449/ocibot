@@ -792,6 +792,12 @@ onMounted(async () => {
   border-color: transparent;
   color: var(--danger);
 }
+:global(html[data-theme='dark']) .parse-box.ok {
+  color: #7dffa8;
+}
+:global(html[data-theme='dark']) .parse-box.bad {
+  color: #ffb0ad;
+}
 .manual-block {
   border-top: 1px solid var(--border);
   padding-top: 0.85rem;
@@ -831,7 +837,4 @@ code {
   margin-top: 0.15rem;
 }
 
-html[data-theme='dark'] .parse-box.ok {
-  color: var(--ok);
-}
 </style>

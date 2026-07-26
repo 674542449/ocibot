@@ -483,16 +483,32 @@ onMounted(async () => {
   color: #fff;
 }
 .badge.st-ok {
-  background: #14532d;
-  color: #86efac;
+  background: var(--ok-soft);
+  color: var(--ok);
+  border-color: transparent;
 }
 .badge.st-warn {
-  background: #78350f;
-  color: #fde68a;
+  background: var(--warn-soft);
+  color: var(--warn);
+  border-color: transparent;
 }
 .badge.st-critical,
 .badge.st-over {
-  background: #7f1d1d;
-  color: #fecaca;
+  background: var(--danger-soft);
+  color: var(--danger);
+  border-color: transparent;
+}
+:global(html[data-theme='dark']) .badge.st-ok {
+  color: #7dffa8;
+  background: rgba(28, 78, 52, 0.85);
+}
+:global(html[data-theme='dark']) .badge.st-warn {
+  color: #ffd27a;
+  background: rgba(90, 64, 20, 0.85);
+}
+:global(html[data-theme='dark']) .badge.st-critical,
+:global(html[data-theme='dark']) .badge.st-over {
+  color: #ffb0ad;
+  background: rgba(96, 40, 38, 0.85);
 }
 </style>

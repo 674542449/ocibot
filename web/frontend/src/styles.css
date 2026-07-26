@@ -50,36 +50,36 @@
   font-feature-settings: "kern";
 }
 
-/* Optional dark glass */
+/* Optional dark glass — keep text/surfaces high-contrast on charcoal */
 html[data-theme='dark'] {
   color-scheme: dark;
-  --bg: #121216;
-  --bg-glow-1: rgba(64, 128, 255, 0.16);
-  --bg-glow-2: rgba(107, 78, 255, 0.12);
-  --panel: rgba(35, 35, 38, 0.72);
-  --panel-solid: #232326;
-  --panel-2: rgba(42, 42, 46, 0.78);
-  --border: rgba(255, 255, 255, 0.08);
-  --border-strong: rgba(255, 255, 255, 0.14);
-  --glass-border: rgba(255, 255, 255, 0.1);
-  --glass-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.08);
-  --text: #f2f3f5;
-  --muted: #86909c;
-  --text-secondary: #c9cdd4;
-  --accent: #4080ff;
-  --accent-hover: #6aa1ff;
-  --accent-soft: rgba(26, 39, 68, 0.9);
-  --accent-soft-2: #243656;
-  --danger: #f76965;
-  --danger-soft: rgba(59, 34, 32, 0.9);
+  --bg: #0f1014;
+  --bg-glow-1: rgba(64, 128, 255, 0.14);
+  --bg-glow-2: rgba(107, 78, 255, 0.1);
+  --panel: rgba(28, 29, 34, 0.88);
+  --panel-solid: #1c1d22;
+  --panel-2: rgba(36, 38, 44, 0.92);
+  --border: rgba(255, 255, 255, 0.1);
+  --border-strong: rgba(255, 255, 255, 0.2);
+  --glass-border: rgba(255, 255, 255, 0.12);
+  --glass-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  --text: #f5f6f8;
+  --muted: #9aa3b2;
+  --text-secondary: #c5cad3;
+  --accent: #5b91ff;
+  --accent-hover: #82adff;
+  --accent-soft: rgba(48, 74, 130, 0.55);
+  --accent-soft-2: #3a547d;
+  --danger: #ff7b76;
+  --danger-soft: rgba(90, 40, 38, 0.72);
   --ok: #3dd68c;
-  --ok-soft: rgba(26, 51, 38, 0.9);
-  --warn: #f5a623;
-  --warn-soft: rgba(59, 46, 20, 0.9);
-  --input-bg: rgba(42, 42, 46, 0.82);
-  --row-hover: rgba(46, 46, 50, 0.85);
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.28), 0 4px 16px rgba(0, 0, 0, 0.18);
-  --shadow-md: 0 12px 32px rgba(0, 0, 0, 0.35);
+  --ok-soft: rgba(28, 68, 48, 0.72);
+  --warn: #f5b942;
+  --warn-soft: rgba(90, 64, 20, 0.72);
+  --input-bg: rgba(36, 38, 44, 0.95);
+  --row-hover: rgba(48, 50, 58, 0.9);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35), 0 4px 16px rgba(0, 0, 0, 0.22);
+  --shadow-md: 0 12px 32px rgba(0, 0, 0, 0.42);
 }
 
 * {
@@ -138,8 +138,10 @@ button {
   -webkit-backdrop-filter: blur(10px);
 }
 
-html[data-theme='dark'] button {
-  background: rgba(255, 255, 255, 0.06);
+html[data-theme='dark'] button:not(.primary):not(.danger):not(.ghost) {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: var(--border-strong);
+  color: var(--text);
 }
 
 button:hover:not(:disabled) {
@@ -147,8 +149,10 @@ button:hover:not(:disabled) {
   border-color: var(--accent-soft-2);
 }
 
-html[data-theme='dark'] button:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.1);
+html[data-theme='dark'] button:hover:not(:disabled):not(.primary):not(.danger):not(.ghost) {
+  background: rgba(255, 255, 255, 0.14);
+  border-color: var(--accent-soft-2);
+  color: var(--text);
 }
 
 button.primary {
@@ -160,6 +164,18 @@ button.primary {
 
 button.primary:hover:not(:disabled) {
   background: linear-gradient(180deg, var(--accent-hover) 0%, #1f4fd6 100%);
+  border-color: transparent;
+  color: #fff;
+}
+
+html[data-theme='dark'] button.primary {
+  color: #fff;
+  background: linear-gradient(180deg, #5b91ff 0%, var(--accent) 100%);
+  border-color: transparent;
+}
+
+html[data-theme='dark'] button.primary:hover:not(:disabled) {
+  background: linear-gradient(180deg, var(--accent-hover) 0%, #3a6fe0 100%);
   border-color: transparent;
   color: #fff;
 }
@@ -177,6 +193,18 @@ button.danger:hover:not(:disabled) {
   border-color: var(--danger);
 }
 
+html[data-theme='dark'] button.danger {
+  color: #ffb0ad;
+  background: var(--danger-soft);
+  border-color: transparent;
+}
+
+html[data-theme='dark'] button.danger:hover:not(:disabled) {
+  background: var(--danger);
+  color: #fff;
+  border-color: var(--danger);
+}
+
 button.ghost {
   background: transparent;
   border-color: transparent;
@@ -185,6 +213,17 @@ button.ghost {
 }
 
 button.ghost:hover:not(:disabled) {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+html[data-theme='dark'] button.ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-secondary);
+}
+
+html[data-theme='dark'] button.ghost:hover:not(:disabled) {
   background: var(--panel-2);
   color: var(--text);
 }
@@ -231,6 +270,18 @@ textarea:focus {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--muted);
+  opacity: 1;
+}
+
+/* Native <select> menus: force readable option colors in dark mode. */
+html[data-theme='dark'] option {
+  background: var(--panel-solid);
+  color: var(--text);
 }
 
 .card {
@@ -323,8 +374,9 @@ th,
 td {
   text-align: left;
   padding: 0.7rem 0.85rem;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+  border-bottom: 1px solid color-mix(in srgb, var(--border-strong) 55%, transparent);
   vertical-align: middle;
+  color: var(--text);
 }
 
 th {
@@ -341,7 +393,8 @@ th {
 }
 
 html[data-theme='dark'] th {
-  background: rgba(30, 30, 34, 0.82);
+  background: rgba(24, 25, 30, 0.94);
+  color: var(--text-secondary);
 }
 
 tr:last-child td {
@@ -370,6 +423,12 @@ tr:hover td {
   box-shadow: var(--glass-highlight);
 }
 
+html[data-theme='dark'] .badge {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-secondary);
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
 .badge.running {
   color: var(--ok);
   background: var(--ok-soft);
@@ -385,6 +444,26 @@ tr:hover td {
 .badge.err {
   color: var(--danger);
   background: var(--danger-soft);
+}
+
+html[data-theme='dark'] .badge.running {
+  color: #7dffa8;
+  background: rgba(28, 78, 52, 0.85);
+  border-color: rgba(61, 214, 140, 0.28);
+}
+html[data-theme='dark'] .badge.stopped {
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.08);
+}
+html[data-theme='dark'] .badge.warn {
+  color: #ffd27a;
+  background: rgba(90, 64, 20, 0.85);
+  border-color: rgba(245, 185, 66, 0.28);
+}
+html[data-theme='dark'] .badge.err {
+  color: #ffb0ad;
+  background: rgba(96, 40, 38, 0.85);
+  border-color: rgba(255, 123, 118, 0.28);
 }
 
 .error-box {
@@ -414,7 +493,13 @@ tr:hover td {
 }
 
 html[data-theme='dark'] .success-box {
-  color: var(--ok);
+  color: #7dffa8;
+  border-color: rgba(61, 214, 140, 0.22);
+}
+
+html[data-theme='dark'] .error-box {
+  color: #ffb0ad;
+  border-color: rgba(255, 123, 118, 0.22);
 }
 
 .field label {
@@ -568,6 +653,13 @@ label.choice.muted,
   border: 1px solid var(--border);
 }
 
+html[data-theme='dark'] .tab-row > button.primary,
+html[data-theme='dark'] .scroll-x > button.primary {
+  background: rgba(255, 255, 255, 0.1);
+  color: #9ec0ff;
+  border-color: var(--border-strong);
+}
+
 .actions-row {
   display: flex;
   flex-wrap: wrap;
@@ -607,7 +699,8 @@ label.choice.muted,
 }
 
 html[data-theme='dark'] .btn-group {
-  background: rgba(255, 255, 255, 0.05);
+  background: rgba(255, 255, 255, 0.06);
+  border-color: var(--border);
 }
 
 .btn-group button {
@@ -635,6 +728,11 @@ code {
   background: var(--panel-2);
   padding: 0.1rem 0.35rem;
   border-radius: 4px;
+  color: var(--text);
+}
+
+html[data-theme='dark'] code {
+  background: rgba(255, 255, 255, 0.08);
   color: var(--text-secondary);
 }
 

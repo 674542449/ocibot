@@ -31,7 +31,7 @@
           </tbody>
         </table>
       </div>
-      <p class="muted" style="margin: 0; font-size: 12px; color: #fbbf24">
+      <p class="muted warn-text" style="margin: 0; font-size: 12px">
         ⚠ 若勾选了「允许外网直接访问」，系统会放宽云端安全组与系统内防火墙；容量重试会持续调用创建接口，请确认间隔与次数。
         服务端会按 Always Free 额度拦截超额创建（免费/未知账号硬拦；已付费账号仅警告）。
       </p>
@@ -45,7 +45,7 @@
         <div class="muted" style="margin-top: 0.25rem">
           {{ (quotaPreview.summary_lines || []).slice(0, 4).join(' · ') || '—' }}
         </div>
-        <p v-if="quotaLoadError" class="muted" style="margin: 0.35rem 0 0; color: #fbbf24">
+        <p v-if="quotaLoadError" class="muted warn-text" style="margin: 0.35rem 0 0">
           {{ quotaLoadError }}
         </p>
       </div>
@@ -786,6 +786,9 @@ onMounted(async () => {
   width: 28%;
   min-width: 5.5rem;
   white-space: nowrap;
+}
+.warn-text {
+  color: var(--warn) !important;
 }
 @media (max-width: 600px) {
   .confirm-k {
