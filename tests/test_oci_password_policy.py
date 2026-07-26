@@ -111,3 +111,25 @@ def test_disable_propagates_list_failure():
     result = sess.disable_console_password_expiry()
     assert result.ok is False
     assert "no domain" in result.message
+
+
+def test_patch_uses_uppercase_op_enums():
+    """Identity Domains rejects lowercase op; must be ADD/REMOVE/REPLACE."""
+    from oci.identity_domains.models import Operations
+
+    sess = _FakeSession()
+    client = MagicMock()
+    client.patch_password_policy.return_value = SimpleNamespace(
+        data=SimpleNamespace(password_expires_after=None)
+    )
+    after = sess._patch_password_policy_never_expire(client, "pp1")
+    assert after is None
+    assert client.patch_password_policy.call_count == 1
+    kwargs = client.patch_password_policy.call_args.kwargs
+    patch = kwargs["patch_op"]
+    ops = list(patch.operations or [])
+    assert ops
+    for op in ops:
+        assert op.op == Operations.OP_REMOVE
+        assert op.op == "REMOVE"
+        assert op.path in {"passwordExpiresAfter", "passwordExpireWarning"}

@@ -3723,10 +3723,11 @@ class TenantSession:
         """Clear passwordExpiresAfter (and warning) on a domain password policy."""
         from oci.identity_domains.models import Operations, PatchOp
 
-        # SCIM: remove clears the attribute → password never expires.
+        # Identity Domains requires uppercase op enums: ADD / REMOVE / REPLACE
+        # (lowercase "remove" is rejected with "must be one of ['ADD', ...]").
         ops = [
-            Operations(op="remove", path="passwordExpiresAfter"),
-            Operations(op="remove", path="passwordExpireWarning"),
+            Operations(op=Operations.OP_REMOVE, path="passwordExpiresAfter"),
+            Operations(op=Operations.OP_REMOVE, path="passwordExpireWarning"),
         ]
         patch = PatchOp(
             schemas=["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
@@ -3741,11 +3742,12 @@ class TenantSession:
         except ServiceError as exc:
             # Some domains reject remove; fall back to replace with null.
             status = getattr(exc, "status", None)
-            if status not in (400, 422):
+            message = str(getattr(exc, "message", "") or exc)
+            if status not in (400, 422) and "passwordExpiresAfter" not in message:
                 raise
             ops = [
-                Operations(op="replace", path="passwordExpiresAfter", value=None),
-                Operations(op="replace", path="passwordExpireWarning", value=None),
+                Operations(op=Operations.OP_REPLACE, path="passwordExpiresAfter", value=None),
+                Operations(op=Operations.OP_REPLACE, path="passwordExpireWarning", value=None),
             ]
             patch = PatchOp(
                 schemas=["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
