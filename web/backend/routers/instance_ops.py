@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.oci_client import FirewallRuleSpec
+from web.backend import quota_guard
 from web.backend.audit import write_audit
 from web.backend.auth import get_current_user
 from web.backend.db import get_db
