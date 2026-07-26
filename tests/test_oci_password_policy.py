@@ -133,3 +133,66 @@ def test_patch_uses_uppercase_op_enums():
         assert op.op == Operations.OP_REMOVE
         assert op.op == "REMOVE"
         assert op.path in {"passwordExpiresAfter", "passwordExpireWarning"}
+
+
+def test_standard_policy_is_protected():
+    assert TenantSession._is_protected_password_policy(
+        {"id": "StandardPasswordPolicy", "name": "standardPasswordPolicy"}
+    )
+    assert TenantSession._is_protected_password_policy(
+        {"id": "x", "name": "Standard Password Policy"}
+    )
+    assert not TenantSession._is_protected_password_policy(
+        {"id": "DefaultPasswordPolicy", "name": "defaultPasswordPolicy"}
+    )
+
+
+def test_disable_skips_standard_and_updates_default():
+    sess = _FakeSession()
+    sess.list_console_password_policies = MagicMock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(
+            ok=True,
+            message="ok",
+            data={
+                "policies": [
+                    {
+                        "id": "StandardPasswordPolicy",
+                        "name": "standardPasswordPolicy",
+                        "domain_name": "Default",
+                        "domain_url": "https://idcs.example.com",
+                        "password_expires_after": 120,
+                    },
+                    {
+                        "id": "DefaultPasswordPolicy",
+                        "name": "defaultPasswordPolicy",
+                        "domain_name": "Default",
+                        "domain_url": "https://idcs.example.com",
+                        "password_expires_after": 120,
+                    },
+                ]
+            },
+        )
+    )
+    sess._identity_domains_client = MagicMock(return_value=object())  # type: ignore[method-assign]
+    sess._patch_password_policy_never_expire = MagicMock(return_value=None)  # type: ignore[method-assign]
+    result = sess.disable_console_password_expiry()
+    assert result.ok is True
+    assert "关闭强制改密" in result.message
+    assert "defaultPasswordPolicy" in result.message
+    assert "部分失败" not in result.message
+    assert "受保护" in result.message
+    assert len(result.data["updated"]) == 1
+    assert result.data["updated"][0]["id"] == "DefaultPasswordPolicy"
+    assert any("受保护" in str(s.get("reason") or "") for s in result.data["skipped"])
+    sess._patch_password_policy_never_expire.assert_called_once_with(
+        sess._identity_domains_client.return_value, "DefaultPasswordPolicy"
+    )
+
+
+def test_protected_error_message_detection():
+    class FakeErr(Exception):
+        message = "Cannot perform UPDATE operation on protected PasswordPolicy resource."
+
+    assert TenantSession._is_protected_password_policy_error(FakeErr())
+    assert not TenantSession._is_protected_password_policy_error(Exception("not authorized for user"))
+

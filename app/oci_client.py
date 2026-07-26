@@ -3523,12 +3523,79 @@ class TenantSession:
             data={"domains": domains, "policies": policies, "errors": errors},
         )
 
+    # Built-in Identity Domains policies that Oracle marks protected (PATCH → 403).
+    # StandardPasswordPolicy is a system template; console logins use Default/defaultPasswordPolicy.
+    _PROTECTED_PASSWORD_POLICY_IDS = frozenset(
+        {
+            "standardpasswordpolicy",
+            "standardpasswordpolicyid",
+        }
+    )
+    _PROTECTED_PASSWORD_POLICY_NAMES = frozenset(
+        {
+            "standardpasswordpolicy",
+            "standard password policy",
+            "standard",
+        }
+    )
+
+    @classmethod
+    def _is_protected_password_policy(cls, pol: dict[str, Any]) -> bool:
+        pid = str(pol.get("id") or "").strip().lower()
+        name = str(pol.get("name") or "").strip().lower()
+        if pid in cls._PROTECTED_PASSWORD_POLICY_IDS:
+            return True
+        if name in cls._PROTECTED_PASSWORD_POLICY_NAMES:
+            return True
+        # Oracle resource ids often look like StandardPasswordPolicy.
+        if "standardpasswordpolicy" in pid.replace(" ", ""):
+            return True
+        if name.replace(" ", "") == "standardpasswordpolicy":
+            return True
+        return False
+
+    @staticmethod
+    def _is_protected_password_policy_error(exc: BaseException) -> bool:
+        """True when Oracle refuses PATCH because the policy is a protected system resource."""
+        text = " ".join(
+            str(part)
+            for part in (
+                getattr(exc, "message", ""),
+                getattr(exc, "body", ""),
+                exc,
+            )
+            if part
+        ).lower()
+        return (
+            "protected passwordpolicy" in text
+            or "protected resource" in text
+            or "checkprotectedresource" in text
+            or "cannot perform update operation on protected" in text
+        )
+
+    @staticmethod
+    def _password_policy_sort_key(pol: dict[str, Any]) -> tuple:
+        name = str(pol.get("name") or "").strip().lower()
+        pid = str(pol.get("id") or "").strip().lower()
+        # Prefer the real default policy that free-tier console accounts use.
+        if name in {"default", "default password policy", "defaultpasswordpolicy"} or pid in {
+            "defaultpasswordpolicy",
+            "default",
+        }:
+            return (0, name or pid)
+        if "default" in name or "default" in pid:
+            return (1, name or pid)
+        return (2, name or pid)
+
     def disable_console_password_expiry(self) -> OperationResult:
         """Clear Identity Domain ``passwordExpiresAfter`` so console passwords do not expire.
 
         This talks to Oracle Identity Domains (SCIM PasswordPolicy), not the local
         reminder stored on the OCIBot tenant row. Requires domain admin / password
         policy manage rights on the API user.
+
+        Only mutates editable policies (typically Default/defaultPasswordPolicy).
+        Built-in StandardPasswordPolicy is Oracle-protected and is skipped.
         """
         listed = self.list_console_password_policies()
         if not listed.ok:
@@ -3545,19 +3612,16 @@ class TenantSession:
         skipped: list[dict[str, Any]] = []
         errors: list[str] = []
 
-        # Prefer Default password policy first; then others.
-        policies_sorted = sorted(
-            policies,
-            key=lambda p: (
-                0 if str(p.get("name") or "").lower() in {"default", "default password policy"} else 1,
-                str(p.get("name") or ""),
-            ),
-        )
+        policies_sorted = sorted(policies, key=self._password_policy_sort_key)
 
         for pol in policies_sorted:
             domain_url = str(pol.get("domain_url") or "").strip()
             policy_id = str(pol.get("id") or "").strip()
+            label = f"{pol.get('domain_name') or 'domain'}/{pol.get('name') or policy_id}"
             if not domain_url or not policy_id:
+                continue
+            if self._is_protected_password_policy(pol):
+                skipped.append({**pol, "reason": "Oracle 受保护系统策略（不可修改，可忽略）"})
                 continue
             expires_after = pol.get("password_expires_after")
             # None / 0 → already never-expire (domain-dependent; treat both as off).
@@ -3578,9 +3642,28 @@ class TenantSession:
                     }
                 )
             except ServiceError as exc:
-                errors.append(f"{pol.get('domain_name')}/{pol.get('name')}: {_format_service_error(exc)}")
+                if self._is_protected_password_policy_error(exc):
+                    # Standard/system templates refuse UPDATE even when listed.
+                    skipped.append(
+                        {
+                            **pol,
+                            "reason": "Oracle 受保护系统策略（不可修改，可忽略）",
+                            "error": _format_service_error(exc),
+                        }
+                    )
+                else:
+                    errors.append(f"{label}: {_format_service_error(exc)}")
             except Exception as exc:  # noqa: BLE001
-                errors.append(f"{pol.get('domain_name')}/{pol.get('name')}: {exc}")
+                if self._is_protected_password_policy_error(exc):
+                    skipped.append(
+                        {
+                            **pol,
+                            "reason": "Oracle 受保护系统策略（不可修改，可忽略）",
+                            "error": str(exc),
+                        }
+                    )
+                else:
+                    errors.append(f"{label}: {exc}")
 
         if not updated and not skipped and errors:
             return OperationResult(ok=False, message="；".join(errors), data={"updated": [], "errors": errors})
@@ -3592,10 +3675,15 @@ class TenantSession:
             msg = f"已在 Oracle 关闭强制改密：{names}"
             if len(updated) > 5:
                 msg += f" 等 {len(updated)} 条"
-            if skipped:
-                msg += f"；另有 {len(skipped)} 条本就无需过期"
+            # Only mention skips that are useful; don't dump protected-system noise as failure.
+            never = [s for s in skipped if "不强制过期" in str(s.get("reason") or "")]
+            protected = [s for s in skipped if "受保护" in str(s.get("reason") or "")]
+            if never:
+                msg += f"；另有 {len(never)} 条本就无需过期"
+            if protected:
+                msg += f"；已跳过 {len(protected)} 条系统受保护策略（如 StandardPasswordPolicy）"
             if errors:
-                msg += f"；部分失败：{'；'.join(errors[:3])}"
+                msg += f"；其他失败：{'；'.join(errors[:2])}"
             return OperationResult(
                 ok=True,
                 message=msg,
@@ -3603,9 +3691,20 @@ class TenantSession:
             )
 
         if skipped and not errors:
+            protected_only = all("受保护" in str(s.get("reason") or "") for s in skipped)
+            if protected_only:
+                return OperationResult(
+                    ok=False,
+                    message=(
+                        "只找到 Oracle 受保护的系统密码策略（如 StandardPasswordPolicy），"
+                        "无法修改。请确认 Domain 中是否存在 Default/defaultPasswordPolicy，"
+                        "以及 API 用户是否有管理密码策略权限。"
+                    ),
+                    data={"updated": [], "skipped": skipped, "errors": []},
+                )
             return OperationResult(
                 ok=True,
-                message=f"Oracle 密码策略已是「不强制过期」（{len(skipped)} 条）",
+                message=f"Oracle 密码策略已是「不强制过期」或无需修改（{len(skipped)} 条）",
                 data={"updated": [], "skipped": skipped, "errors": []},
             )
 
