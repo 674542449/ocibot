@@ -70,7 +70,16 @@ def init_db() -> None:
     # Import models so metadata is registered.
     from web.backend import models  # noqa: F401
 
-    Base.metadata.create_all(bind=engine)
+    from sqlalchemy.exc import DatabaseError
+
+    try:
+        Base.metadata.create_all(bind=engine)
+    except DatabaseError:
+        # The default OCIBOT_API_WORKERS=2 means two processes run this at startup.
+        # create_all checks-then-creates, so the loser could hit "table already
+        # exists" and take the whole API down with a STARTUP_FAILURE. Retrying
+        # re-inspects and is then a no-op.
+        Base.metadata.create_all(bind=engine)
     _ensure_schema()
 
 

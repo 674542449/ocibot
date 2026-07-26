@@ -16,6 +16,7 @@ from web.backend.db import get_db
 from web.backend.models import SshHostKey, User
 from web.backend.oci_bridge import get_owned_tenant, get_session_for_row, op_result_dict
 from web.backend.schemas import PowerActionResult
+from web.backend.ssh_hostkey import UNREACHABLE as HOSTKEY_UNREACHABLE
 from web.backend.ssh_hostkey import check_instance_host_key, forget_host_key, known_hosts_for
 
 router = APIRouter(tags=["instance-ops"])
@@ -312,16 +313,20 @@ def boot_volume_update(
                     current_size = int(cur.data.get("size_in_gbs") or 0)
             except Exception:
                 current_size = 0
-            try:
-                usage_res = session.get_free_quota_usage(free_only_mode=True)
-                usage = usage_res.data if isinstance(usage_res.data, dict) else {}
-            except Exception:
-                usage = {}
+            # Same two corrections as the block-volume guard: derive free_only from
+            # the tier (True hard-capped paid tenants) and refuse on a partial read
+            # instead of reading it as zero usage.
+            tier = getattr(row, "account_tier", "") or ""
+            free_only = quota_guard.free_only_for_tier(tier)
+            usage = quota_guard.usage_snapshot(session, free_only_mode=free_only)
+            blocked = quota_guard._blocked_by_incomplete_read(usage, free_only)
+            if blocked:
+                raise HTTPException(status_code=503, detail=blocked)
             guard = free_quota.validate_boot_resize_against_quota(
                 current_size_gb=current_size,
                 new_size_gb=body.size_in_gbs,
-                free_only_mode=True,
-                account_tier=getattr(row, "account_tier", "") or "",
+                free_only_mode=free_only,
+                account_tier=tier,
                 usage=usage,
             )
             if not guard.ok:
@@ -349,6 +354,13 @@ def boot_volume_update(
             info.compartment_id,
             size_in_gbs=body.size_in_gbs,
             vpus_per_gb=body.vpus_per_gb,
+            # Bound the wait for an HTTP caller: the library defaults can block for
+            # ~31 minutes waiting on volume hydration, holding a threadpool slot and
+            # a pooled DB connection the whole time. On timeout resize_boot_volume
+            # already returns the "仍在从镜像同步数据（hydrating）…请几分钟后重试"
+            # result, so no new UX is needed. The worker keeps the long defaults.
+            timeout=60,
+            hydration_timeout=120,
         )
         oci_ok = bool(result.ok)
         data: dict[str, Any] = dict(result.data) if isinstance(result.data, dict) else {}
@@ -379,7 +391,12 @@ def boot_volume_update(
                     # that from the caller.
                     data["fs_ok"] = False
                     data["hints"] = [hostkey.message()]
-                    message = (message or "引导卷已调整") + "；文件系统扩展已中止：SSH 主机密钥不匹配"
+                    reason = (
+                        "无法连接 SSH 读取主机密钥"
+                        if hostkey.verdict == HOSTKEY_UNREACHABLE
+                        else "SSH 主机密钥不匹配"
+                    )
+                    message = (message or "引导卷已调整") + f"；文件系统扩展已中止：{reason}"
                     raise _HostKeyRefused()
                 grow = grow_filesystem_over_ssh(
                     target.host,

@@ -613,12 +613,18 @@ async function openBucket(name: string) {
 async function loadObjects() {
   if (!activeBucket.value) return
   busy.value = true
+  // Guard on the bucket as well as the tenant: without it a slow listing could
+  // render under a different bucket, and object deletes are addressed by name.
+  const wantedBucket = activeBucket.value
+  const guard = beginLoad('objects')
   try {
     const { data } = await api.get(
       `/tenants/${tenantId.value}/object-storage/buckets/${encodeURIComponent(activeBucket.value)}/objects`,
     )
+    if (guard.stale() || activeBucket.value !== wantedBucket) return
     objects.value = data.data?.objects || []
   } catch (e: any) {
+    if (guard.stale() || activeBucket.value !== wantedBucket) return
     error.value = e?.message || '列举对象失败'
   } finally {
     busy.value = false

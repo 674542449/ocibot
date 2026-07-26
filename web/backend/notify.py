@@ -10,6 +10,7 @@ import json
 import logging
 import smtplib
 import ssl
+import time
 from email.header import Header
 from email.mime.text import MIMEText
 from email.utils import formataddr
@@ -29,6 +30,9 @@ CHANNEL_KINDS = ("telegram", "bark", "serverchan", "webhook", "smtp")
 EVENT_KEYS = ("capacity", "schedule", "budget")
 
 _HTTP_TIMEOUT = 15.0
+# Fan-out limits for one notify_user() call.
+_MAX_SENDS_PER_EVENT = 20
+_SEND_BUDGET_SEC = 60.0
 # Outbound client: no env proxy (avoid surprising proxy SSRF), no redirects to internal.
 _HTTP_CLIENT_KW = {
     "timeout": _HTTP_TIMEOUT,
@@ -262,12 +266,25 @@ def notify_user(
     except Exception:  # noqa: BLE001
         log.exception("notify_user: query channels failed")
         return results
+    # Bound the fan-out: channels are uncapped per user and each send has a 15-20s
+    # timeout, so one trigger could otherwise stall the worker tick for minutes.
+    started = time.monotonic()
+    sent = 0
     for row in rows:
         events = list(row.events or [])
         if events and event not in events:
             continue
+        if sent >= _MAX_SENDS_PER_EVENT or time.monotonic() - started > _SEND_BUDGET_SEC:
+            log.warning(
+                "notify budget reached for owner=%s event=%s; %d channel(s) not attempted",
+                owner_id,
+                event,
+                len(rows) - sent,
+            )
+            break
         config = decode_channel_config(row.config_encrypted)
         ok, detail = send_to_channel(row.kind, config, title, body)
+        sent += 1
         results.append({"channel": row.name or row.kind, "kind": row.kind, "ok": ok, "detail": detail})
         if not ok:
             log.warning("notify channel %s(%s) failed: %s", row.name, row.kind, detail)

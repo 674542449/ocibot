@@ -29,6 +29,7 @@ log = logging.getLogger("ocibot.hostkey")
 TRUSTED = "trusted"  # matches the remembered fingerprint
 LEARNED = "learned"  # nothing remembered yet; stored now
 MISMATCH = "mismatch"  # differs from what we remembered — refuse to continue
+UNREACHABLE = "unreachable"  # could not read a key at all (port shut, sshd down)
 
 
 @dataclass
@@ -48,6 +49,13 @@ class HostKeyCheck:
             return f"已记住该实例的 SSH 主机密钥指纹：{self.fingerprint}"
         if self.verdict == TRUSTED:
             return ""
+        if self.verdict == UNREACHABLE:
+            # Connectivity problem, NOT evidence of tampering. Saying "possible
+            # MITM" here would train users to dismiss the real warning.
+            return (
+                f"无法读取 SSH 主机密钥：{self.expected}\n"
+                "请确认实例已 RUNNING、22 端口已在 NSG/安全列表放行，且 sshd 已启动。"
+            )
         return (
             "SSH 主机密钥与首次连接时不一致，已中止连接（未发送任何凭据）。\n"
             f"记录的指纹：{self.expected}\n"
@@ -210,9 +218,9 @@ def check_instance_host_key(
         else:
             server_key = asyncio.run(_probe())
     except Exception as exc:  # noqa: BLE001
-        return HostKeyCheck(
-            verdict=MISMATCH, fingerprint="", expected=f"(无法读取主机密钥：{exc})"
-        )
+        # Still not OK (we will not connect without a verified key), but reported as
+        # a reachability failure rather than as tampering.
+        return HostKeyCheck(verdict=UNREACHABLE, fingerprint="", expected=str(exc))
 
     return verify_host_key(
         db,

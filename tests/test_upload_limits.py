@@ -273,6 +273,80 @@ def test_middleware_passes_small_bodies_through():
     assert sent[1]["body"] == b"ok"
 
 
+def test_forged_file_size_cannot_trigger_a_huge_inflate():
+    """The uncompressed-size cap must not rely on the declared file_size.
+
+    file_size comes from the central directory and pyzipper never cross-checks it
+    against the real stream. zf.read() inflates in 1 GiB chunks and only *then*
+    truncates to file_size, so a ~400KB upload declaring 1KB used to materialize
+    ~830MB. The bound has to be on the decompression itself.
+    """
+    import struct
+    import tracemalloc
+    import zipfile
+
+    payload = b"\0" * (64 * 1024 * 1024)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+        z.writestr("tenants.json", payload)
+    blob = buf.getvalue().replace(struct.pack("<I", len(payload)), struct.pack("<I", 1024))
+
+    limit = 5 * 1024 * 1024
+    with pyzipper.AESZipFile(io.BytesIO(blob), "r") as zf:
+        # The forged size sails through a declared-size pre-check.
+        assert zf.getinfo("tenants.json").file_size == 1024
+
+    # What matters is the allocation, not which check trips: a forged small
+    # file_size makes the stream stop at 1024 bytes and fail CRC, which the route
+    # already maps to a 400. The old unbounded zf.read() reached ~830MB peak on
+    # this input; the bounded read must stay small.
+    tracemalloc.start()
+    try:
+        with pyzipper.AESZipFile(io.BytesIO(blob), "r") as zf:
+            with zf.open("tenants.json") as fh:
+                fh.read(limit + 1)
+    except Exception:  # noqa: BLE001 - BadZipFile from the CRC mismatch is expected
+        pass
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert peak < 32 * 1024 * 1024, f"bounded read still allocated {peak / 1024 / 1024:.0f}MB"
+
+
+def test_honestly_oversized_member_is_rejected_by_size():
+    """A member that truthfully declares >5MB is refused by the bounded read."""
+    import zipfile
+
+    payload = b"x" * (6 * 1024 * 1024)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("tenants.json", payload)
+
+    limit = 5 * 1024 * 1024
+    with pyzipper.AESZipFile(io.BytesIO(buf.getvalue()), "r") as zf:
+        with zf.open("tenants.json") as fh:
+            raw = fh.read(limit + 1)
+    assert len(raw) > limit, "an honest oversized member must exceed the limit probe"
+
+
+def test_forged_bomb_is_rejected_by_the_route(client):
+    """End-to-end: the route returns 400, not a 500 or an OOM."""
+    import struct
+    import zipfile
+
+    payload = b"\0" * (64 * 1024 * 1024)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+        z.writestr("tenants.json", payload)
+    blob = buf.getvalue().replace(struct.pack("<I", len(payload)), struct.pack("<I", 1024))
+
+    r = client.post(
+        "/api/backup/import",
+        data={"password": "hunter22"},
+        files={"file": ("bomb.zip", blob, "application/zip")},
+    )
+    assert r.status_code == 400, r.text
+
+
 def test_middleware_ignores_non_http_scopes():
     """WebSocket handshakes must pass straight through."""
     import asyncio

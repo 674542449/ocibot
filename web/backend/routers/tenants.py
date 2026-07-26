@@ -13,6 +13,7 @@ from app.config_store import TenantConfig
 from web.backend.auth import get_current_user
 from web.backend.crypto_util import encrypt_text
 from web.backend.db import get_db
+from web.backend.launch_service import clear_launch_meta_cache
 from web.backend.models import Tenant, User
 from web.backend.oci_bridge import drop_session, get_owned_tenant, get_session_for_row
 from web.backend.schemas import (
@@ -316,6 +317,9 @@ def delete_tenant(
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     drop_session(row.id)
+    # The launch-meta cache keyed on this tenant would otherwise be retained until
+    # its TTL expired (clear_launch_meta_cache had no callers at all).
+    clear_launch_meta_cache(row.id)
     db.delete(row)
     db.commit()
     return {"message": "已删除"}

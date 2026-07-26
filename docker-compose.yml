@@ -53,6 +53,11 @@ services:
       # guard never actually ran. They now come from web/.env, falling back to the
       # application defaults in web/backend/config.py.
       DATABASE_URL: postgresql+psycopg://ocibot:${POSTGRES_PASSWORD:-ocibot_dev_pass}@db:5432/ocibot
+      # Pin the IN-CONTAINER listen port. OCIBOT_PORT is the host publish knob
+      # below; run.py also reads it to choose the listen port, so a non-8000 value
+      # in web/.env would move the listener away from the port the mapping and the
+      # healthcheck target.
+      OCIBOT_PORT: 8000
       # In-panel self-update (admin). Requires mounts below.
       # OCIBOT_HOST_REPO must be the absolute path on the *host* (set by install.sh).
       #

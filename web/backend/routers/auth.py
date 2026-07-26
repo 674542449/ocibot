@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from web.backend.audit import write_audit
 from web.backend.auth import (
     clear_auth_cookie,
+    count_users,
     create_access_token,
     get_current_user,
     hash_password,
@@ -104,6 +105,13 @@ def register(
     username = body.username.strip()
     if len(username) < 3:
         raise HTTPException(status_code=400, detail="用户名至少 3 个字符")
+
+    # Gate BEFORE the existence lookup, otherwise a closed-registration panel still
+    # answers "用户名已存在" vs "已关闭开放注册" and becomes an unauthenticated
+    # username oracle. The authoritative count for is_admin stays below, inside the
+    # advisory lock, so the first-admin race is unaffected.
+    if not open_registration_allowed(db) and count_users(db) > 0:
+        raise HTTPException(status_code=403, detail="已关闭开放注册，请联系管理员")
 
     existing = db.scalar(select(User).where(User.username == username))
     if existing:

@@ -404,20 +404,25 @@ async function load() {
   }
   loading.value = true
   const seq = ++loadSeq
+  // Also capture the tenant: the sequence alone does not catch a switch that
+  // happens without starting a new load, which would render tenant A's
+  // instances under tenant B's selection.
+  const wanted = tenantId.value
+  const superseded = () => seq !== loadSeq || tenantId.value !== wanted
   try {
     const res = await api.get<Instance[]>(`/tenants/${tenantId.value}/instances`, {
       params: { resolve_ips: resolveIps.value, include_subcompartments: true },
     })
     // Discard out-of-order responses from a superseded tenant switch.
-    if (seq !== loadSeq) return
+    if (superseded()) return
     instances.value = res.data
     loadedOnce.value = true
   } catch (e: any) {
-    if (seq !== loadSeq) return
+    if (superseded()) return
     error.value = e?.message || '加载失败'
     instances.value = []
   } finally {
-    if (seq === loadSeq) {
+    if (!superseded()) {
       loading.value = false
       // Drop selections that no longer exist in the refreshed list.
       const live = new Set(instances.value.map((i) => selKey(i)))

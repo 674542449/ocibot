@@ -328,6 +328,11 @@ class Worker:
                 update(CapacityJob)
                 .where(
                     CapacityJob.id == job.id,
+                    # Re-assert the candidate conditions inside the claim: the
+                    # candidate list was read before the OCI work above, so a user
+                    # who pressed "stop" in between still got one more launch.
+                    CapacityJob.enabled.is_(True),
+                    CapacityJob.status.in_(("idle", "running")),
                     (CapacityJob.locked_until.is_(None)) | (CapacityJob.locked_until < claim_at),
                 )
                 .values(locked_by=self.worker_id, locked_until=lock_until, status="running")
@@ -431,11 +436,13 @@ class Worker:
         # Quota re-check runs BEFORE the attempt counter moves, so deferring on an
         # unreadable quota does not burn attempts during an Oracle API outage.
         tier = getattr(tenant, "account_tier", "") or ""
+        pre_snapshot: Optional[dict[str, Any]] = None
         try:
             from web.backend.quota_guard import free_only_for_tier, usage_snapshot
 
             if hasattr(session, "get_free_quota_usage") and free_only_for_tier(tier):
                 snapshot = usage_snapshot(session, free_only_mode=True)
+                pre_snapshot = snapshot
                 if snapshot.get("read_incomplete"):
                     # Do NOT launch on an undercount — a partial read looks like
                     # free headroom and could create billable overage. Reschedule
@@ -483,6 +490,13 @@ class Worker:
                     memory_in_gbs=payload.get("memory_in_gbs"),
                     boot_volume_size_in_gbs=payload.get("boot_volume_size_in_gbs"),
                     boot_volume_vpus_per_gb=payload.get("boot_volume_vpus_per_gb") or 10,
+                    # Reuse the snapshot the deferral decision was made on. Letting
+                    # this take its own read meant the pre-check above was not the
+                    # deciding one: a second, throttled read returns zeroed usage
+                    # (check_launch_quota does not apply the incomplete-read block,
+                    # it only builds a GuardResult) and the launch proceeded anyway.
+                    # Also halves the OCI enumeration per attempt.
+                    usage=pre_snapshot,
                 )
                 # Ignore pure "spec incomplete" issues here — the launch path will
                 # surface those; we only stop on real free-cap exhaustion / non-free shape.
@@ -690,6 +704,12 @@ class Worker:
             if get_meta(db, KEY_DAILY_CHECKS_DATE) == today:
                 return
             set_meta(db, KEY_DAILY_CHECKS_DATE, today)
+            # Commit the day claim immediately. It used to be flushed only, so the
+            # whole tenant sweep (Usage API calls plus notification sends, tens of
+            # seconds) ran inside one open write transaction: on SQLite that blocks
+            # every API write with "database is locked", and a restart mid-sweep
+            # re-ran every call and re-sent every alert.
+            db.commit()
         except Exception:  # noqa: BLE001
             log.exception("daily-check gate failed")
             return
@@ -727,7 +747,10 @@ class Worker:
             return
         currency = str(data.get("currency") or "USD")
         tenant.budget_notified_month = month
-        db.flush()
+        # Commit before sending: a flush alone could be rolled back by a later
+        # failure in the same tick, un-marking a month whose alert was already
+        # delivered and re-sending it on the next run.
+        db.commit()
         notify_user(
             db,
             tenant.owner_id,

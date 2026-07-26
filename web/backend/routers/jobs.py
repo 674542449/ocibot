@@ -81,24 +81,6 @@ def create_capacity_job(
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    # Compliance: at most one active capacity-retry job per tenant (serialize retries).
-    if body.enabled:
-        existing = db.scalar(
-            select(CapacityJob)
-            .where(
-                CapacityJob.tenant_id == body.tenant_id,
-                CapacityJob.owner_id == user.id,
-                CapacityJob.enabled.is_(True),
-                CapacityJob.status.in_(("idle", "running")),
-            )
-            .limit(1)
-        )
-        if existing is not None:
-            raise HTTPException(
-                status_code=409,
-                detail="该租户已有进行中的容量重试任务，请先在任务中心停止或删除后再新建",
-            )
-
     try:
         payload = sanitize_launch_payload(body.launch_payload, for_retry=True)
     except ValueError as exc:
@@ -151,6 +133,26 @@ def create_capacity_job(
         attempts=0,
         next_run_at=now if body.enabled else None,
     )
+    # Re-checked immediately before the INSERT rather than before the quota
+    # enumeration above: that left a multi-second window in which two concurrent
+    # creates both passed and produced two jobs racing LaunchInstance.
+    if body.enabled:
+        existing = db.scalar(
+            select(CapacityJob)
+            .where(
+                CapacityJob.tenant_id == body.tenant_id,
+                CapacityJob.owner_id == user.id,
+                CapacityJob.enabled.is_(True),
+                CapacityJob.status.in_(("idle", "running")),
+            )
+            .limit(1)
+        )
+        if existing is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="该租户已有进行中的容量重试任务，请先在任务中心停止或删除后再新建",
+            )
+
     db.add(row)
     db.commit()
     db.refresh(row)

@@ -2,10 +2,26 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any, Optional
+from datetime import datetime, timezone
+from typing import Annotated, Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, Field
+
+
+def _assume_utc(value: Any) -> Any:
+    """Tag naive datetimes as UTC.
+
+    SQLite returns timezone-naive values even for DateTime(timezone=True), so these
+    serialized without an offset and the SPA rendered them as local time — every
+    job/attempt/run timestamp appeared shifted by the viewer's UTC offset. Every
+    datetime written by this app is UTC (models use datetime.now(timezone.utc)).
+    """
+    if isinstance(value, datetime) and value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+UtcDatetime = Annotated[datetime, BeforeValidator(_assume_utc)]
 
 
 # ---- Auth ----
@@ -26,7 +42,7 @@ class LoginRequest(BaseModel):
 
 
 class ChangePasswordRequest(BaseModel):
-    old_password: str
+    old_password: str = Field(max_length=1024)
     new_password: str = Field(min_length=8, max_length=128)
 
 
@@ -35,7 +51,7 @@ class TotpEnableRequest(BaseModel):
 
 
 class TotpDisableRequest(BaseModel):
-    password: str
+    password: str = Field(max_length=1024)
     code: str = Field(min_length=6, max_length=8)
 
 
@@ -55,7 +71,7 @@ class UserOut(BaseModel):
     username: str
     is_admin: bool = False
     totp_enabled: bool = False
-    created_at: datetime
+    created_at: UtcDatetime
 
     model_config = {"from_attributes": True}
 
@@ -65,15 +81,15 @@ class UserOut(BaseModel):
 
 class TenantCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128)
-    user_ocid: str
-    tenancy_ocid: str
-    fingerprint: str
-    region: str = "ap-tokyo-1"
-    private_key_pem: str
-    compartment_ocid: str = ""
-    description: str = ""
+    user_ocid: str = Field(max_length=128)
+    tenancy_ocid: str = Field(max_length=128)
+    fingerprint: str = Field(max_length=128)
+    region: str = Field(default="ap-tokyo-1", max_length=64)
+    private_key_pem: str = Field(max_length=32_000)
+    compartment_ocid: str = Field(default="", max_length=128)
+    description: str = Field(default="", max_length=512)
     enabled: bool = True
-    color: str = "#3B82F6"
+    color: str = Field(default="#3B82F6", max_length=32)
     budget_monthly_usd: float = 0.0
 
 
@@ -132,8 +148,8 @@ class TenantOut(BaseModel):
     has_private_key: bool
     account_tier: str
     budget_monthly_usd: float = 0.0
-    created_at: datetime
-    updated_at: datetime
+    created_at: UtcDatetime
+    updated_at: UtcDatetime
 
     model_config = {"from_attributes": True}
 
@@ -266,13 +282,13 @@ class CapacityJobOut(BaseModel):
     max_attempts: int
     attempts: int
     last_error: str
-    last_attempt_at: Optional[datetime] = None
-    next_run_at: Optional[datetime] = None
-    cooldown_until: Optional[datetime] = None
+    last_attempt_at: Optional[UtcDatetime] = None
+    next_run_at: Optional[UtcDatetime] = None
+    cooldown_until: Optional[UtcDatetime] = None
     consecutive_rate_limits: int
     success_instance_id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: UtcDatetime
+    updated_at: UtcDatetime
     launch_payload: dict[str, Any] = Field(default_factory=dict)
     fallback_configs: list[dict[str, Any]] = Field(default_factory=list)
     has_user_data: bool = False
@@ -291,7 +307,7 @@ class CapacityAttemptOut(BaseModel):
     message: str
     availability_domain: str
     config_label: str
-    created_at: datetime
+    created_at: UtcDatetime
 
     model_config = {"from_attributes": True}
 
@@ -305,20 +321,21 @@ class ScheduleRunOut(BaseModel):
     instance_count: int
     success_count: int
     message: str
-    created_at: datetime
+    created_at: UtcDatetime
 
     model_config = {"from_attributes": True}
 
 
 class ScheduleJobCreate(BaseModel):
     tenant_id: str
-    name: str
+    name: str = Field(max_length=128)
     kind: str = "weekly"  # weekly | once
     time_of_day: str = "22:00"
     weekdays: list[int] = Field(default_factory=lambda: [0, 1, 2, 3, 4])
     run_at: Optional[datetime] = None  # required when kind == "once"
     action: str = "SOFTSTOP"
-    instance_ids: list[str] = Field(default_factory=list)
+    # Bounded: the worker fires these serially, one OCI call each.
+    instance_ids: list[str] = Field(default_factory=list, max_length=200)
     enabled: bool = True
 
 
@@ -330,11 +347,11 @@ class ScheduleJobOut(BaseModel):
     kind: str = "weekly"
     time_of_day: str
     weekdays: list[Any]
-    run_at: Optional[datetime] = None
+    run_at: Optional[UtcDatetime] = None
     action: str
     instance_ids: list[Any]
     last_run_date: str
-    created_at: datetime
+    created_at: UtcDatetime
 
     model_config = {"from_attributes": True}
 

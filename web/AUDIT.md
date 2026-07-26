@@ -78,6 +78,57 @@ anywhere in the SPA and no token in `localStorage`.
   same transaction that sets `running`, and `fetch_remote_head()` moved out of the
   critical section.
 
+### Pass 7 — full-codebase sweep (0.4.14)
+
+20 agents across 10 dimensions, each finding adversarially verified: 32 confirmed,
+11 refuted. The newly written security code from passes 4–6 was treated as prime
+suspect, and three of the four most serious findings were in it.
+
+**Highest impact — a control that was believed complete but was not:**
+`/api/backup/import`'s "5MB uncompressed" cap trusted `ZipInfo.file_size`, which
+comes from the central directory and is attacker-controlled; pyzipper never
+cross-checks it. `zf.read()` inflates in 1 GiB chunks and only *then* truncates to
+`file_size`, so a 398KB upload declaring 1KB peaked at **830MB** of allocation
+(reproduced; 11.2MB after the fix, which bounds the decompression itself via
+`zf.open(member).read(LIMIT+1)`). Any authenticated user could reach it, and the
+resulting `BadZipFile` was reported as a wrong-password 400, hiding the attack.
+
+**In the new code:**
+- The worker's fail-closed quota check was advisory only: `check_launch_quota` took
+  its *own* snapshot, and a failed read becomes `{"read_incomplete": True}` with no
+  usage keys, which the validators read as "full quota free". The pre-read is now
+  passed in, so exactly one read decides — also halving OCI enumeration per attempt.
+- `_apply_job` wrote `OCIBOT_GIT_SHA` into `os.environ`, so the worker that served
+  the apply reported the *target* commit as the running build and skipped the
+  failed-update reconciliation added in pass 5.
+- `sync_db_password` re-parsed `web/.env` with `cut`, which does not match dotenv
+  semantics (quotes, CR, inline comments) and could therefore set a password
+  differing from the one api/worker use. It now reads what compose actually
+  interpolated, and passes the statement over stdin so the password never appears
+  in a process command line.
+- The storage/boot-volume guards hardcoded `free_only_mode=True`, which hard-capped
+  **paid** tenants at 200GB, and ignored `read_incomplete`. Both corrected.
+- An unreachable SSH port was reported as a host-key mismatch / possible MITM. A
+  distinct `UNREACHABLE` verdict now reports connectivity instead — a false MITM
+  warning trains users to dismiss the real one.
+- Concurrent first-connect hit the host-key unique constraint and surfaced as an
+  internal error (fixed in 7ad1a26).
+
+**Elsewhere:** stop-then-launch race in the capacity claim; the one-active-job
+check moved next to its INSERT; unbounded `instance_ids` and several unbounded
+string fields; `init_db()` racing `create_all` across two workers; the daily-check
+sweep holding a SQLite write transaction across network I/O; naive timestamps
+serialized without an offset (every job time rendered shifted); uncapped
+notification fan-out; an unevictable launch-meta cache; the registration
+username-existence oracle; `estimate_object_storage_usage` missing `fields` (the
+object-storage gauge always read 0); and the inline boot-volume hydration wait that
+could pin a request thread for ~31 minutes.
+
+**Verified sound, no change needed:** the 413 from `BodySizeLimitMiddleware` carries
+the security headers and logs no ERROR records (`BodyTooLarge` never reaches
+`ServerErrorMiddleware`); the `ssh_host_keys` upgrade path creates the table with
+its unique constraint on a pre-existing database without touching existing rows.
+
 ### Known remaining gap
 
 **DNS rebinding on outbound notifications.** `resolve_and_check_host()` validates

@@ -109,9 +109,6 @@ link_root_env() {
 sync_db_password() {
   local envf="$REPO_DIR/web/.env"
   [ -f "$envf" ] || return 0
-  local pw
-  pw="$(grep -E '^POSTGRES_PASSWORD=' "$envf" | head -n1 | cut -d= -f2-)"
-  [ -n "$pw" ] || return 0
   local i
   for i in $(seq 1 20); do
     if compose exec -T db pg_isready -U ocibot -d ocibot >/dev/null 2>&1; then
@@ -119,11 +116,24 @@ sync_db_password() {
     fi
     sleep 2
   done
-  # Single-quoted SQL literal; escape any embedded quote.
+  # Read the value compose ACTUALLY interpolated rather than re-parsing the file.
+  # A hand-rolled `cut` does not match dotenv semantics (surrounding quotes,
+  # trailing CR, inline comments), so it could set a password different from the
+  # one api/worker connect with — which is exactly the failure this function
+  # exists to prevent.
+  local pw
+  pw="$(compose exec -T db printenv POSTGRES_PASSWORD 2>/dev/null | tr -d '\r\n')"
+  if [ -z "$pw" ]; then
+    warn "无法读取数据库容器的 POSTGRES_PASSWORD，跳过密码同步"
+    return 0
+  fi
+  # Single-quoted SQL literal; escape any embedded quote. Passed over stdin so the
+  # password never appears in a process command line (visible to any local user
+  # via ps) or in psql's history.
   local esc
   esc="$(printf '%s' "$pw" | sed "s/'/''/g")"
-  if compose exec -T db psql -U ocibot -d ocibot -v ON_ERROR_STOP=1 \
-      -c "ALTER USER ocibot WITH PASSWORD '$esc';" >/dev/null 2>&1; then
+  if printf "ALTER USER ocibot WITH PASSWORD '%s';\n" "$esc" \
+      | compose exec -T db psql -U ocibot -d ocibot -v ON_ERROR_STOP=1 -f - >/dev/null 2>&1; then
     log "数据库密码已与 web/.env 对齐"
   else
     warn "无法同步数据库密码（数据库可能未就绪）；如 api 连不上库请手动执行 ALTER USER"

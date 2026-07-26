@@ -28,6 +28,7 @@ from app.scheduler import (
 # tenant_id -> (monotonic_ts, meta)
 _META_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _META_TTL = 15 * 60
+_META_MAX_ENTRIES = 64
 
 
 def clear_launch_meta_cache(tenant_id: Optional[str] = None) -> None:
@@ -118,7 +119,16 @@ def fetch_launch_meta(session: TenantSession, *, tenant_id: str, force: bool = F
         "cached": False,
         "cache_age_sec": 0,
     }
-    _META_CACHE[cache_key] = (time.monotonic(), dict(meta))
+    # Evict before inserting: this cache holds every tenant's full image/shape/
+    # network metadata and previously never released an entry, so RSS grew with
+    # every tenant and region ever visited.
+    now = time.monotonic()
+    for key in [k for k, (ts, _) in _META_CACHE.items() if now - ts >= _META_TTL]:
+        _META_CACHE.pop(key, None)
+    while len(_META_CACHE) >= _META_MAX_ENTRIES:
+        oldest = min(_META_CACHE, key=lambda k: _META_CACHE[k][0])
+        _META_CACHE.pop(oldest, None)
+    _META_CACHE[cache_key] = (now, dict(meta))
     return meta
 
 

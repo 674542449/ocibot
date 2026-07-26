@@ -26,6 +26,7 @@ from web.backend.ssh_bridge import (
     resolve_instance_ssh_target,
     validate_ssh_auth,
 )
+from web.backend.ssh_hostkey import UNREACHABLE as HOSTKEY_UNREACHABLE
 from web.backend.ssh_hostkey import (
     LEARNED,
     known_hosts_for,
@@ -283,30 +284,34 @@ async def webssh_endpoint(websocket: WebSocket, tenant_id: str, instance_id: str
 
         hostkey = await asyncio.to_thread(_check)
         if not hostkey.ok:
-            with SessionLocal() as db:
-                write_audit(
-                    db,
-                    owner_id=user.id,
-                    action="webssh.hostkey_mismatch",
-                    target=instance_id,
-                    detail={
-                        "tenant_id": tenant_id,
-                        "host": host,
-                        "expected": hostkey.expected,
-                        "actual": hostkey.fingerprint,
-                    },
-                )
+            # Only a real fingerprint change is reported as a mismatch; a shut port
+            # or a stopped sshd must not be presented as a possible attack.
+            is_mismatch = hostkey.verdict != HOSTKEY_UNREACHABLE
+            if is_mismatch:
+                with SessionLocal() as db:
+                    write_audit(
+                        db,
+                        owner_id=user.id,
+                        action="webssh.hostkey_mismatch",
+                        target=instance_id,
+                        detail={
+                            "tenant_id": tenant_id,
+                            "host": host,
+                            "expected": hostkey.expected,
+                            "actual": hostkey.fingerprint,
+                        },
+                    )
             await _send_json(
                 websocket,
                 {
                     "type": "error",
                     "message": hostkey.message(),
-                    "code": "hostkey_mismatch",
-                    "expected_fingerprint": hostkey.expected,
+                    "code": "hostkey_mismatch" if is_mismatch else "hostkey_unreachable",
+                    "expected_fingerprint": hostkey.expected if is_mismatch else "",
                     "actual_fingerprint": hostkey.fingerprint,
                 },
             )
-            await websocket.close(code=4495)
+            await websocket.close(code=4495 if is_mismatch else 4502)
             return
         if hostkey.verdict == LEARNED:
             await _send_json(

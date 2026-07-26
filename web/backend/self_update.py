@@ -548,11 +548,13 @@ def _detach_stack_restart(host: Path, host_repo: str, project: str, new_sha: str
         rel = "web/data/self_update_restart.sh"
     script_on_host = f"{host_repo.rstrip('/')}/{rel}"
 
+    # No --rm here either: the container's exit code and logs are what
+    # _helper_container_outcome() inspects to detect a failed update. The
+    # `docker rm -f` below keeps the fixed name reusable.
     cmd = [
         "docker",
         "run",
         "-d",
-        "--rm",
         "--name",
         "ocibot-self-update-restart",
         "-v",
@@ -714,8 +716,13 @@ def _apply_job(username: str) -> None:
 
         code, out = _run_cmd(["git", "-C", str(host), "rev-parse", "HEAD"], timeout=20)
         new_sha = out.strip() if code == 0 else ""
-        if new_sha:
-            os.environ["OCIBOT_GIT_SHA"] = new_sha
+        # Deliberately NOT written into os.environ: local_build_info() reads
+        # OCIBOT_GIT_SHA, so mutating it made this worker report the *target*
+        # commit as the running build. get_status() then saw applied_sha ==
+        # local git_sha and skipped the failed-update reconciliation, reporting
+        # success even when the helper's build failed and the container was never
+        # replaced. The helpers receive new_sha as an argument already, and
+        # install.sh recomputes it from git regardless.
         log_buf = _append_log(log_buf, f"HEAD after reset={new_sha}\n")
         log_buf = _append_log(log_buf, f"host_repo_on_host={host_repo}\n")
 
@@ -956,7 +963,13 @@ def start_update(db: Session, *, username: str) -> dict[str, Any]:
                 from web.backend.models import AppMeta
 
                 locked = db.scalar(
-                    select(AppMeta).where(AppMeta.key == KEY_UPDATE_STATUS).with_for_update()
+                    select(AppMeta)
+                    .where(AppMeta.key == KEY_UPDATE_STATUS)
+                    .with_for_update()
+                    # Without populate_existing the identity map returns the row
+                    # this session already loaded, so the re-check inspected stale
+                    # data and the cross-process mutex excluded nothing.
+                    .execution_options(populate_existing=True)
                 )
                 if locked is not None:
                     current = json.loads(locked.value or "{}")

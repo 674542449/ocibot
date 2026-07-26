@@ -5049,7 +5049,13 @@ class TenantSession:
                     if obj_count >= max_objects_per_bucket:
                         truncated = True
                         break
-                    kwargs: dict[str, Any] = {"limit": min(1000, max_objects_per_bucket - obj_count)}
+                    # "size" must be requested explicitly: without `fields` every
+                    # ObjectSummary.size is None, so this estimator summed zeros and
+                    # the object-storage quota gauge always read 0 GB.
+                    kwargs: dict[str, Any] = {
+                        "limit": min(1000, max_objects_per_bucket - obj_count),
+                        "fields": "name,size",
+                    }
                     if start:
                         kwargs["start"] = start
                     try:

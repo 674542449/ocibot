@@ -67,6 +67,16 @@ async function resetHostKey() {
     await api.delete(`/tenants/${props.tenantId}/instances/${props.instanceId}/host-key`)
     hostKeyMismatch.value = false
     error.value = ''
+    // sendAuth() deliberately wipes the password after transmitting it, so in
+    // password mode there is nothing left to reconnect with — ask for it again
+    // instead of firing a connect that would immediately fail validation.
+    const missingCredential =
+      (creds.authMode === 'password' && !creds.password) ||
+      (creds.authMode === 'key' && !creds.privateKeyPem.trim())
+    if (missingCredential) {
+      hostKeyNote.value = '已重置主机密钥记录，请重新填写 SSH 凭据后点击「连接 WebSSH」'
+      return
+    }
     hostKeyNote.value = '已重置主机密钥记录，正在重新连接…'
     await connect()
   } catch (e: any) {

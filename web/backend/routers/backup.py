@@ -128,19 +128,28 @@ def import_encrypted_zip(
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="空文件")
 
+    _MAX_INFLATED = 5 * 1024 * 1024
     try:
         with pyzipper.AESZipFile(io.BytesIO(raw_bytes), "r") as zf:
             zf.setpassword(password.encode("utf-8"))
             names = zf.namelist()
+            if len(names) > 64:
+                raise HTTPException(status_code=400, detail="备份文件条目过多")
             member = "tenants.json" if "tenants.json" in names else (names[0] if names else "")
             if not member:
                 raise HTTPException(status_code=400, detail="备份文件为空")
-            # Guard zip-bomb: refuse members larger than 5 MiB uncompressed.
+            # Cheap early-out on the declared size — but it is only a hint: file_size
+            # comes from the central directory and is attacker-controlled (pyzipper
+            # never cross-checks it against the actual stream), so it cannot be the
+            # bound. zf.read() would inflate in 1 GiB chunks and only THEN truncate
+            # to file_size, so a ~200KB upload declaring 1KB could still materialize
+            # hundreds of MB. Bound the decompression itself instead.
             info = zf.getinfo(member)
-            if int(getattr(info, "file_size", 0) or 0) > 5 * 1024 * 1024:
+            if int(getattr(info, "file_size", 0) or 0) > _MAX_INFLATED:
                 raise HTTPException(status_code=400, detail="备份内容过大（解压后上限 5MB）")
-            raw = zf.read(member)
-            if len(raw) > 5 * 1024 * 1024:
+            with zf.open(member) as fh:
+                raw = fh.read(_MAX_INFLATED + 1)
+            if len(raw) > _MAX_INFLATED:
                 raise HTTPException(status_code=400, detail="备份内容过大（解压后上限 5MB）")
     except HTTPException:
         raise

@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app import free_quota
+from web.backend import quota_guard
 from web.backend.audit import write_audit
 from web.backend.auth import get_current_user
 from web.backend.db import get_db
@@ -28,14 +29,6 @@ def _row(db: Session, user_id: str, tenant_id: str):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-def _quota_snapshot(session, row) -> dict[str, Any]:
-    try:
-        result = session.get_free_quota_usage(free_only_mode=True)
-        return result.data if isinstance(result.data, dict) else {}
-    except Exception:
-        return {}
-
-
 def _guard_storage_delta(
     session,
     row,
@@ -43,12 +36,22 @@ def _guard_storage_delta(
     current_size_gb: float,
     new_size_gb: float,
 ) -> None:
-    snap = _quota_snapshot(session, row)
+    # free_only was hardcoded True here, which hard-capped PAID tenants at the
+    # Always-Free 200GB with no way to opt out. Derive it from the tier like the
+    # launch path does.
+    tier = getattr(row, "account_tier", "") or ""
+    free_only = quota_guard.free_only_for_tier(tier)
+    # usage_snapshot flags a partial/failed read; treating that as zero usage let
+    # a throttled read look like a full free quota.
+    snap = quota_guard.usage_snapshot(session, free_only_mode=free_only)
+    blocked = quota_guard._blocked_by_incomplete_read(snap, free_only)
+    if blocked:
+        raise HTTPException(status_code=503, detail=blocked)
     guard = free_quota.validate_block_volume_against_quota(
         current_size_gb=current_size_gb,
         new_size_gb=new_size_gb,
-        free_only_mode=True,
-        account_tier=getattr(row, "account_tier", "") or "",
+        free_only_mode=free_only,
+        account_tier=tier,
         usage=snap,
     )
     if not guard.ok:
