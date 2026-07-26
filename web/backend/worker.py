@@ -7,7 +7,7 @@ Responsibilities:
 - capacity retry with AD × config (downgrade) rotation, per-attempt logging
 - weekly + one-shot power schedules with execution history
 - worker heartbeat (AppMeta) so the panel can show liveness
-- daily checks: budget alerts + OCI login password expiry reminders
+- daily checks: budget alerts
 - push notifications (Telegram / Bark / ServerChan / Webhook / SMTP)
 """
 
@@ -647,15 +647,10 @@ class Worker:
             log.exception("daily-check gate failed")
             return
         log.info("running daily checks (%s)", today)
-        # Password expiry is local DB only (no OCI). Budget checks hit Usage API —
-        # run them strictly one tenant at a time with a short pause to avoid
-        # multi-account bursts.
+        # Budget checks hit Usage API — run them strictly one tenant at a time
+        # with a short pause to avoid multi-account bursts.
         tenants = db.scalars(select(Tenant).where(Tenant.enabled.is_(True))).all()
         for tenant in tenants:
-            try:
-                self._check_tenant_password_expiry(db, tenant, today)
-            except Exception:  # noqa: BLE001
-                log.exception("password expiry check failed tenant=%s", tenant.id)
             try:
                 self._check_tenant_budget(db, tenant)
             except Exception:  # noqa: BLE001
@@ -697,37 +692,6 @@ class Worker:
                 "请到「账号用量」页查看服务明细，必要时清理付费资源。"
             ),
         )
-
-    def _check_tenant_password_expiry(self, db: Session, tenant: Tenant, today: str) -> None:
-        changed = (tenant.password_changed_at or "").strip()
-        expiry_days = int(tenant.password_expiry_days or 0)
-        if not changed or expiry_days <= 0:
-            return
-        if tenant.pwd_expiry_notified_on == today:
-            return
-        try:
-            changed_date = datetime.strptime(changed[:10], "%Y-%m-%d").date()
-        except ValueError:
-            return
-        due = changed_date + timedelta(days=expiry_days)
-        days_left = (due - _local_now().date()).days
-        if days_left > 7:
-            return
-        tenant.pwd_expiry_notified_on = today
-        db.flush()
-        state = f"还有 {days_left} 天到期" if days_left >= 0 else f"已过期 {-days_left} 天"
-        notify_user(
-            db,
-            tenant.owner_id,
-            "password_expiry",
-            "🔐 OCIBot 甲骨文密码到期提醒",
-            (
-                f"租户「{tenant.name}」的 Oracle Cloud 登录密码{state}"
-                f"（修改于 {changed_date.isoformat()}，有效期 {expiry_days} 天）。\n"
-                "请尽快登录 Oracle Cloud 控制台修改密码，并在面板租户设置里更新修改日期。"
-            ),
-        )
-
 
 def main() -> int:
     Worker().run_forever()

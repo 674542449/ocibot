@@ -14,7 +14,7 @@
         <div>
           <h3 style="margin: 0">通知推送</h3>
           <p class="muted" style="margin: 0.2rem 0 0; font-size: 12px">
-            抢机成功/失败、定时任务失败、预算超额、密码到期时推送。支持 Telegram / Bark / Server酱 / Webhook / 邮件。
+            抢机成功/失败、定时任务失败、预算超额时推送。支持 Telegram / Bark / Server酱 / Webhook / 邮件。
           </p>
         </div>
         <button class="primary" @click="showAdd = !showAdd">{{ showAdd ? '收起' : '添加渠道' }}</button>
@@ -223,7 +223,6 @@ const EVENTS = [
   { key: 'capacity', label: '抢机结果' },
   { key: 'schedule', label: '定时任务失败' },
   { key: 'budget', label: '预算超额' },
-  { key: 'password_expiry', label: '密码到期' },
 ]
 
 const channels = ref<Channel[]>([])

@@ -35,8 +35,6 @@ def tenant_row_to_config(row: Tenant) -> TenantConfig:
         description=row.description or "",
         enabled=bool(row.enabled),
         color=row.color or "#3B82F6",
-        password_changed_at=row.password_changed_at or "",
-        password_expiry_days=int(row.password_expiry_days or 0),
         account_tier=row.account_tier or "",
     )
 

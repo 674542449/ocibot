@@ -26,7 +26,7 @@ from web.backend.url_safety import assert_safe_outbound_url, validate_public_htt
 log = logging.getLogger("ocibot.notify")
 
 CHANNEL_KINDS = ("telegram", "bark", "serverchan", "webhook", "smtp")
-EVENT_KEYS = ("capacity", "schedule", "budget", "password_expiry")
+EVENT_KEYS = ("capacity", "schedule", "budget")
 
 _HTTP_TIMEOUT = 15.0
 # Outbound client: no env proxy (avoid surprising proxy SSRF), no redirects to internal.

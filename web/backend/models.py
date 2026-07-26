@@ -63,14 +63,15 @@ class Tenant(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     color: Mapped[str] = mapped_column(String(32), default="#3B82F6")
     private_key_encrypted: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # Legacy local password-reminder columns (unused by UI/API; kept for DB compatibility).
     password_changed_at: Mapped[str] = mapped_column(String(64), default="")
-    password_expiry_days: Mapped[int] = mapped_column(Integer, default=120)
+    password_expiry_days: Mapped[int] = mapped_column(Integer, default=0)
     account_tier: Mapped[str] = mapped_column(String(16), default="")  # paid|free|""
     # Monthly cost budget (USD). 0 = alerts off.
     budget_monthly_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     # "YYYY-MM" of the last month a budget-exceeded notification was sent.
     budget_notified_month: Mapped[str] = mapped_column(String(8), default="", nullable=False)
-    # "YYYY-MM-DD" of the last day a password-expiry notification was sent.
+    # Legacy: last local password-expiry notify day (unused).
     pwd_expiry_notified_on: Mapped[str] = mapped_column(String(16), default="", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
@@ -199,9 +200,9 @@ class NotificationChannel(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     # Encrypted JSON dict of channel-specific config (bot_token/chat_id/url/...).
     config_encrypted: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    # Event switches (all default on): capacity / schedule / budget / password_expiry
+    # Event switches (all default on): capacity / schedule / budget
     events: Mapped[list[Any]] = mapped_column(
-        JSON, default=lambda: ["capacity", "schedule", "budget", "password_expiry"]
+        JSON, default=lambda: ["capacity", "schedule", "budget"]
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)

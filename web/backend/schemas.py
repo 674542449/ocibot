@@ -71,8 +71,6 @@ class TenantCreate(BaseModel):
     description: str = ""
     enabled: bool = True
     color: str = "#3B82F6"
-    password_changed_at: str = ""
-    password_expiry_days: int = Field(default=120, ge=0, le=3650)
     budget_monthly_usd: float = 0.0
 
 
@@ -112,8 +110,6 @@ class TenantUpdate(BaseModel):
     description: Optional[str] = None
     enabled: Optional[bool] = None
     color: Optional[str] = None
-    password_changed_at: Optional[str] = None
-    password_expiry_days: Optional[int] = Field(default=None, ge=0, le=3650)
     budget_monthly_usd: Optional[float] = None
 
 
@@ -129,12 +125,6 @@ class TenantOut(BaseModel):
     enabled: bool
     color: str
     has_private_key: bool
-    password_changed_at: str
-    password_expiry_days: int
-    # Computed password-policy fields (real countdown from DB values)
-    password_expires_on: str = ""  # YYYY-MM-DD or ""
-    password_days_left: Optional[int] = None
-    password_status: str = "off"  # off|ok|warn|expired
     account_tier: str
     budget_monthly_usd: float = 0.0
     created_at: datetime
@@ -143,30 +133,11 @@ class TenantOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class PasswordPolicyUpdate(BaseModel):
-    """Update Oracle console password reminder policy (stored on tenant row)."""
-
-    password_changed_at: Optional[str] = None  # YYYY-MM-DD; empty clears
-    password_expiry_days: Optional[int] = Field(default=None, ge=0, le=3650)
-    # If true, set password_changed_at to today (UTC) and clear expiry notification flag.
-    mark_changed_today: bool = False
-
-
-class PasswordPolicyOut(BaseModel):
-    password_changed_at: str
-    password_expiry_days: int
-    password_expires_on: str
-    password_days_left: Optional[int] = None
-    password_status: str
-    message: str = ""
-
-
 class OciPasswordPolicyOut(BaseModel):
     """Result of reading / mutating Oracle Identity Domain password policies."""
 
     ok: bool
     message: str
-    local_password_expiry_days: Optional[int] = None
     data: dict[str, Any] = Field(default_factory=dict)
 
 

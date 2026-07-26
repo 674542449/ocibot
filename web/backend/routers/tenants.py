@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Annotated, Optional
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
@@ -17,8 +17,6 @@ from web.backend.models import Tenant, User
 from web.backend.oci_bridge import drop_session, get_owned_tenant, get_session_for_row
 from web.backend.schemas import (
     OciPasswordPolicyOut,
-    PasswordPolicyOut,
-    PasswordPolicyUpdate,
     TenantCreate,
     TenantOut,
     TenantParseResult,
@@ -31,56 +29,7 @@ from web.backend.tenant_import import parse_pasted_oci_bundle
 router = APIRouter(prefix="/tenants", tags=["tenants"])
 
 
-def _tenant_config_for_password(row: Tenant) -> TenantConfig:
-    """Build a lightweight TenantConfig so we can reuse password-policy helpers."""
-    created = ""
-    if row.created_at is not None:
-        created = row.created_at.isoformat()
-    return TenantConfig(
-        id=row.id,
-        name=row.name or "",
-        user_ocid=row.user_ocid or "",
-        tenancy_ocid=row.tenancy_ocid or "",
-        fingerprint=row.fingerprint or "",
-        region=row.region or "",
-        private_key_pem="",
-        password_changed_at=row.password_changed_at or "",
-        password_expiry_days=int(row.password_expiry_days or 0),
-        created_at=created,
-    )
-
-
-def _password_policy_fields(row: Tenant) -> dict:
-    cfg = _tenant_config_for_password(row)
-    expiry = cfg.password_expiry_date()
-    status, message = cfg.password_status()
-    return {
-        "password_changed_at": (row.password_changed_at or "").strip(),
-        "password_expiry_days": int(row.password_expiry_days or 0),
-        "password_expires_on": expiry.date().isoformat() if expiry else "",
-        "password_days_left": cfg.password_days_left(),
-        "password_status": status,
-        "message": message,
-    }
-
-
-def _normalize_password_changed_at(value: Optional[str]) -> str:
-    """Accept YYYY-MM-DD (or longer ISO); empty clears. Raises HTTPException on bad input."""
-    if value is None:
-        return ""
-    raw = value.strip()
-    if not raw:
-        return ""
-    day = raw[:10]
-    try:
-        datetime.strptime(day, "%Y-%m-%d")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="密码修改日须为 YYYY-MM-DD") from exc
-    return day
-
-
 def _to_out(row: Tenant) -> TenantOut:
-    policy = _password_policy_fields(row)
     return TenantOut(
         id=row.id,
         name=row.name,
@@ -93,11 +42,6 @@ def _to_out(row: Tenant) -> TenantOut:
         enabled=bool(row.enabled),
         color=row.color or "#3B82F6",
         has_private_key=bool(row.private_key_encrypted),
-        password_changed_at=policy["password_changed_at"],
-        password_expiry_days=policy["password_expiry_days"],
-        password_expires_on=policy["password_expires_on"],
-        password_days_left=policy["password_days_left"],
-        password_status=policy["password_status"],
         account_tier=row.account_tier or "",
         budget_monthly_usd=float(row.budget_monthly_usd or 0.0),
         created_at=row.created_at,
@@ -217,8 +161,6 @@ def import_tenant_from_paste(
             session = get_session_for_row(row)
             test = session.test_connection()
             if not test.ok:
-                # Keep tenant but surface failure via 201 + client can re-test;
-                # still return created tenant. Message is not part of TenantOut.
                 pass
         except Exception:
             pass
@@ -253,8 +195,6 @@ def create_tenant(
         enabled=body.enabled,
         color=body.color or "#3B82F6",
         private_key_encrypted=encrypt_text(body.private_key_pem.strip()),
-        password_changed_at=_normalize_password_changed_at(body.password_changed_at or ""),
-        password_expiry_days=int(body.password_expiry_days or 0),
         budget_monthly_usd=float(body.budget_monthly_usd or 0.0),
     )
     db.add(row)
@@ -291,19 +231,10 @@ def update_tenant(
     data = body.model_dump(exclude_unset=True)
     new_pem = data.pop("private_key_pem", None)
 
-    if "password_changed_at" in data:
-        data["password_changed_at"] = _normalize_password_changed_at(data.get("password_changed_at"))
-        # Reset daily notify flag so a new baseline can re-alert when due again.
-        row.pwd_expiry_notified_on = ""
-    if "password_expiry_days" in data and data["password_expiry_days"] is not None:
-        data["password_expiry_days"] = max(0, min(3650, int(data["password_expiry_days"])))
-        row.pwd_expiry_notified_on = ""
-
     for key, value in data.items():
-        if value is not None or key == "password_changed_at":
+        if value is not None:
             setattr(row, key, value if not isinstance(value, str) else value.strip())
 
-    # Validate with effective PEM
     from web.backend.crypto_util import decrypt_text
 
     pem = new_pem.strip() if isinstance(new_pem, str) and new_pem.strip() else decrypt_text(row.private_key_encrypted)
@@ -327,59 +258,6 @@ def update_tenant(
     return _to_out(row)
 
 
-@router.get("/{tenant_id}/password-policy", response_model=PasswordPolicyOut)
-def get_password_policy(
-    tenant_id: str,
-    user: Annotated[User, Depends(get_current_user)],
-    db: Annotated[Session, Depends(get_db)],
-) -> PasswordPolicyOut:
-    try:
-        row = get_owned_tenant(db, user.id, tenant_id)
-    except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return PasswordPolicyOut(**_password_policy_fields(row))
-
-
-@router.patch("/{tenant_id}/password-policy", response_model=PasswordPolicyOut)
-def update_password_policy(
-    tenant_id: str,
-    body: PasswordPolicyUpdate,
-    user: Annotated[User, Depends(get_current_user)],
-    db: Annotated[Session, Depends(get_db)],
-) -> PasswordPolicyOut:
-    """Persist password reminder settings (days / last-changed date) on the tenant row."""
-    try:
-        row = get_owned_tenant(db, user.id, tenant_id)
-    except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    data = body.model_dump(exclude_unset=True)
-    changed = False
-
-    if body.mark_changed_today:
-        row.password_changed_at = datetime.now(timezone.utc).date().isoformat()
-        row.pwd_expiry_notified_on = ""
-        changed = True
-    elif "password_changed_at" in data:
-        row.password_changed_at = _normalize_password_changed_at(data.get("password_changed_at"))
-        row.pwd_expiry_notified_on = ""
-        changed = True
-
-    if "password_expiry_days" in data and data["password_expiry_days"] is not None:
-        row.password_expiry_days = max(0, min(3650, int(data["password_expiry_days"])))
-        # Changing the period should allow a fresh notification cycle.
-        row.pwd_expiry_notified_on = ""
-        changed = True
-
-    if not changed:
-        raise HTTPException(status_code=400, detail="未提供可更新的密码策略字段")
-
-    row.updated_at = datetime.now(timezone.utc)
-    db.commit()
-    db.refresh(row)
-    return PasswordPolicyOut(**_password_policy_fields(row))
-
-
 @router.get("/{tenant_id}/oci-password-policy", response_model=OciPasswordPolicyOut)
 def get_oci_password_policy(
     tenant_id: str,
@@ -397,7 +275,6 @@ def get_oci_password_policy(
         return OciPasswordPolicyOut(
             ok=bool(result.ok),
             message=result.message or "",
-            local_password_expiry_days=int(row.password_expiry_days or 0),
             data=result.data if isinstance(result.data, dict) else {},
         )
     except Exception as exc:  # noqa: BLE001
@@ -410,11 +287,7 @@ def disable_oci_password_expiry(
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> OciPasswordPolicyOut:
-    """Call Oracle Identity Domains API to clear passwordExpiresAfter (never expire).
-
-    Also turns off the local OCIBot password-expiry reminder (days=0) when Oracle
-    update succeeds, so the tenant list badge matches the real policy.
-    """
+    """Call Oracle Identity Domains API to clear passwordExpiresAfter (never expire)."""
     try:
         row = get_owned_tenant(db, user.id, tenant_id)
     except LookupError as exc:
@@ -425,18 +298,9 @@ def disable_oci_password_expiry(
     except Exception as exc:  # noqa: BLE001
         return OciPasswordPolicyOut(ok=False, message=str(exc), data={})
 
-    if result.ok:
-        # Keep panel reminder in sync with the real Oracle policy.
-        row.password_expiry_days = 0
-        row.pwd_expiry_notified_on = ""
-        row.updated_at = datetime.now(timezone.utc)
-        db.commit()
-        db.refresh(row)
-
     return OciPasswordPolicyOut(
         ok=bool(result.ok),
         message=result.message or "",
-        local_password_expiry_days=int(row.password_expiry_days or 0),
         data=result.data if isinstance(result.data, dict) else {},
     )
 
