@@ -161,6 +161,15 @@ class PasswordPolicyOut(BaseModel):
     message: str = ""
 
 
+class OciPasswordPolicyOut(BaseModel):
+    """Result of reading / mutating Oracle Identity Domain password policies."""
+
+    ok: bool
+    message: str
+    local_password_expiry_days: Optional[int] = None
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
 class TenantTestResult(BaseModel):
     ok: bool
     message: str

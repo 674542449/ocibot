@@ -16,6 +16,7 @@ from web.backend.db import get_db
 from web.backend.models import Tenant, User
 from web.backend.oci_bridge import drop_session, get_owned_tenant, get_session_for_row
 from web.backend.schemas import (
+    OciPasswordPolicyOut,
     PasswordPolicyOut,
     PasswordPolicyUpdate,
     TenantCreate,
@@ -377,6 +378,67 @@ def update_password_policy(
     db.commit()
     db.refresh(row)
     return PasswordPolicyOut(**_password_policy_fields(row))
+
+
+@router.get("/{tenant_id}/oci-password-policy", response_model=OciPasswordPolicyOut)
+def get_oci_password_policy(
+    tenant_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> OciPasswordPolicyOut:
+    """Read Oracle Identity Domain password policies (real console force-change settings)."""
+    try:
+        row = get_owned_tenant(db, user.id, tenant_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    try:
+        session = get_session_for_row(row)
+        result = session.list_console_password_policies()
+        return OciPasswordPolicyOut(
+            ok=bool(result.ok),
+            message=result.message or "",
+            local_password_expiry_days=int(row.password_expiry_days or 0),
+            data=result.data if isinstance(result.data, dict) else {},
+        )
+    except Exception as exc:  # noqa: BLE001
+        return OciPasswordPolicyOut(ok=False, message=str(exc), data={})
+
+
+@router.post("/{tenant_id}/oci-password-policy/disable-expiry", response_model=OciPasswordPolicyOut)
+def disable_oci_password_expiry(
+    tenant_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> OciPasswordPolicyOut:
+    """Call Oracle Identity Domains API to clear passwordExpiresAfter (never expire).
+
+    Also turns off the local OCIBot password-expiry reminder (days=0) when Oracle
+    update succeeds, so the tenant list badge matches the real policy.
+    """
+    try:
+        row = get_owned_tenant(db, user.id, tenant_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    try:
+        session = get_session_for_row(row)
+        result = session.disable_console_password_expiry()
+    except Exception as exc:  # noqa: BLE001
+        return OciPasswordPolicyOut(ok=False, message=str(exc), data={})
+
+    if result.ok:
+        # Keep panel reminder in sync with the real Oracle policy.
+        row.password_expiry_days = 0
+        row.pwd_expiry_notified_on = ""
+        row.updated_at = datetime.now(timezone.utc)
+        db.commit()
+        db.refresh(row)
+
+    return OciPasswordPolicyOut(
+        ok=bool(result.ok),
+        message=result.message or "",
+        local_password_expiry_days=int(row.password_expiry_days or 0),
+        data=result.data if isinstance(result.data, dict) else {},
+    )
 
 
 @router.delete("/{tenant_id}")

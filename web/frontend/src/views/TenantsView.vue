@@ -61,7 +61,14 @@
                 <button :disabled="busy === t.id" @click="detectTier(t)">识别等级</button>
                 <button
                   :disabled="busy === t.id"
-                  title="把密码最近修改日记为今天，并重置到期提醒"
+                  title="调用 Oracle Identity Domain API，把控制台强制改密周期改为不强制"
+                  @click="disableOciPasswordExpiry(t)"
+                >
+                  关闭强制改密
+                </button>
+                <button
+                  :disabled="busy === t.id"
+                  title="把密码最近修改日记为今天，并重置本地到期提醒（不改 Oracle）"
                   @click="markPasswordChanged(t)"
                 >
                   已改密
@@ -275,11 +282,12 @@ key_file=~/.oci/oci_api_key.pem"
           </div>
         </div>
         <p class="field-hint" style="margin: 0">
-          这是面板本地策略，会写入租户表
+          这是面板<strong>本地提醒</strong>，写入租户表
           <code>password_expiry_days</code> /
-          <code>password_changed_at</code>。
-          填 <strong>0</strong> 关闭徽章与推送；不是 Oracle 官网强制改密。
-          改完后请点「仅保存密码策略」或「保存全部」。
+          <code>password_changed_at</code>，不是 Oracle 官网强制改密。
+          要真正关掉控制台约 120 天强制改密，请在列表点
+          <strong>关闭强制改密</strong>（会调 Oracle Identity Domain API）。
+          本地填 <strong>0</strong> 仅关闭徽章与推送。
         </p>
         <p v-if="editPolicyPreview" class="muted" style="margin: 0; font-size: 13px">
           {{ editPolicyPreview }}
@@ -703,6 +711,44 @@ async function markPasswordChanged(t: Tenant) {
     msg.value = `${t.name}: 已写入数据库（今天改密）· ${data.message || `到期 ${data.password_expires_on || '—'}`}`
   } catch (e: any) {
     error.value = e?.message || '更新密码策略失败'
+  } finally {
+    busy.value = ''
+  }
+}
+
+async function disableOciPasswordExpiry(t: Tenant) {
+  if (
+    !confirm(
+      `对租户「${t.name}」调用 Oracle API，关闭控制台强制改密（默认约 120 天）？\n\n` +
+        `会修改 Identity Domain 的 PasswordPolicy.passwordExpiresAfter。\n` +
+        `需要 API 用户具备 Domain / 密码策略管理权限。成功后会同步关闭本地面板提醒。`,
+    )
+  ) {
+    return
+  }
+  error.value = ''
+  msg.value = ''
+  busy.value = t.id
+  try {
+    const { data } = await api.post<{
+      ok: boolean
+      message: string
+      local_password_expiry_days?: number | null
+      data?: Record<string, unknown>
+    }>(`/tenants/${t.id}/oci-password-policy/disable-expiry`)
+    if (data.ok) {
+      // Oracle success also clears local reminder days on the server.
+      t.password_expiry_days = data.local_password_expiry_days ?? 0
+      t.password_expires_on = ''
+      t.password_days_left = null
+      t.password_status = 'off'
+      replaceTenant(t)
+      msg.value = `${t.name}: ${data.message || '已关闭 Oracle 强制改密'}`
+    } else {
+      error.value = `${t.name}: ${data.message || '关闭强制改密失败'}`
+    }
+  } catch (e: any) {
+    error.value = e?.message || '关闭强制改密失败'
   } finally {
     busy.value = ''
   }

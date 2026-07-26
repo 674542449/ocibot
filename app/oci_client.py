@@ -3478,6 +3478,287 @@ class TenantSession:
         info["home_region"] = self._home_region() or info["home_region"]
         return OperationResult(ok=True, message="已读取账号信息", data=info)
 
+    def list_console_password_policies(self) -> OperationResult:
+        """List Identity Domain password policies (console login password expiry, etc.).
+
+        Free / modern tenancies store the 120-day force-change rule in the
+        domain PasswordPolicy resource (`passwordExpiresAfter`), not the local
+        OCIBot reminder fields.
+        """
+        try:
+            domains = self._list_identity_domains()
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=str(exc))
+
+        if not domains:
+            return OperationResult(
+                ok=False,
+                message=(
+                    "未找到 Identity Domain。当前租户可能仍是经典 IAM，"
+                    "或 API 用户缺少 list domains 权限。"
+                ),
+                data={"domains": [], "policies": []},
+            )
+
+        policies: list[dict[str, Any]] = []
+        errors: list[str] = []
+        for domain in domains:
+            try:
+                client = self._identity_domains_client(domain["url"])
+                items = self._list_domain_password_policies(client)
+                for item in items:
+                    policies.append({**item, "domain_id": domain["id"], "domain_name": domain["name"], "domain_url": domain["url"]})
+            except ServiceError as exc:
+                errors.append(f"{domain['name']}: {_format_service_error(exc)}")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{domain['name']}: {exc}")
+
+        if not policies and errors:
+            return OperationResult(ok=False, message="；".join(errors), data={"domains": domains, "policies": []})
+        return OperationResult(
+            ok=True,
+            message=f"已读取 {len(policies)} 条密码策略（{len(domains)} 个 Domain）",
+            data={"domains": domains, "policies": policies, "errors": errors},
+        )
+
+    def disable_console_password_expiry(self) -> OperationResult:
+        """Clear Identity Domain ``passwordExpiresAfter`` so console passwords do not expire.
+
+        This talks to Oracle Identity Domains (SCIM PasswordPolicy), not the local
+        reminder stored on the OCIBot tenant row. Requires domain admin / password
+        policy manage rights on the API user.
+        """
+        listed = self.list_console_password_policies()
+        if not listed.ok:
+            return listed
+        policies = list((listed.data or {}).get("policies") or [])
+        if not policies:
+            return OperationResult(
+                ok=False,
+                message=listed.message or "未找到可修改的密码策略",
+                data=listed.data,
+            )
+
+        updated: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        errors: list[str] = []
+
+        # Prefer Default password policy first; then others.
+        policies_sorted = sorted(
+            policies,
+            key=lambda p: (
+                0 if str(p.get("name") or "").lower() in {"default", "default password policy"} else 1,
+                str(p.get("name") or ""),
+            ),
+        )
+
+        for pol in policies_sorted:
+            domain_url = str(pol.get("domain_url") or "").strip()
+            policy_id = str(pol.get("id") or "").strip()
+            if not domain_url or not policy_id:
+                continue
+            expires_after = pol.get("password_expires_after")
+            # None / 0 → already never-expire (domain-dependent; treat both as off).
+            if expires_after is None or expires_after == 0:
+                skipped.append({**pol, "reason": "已是不强制过期"})
+                continue
+            try:
+                client = self._identity_domains_client(domain_url)
+                after = self._patch_password_policy_never_expire(client, policy_id)
+                updated.append(
+                    {
+                        "id": policy_id,
+                        "name": pol.get("name") or "",
+                        "domain_name": pol.get("domain_name") or "",
+                        "domain_url": domain_url,
+                        "password_expires_after_before": expires_after,
+                        "password_expires_after_after": after,
+                    }
+                )
+            except ServiceError as exc:
+                errors.append(f"{pol.get('domain_name')}/{pol.get('name')}: {_format_service_error(exc)}")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{pol.get('domain_name')}/{pol.get('name')}: {exc}")
+
+        if not updated and not skipped and errors:
+            return OperationResult(ok=False, message="；".join(errors), data={"updated": [], "errors": errors})
+
+        if updated:
+            names = "、".join(
+                f"{u.get('domain_name') or 'domain'}/{u.get('name') or u.get('id')}" for u in updated[:5]
+            )
+            msg = f"已在 Oracle 关闭强制改密：{names}"
+            if len(updated) > 5:
+                msg += f" 等 {len(updated)} 条"
+            if skipped:
+                msg += f"；另有 {len(skipped)} 条本就无需过期"
+            if errors:
+                msg += f"；部分失败：{'；'.join(errors[:3])}"
+            return OperationResult(
+                ok=True,
+                message=msg,
+                data={"updated": updated, "skipped": skipped, "errors": errors},
+            )
+
+        if skipped and not errors:
+            return OperationResult(
+                ok=True,
+                message=f"Oracle 密码策略已是「不强制过期」（{len(skipped)} 条）",
+                data={"updated": [], "skipped": skipped, "errors": []},
+            )
+
+        return OperationResult(
+            ok=False,
+            message="；".join(errors) if errors else "未能修改任何密码策略",
+            data={"updated": updated, "skipped": skipped, "errors": errors},
+        )
+
+    def _list_identity_domains(self) -> list[dict[str, str]]:
+        """Return ACTIVE identity domains with a usable domain URL."""
+        if not OCI_AVAILABLE:
+            raise OCIClientError("未安装 oci SDK")
+        tenancy = self.tenant.tenancy_ocid.strip()
+        # Domains are tenancy-scoped; list from home-region identity when possible.
+        identity = self.identity
+        home = self._home_region()
+        if home and home != self.tenant.region.strip():
+            try:
+                identity = IdentityClient(self._config_for_region(home), retry_strategy=sdk_default_retry_strategy())
+            except Exception:  # noqa: BLE001
+                identity = self.identity
+
+        response = oci.pagination.list_call_get_all_results(
+            identity.list_domains,
+            compartment_id=tenancy,
+            lifecycle_state="ACTIVE",
+        )
+        items: list[dict[str, str]] = []
+        for d in response.data or []:
+            url = (
+                getattr(d, "url", None)
+                or getattr(d, "home_region_url", None)
+                or ""
+            )
+            url = str(url or "").strip().rstrip("/")
+            if not url:
+                continue
+            items.append(
+                {
+                    "id": str(getattr(d, "id", "") or ""),
+                    "name": str(getattr(d, "display_name", "") or getattr(d, "id", "") or ""),
+                    "url": url,
+                    "type": str(getattr(d, "type", "") or ""),
+                    "home_region": str(getattr(d, "home_region", "") or ""),
+                }
+            )
+        # Prefer Default domain first.
+        items.sort(key=lambda x: (0 if x.get("type") == "DEFAULT" else 1, x.get("name") or ""))
+        return items
+
+    def _identity_domains_client(self, service_endpoint: str) -> Any:
+        if not OCI_AVAILABLE:
+            raise OCIClientError("未安装 oci SDK")
+        try:
+            from oci.identity_domains import IdentityDomainsClient
+        except ImportError as exc:  # pragma: no cover
+            raise OCIClientError("当前 oci SDK 不支持 Identity Domains") from exc
+        endpoint = (service_endpoint or "").strip().rstrip("/")
+        if not endpoint:
+            raise OCIClientError("Identity Domain URL 为空")
+        # Domain SCIM endpoint is global to that domain; region in config is still required.
+        cfg = self._config_for_region(self._home_region() or self.tenant.region.strip())
+        return IdentityDomainsClient(
+            cfg,
+            service_endpoint=endpoint,
+            retry_strategy=sdk_default_retry_strategy(),
+        )
+
+    def _list_domain_password_policies(self, client: Any) -> list[dict[str, Any]]:
+        """Fetch all password policies from one domain client."""
+        items: list[dict[str, Any]] = []
+        start_index = 1
+        count = 100
+        while True:
+            resp = client.list_password_policies(
+                start_index=start_index,
+                count=count,
+                attribute_sets=["all"],
+            )
+            data = getattr(resp, "data", None)
+            resources = getattr(data, "resources", None) if data is not None else None
+            if resources is None and isinstance(data, list):
+                resources = data
+            resources = resources or []
+            for p in resources:
+                items.append(self._password_policy_to_dict(p))
+            total = int(getattr(data, "total_results", 0) or 0) if data is not None else 0
+            if not resources:
+                break
+            start_index += len(resources)
+            if total and start_index > total:
+                break
+            if len(resources) < count:
+                break
+            if start_index > 1000:  # hard safety
+                break
+        return items
+
+    @staticmethod
+    def _password_policy_to_dict(policy: Any) -> dict[str, Any]:
+        expires = getattr(policy, "password_expires_after", None)
+        warning = getattr(policy, "password_expire_warning", None)
+        return {
+            "id": str(getattr(policy, "id", "") or ""),
+            "ocid": str(getattr(policy, "ocid", "") or ""),
+            "name": str(getattr(policy, "name", "") or ""),
+            "description": str(getattr(policy, "description", "") or ""),
+            "password_expires_after": expires if expires is not None else None,
+            "password_expire_warning": warning if warning is not None else None,
+            "priority": getattr(policy, "priority", None),
+        }
+
+    def _patch_password_policy_never_expire(self, client: Any, password_policy_id: str) -> Any:
+        """Clear passwordExpiresAfter (and warning) on a domain password policy."""
+        from oci.identity_domains.models import Operations, PatchOp
+
+        # SCIM: remove clears the attribute → password never expires.
+        ops = [
+            Operations(op="remove", path="passwordExpiresAfter"),
+            Operations(op="remove", path="passwordExpireWarning"),
+        ]
+        patch = PatchOp(
+            schemas=["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            operations=ops,
+        )
+        try:
+            resp = client.patch_password_policy(
+                password_policy_id,
+                patch_op=patch,
+                attribute_sets=["all"],
+            )
+        except ServiceError as exc:
+            # Some domains reject remove; fall back to replace with null.
+            status = getattr(exc, "status", None)
+            if status not in (400, 422):
+                raise
+            ops = [
+                Operations(op="replace", path="passwordExpiresAfter", value=None),
+                Operations(op="replace", path="passwordExpireWarning", value=None),
+            ]
+            patch = PatchOp(
+                schemas=["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+                operations=ops,
+            )
+            resp = client.patch_password_policy(
+                password_policy_id,
+                patch_op=patch,
+                attribute_sets=["all"],
+            )
+        data = getattr(resp, "data", None)
+        return getattr(data, "password_expires_after", None) if data is not None else None
+
     def _home_region(self) -> str:
         """Resolve the tenancy's home region name (cached). Falls back to the
         tenant's configured region. Budgets and some Usage API calls only work

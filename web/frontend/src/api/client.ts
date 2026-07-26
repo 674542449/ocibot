@@ -80,6 +80,14 @@ export type PasswordPolicy = {
   message: string
 }
 
+/** Oracle Identity Domain password-policy mutation result. */
+export type OciPasswordPolicyResult = {
+  ok: boolean
+  message: string
+  local_password_expiry_days?: number | null
+  data?: Record<string, unknown>
+}
+
 export type Instance = {
   id: string
   display_name: string
