@@ -73,6 +73,15 @@ const loading = ref(false)
 const error = ref('')
 const hint = ref('')
 
+/** Only follow same-origin in-app paths, never an attacker-supplied absolute URL. */
+function safeRedirect(raw: unknown): string {
+  const target = typeof raw === 'string' ? raw : ''
+  // Must be a single-slash-rooted path: rejects "//evil.com", "https://evil.com"
+  // and "javascript:..." regardless of how the router resolves them later.
+  if (!/^\/(?!\/)/.test(target)) return '/'
+  return target
+}
+
 async function submit() {
   error.value = ''
   hint.value = ''
@@ -84,8 +93,7 @@ async function submit() {
       await auth.register(username.value.trim(), password.value)
       hint.value = '注册成功'
     }
-    const redirect = (route.query.redirect as string) || '/'
-    await router.replace(redirect)
+    await router.replace(safeRedirect(route.query.redirect))
   } catch (e: any) {
     const msg = e?.message || '请求失败'
     if (msg === 'totp_required') {

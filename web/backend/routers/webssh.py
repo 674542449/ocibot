@@ -10,6 +10,7 @@ import json
 import logging
 import time
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from jose import JWTError
@@ -17,6 +18,7 @@ from sqlalchemy import select
 
 from web.backend.audit import write_audit
 from web.backend.auth import COOKIE_NAME, decode_token
+from web.backend.config import get_settings
 from web.backend.db import SessionLocal
 from web.backend.models import User
 from web.backend.oci_bridge import get_owned_tenant, get_session_for_row
@@ -67,6 +69,41 @@ async def _release_slot(user_id: str, instance_id: str) -> None:
             _instance_sessions[instance_id] = i
 
 
+def _origin_host(origin: str) -> str:
+    """Return the host[:port] part of an Origin header value, lowercased."""
+    parsed = urlparse((origin or "").strip())
+    return (parsed.netloc or "").strip().lower()
+
+
+def websocket_origin_allowed(websocket: WebSocket) -> bool:
+    """Reject cross-site WebSocket handshakes (CSWSH).
+
+    CORS does not apply to WebSockets and SameSite=Lax is not a guarantee here
+    (SameSite=None is a supported configuration), so a cookie-authenticated WS
+    endpoint must check Origin itself — otherwise any website the victim visits
+    could open a terminal on their instances.
+
+    A missing Origin is allowed: browsers always send it on a WS handshake, while
+    non-browser clients (which do not carry the victim's cookie) often omit it.
+    """
+    origin = (websocket.headers.get("origin") or "").strip()
+    if not origin:
+        return True
+    origin_host = _origin_host(origin)
+    if not origin_host:
+        return False
+    # Same-origin: compare host[:port] only. Behind a TLS-terminating proxy the
+    # browser's Origin is https:// while this hop is plain ws://, so the scheme
+    # cannot be compared reliably.
+    host_header = (websocket.headers.get("host") or "").strip().lower()
+    if host_header and origin_host == host_header:
+        return True
+    for allowed in get_settings().cors_origin_list():
+        if origin_host == _origin_host(allowed):
+            return True
+    return False
+
+
 def _user_from_websocket(websocket: WebSocket) -> Any:
     # Cookie only — never accept JWT from query string (leaks via logs/Referer).
     token = websocket.cookies.get(COOKIE_NAME) or ""
@@ -109,6 +146,13 @@ async def _send_json(ws: WebSocket, payload: dict[str, Any]) -> None:
 
 @router.websocket("/tenants/{tenant_id}/instances/{instance_id}/webssh")
 async def webssh_endpoint(websocket: WebSocket, tenant_id: str, instance_id: str) -> None:
+    # Cross-site handshakes are refused before the socket is even accepted, so a
+    # malicious page cannot ride the victim's session cookie into a shell.
+    if not websocket_origin_allowed(websocket):
+        log.warning("webssh rejected cross-origin handshake: %r", websocket.headers.get("origin"))
+        await websocket.close(code=4403)
+        return
+
     await websocket.accept()
     user: Optional[Any] = None
     slot_held = False

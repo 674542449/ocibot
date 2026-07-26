@@ -246,6 +246,9 @@ class CapacityJobCreate(BaseModel):
     interval_sec: int = 180
     max_attempts: int = 200
     enabled: bool = True
+    # Flex-only downgrade candidates the worker rotates through after the primary
+    # config fails across all ADs: [{"ocpus": 2, "memory_in_gbs": 12}, ...] (max 5).
+    fallback_configs: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class CapacityJobOut(BaseModel):

@@ -1,5 +1,67 @@
 # Web audit notes
 
+## Pass 4 — full-codebase bug + security review (0.4.14, 2026-07-26)
+
+Reviewed every router, the worker, the shared OCI layer entry points, the SPA and
+the deployment config. Findings that were real and are now fixed:
+
+### Security
+
+| Issue | Severity | Fix |
+|-------|----------|-----|
+| `run.py` passed `proxy_headers=True, forwarded_allow_ips="*"` to uvicorn. Its ProxyHeadersMiddleware then **overwrote `scope["client"]` from `X-Forwarded-For` for every peer**, so `request.client.host` — the login/register rate-limit bucket key — was attacker-controlled. A fresh forged IP per request defeated the throttle entirely, making password brute-force unlimited even though `OCIBOT_TRUST_PROXY` defaults to 0. | **Critical** | Proxy headers are honoured only when `OCIBOT_TRUST_PROXY=1`, and only from `OCIBOT_FORWARDED_ALLOW_IPS` (loopback by default). |
+| The WebSSH WebSocket authenticated by cookie but never checked `Origin`. CORS does not apply to WebSockets, so with `OCIBOT_COOKIE_SAMESITE=none` (a supported setting) any site the victim visited could open a shell on their instances (CSWSH). | High | `websocket_origin_allowed()` rejects cross-site handshakes before `accept()`; same-origin and explicitly allowlisted CORS origins pass, absent `Origin` (non-browser clients) still allowed. |
+| `OCIBOT_CORS_ORIGINS=*` combined with cookie credentials makes Starlette *reflect* the caller's Origin plus `Allow-Credentials: true` — any website could read the API as the logged-in user. | High | A literal `*` is dropped from the origin list and logged loudly at startup. |
+| Backup import and object-storage upload called `await file.read()` (whole body into one bytes object) *before* any size check, and did blocking work inside `async def` — memory pressure plus event-loop stalls for every other request on the worker. | High | Bounded chunked read (`web/backend/uploads.py`), both routes converted to sync/threadpool handlers, plus a 32MB request-body ceiling middleware so oversized bodies never reach the disk spool. |
+| SSRF address filter missed several non-public ranges: `0.0.0.0/8` (only `0.0.0.0` itself was caught), carrier-grade NAT `100.64.0.0/10`, `192.0.0.0/24`, `240.0.0.0/4`, benchmarking/TEST-NET, and IPv6 forms that translate to IPv4 — **NAT64 `64:ff9b::/96`** and **6to4 `2002::/16`**, e.g. `64:ff9b::a9fe:a9fe` reaching cloud metadata. | Medium | Explicit CIDR list plus embedded-IPv4 unwrapping for mapped/NAT64/6to4; service-port blocklist widened. |
+| No HSTS / COOP / CORP headers. | Low | Added (HSTS gated on `OCIBOT_COOKIE_SECURE` so a plain-HTTP deploy is not locked out). |
+| `docker-compose.yml` defaulted `OCIBOT_UPDATE_ENABLED=1` while mounting `docker.sock`; applying an update runs a helper container and may `nsenter` the host namespace, so an admin session is effectively host root. | Medium | Default flipped to opt-in `0`. `scripts/install.sh` still sets `1` explicitly, so the supported install keeps one-click update. Added `no-new-privileges` and an `OCIBOT_BIND` knob. |
+| Short/low-entropy `OCIBOT_MASTER_KEY` accepted silently by default; it is stretched with a single unsalted SHA-256 into the Fernet key, so a weak value is brute-forceable offline against a stolen DB. | Medium | Startup now warns with specific reasons (`weak_secret_reasons()`); the hard fail under `OCIBOT_REQUIRE_SECURE_SECRETS=1` is unchanged. **The derivation itself was deliberately left alone — changing it would make every stored private key undecryptable.** |
+| Login `redirect` query param was passed straight to `router.replace()`. | Low | Only single-slash-rooted paths are followed. |
+
+### Correctness
+
+- `POST /api/jobs/capacity` validated `fallback_configs` against the free-tier
+  quota and then built the row **without them**, so the worker (which reads
+  `job.fallback_configs` to rotate AD × config) only ever tried the primary
+  config. Field added to the schema, validation shared with the launch wizard via
+  `normalize_fallback_configs()`, and now persisted.
+- Power schedules could **fire twice**. The "already ran today" claim was a bare
+  `db.flush()`, invisible to other connections until commit, so a second worker
+  ticking in the same minute re-fired the same STOP/START. Now a conditional
+  `UPDATE` committed before any OCI call. (On SQLite the old code instead hit
+  `database is locked` and silently skipped the schedule.)
+- `POST /tenants/{id}/launch` wrapped the quota guard in `except HTTPException:
+  raise` with no other handler, so a quota-read failure surfaced as an unhandled
+  500. Now 502 with the cause, matching the `/jobs/capacity` path.
+- `prepare_launch_network()` derived `for_retry` from `auth_mode == "key"` instead
+  of the caller's actual retry flag, validating plain launches under retry-only
+  rules. Threaded through properly.
+- Backup import could 500 on a hostile `password_expiry_days` (out-of-range int
+  overflowing the column). Clamped.
+- `AdminView.vue` declared its log-translation table as `[RegExp, string][]` while
+  the last entry holds a callback — `vue-tsc` errors and `rep` narrowed to `never`
+  in the callable branch. Type widened (vite never typechecked, so this was latent).
+
+### Reviewed and found already correct
+
+Per-endpoint ownership checks (`owner_id == current_user.id`) are present on every
+tenant/job/instance/notification/audit route; JWT alg is pinned with a
+`token_version` revocation counter; TOTP requires verification before enable;
+cloud-init writes user scripts via a YAML block scalar so arbitrary content cannot
+break out; capacity retries keep the durable committed lease, 60s floor, 429
+backoff and `NoneRetryStrategy` on `LaunchInstance`; no `v-html`/`innerHTML`
+anywhere in the SPA and no token in `localStorage`.
+
+### Known remaining gap
+
+**DNS rebinding on outbound notifications.** `resolve_and_check_host()` validates
+the resolved addresses, then httpx resolves again when connecting, so a hostname
+whose DNS answer flips between the two can still be reached. Closing it properly
+needs connect-time address pinning. Mitigations today: only authenticated users
+can register targets, redirects are never followed, `trust_env=False`, and the
+send path re-validates. Documented in `url_safety.resolve_and_check_host`.
+
 ## Pass 2 — web-only migration + hardening (2026-07-25)
 
 The desktop (Tkinter) version was removed; `app/` now holds only the shared OCI

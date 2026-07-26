@@ -17,7 +17,7 @@ class Settings(BaseSettings):
 
     app_name: str = "OCIBot Web"
     # Bump when shipping user-visible panel features so operators can verify deploy.
-    app_version: str = "0.4.13"
+    app_version: str = "0.4.14"
     debug: bool = False
 
     # sqlite+pysqlite:////absolute/path.db  or  postgresql+psycopg://user:pass@host/db
@@ -69,12 +69,44 @@ class Settings(BaseSettings):
     require_secure_secrets: bool = Field(default=False, alias="OCIBOT_REQUIRE_SECURE_SECRETS")
 
     def cors_origin_list(self) -> list[str]:
-        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+        """Exact browser origins allowed by CORS.
+
+        A literal "*" is dropped: the auth cookie is sent with credentials, and
+        Starlette answers wildcard+credentials by *reflecting* the caller's Origin
+        together with Access-Control-Allow-Credentials: true — i.e. any website
+        could read this API as the logged-in user. Callers that really want an
+        open API must list the origins explicitly.
+        """
+        origins: list[str] = []
+        for raw in self.cors_origins.split(","):
+            origin = raw.strip()
+            if not origin or origin == "*":
+                continue
+            origins.append(origin)
+        return origins
+
+    def cors_wildcard_requested(self) -> bool:
+        return any(o.strip() == "*" for o in self.cors_origins.split(","))
+
+    def weak_secret_reasons(self) -> list[str]:
+        """Human-readable reasons the configured secrets are not production-grade."""
+        reasons: list[str] = []
+        if self.master_key in _INSECURE_DEFAULTS:
+            reasons.append("OCIBOT_MASTER_KEY 仍是内置默认值")
+        elif len(self.master_key) < _MIN_SECRET_LEN:
+            reasons.append(f"OCIBOT_MASTER_KEY 短于 {_MIN_SECRET_LEN} 字符")
+        if self.jwt_secret in _INSECURE_DEFAULTS:
+            reasons.append("OCIBOT_JWT_SECRET 仍是内置默认值")
+        elif len(self.jwt_secret) < _MIN_SECRET_LEN:
+            reasons.append(f"OCIBOT_JWT_SECRET 短于 {_MIN_SECRET_LEN} 字符")
+        return reasons
 
     @property
     def is_sqlite(self) -> bool:
         return self.database_url.startswith("sqlite")
 
+
+_MIN_SECRET_LEN = 24
 
 _INSECURE_DEFAULTS = {
     "dev-only-change-me-ocibot-web-master-key",
@@ -93,6 +125,8 @@ def get_settings() -> Settings:
                 "OCIBOT_REQUIRE_SECURE_SECRETS=1 but OCIBOT_MASTER_KEY / OCIBOT_JWT_SECRET "
                 "still use insecure defaults. Generate long random secrets before starting."
             )
-        if len(settings.master_key) < 24 or len(settings.jwt_secret) < 24:
-            raise RuntimeError("OCIBOT_MASTER_KEY and OCIBOT_JWT_SECRET must be at least 24 characters")
+        if len(settings.master_key) < _MIN_SECRET_LEN or len(settings.jwt_secret) < _MIN_SECRET_LEN:
+            raise RuntimeError(
+                f"OCIBOT_MASTER_KEY and OCIBOT_JWT_SECRET must be at least {_MIN_SECRET_LEN} characters"
+            )
     return settings

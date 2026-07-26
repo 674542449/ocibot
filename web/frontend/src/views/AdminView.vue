@@ -257,7 +257,8 @@ function translateUpdateLine(line: string): string {
   let s = line
 
   // High-level step markers from our scripts
-  const stepMap: Array<[RegExp, string]> = [
+  // The last entry maps via a callback, so the replacement is string | fn.
+  const stepMap: Array<[RegExp, string | ((matched: string) => string)]> = [
     [/^\[ocibot-update\]\s*panel update begin.*/i, '▶ 开始面板更新'],
     [/^\[ocibot-update\]\s*panel update finished.*/i, '✔ 面板更新流程结束'],
     [/^\[ocibot-update\]\s*restart begin.*/i, '▶ 开始重启服务'],
@@ -266,7 +267,10 @@ function translateUpdateLine(line: string): string {
     [/^\[ocibot-update\]\s*step:\s*docker compose up.*/i, '▶ 步骤：启动并滚动更新容器'],
     [/^\[ocibot-update\]\s*build --pull failed.*/i, '⚠ 带 --pull 构建失败，改为不拉基础镜像重试'],
     [/^\[ocibot-update\]\s*host install\.sh path.*/i, '▶ 使用宿主机 install.sh 路径更新'],
-    [/^\[ocibot-update\]\s*.*/i, (m) => `· ${String(m).replace(/^\[ocibot-update\]\s*/i, '')}`],
+    [
+      /^\[ocibot-update\]\s*.*/i,
+      (matched: string) => `· ${matched.replace(/^\[ocibot-update\]\s*/i, '')}`,
+    ],
   ]
   for (const [re, rep] of stepMap) {
     if (re.test(s)) {

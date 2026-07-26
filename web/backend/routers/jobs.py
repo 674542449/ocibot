@@ -18,6 +18,7 @@ from app.scheduler import (
 )
 from web.backend.auth import get_current_user
 from web.backend.db import get_db
+from web.backend.launch_service import normalize_fallback_configs, shape_is_flex
 from web.backend.models import CapacityAttempt, CapacityJob, ScheduleJobRow, ScheduleRun, User
 from web.backend.oci_bridge import get_owned_tenant, get_session_for_row
 from web.backend.quota_guard import enforce_launch_quota
@@ -103,6 +104,18 @@ def create_capacity_job(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    # Downgrade candidates must survive to the row: the worker reads
+    # job.fallback_configs to rotate configs, so dropping them here silently
+    # turned a multi-config retry into a single-config one.
+    try:
+        fallback_configs = normalize_fallback_configs(
+            body.fallback_configs or payload.get("fallback_configs") or [],
+            is_flex=shape_is_flex(str(payload.get("shape") or "")),
+            as_retry=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     # Always Free guard — same rules as the launch wizard.
     try:
         session = get_session_for_row(tenant)
@@ -114,7 +127,7 @@ def create_capacity_job(
             memory_in_gbs=payload.get("memory_in_gbs"),
             boot_volume_size_in_gbs=payload.get("boot_volume_size_in_gbs"),
             boot_volume_vpus_per_gb=payload.get("boot_volume_vpus_per_gb") or 10,
-            fallback_configs=list(getattr(body, "fallback_configs", None) or payload.get("fallback_configs") or []),
+            fallback_configs=fallback_configs,
         )
     except HTTPException:
         raise
@@ -132,6 +145,7 @@ def create_capacity_job(
         status="idle" if body.enabled else "stopped",
         launch_payload=payload,
         availability_domains=list(body.availability_domains or []),
+        fallback_configs=fallback_configs,
         interval_sec=interval,
         max_attempts=max_attempts,
         attempts=0,

@@ -61,17 +61,29 @@ def _bootstrap_admin() -> None:
 
 
 def _warn_insecure_secrets() -> None:
-    """Loudly warn when running with built-in dev secrets (not a hard fail unless
+    """Loudly warn about weak/default secrets (not a hard fail unless
     OCIBOT_REQUIRE_SECURE_SECRETS=1, which get_settings() enforces separately)."""
-    from web.backend.config import _INSECURE_DEFAULTS, get_settings
-
     settings = get_settings()
-    weak = settings.master_key in _INSECURE_DEFAULTS or settings.jwt_secret in _INSECURE_DEFAULTS
-    if weak:
+    reasons = settings.weak_secret_reasons()
+    if reasons:
         log.warning(
-            "SECURITY: using built-in default OCIBOT_MASTER_KEY / OCIBOT_JWT_SECRET. "
-            "Set strong random values before exposing this panel on a network. "
-            "Rotating OCIBOT_MASTER_KEY makes existing encrypted private keys undecryptable."
+            "SECURITY: %s. The master key is stretched with a single SHA-256 into the "
+            "Fernet key, so a short/guessable value is brute-forceable offline against a "
+            "stolen database. Set long random values (>=24 chars) and "
+            "OCIBOT_REQUIRE_SECURE_SECRETS=1 before exposing this panel on a network. "
+            "Rotating OCIBOT_MASTER_KEY makes existing encrypted private keys undecryptable.",
+            "；".join(reasons),
+        )
+    if settings.cors_wildcard_requested():
+        log.warning(
+            "SECURITY: OCIBOT_CORS_ORIGINS contains '*', which is ignored. Wildcard CORS "
+            "combined with cookie credentials would let any website read this API as the "
+            "logged-in user. List the real origins explicitly instead."
+        )
+    if not settings.cookie_secure:
+        log.warning(
+            "SECURITY: OCIBOT_COOKIE_SECURE=0 — the session cookie may be sent over plain "
+            "HTTP. Terminate TLS in front of the panel and set it to 1."
         )
 
 
@@ -116,6 +128,26 @@ def create_app() -> FastAPI:
     def health() -> HealthOut:
         return HealthOut(status="ok", version=settings.app_version, app=settings.app_name)
 
+    # Largest request body accepted anywhere. The biggest legitimate payload is a
+    # 20MB backup ZIP; this bound stops a huge upload from being buffered to the
+    # container's disk before any route-level check can reject it.
+    _MAX_BODY_BYTES = 32 * 1024 * 1024
+
+    @app.middleware("http")
+    async def limit_body_size(request, call_next):
+        raw_len = request.headers.get("content-length")
+        if raw_len:
+            try:
+                declared = int(raw_len)
+            except ValueError:
+                return JSONResponse({"detail": "Content-Length 无效"}, status_code=400)
+            if declared > _MAX_BODY_BYTES:
+                return JSONResponse(
+                    {"detail": f"请求体过大（上限 {_MAX_BODY_BYTES // (1024 * 1024)}MB）"},
+                    status_code=413,
+                )
+        return await call_next(request)
+
     @app.middleware("http")
     async def security_headers(request, call_next):
         response = await call_next(request)
@@ -127,6 +159,15 @@ def create_app() -> FastAPI:
             "Permissions-Policy",
             "camera=(), microphone=(), geolocation=(), payment=()",
         )
+        response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+        response.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+        response.headers.setdefault("X-Permitted-Cross-Domain-Policies", "none")
+        # HSTS only makes sense once TLS is actually in front of the panel;
+        # OCIBOT_COOKIE_SECURE=1 is the operator's "we are on HTTPS" signal.
+        if settings.cookie_secure:
+            response.headers.setdefault(
+                "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+            )
         # CSP: SPA is same-origin; allow inline styles from Vue scoped + xterm.
         response.headers.setdefault(
             "Content-Security-Policy",

@@ -121,6 +121,48 @@ def fetch_launch_meta(session: TenantSession, *, tenant_id: str, force: bool = F
     return meta
 
 
+def shape_is_flex(shape: str) -> bool:
+    """True for *.Flex shapes (fixed shapes like E2.1.Micro must not be resized)."""
+    shape_l = str(shape or "").strip().lower()
+    if "e2.1.micro" in shape_l or shape_l.endswith(".micro"):
+        return False
+    return shape_l.endswith(".flex") or ".flex." in shape_l
+
+
+def normalize_fallback_configs(
+    raw_fallbacks: Any,
+    *,
+    is_flex: bool,
+    as_retry: bool,
+) -> list[dict[str, float]]:
+    """Validate capacity-retry downgrade candidates. Raises ValueError when invalid.
+
+    Shared by the launch wizard and POST /jobs/capacity so both enforce the same
+    limits (Flex-only, retry-only, max 5, sane OCPU/memory).
+    """
+    fallback_configs: list[dict[str, float]] = []
+    if not raw_fallbacks:
+        return fallback_configs
+    if not is_flex:
+        raise ValueError("仅 *.Flex 型号支持降级配置")
+    if not as_retry:
+        raise ValueError("降级配置仅在容量自动重试模式下生效")
+    if not isinstance(raw_fallbacks, list) or len(raw_fallbacks) > 5:
+        raise ValueError("降级配置最多 5 组")
+    for item in raw_fallbacks:
+        if not isinstance(item, dict):
+            raise ValueError("降级配置格式无效")
+        try:
+            fb_ocpus = float(item.get("ocpus"))
+            fb_mem = float(item.get("memory_in_gbs"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("降级配置的 OCPU / 内存必须为数字") from exc
+        if not (0 < fb_ocpus <= 64) or not (1 <= fb_mem <= 1024):
+            raise ValueError("降级配置数值超出合理范围")
+        fallback_configs.append({"ocpus": fb_ocpus, "memory_in_gbs": fb_mem})
+    return fallback_configs
+
+
 def build_launch_request(
     body: dict[str, Any],
     *,
@@ -204,26 +246,9 @@ def build_launch_request(
 
     # Downgrade candidates for Flex shapes (capacity retry tries these in order
     # after the primary config fails across all ADs).
-    fallback_configs: list[dict[str, float]] = []
-    raw_fallbacks = body.get("fallback_configs") or []
-    if raw_fallbacks:
-        if not is_flex:
-            raise ValueError("仅 *.Flex 型号支持降级配置")
-        if not as_retry:
-            raise ValueError("降级配置仅在容量自动重试模式下生效")
-        if not isinstance(raw_fallbacks, list) or len(raw_fallbacks) > 5:
-            raise ValueError("降级配置最多 5 组")
-        for item in raw_fallbacks:
-            if not isinstance(item, dict):
-                raise ValueError("降级配置格式无效")
-            try:
-                fb_ocpus = float(item.get("ocpus"))
-                fb_mem = float(item.get("memory_in_gbs"))
-            except (TypeError, ValueError) as exc:
-                raise ValueError("降级配置的 OCPU / 内存必须为数字") from exc
-            if not (0 < fb_ocpus <= 64) or not (1 <= fb_mem <= 1024):
-                raise ValueError("降级配置数值超出合理范围")
-            fallback_configs.append({"ocpus": fb_ocpus, "memory_in_gbs": fb_mem})
+    fallback_configs = normalize_fallback_configs(
+        body.get("fallback_configs") or [], is_flex=is_flex, as_retry=as_retry
+    )
 
     launch_token = str(body.get("launch_token") or uuid.uuid4())
     payload = sanitize_launch_payload(
@@ -270,7 +295,13 @@ def build_launch_request(
     }
 
 
-def prepare_launch_network(session: TenantSession, payload: dict[str, Any], *, meta: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+def prepare_launch_network(
+    session: TenantSession,
+    payload: dict[str, Any],
+    *,
+    meta: Optional[dict[str, Any]] = None,
+    for_retry: bool = False,
+) -> dict[str, Any]:
     """Match desktop pre-launch: optional IPv6 enable + managed open NSG.
 
     Mutates and returns payload (adds vcn_id / nsg_ids / managed_nsg_id when created).
@@ -334,7 +365,9 @@ def prepare_launch_network(session: TenantSession, payload: dict[str, Any], *, m
     from app.oci_client import sanitize_launch_payload
 
     try:
-        payload = sanitize_launch_payload(payload, for_retry=str(payload.get("auth_mode") or "key") == "key")
+        # for_retry mirrors the caller's actual mode; deriving it from auth_mode
+        # meant a plain key-mode launch was validated under retry-only rules.
+        payload = sanitize_launch_payload(payload, for_retry=for_retry)
     except ValueError:
         # keep enriched fields even if retry sanitize is strict
         pass

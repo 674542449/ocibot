@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.4.14 — 2026-07-26
+
+### 安全（重要）
+- **修复登录限流可被绕过**：`run.py` 之前让 uvicorn 无条件信任所有来源的
+  `X-Forwarded-For`（`forwarded_allow_ips="*"`），它会直接改写 `request.client.host`，
+  而这正是登录限流的计数键 —— 攻击者每次请求伪造一个 IP 即可无限暴力破解密码。
+  现在只有 `OCIBOT_TRUST_PROXY=1` 时才信任代理头，且仅信任
+  `OCIBOT_FORWARDED_ALLOW_IPS`（默认回环地址）
+- **WebSSH 增加 Origin 校验**：WebSocket 不受 CORS 保护，`SameSite=none` 配置下
+  任意网站都可借受害者 Cookie 打开终端（CSWSH）；跨站握手现在在 accept 前直接拒绝
+- **忽略 `OCIBOT_CORS_ORIGINS=*`**：通配符 + Cookie 凭据会让 Starlette 回显来源域，
+  等于任意站点可以以登录用户身份读取 API；启动时会明确告警
+- **上传不再整体读入内存**：备份导入 / 对象上传改为分块限量读取，两个接口从
+  `async def` 改为同步（线程池）执行，避免阻塞事件循环；新增 32MB 请求体上限
+- **补齐 SSRF 地址过滤**：新增 `0.0.0.0/8`、`100.64.0.0/10`、`192.0.0.0/24`、
+  `240.0.0.0/4` 等段，并解开 NAT64 `64:ff9b::/96` 与 6to4 `2002::/16` 中内嵌的 IPv4
+  （此前 `64:ff9b::a9fe:a9fe` 可绕过限制访问云元数据）
+- 新增 HSTS / COOP / CORP 响应头（HSTS 仅在 `OCIBOT_COOKIE_SECURE=1` 时下发）
+- **面板内一键更新改为默认关闭**：它会驱动挂载的 `docker.sock` 并可能进入宿主机
+  命名空间，管理员失陷≈宿主机 root。`scripts/install.sh` 仍显式置 1，推荐安装方式不受影响
+- 弱 / 短 `OCIBOT_MASTER_KEY` 启动时给出具体告警（密钥派生方式未改动，改了会导致
+  已存私钥无法解密）
+- compose 增加 `no-new-privileges`，新增 `OCIBOT_BIND` 可只监听 127.0.0.1
+
+### 修复
+- **容量重试的降级配置会被丢弃**：`POST /jobs/capacity` 校验了 `fallback_configs`
+  却没写入任务行，Worker 因此只会尝试主配置；现已持久化并与创建向导共用校验
+- **定时任务可能重复执行**：「今天已跑」标记只 `flush()` 未提交，两个 Worker 在同一
+  分钟会各发一次开关机；改为提交后再执行（SQLite 上旧代码则会因锁冲突静默跳过）
+- 创建实例时额度校验失败会抛未处理的 500，现返回 502 并带原因
+- `prepare_launch_network()` 用 `auth_mode` 推断重试模式，导致普通创建被按重试规则校验
+- 备份导入遇到超范围 `password_expiry_days` 会 500，现做截断
+- 登录后跳转只接受站内路径
+- `AdminView.vue` 日志翻译表类型错误（vue-tsc 报错，vite 不做类型检查所以此前未暴露）
+
+### 测试
+- 新增 `tests/test_web_hardening.py`、`test_upload_limits.py`、
+  `test_schedule_single_fire.py`、`test_capacity_job_create.py`，并扩充 `test_url_safety.py`
+- 共 204 passed / 1 skipped
+
+### 升级
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 0.4.14
+```
+
+---
+
 ## 0.4.13 — 2026-07-26
 
 ### 行为 · 减少 Oracle API 调用

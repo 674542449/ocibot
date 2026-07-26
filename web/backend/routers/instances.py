@@ -463,10 +463,16 @@ def launch_instance(
         )
     except HTTPException:
         raise
+    except Exception as exc:  # noqa: BLE001
+        # A quota-read failure must not surface as an unhandled 500 (this branch
+        # previously re-raised HTTPException only, so anything else escaped).
+        raise HTTPException(status_code=502, detail=f"校验免费额度失败: {exc}") from exc
 
     # Pre-launch: IPv6 + managed NSG (desktop parity)
     try:
-        payload = prepare_launch_network(session, payload, meta=meta)
+        payload = prepare_launch_network(
+            session, payload, meta=meta, for_retry=bool(built["as_retry"])
+        )
         built["payload"] = payload
     except (ValueError, OCIClientError) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc

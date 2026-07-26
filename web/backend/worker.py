@@ -145,9 +145,20 @@ class Worker:
                 run_at = _as_utc(job.run_at)
                 if run_at is None or run_at > now_utc:
                     continue
-                job.enabled = False  # fire exactly once
-                job.last_run_date = today
-                db.flush()
+                # Claim the job with a conditional UPDATE committed BEFORE the OCI
+                # calls: two workers (or an API restart mid-tick) previously both
+                # saw enabled=True and fired the same power action twice, because
+                # flush() alone is invisible to other connections until commit.
+                claimed = db.execute(
+                    update(ScheduleJobRow)
+                    .where(ScheduleJobRow.id == job.id, ScheduleJobRow.enabled.is_(True))
+                    .values(enabled=False, last_run_date=today)
+                    .execution_options(synchronize_session=False)
+                ).rowcount
+                if not claimed:
+                    continue
+                db.commit()
+                db.refresh(job)
             else:
                 if weekday not in (job.weekdays or []):
                     continue
@@ -155,8 +166,20 @@ class Worker:
                     continue
                 if job.last_run_date == today:
                     continue
-                job.last_run_date = today
-                db.flush()
+                claimed = db.execute(
+                    update(ScheduleJobRow)
+                    .where(
+                        ScheduleJobRow.id == job.id,
+                        (ScheduleJobRow.last_run_date.is_(None))
+                        | (ScheduleJobRow.last_run_date != today),
+                    )
+                    .values(last_run_date=today)
+                    .execution_options(synchronize_session=False)
+                ).rowcount
+                if not claimed:
+                    continue
+                db.commit()
+                db.refresh(job)
             try:
                 self._fire_schedule(db, job)
             except Exception as exc:  # noqa: BLE001
@@ -389,7 +412,7 @@ class Worker:
             from web.backend.launch_service import prepare_launch_network
 
             if not payload.get("nsg_ids") and not payload.get("managed_nsg_id"):
-                payload = prepare_launch_network(session, payload, meta=None)
+                payload = prepare_launch_network(session, payload, meta=None, for_retry=True)
                 base_payload = dict(job.launch_payload or {})
                 for key in ("nsg_ids", "managed_nsg_id", "vcn_id", "network_compartment_id", "subnet_id", "launch_token"):
                     if payload.get(key):

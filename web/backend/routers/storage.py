@@ -14,6 +14,7 @@ from web.backend.auth import get_current_user
 from web.backend.db import get_db
 from web.backend.models import User
 from web.backend.oci_bridge import get_owned_tenant, get_session_for_row, op_result_dict
+from web.backend.uploads import read_upload_limited
 
 router = APIRouter(tags=["storage"])
 
@@ -422,7 +423,7 @@ def delete_object(
 
 
 @router.post("/tenants/{tenant_id}/object-storage/buckets/{name}/objects")
-async def put_object(
+def put_object(
     tenant_id: str,
     name: str,
     user: Annotated[User, Depends(get_current_user)],
@@ -430,10 +431,17 @@ async def put_object(
     file: UploadFile = File(...),
     object_name: str = Form(""),
 ) -> dict[str, Any]:
+    """Upload one object.
+
+    Sync handler on purpose: ``session.put_object`` is a blocking OCI call, and
+    running it inside an ``async def`` stalled the whole event loop (every other
+    request on this worker) for the duration of the upload.
+    """
     row = _row(db, user.id, tenant_id)
-    raw = await file.read()
-    if len(raw) > _MAX_UPLOAD:
-        raise HTTPException(status_code=400, detail=f"文件超过 {_MAX_UPLOAD} 字节上限")
+    # Bounded read: reject an oversized upload instead of materializing it first.
+    raw = read_upload_limited(
+        file, _MAX_UPLOAD, too_large_detail=f"文件超过 {_MAX_UPLOAD} 字节上限"
+    )
     obj_name = (object_name or file.filename or "").strip()
     if not obj_name:
         raise HTTPException(status_code=400, detail="缺少对象名")

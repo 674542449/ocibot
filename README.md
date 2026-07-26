@@ -128,9 +128,11 @@ docker compose up -d --build
 | `OCIBOT_CORS_ORIGINS` | 精确来源列表 | 浏览器跨域白名单 |
 | `OCIBOT_ALLOW_OPEN_REGISTRATION` | 默认 `0` | 首用户后是否开放注册 |
 | `OCIBOT_TRUST_PROXY` | 默认 `0` | 是否信任 `X-Forwarded-For`（仅反代后开启） |
+| `OCIBOT_FORWARDED_ALLOW_IPS` | 反代地址/CIDR | 允许携带代理头的来源，默认回环；勿用 `*` |
 | `OCIBOT_API_WORKERS` | 默认 `2` | API 进程数 |
 | `OCIBOT_PORT` | 默认 `8000` | 宿主机映射端口 |
-| `OCIBOT_UPDATE_ENABLED` | 默认 `1` | 面板内自更新开关 |
+| `OCIBOT_BIND` | 反代后设 `127.0.0.1` | 端口绑定的宿主机网卡，默认 `0.0.0.0` |
+| `OCIBOT_UPDATE_ENABLED` | 默认 `0` | 面板内自更新开关（`install.sh` 会置 `1`） |
 | `OCIBOT_HOST_REPO` | 宿主机绝对路径 | 自更新绑定的代码目录 |
 
 安装脚本会生成随机密钥并默认开启 `OCIBOT_REQUIRE_SECURE_SECRETS=1`。
@@ -139,13 +141,19 @@ docker compose up -d --build
 
 ## 安全建议（上线前）
 
-1. 使用强随机 `OCIBOT_MASTER_KEY` / `OCIBOT_JWT_SECRET`，并设置 `OCIBOT_REQUIRE_SECURE_SECRETS=1`
-2. 前置 HTTPS 反代，设置 `OCIBOT_COOKIE_SECURE=1`
-3. 限制 `OCIBOT_CORS_ORIGINS` 为真实访问域名
+1. 使用强随机 `OCIBOT_MASTER_KEY` / `OCIBOT_JWT_SECRET`（≥24 位），并设置 `OCIBOT_REQUIRE_SECURE_SECRETS=1`
+   - 主密钥经单次 SHA-256 派生 Fernet 密钥：短密钥在数据库泄露后可被离线爆破
+2. 前置 HTTPS 反代，设置 `OCIBOT_COOKIE_SECURE=1`（同时才会下发 HSTS），并设 `OCIBOT_BIND=127.0.0.1`
+3. 限制 `OCIBOT_CORS_ORIGINS` 为真实访问域名。**`*` 会被忽略**：通配符 + Cookie 凭据
+   等于任意站点都能以登录用户身份读取 API
 4. 首用户注册后保持关闭开放注册；需要加用户时再临时打开
-5. 仅在受信反代后开启 `OCIBOT_TRUST_PROXY=1`
-6. 管理员可挂载 `docker.sock` 做自更新：**管理员失陷 ≈ 宿主机失陷**；多管理员不可信时关闭 `OCIBOT_UPDATE_ENABLED`
-7. Webhook / Bark 目标已做私网与元数据地址拦截，仍建议只给受信用户开通知配置
+5. `OCIBOT_TRUST_PROXY=1` 只在受信反代后开启，并把 `OCIBOT_FORWARDED_ALLOW_IPS`
+   设为反代地址。**直连部署务必保持 `0`**：否则客户端可伪造 `X-Forwarded-For`
+   绕过登录限流，无限次尝试密码
+6. 面板内自更新默认关闭。开启后它会驱动挂载的 `docker.sock`（并可能进入宿主机命名空间），
+   **管理员失陷 ≈ 宿主机 root 失陷**；仅在所有管理员可信时设 `OCIBOT_UPDATE_ENABLED=1`
+7. Webhook / Bark / SMTP 目标已拦截私网、元数据、NAT64/6to4 等地址，仍建议只给受信用户开通知配置
+   - 已知残留风险：DNS rebinding（校验与连接之间 DNS 可变）；详见 [web/AUDIT.md](web/AUDIT.md)
 
 更细的审计说明见 [web/AUDIT.md](web/AUDIT.md)。
 

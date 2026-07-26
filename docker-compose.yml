@@ -28,6 +28,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 12
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
     # Not published to host by default (more secure). Uncomment if you need psql from outside.
     # ports:
@@ -51,7 +53,13 @@ services:
       OCIBOT_REQUIRE_SECURE_SECRETS: ${OCIBOT_REQUIRE_SECURE_SECRETS:-0}
       # In-panel self-update (admin). Requires mounts below.
       # OCIBOT_HOST_REPO must be the absolute path on the *host* (set by install.sh).
-      OCIBOT_UPDATE_ENABLED: ${OCIBOT_UPDATE_ENABLED:-1}
+      #
+      # OFF by default: applying an update runs a helper container on the mounted
+      # docker.sock (and may enter the host namespace), so an admin session that
+      # can reach it is effectively host root. scripts/install.sh sets this to 1
+      # explicitly, so the supported install keeps one-click update; enable it for
+      # a manual compose deploy only if every admin is trusted.
+      OCIBOT_UPDATE_ENABLED: ${OCIBOT_UPDATE_ENABLED:-0}
       OCIBOT_UPDATE_REPO: ${OCIBOT_UPDATE_REPO:-674542449/ocibot}
       OCIBOT_UPDATE_BRANCH: ${OCIBOT_UPDATE_BRANCH:-main}
       OCIBOT_HOST_DIR: /host/ocibot
@@ -63,7 +71,11 @@ services:
       - ${OCIBOT_HOST_REPO:-/root/ocibot}:/host/ocibot
       - /var/run/docker.sock:/var/run/docker.sock
     ports:
-      - "${OCIBOT_PORT:-8000}:8000"
+      # Defaults to every interface. Behind a TLS reverse proxy set
+      # OCIBOT_BIND=127.0.0.1 so the plain-HTTP port is not reachable directly.
+      - "${OCIBOT_BIND:-0.0.0.0}:${OCIBOT_PORT:-8000}:8000"
+    security_opt:
+      - no-new-privileges:true
     depends_on:
       db:
         condition: service_healthy
@@ -87,6 +99,8 @@ services:
       OCIBOT_WORKER_ID: ${OCIBOT_WORKER_ID:-worker-1}
       OCIBOT_DB_POOL_SIZE: ${OCIBOT_DB_POOL_SIZE:-5}
       OCIBOT_DB_MAX_OVERFLOW: ${OCIBOT_DB_MAX_OVERFLOW:-10}
+    security_opt:
+      - no-new-privileges:true
     depends_on:
       db:
         condition: service_healthy

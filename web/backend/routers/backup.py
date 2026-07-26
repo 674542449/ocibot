@@ -20,6 +20,7 @@ from web.backend.crypto_util import decrypt_text, encrypt_text
 from web.backend.db import get_db
 from web.backend.models import Tenant, User
 from web.backend.audit import write_audit
+from web.backend.uploads import read_upload_limited
 
 router = APIRouter(prefix="/backup", tags=["backup"])
 
@@ -102,23 +103,30 @@ def export_encrypted_zip(
 
 
 @router.post("/import", response_model=RestoreResult)
-async def import_encrypted_zip(
+def import_encrypted_zip(
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
     password: Annotated[str, Form()],
     file: UploadFile = File(...),
 ) -> RestoreResult:
+    """Restore tenants from an AES ZIP.
+
+    Sync handler on purpose: ZIP decryption, JSON parsing and the per-tenant
+    re-encryption are all blocking, so FastAPI runs this in its threadpool
+    instead of stalling the event loop for every other request.
+    """
     import pyzipper
 
     password = (password or "").strip()
     if len(password) < 6:
         raise HTTPException(status_code=400, detail="备份密码至少需要 6 位")
-    raw_bytes = await file.read()
+    # Hard cap: 20 MiB encrypted backup is already huge for tenant JSON. Bounded
+    # read so an oversized upload is rejected instead of being buffered whole.
+    raw_bytes = read_upload_limited(
+        file, 20 * 1024 * 1024, too_large_detail="备份文件过大（上限 20MB）"
+    )
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="空文件")
-    # Hard cap: 20 MiB encrypted backup is already huge for tenant JSON
-    if len(raw_bytes) > 20 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="备份文件过大（上限 20MB）")
 
     try:
         with pyzipper.AESZipFile(io.BytesIO(raw_bytes), "r") as zf:
@@ -149,6 +157,14 @@ async def import_encrypted_zip(
         raise HTTPException(status_code=400, detail="备份内容格式无效")
     if len(items) > 200:
         raise HTTPException(status_code=400, detail="单次备份租户过多（上限 200）")
+    def _expiry_days(raw: Any) -> int:
+        """Archive-supplied value clamped to the Integer column's safe range."""
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 120
+        return max(0, min(value, 36500))
+
     imported_ids: list[str] = []
     for item in items:
         if not isinstance(item, dict):
@@ -170,7 +186,7 @@ async def import_encrypted_zip(
                 enabled=bool(item.get("enabled", True)),
                 color=str(item.get("color") or "#3B82F6")[:32],
                 password_changed_at=str(item.get("password_changed_at") or "")[:64],
-                password_expiry_days=int(item.get("password_expiry_days") or 120),
+                password_expiry_days=_expiry_days(item.get("password_expiry_days") or 120),
                 account_tier=str(item.get("account_tier") or "")[:16],
             )
             errors = cfg.validate()
