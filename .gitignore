@@ -37,3 +37,6 @@ web/.env
 Thumbs.db
 .idea/
 .vscode/
+
+# Stray agent/scratch dirs
+.scratch_tmp/
