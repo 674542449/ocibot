@@ -389,7 +389,17 @@ async def webssh_endpoint(websocket: WebSocket, tenant_id: str, instance_id: str
                 while True:
                     data = await process.stdout.read(8192)
                     if not data:
-                        break
+                        # Remote shell exited. Silently breaking left the browser
+                        # looking connected until the next keystroke hit a closed
+                        # stdin and surfaced as "WebSSH 内部错误"; tell the client.
+                        try:
+                            await _send_json(
+                                websocket, {"type": "error", "message": "远程会话已结束"}
+                            )
+                            await websocket.close(code=1000)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        return
                     last_activity = time.monotonic()
                     if isinstance(data, bytes):
                         await websocket.send_bytes(data)
@@ -427,6 +437,21 @@ async def webssh_endpoint(websocket: WebSocket, tenant_id: str, instance_id: str
                         pass
                     return
 
+        async def _write_stdin(payload: Any) -> bool:
+            """Forward a keystroke; False once the remote side is gone."""
+            try:
+                process.stdin.write(payload)
+                return True
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                # Writing to a shell that already exited used to raise out of the
+                # receive loop and surface as a generic "WebSSH 内部错误".
+                try:
+                    await _send_json(websocket, {"type": "error", "message": "远程会话已结束"})
+                    await websocket.close(code=1000)
+                except Exception:  # noqa: BLE001
+                    pass
+                return False
+
         ssh_task = asyncio.create_task(_pump_ssh_to_ws())
         err_task = asyncio.create_task(_pump_stderr())
         idle_task = asyncio.create_task(_idle_watch())
@@ -457,9 +482,11 @@ async def webssh_endpoint(websocket: WebSocket, tenant_id: str, instance_id: str
                         if isinstance(ctrl, dict) and ctrl.get("type") == "ping":
                             await _send_json(websocket, {"type": "pong"})
                             continue
-                    process.stdin.write(text)
+                    if not await _write_stdin(text):
+                        break
                 elif "bytes" in message and message["bytes"] is not None:
-                    process.stdin.write(message["bytes"])
+                    if not await _write_stdin(message["bytes"]):
+                        break
         except WebSocketDisconnect:
             pass
         finally:

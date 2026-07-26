@@ -409,6 +409,8 @@ async function loadBoot() {
     params: { include_subcompartments: includeSub.value },
   })
   if (guard.stale()) return
+  // Surface a tenant-level failure instead of rendering it as "no volumes".
+  if (data.ok === false) error.value = data.message || '读取引导卷失败'
   bootVolumes.value = data.data?.volumes || []
 }
 
@@ -419,6 +421,7 @@ async function loadBlock() {
     params: { include_subcompartments: true },
   })
   if (guard.stale()) return
+  if (data.ok === false) error.value = data.message || '读取块卷失败'
   blockVolumes.value = data.data?.volumes || []
   // Pre-fill AD from first volume or boot
   if (!createForm.availability_domain) {
@@ -435,6 +438,7 @@ async function loadBuckets() {
   const guard = beginLoad('buckets')
   const { data } = await api.get(`/tenants/${tenantId.value}/object-storage/buckets`)
   if (guard.stale()) return
+  if (data.ok === false) error.value = data.message || '读取存储桶失败'
   buckets.value = data.data?.buckets || []
   objectNs.value = data.data?.namespace || ''
 }

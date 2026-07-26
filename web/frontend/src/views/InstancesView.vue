@@ -17,7 +17,7 @@
           <input v-model="resolveIps" type="checkbox" />
           <span>解析 IP</span>
         </label>
-        <button class="primary" :disabled="loading || !tenantId" @click="load">
+        <button class="primary" :disabled="loading || !tenantId" @click="refresh">
           {{ loading ? '加载中…' : '刷新' }}
         </button>
         <button type="button" :disabled="!filtered.length" @click="exportCsv">导出 CSV</button>
@@ -391,9 +391,19 @@ async function loadTenants() {
 }
 
 let loadSeq = 0
-async function load() {
+
+/** Manual 刷新: clear the banners, then load. */
+function refresh() {
   error.value = ''
   msg.value = ''
+  void load()
+}
+
+async function load() {
+  // Deliberately does NOT clear msg/error: power, rename, terminate and the bulk
+  // actions all call load() right after succeeding, so clearing here wiped the
+  // very success message (and the bulk failure list) before it could be read.
+  // Each of those handlers already clears both refs at entry.
   if (!tenantId.value) {
     instances.value = []
     loading.value = false
@@ -422,8 +432,12 @@ async function load() {
     error.value = e?.message || '加载失败'
     instances.value = []
   } finally {
+    // The spinner is owned by SEQUENCE only. Gating it on the tenant check too
+    // meant that switching tenant mid-request left loading=true forever: no newer
+    // load() had started to take ownership, and 刷新 is :disabled="loading", so
+    // the page became permanently unrefreshable.
+    if (seq === loadSeq) loading.value = false
     if (!superseded()) {
-      loading.value = false
       // Drop selections that no longer exist in the refreshed list.
       const live = new Set(instances.value.map((i) => selKey(i)))
       for (const key of [...selected]) {

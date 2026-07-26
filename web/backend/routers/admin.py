@@ -15,6 +15,7 @@ from web.backend.auth import get_admin_user, hash_password
 from web.backend.config import get_settings
 from web.backend.db import get_db
 from web.backend.meta import KEY_OPEN_REGISTRATION, get_meta, set_meta
+from web.backend.schemas import UtcDatetime
 from web.backend.models import Tenant, User
 from web.backend import self_update
 
@@ -28,7 +29,9 @@ class AdminUserOut(BaseModel):
     is_admin: bool
     totp_enabled: bool
     tenant_count: int
-    created_at: str
+    # Was a bare isoformat() of a naive value, so the browser read UTC as local
+    # time and 注册时间 appeared shifted by the viewer's offset.
+    created_at: Optional[UtcDatetime] = None
 
 
 class AdminUserPatch(BaseModel):
@@ -67,7 +70,7 @@ def list_users(
             is_admin=bool(u.is_admin),
             totp_enabled=bool(u.totp_enabled),
             tenant_count=int(counts.get(u.id, 0)),
-            created_at=u.created_at.isoformat() if u.created_at else "",
+            created_at=u.created_at,
         )
         for u in rows
     ]
@@ -120,7 +123,7 @@ def patch_user(
         is_admin=bool(target.is_admin),
         totp_enabled=bool(target.totp_enabled),
         tenant_count=tenant_count,
-        created_at=target.created_at.isoformat() if target.created_at else "",
+        created_at=target.created_at,
     )
 
 
@@ -134,6 +137,12 @@ def reset_password(
     target = db.get(User, user_id)
     if target is None:
         raise HTTPException(status_code=404, detail="用户不存在")
+    if target.id == admin.id:
+        # Mirrors the self-guards in patch_user. Resetting your OWN password here
+        # revokes your session and clears your 2FA while returning the only copy of
+        # the new password in the response body — a lone admin who loses it has no
+        # recovery path. Changing your own password has its own flow.
+        raise HTTPException(status_code=400, detail="请在「设置」页修改自己的密码")
     new_password = secrets.token_urlsafe(12)
     target.password_hash = hash_password(new_password)
     target.token_version = int(target.token_version or 1) + 1

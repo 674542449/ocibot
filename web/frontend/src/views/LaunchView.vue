@@ -508,10 +508,20 @@ async function loadMeta(force = false) {
     } else {
       form.availability_domain = ''
     }
-    // default image + shape for this tenant
-    if (data?.images?.length) {
-      const preferArm = data.images.find((i: ImageInfo) => /arm|aarch64/i.test(`${i.label} ${i.architecture}`))
-      form.image_id = (preferArm || data.images[0]).id
+    // Rebind the image against the list for the CURRENTLY SELECTED OS family, and
+    // keep the prior choice when it is still valid — the same rule used for the AD
+    // above. Seeding from data.images (which is Ubuntu-only) discarded a non-Ubuntu
+    // 操作系统 selection: the 镜像 select then had no matching option and rendered
+    // blank, onImageChange saw no image, and the shape fell back to the x86
+    // E2.1.Micro — so the form could submit an ARM image on a fixed x86 shape.
+    const imgList = images.value
+    if (imgList.length) {
+      if (!imgList.some((i: ImageInfo) => i.id === form.image_id)) {
+        const preferArm = imgList.find((i: ImageInfo) =>
+          /arm|aarch64/i.test(`${i.label} ${i.architecture}`),
+        )
+        form.image_id = (preferArm || imgList[0]).id
+      }
     } else {
       form.image_id = ''
       form.shape = ''

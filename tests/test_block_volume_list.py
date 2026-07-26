@@ -57,8 +57,17 @@ class FakeBlock:
 
 
 class FakeCompute:
-    def list_volume_attachments(self, ad, cid, instance_id=None, volume_id=None):
-        return SimpleNamespace(data=[])
+    def __init__(self):
+        self.attachments = []
+        self.calls = []
+
+    # Signature mirrors oci.core.ComputeClient.list_volume_attachments exactly:
+    # ONE positional (compartment_id), everything else keyword. The previous fake
+    # declared (self, ad, cid, ...), which accepted the app's buggy positional
+    # call and hid the TypeError that made every volume look unattached.
+    def list_volume_attachments(self, compartment_id, **kwargs):
+        self.calls.append((compartment_id, kwargs))
+        return SimpleNamespace(data=list(self.attachments))
 
     def get_instance(self, iid):
         return SimpleNamespace(
@@ -102,8 +111,10 @@ def test_list_block_volumes_shape(monkeypatch):
     # pagination helper just calls the function
     import oci
 
-    def fake_list_call(fn, **kwargs):
-        return fn(**kwargs)
+    # Forward positionals too, so a wrong call signature raises instead of being
+    # silently accepted by a permissive fake.
+    def fake_list_call(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
 
     monkeypatch.setattr(oci.pagination, "list_call_get_all_results", fake_list_call, raising=False)
 
@@ -115,6 +126,43 @@ def test_list_block_volumes_shape(monkeypatch):
     assert vols[0]["kind"] == "block"
     assert vols[0]["size_in_gbs"] == 50
     assert result.data["summary"]["count"] == 1
+
+
+def test_attached_block_volume_is_reported_as_attached(monkeypatch):
+    """An ATTACHED attachment must surface, or the UI can never offer 卸载.
+
+    The volume-attachment lookup was passing availability_domain positionally,
+    which raised TypeError into a bare `except Exception: atts = []`, so every
+    block volume rendered as 未挂载 and the detach button (v-if="v.attachment_id")
+    could not appear.
+    """
+    s = _session()
+    s.compute.attachments = [
+        SimpleNamespace(
+            id="ocid1.volumeattachment.oc1..a1",
+            volume_id="ocid1.volume.oc1..v1",
+            instance_id="ocid1.instance.oc1..i1",
+            lifecycle_state="ATTACHED",
+            availability_domain="AD-1",
+        )
+    ]
+
+    import oci
+
+    def fake_list_call(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(oci.pagination, "list_call_get_all_results", fake_list_call, raising=False)
+
+    result = s.list_block_volumes(include_subcompartments=False, include_attachments=True)
+    assert result.ok, result.message
+    vol = result.data["volumes"][0]
+    assert vol["instance_id"] == "ocid1.instance.oc1..i1", vol
+    assert vol["attachment_id"] == "ocid1.volumeattachment.oc1..a1", vol
+    assert vol["attachment_state"] == "ATTACHED", vol
+    assert result.data["summary"]["attached"] == 1, result.data["summary"]
+    # The AD must have been sent as a keyword, matching the real SDK signature.
+    assert s.compute.calls and "availability_domain" in s.compute.calls[0][1]
 
 
 def test_create_block_volume():

@@ -484,7 +484,9 @@ async function saveManual() {
         region: form.region,
         compartment_ocid: form.compartment_ocid,
         description: form.description,
-        budget_monthly_usd: form.budget_monthly_usd,
+        // Clearing the field yields '' which fails float validation with a raw
+        // English 422 and rejects the entire edit; treat blank as 0 (alerts off).
+        budget_monthly_usd: Number(form.budget_monthly_usd) || 0,
       }
       if (form.private_key_pem.trim()) {
         payload.private_key_pem = form.private_key_pem

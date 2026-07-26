@@ -655,12 +655,14 @@ async function loadReservedIps() {
 }
 
 async function createReservedIp() {
-  const name = prompt('保留 IP 名称（可选）', '') ?? ''
+  // `?? ''` mapped Cancel (null) to an empty name and provisioned the IP anyway.
+  const name = prompt('保留 IP 名称（可选）', '')
+  if (name == null) return
   ripBusy.value = true
   error.value = ''
   try {
     const { data } = await api.post(`/tenants/${tenantId.value}/reserved-ips`, {
-      display_name: name,
+      display_name: name.trim(),
     })
     if (data.ok) msg.value = data.message
     else error.value = data.message
@@ -1155,8 +1157,10 @@ async function addRule(nsgId: string) {
         direction: ruleForm.direction,
         protocol: ruleForm.protocol,
         cidr: ruleForm.cidr,
-        port_min: ruleForm.protocol === 'all' || ruleForm.protocol === '1' ? null : ruleForm.port_min,
-        port_max: ruleForm.protocol === 'all' || ruleForm.protocol === '1' ? null : ruleForm.port_min,
+        // An empty input yields '' which fails int validation with a raw 422;
+        // send null so the backend treats it as "all ports" as intended.
+        port_min: portOrNull(),
+        port_max: portOrNull(),
       },
     )
     if (data.ok) msg.value = data.message
@@ -1166,6 +1170,13 @@ async function addRule(nsgId: string) {
     error.value = e?.message || '添加失败'
   }
 }
+/** Port for the rule payload, or null when not applicable / left blank. */
+function portOrNull(): number | null {
+  if (ruleForm.protocol === 'all' || ruleForm.protocol === '1') return null
+  const n = Number(ruleForm.port_min)
+  return Number.isFinite(n) && n > 0 ? n : null
+}
+
 async function deleteRule(nsgId: string, ruleId: string) {
   if (!confirm('删除该规则？')) return
   try {
@@ -1285,7 +1296,11 @@ async function power(action: string) {
       `/tenants/${tenantId.value}/instances/${instanceId.value}/power`,
       { action },
     )
-    msg.value = data.message
+    // The API answers 200 with ok=false when OCI refuses the action (wrong
+    // lifecycle state, etc.) — showing data.message as a success banner told the
+    // user it worked. Branch on ok, like doReplaceIp already does.
+    if (data.ok) msg.value = data.message
+    else error.value = data.message || '操作失败'
     await loadInstance()
   } catch (e: any) {
     error.value = e?.message || '操作失败'
@@ -1302,7 +1317,8 @@ async function doRename() {
       `/tenants/${tenantId.value}/instances/${instanceId.value}/rename`,
       { display_name: name.trim() },
     )
-    msg.value = data.message
+    if (data.ok) msg.value = data.message
+    else error.value = data.message || '重命名失败'
     await loadInstance()
   } catch (e: any) {
     error.value = e?.message || '失败'
@@ -1349,6 +1365,12 @@ async function doTerminate() {
       `/tenants/${tenantId.value}/instances/${instanceId.value}/terminate`,
       { preserve_boot_volume: false },
     )
+    if (!data.ok) {
+      // Navigating away on a refused terminate left the user believing the
+      // instance was gone.
+      error.value = data.message || '终止失败'
+      return
+    }
     msg.value = data.message
     setTimeout(() => router.push('/'), 800)
   } catch (e: any) {

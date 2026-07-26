@@ -75,7 +75,10 @@ def _owned(db: Session, user_id: str, channel_id: str) -> NotificationChannel:
 
 
 def _clean_events(events: list[str]) -> list[str]:
-    return [e for e in events if e in EVENT_KEYS] or list(EVENT_KEYS)
+    # An empty selection means "no events": coercing it back to all three silently
+    # re-enabled every notification the user had just switched off. Creation still
+    # defaults to all three via ChannelCreate.events' default_factory.
+    return [e for e in events if e in EVENT_KEYS]
 
 
 @router.get("", response_model=list[ChannelOut])

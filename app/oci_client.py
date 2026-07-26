@@ -3187,11 +3187,18 @@ class TenantSession:
             return []
         return [c for c in items if getattr(c, "lifecycle_state", "") not in ("DELETED", "DELETING")]
 
-    def delete_console_connection(self, console_connection_id: str) -> None:
+    def delete_console_connection(self, console_connection_id: str) -> OperationResult:
+        """Delete a console connection.
+
+        Returns a result instead of swallowing the error: the caller reported
+        success unconditionally, so a refused delete looked like it worked while the
+        entry stayed in the list.
+        """
         try:
             self.compute.delete_instance_console_connection(console_connection_id)
-        except ServiceError:
-            pass
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        return OperationResult(ok=True, message="已删除控制台连接")
 
     def create_console_connection(
         self, instance_id: str, compartment_id: str, ssh_public_key: str
@@ -4482,10 +4489,16 @@ class TenantSession:
                 if not ad:
                     continue
                 try:
+                    # ComputeClient.list_volume_attachments is
+                    # (compartment_id, **kwargs) — only ONE positional, unlike
+                    # list_boot_volume_attachments which takes (availability_domain,
+                    # compartment_id). Passing the AD positionally raised TypeError
+                    # into the bare except below, so attachment data was always
+                    # empty and every block volume looked unattached.
                     atts = oci.pagination.list_call_get_all_results(
                         self.compute.list_volume_attachments,
-                        ad,
                         cid,
+                        availability_domain=ad,
                     ).data
                 except Exception:
                     atts = []
@@ -4609,7 +4622,12 @@ class TenantSession:
             cid = getattr(vol, "compartment_id", "") or self.resolve_compartment()
             if ad:
                 try:
-                    atts = self.compute.list_volume_attachments(ad, cid, volume_id=volume_id).data or []
+                    # AD is a keyword here (see list_volume_attachments signature);
+                    # positionally it raised TypeError, so this "still attached"
+                    # guard silently passed and delete was attempted regardless.
+                    atts = self.compute.list_volume_attachments(
+                        cid, availability_domain=ad, volume_id=volume_id
+                    ).data or []
                     live = [
                         a
                         for a in atts
@@ -4737,7 +4755,9 @@ class TenantSession:
             inst = self.compute.get_instance(instance_id).data
             ad = getattr(inst, "availability_domain", "") or ""
             cid = (compartment_id or getattr(inst, "compartment_id", "") or self.resolve_compartment()).strip()
-            atts = self.compute.list_volume_attachments(ad, cid, instance_id=instance_id).data or []
+            atts = self.compute.list_volume_attachments(
+                cid, availability_domain=ad, instance_id=instance_id
+            ).data or []
             items = []
             for a in atts:
                 state = str(getattr(a, "lifecycle_state", "") or "")

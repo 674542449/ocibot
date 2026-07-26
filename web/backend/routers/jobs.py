@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Annotated
 
@@ -210,6 +211,10 @@ def resume_capacity_job(
         raise HTTPException(status_code=404, detail="任务不存在")
     if row.status == "success":
         raise HTTPException(status_code=400, detail="任务已成功，请新建任务")
+    # An exhausted job resumed to status=idle is immediately re-failed by the
+    # worker's max-attempts check, so 「继续」 reported success and did nothing.
+    if int(row.attempts or 0) >= clamp_max_attempts(row.max_attempts):
+        raise HTTPException(status_code=400, detail="已达最大重试次数，请新建任务")
     # Same one-active-retry-per-tenant rule the create paths enforce. Resuming
     # skipped it, so stopping job A, creating job B, then resuming A left two
     # active jobs racing LaunchInstance for the same tenant.
@@ -287,8 +292,12 @@ def create_schedule(
     tod = (body.time_of_day or "22:00").strip()
     run_at = body.run_at
     if kind == "weekly":
-        if len(tod) != 5 or tod[2] != ":":
-            raise HTTPException(status_code=400, detail="time_of_day 格式应为 HH:MM")
+        # "24:00" / "99:99" passed the old length+colon check, then never matched
+        # the worker's strftime("%H:%M"), so the schedule silently never fired.
+        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", tod):
+            raise HTTPException(
+                status_code=400, detail="time_of_day 格式应为 HH:MM（00:00–23:59）"
+            )
         if not body.weekdays:
             raise HTTPException(status_code=400, detail="每周任务需要至少选择一个星期")
         run_at = None

@@ -126,10 +126,12 @@ def delete_console(
     row = _row(db, user.id, tenant_id)
     try:
         session = get_session_for_row(row)
-        session.delete_console_connection(connection_id)
-        return {"message": "已删除控制台连接"}
+        result = session.delete_console_connection(connection_id)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if not result.ok:
+        raise HTTPException(status_code=502, detail=result.message or "删除控制台连接失败")
+    return {"message": result.message or "已删除控制台连接"}
 
 
 @router.get("/tenants/{tenant_id}/instances/{instance_id}/firewall")

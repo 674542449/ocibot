@@ -184,6 +184,19 @@ class Worker:
                 self._fire_schedule(db, job)
             except Exception as exc:  # noqa: BLE001
                 log.error("schedule %s failed: %s", job.id, exc)
+                # The day was already claimed, so without a history row the run
+                # vanished: no record in 运行历史 and no retry until tomorrow.
+                self._record_schedule_run(
+                    db, job, ok=False, total=0, success=0, message=str(exc)[:2000]
+                )
+                notify_user(
+                    db,
+                    job.owner_id,
+                    "schedule",
+                    "OCIBot 定时任务执行失败",
+                    f"任务「{job.name}」动作 {job.action} 执行失败：{exc}",
+                )
+                db.commit()
 
     def _fire_schedule(self, db: Session, job: ScheduleJobRow) -> None:
         tenant = db.get(Tenant, job.tenant_id)

@@ -169,7 +169,11 @@
                 <button v-if="u.id !== meId" @click="toggleActive(u)">
                   {{ u.is_active ? '禁用' : '启用' }}
                 </button>
-                <button @click="resetPassword(u)">重置密码</button>
+                <!-- Never offered for yourself: the reset revokes your session and
+                     clears your 2FA, and the redirect that followed destroyed the
+                     one-time password before it could be read — locking out a lone
+                     admin with no recovery path. Use 设置 → 修改面板密码 instead. -->
+                <button v-if="u.id !== meId" @click="resetPassword(u)">重置密码</button>
                 <button v-if="u.id !== meId" @click="toggleAdmin(u)">
                   {{ u.is_admin ? '取消管理员' : '设为管理员' }}
                 </button>
@@ -531,12 +535,6 @@ async function resetPassword(u: AdminUser) {
   try {
     const { data } = await api.post(`/admin/users/${u.id}/reset-password`)
     msg.value = `「${data.username}」的新密码：${data.new_password}\n${data.message}`
-    if (u.id === meId.value) {
-      // Own password reset revokes our token; back to login.
-      auth.clearLocal()
-      location.href = '/login'
-      return
-    }
     await load()
   } catch (e: any) {
     error.value = e?.message || '重置失败'

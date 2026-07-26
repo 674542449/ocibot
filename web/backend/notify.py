@@ -271,8 +271,13 @@ def notify_user(
     started = time.monotonic()
     sent = 0
     for row in rows:
-        events = list(row.events or [])
-        if events and event not in events:
+        # None vs []: rows created before the events column existed have NULL and
+        # must keep receiving everything (_ensure_schema cannot backfill a callable
+        # default), while an explicitly empty list means the user switched every
+        # event off and must receive nothing. `list(row.events or [])` collapsed
+        # both to "send everything".
+        events = row.events
+        if events is not None and event not in list(events):
             continue
         if sent >= _MAX_SENDS_PER_EVENT or time.monotonic() - started > _SEND_BUDGET_SEC:
             log.warning(
