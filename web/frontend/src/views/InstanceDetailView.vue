@@ -240,6 +240,15 @@
         </div>
       </div>
       <p class="muted" style="margin: 0; font-size: 12px">{{ fwMsg }}</p>
+
+      <!-- Nothing at all: say so instead of rendering a blank panel. -->
+      <div v-if="!fwGroups.length && !fwSecurityLists.length" class="card" style="padding: 0.75rem">
+        <div class="muted" style="font-size: 13px">
+          该实例没有关联的网络安全组（NSG），其子网也没有可读的安全列表。<br />
+          放行端口可点「一键全开放」（会为实例创建并绑定一个 NSG），或在 Oracle 控制台为子网添加安全列表规则。
+        </div>
+      </div>
+
       <div v-for="g in fwGroups" :key="g.id" class="card" style="padding: 0.75rem">
         <div style="font-weight: 600">
           {{ g.display_name }}
@@ -297,6 +306,47 @@
           </div>
         </div>
         <button class="primary" style="margin-top: 0.4rem" @click="addRule(g.id)">添加规则</button>
+      </div>
+
+      <!-- Subnet security lists: where the rules actually live for most instances.
+           Read-only here — the add/delete endpoints operate on NSGs. -->
+      <div
+        v-for="sl in fwSecurityLists"
+        :key="sl.id"
+        class="card"
+        style="padding: 0.75rem"
+      >
+        <div style="font-weight: 600">
+          {{ sl.display_name }}
+          <span class="badge">子网安全列表 · 只读</span>
+        </div>
+        <div class="muted" style="font-size: 11px; word-break: break-all">{{ sl.id }}</div>
+        <div class="table-wrap" style="margin-top: 0.5rem">
+          <table>
+            <thead>
+              <tr>
+                <th>方向</th>
+                <th>协议</th>
+                <th>CIDR</th>
+                <th>端口</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-if="!(sl.rules || []).length">
+                <td colspan="4" class="muted">该安全列表没有规则</td>
+              </tr>
+              <tr v-for="(r, i) in sl.rules || []" :key="`${sl.id}-${i}`">
+                <td>{{ r.direction_label || r.direction }}</td>
+                <td>{{ r.protocol_label || r.protocol }}</td>
+                <td>{{ r.cidr }}</td>
+                <td>{{ r.port }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="muted" style="margin: 0.4rem 0 0; font-size: 12px">
+          安全列表规则请在 Oracle 控制台修改；面板的「添加规则 / 一键全开放」只作用于 NSG。
+        </p>
       </div>
     </div>
 
@@ -1110,6 +1160,8 @@ async function deleteConsole(id: string) {
 
 // ---- firewall ----
 const fwGroups = ref<any[]>([])
+// Subnet security lists — for most instances this is where the rules actually are.
+const fwSecurityLists = ref<any[]>([])
 const fwMsg = ref('')
 const fwBusy = ref(false)
 const ruleForm = reactive({
@@ -1125,7 +1177,9 @@ async function loadFirewall() {
       `/tenants/${tenantId.value}/instances/${instanceId.value}/firewall`,
     )
     fwMsg.value = data.message || ''
+    if (data.ok === false) error.value = data.message || '加载防火墙规则失败'
     fwGroups.value = data.data?.groups || []
+    fwSecurityLists.value = data.data?.security_lists || []
   } catch (e: any) {
     error.value = e?.message || '加载防火墙规则失败'
   }

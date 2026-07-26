@@ -105,6 +105,60 @@
         <span v-if="!meta && tenantId" class="muted" style="font-size: 12px">
           为减少 API 调用，进入本页不会自动拉取租户元数据
         </span>
+        <button type="button" :disabled="!tenantId || loadingQuota" @click="loadQuotaPreview">
+          {{ loadingQuota ? '读取额度中…' : '刷新免费额度' }}
+        </button>
+      </div>
+
+      <!-- Account free-tier usage, visible while configuring (not only at confirm). -->
+      <div v-if="quotaPreview" class="card quota-panel">
+        <div class="row" style="justify-content: space-between; align-items: baseline">
+          <strong>该账号 Always Free 已用额度</strong>
+          <span class="row" style="gap: 0.4rem; align-items: center">
+            <span v-if="quotaPreview.account_tier" class="badge">
+              {{ quotaPreview.account_tier === 'paid' ? '付费账号' : '免费账号' }}
+            </span>
+            <span
+              class="badge"
+              :class="quotaPreview.overall_status === 'ok' ? 'running' : 'warn'"
+            >{{ quotaStatusLabel(quotaPreview.overall_status) }}</span>
+          </span>
+        </div>
+        <p v-if="quotaPreview.read_incomplete" class="muted warn-text" style="margin: 0.3rem 0 0; font-size: 12px">
+          ⚠ 用量读取不完整（Oracle API 报错或限流），下列数字可能偏低，提交时服务端会拒绝创建。
+        </p>
+        <div class="quota-grid">
+          <div v-for="q in quotaRows" :key="q.key" class="quota-item">
+            <div class="quota-label">{{ q.label }}</div>
+            <div class="quota-bar">
+              <div
+                class="quota-fill"
+                :class="q.status"
+                :style="{ width: Math.min(100, q.ratio * 100) + '%' }"
+              />
+            </div>
+            <div class="quota-nums">
+              已用 <strong>{{ q.used }}</strong> / {{ q.limit }}{{ q.unit }}
+              <span class="muted">（剩余 {{ q.remaining }}{{ q.unit }}）</span>
+            </div>
+          </div>
+        </div>
+        <p v-if="quotaLoadError" class="muted warn-text" style="margin: 0.35rem 0 0; font-size: 12px">
+          {{ quotaLoadError }}
+        </p>
+      </div>
+
+      <!-- Pre-submit verdict for the CURRENT form, from the server's own guard. -->
+      <div v-if="quotaVerdict && quotaVerdict.blocked" class="error-box" style="white-space: pre-line">
+        <strong>当前配置会超出免费额度，已阻止提交：</strong>
+        {{ (quotaVerdict.errors || []).join('\n') }}
+      </div>
+      <div
+        v-else-if="quotaVerdict && (quotaVerdict.warnings || []).length"
+        class="card"
+        style="padding: 0.6rem; font-size: 12px"
+      >
+        <strong>提醒：</strong>{{ (quotaVerdict.warnings || []).join('；') }}
       </div>
 
       <div v-if="loadingMeta" class="muted">正在加载镜像 / Shape / 网络…</div>
@@ -310,8 +364,12 @@
       </p>
 
       <div class="row">
-        <button class="primary" :disabled="submitting || !tenantId || loadingMeta" @click="openConfirm">
-          下一步：确认配置
+        <button
+          class="primary"
+          :disabled="submitting || loadingQuota || !tenantId || loadingMeta"
+          @click="openConfirm"
+        >
+          {{ loadingQuota ? '校验额度中…' : '下一步：确认配置' }}
         </button>
       </div>
     </div>
@@ -380,6 +438,45 @@ function dismissPassword() {
 const presetHint = ref('')
 const sshFile = ref('')
 const quotaPreview = ref<any>(null)
+const quotaVerdict = ref<any>(null)
+const loadingQuota = ref(false)
+
+const QUOTA_ROWS: { key: string; label: string; unit: string }[] = [
+  { key: 'a1_ocpu', label: 'A1.Flex OCPU', unit: '' },
+  { key: 'a1_memory_gb', label: 'A1.Flex 内存', unit: ' GB' },
+  { key: 'e2_micro_count', label: 'E2.1.Micro 实例', unit: ' 台' },
+  { key: 'block_storage_gb', label: '块存储（含引导卷）', unit: ' GB' },
+]
+
+function fmtNum(n: unknown): string {
+  const v = Number(n)
+  if (!Number.isFinite(v)) return '—'
+  return Number.isInteger(v) ? String(v) : v.toFixed(1)
+}
+
+function quotaStatusLabel(status: string): string {
+  return (
+    { ok: '正常', warn: '接近上限', critical: '即将用尽', over: '已超额' }[status] || status || '—'
+  )
+}
+
+/** Per-resource used/limit/remaining rows for the usage panel. */
+const quotaRows = computed(() => {
+  const buckets = quotaPreview.value?.buckets || {}
+  return QUOTA_ROWS.map((r) => {
+    const b = buckets[r.key] || {}
+    return {
+      key: r.key,
+      label: r.label,
+      unit: r.unit,
+      used: fmtNum(b.used),
+      limit: fmtNum(b.limit),
+      remaining: fmtNum(b.remaining),
+      ratio: Number(b.ratio) || 0,
+      status: b.status || 'ok',
+    }
+  })
+})
 const quotaLoadError = ref('')
 
 const form = reactive({
@@ -689,20 +786,69 @@ const confirmRows = computed(() => {
 })
 
 async function loadQuotaPreview() {
-  quotaPreview.value = null
+  if (!tenantId.value || loadingQuota.value) return
+  loadingQuota.value = true
   quotaLoadError.value = ''
-  if (!tenantId.value) return
   try {
     const { data } = await api.get(`/tenants/${tenantId.value}/free-quota`)
     quotaPreview.value = data.data || null
   } catch (e: any) {
+    quotaPreview.value = null
     quotaLoadError.value = e?.message || '无法读取免费额度（提交时仍会由服务端校验）'
+  } finally {
+    loadingQuota.value = false
+  }
+}
+
+/**
+ * Ask the SERVER to judge the current form against the free-tier caps.
+ *
+ * Deliberately not reimplemented client-side: the endpoint runs the same
+ * check_launch_quota the launch path enforces with, so the pre-submit verdict
+ * cannot drift from what the server will actually do.
+ */
+async function checkQuotaForForm(): Promise<boolean> {
+  quotaVerdict.value = null
+  if (!tenantId.value) return true
+  loadingQuota.value = true
+  try {
+    const { data } = await api.post(`/tenants/${tenantId.value}/launch-quota-check`, {
+      shape: form.shape,
+      image_id: form.image_id,
+      ocpus: isFlex.value ? form.ocpus : null,
+      memory_in_gbs: isFlex.value ? form.memory_in_gbs : null,
+      boot_volume_size_in_gbs: form.boot_volume_size_in_gbs || null,
+      boot_volume_vpus_per_gb: form.boot_volume_vpus_per_gb,
+    })
+    quotaVerdict.value = data
+    // Keep the usage panel in sync with the snapshot the verdict used.
+    if (data?.buckets) {
+      quotaPreview.value = {
+        account_tier: data.account_tier,
+        read_incomplete: data.read_incomplete,
+        overall_status: data.overall_status,
+        limits: data.limits,
+        usage: data.usage,
+        remaining: data.remaining,
+        buckets: data.buckets,
+        summary_lines: data.summary_lines,
+      }
+    }
+    return !data?.blocked
+  } catch (e: any) {
+    // A failed pre-check must not block a launch the server might well accept —
+    // the server re-validates on submit either way.
+    quotaLoadError.value = e?.message || '无法预检免费额度（提交时仍会由服务端校验）'
+    return true
+  } finally {
+    loadingQuota.value = false
   }
 }
 
 async function openConfirm() {
   error.value = ''
   msg.value = ''
+  if (loadingQuota.value) return
   if (!tenantId.value) {
     error.value = '请选择租户'
     return
@@ -715,7 +861,12 @@ async function openConfirm() {
     error.value = '请完整选择 AD / 镜像 / Shape'
     return
   }
-  await loadQuotaPreview()
+  const allowed = await checkQuotaForForm()
+  if (!allowed) {
+    // Blocked: the reason is rendered from quotaVerdict above the button.
+    error.value = '当前配置会超出 Always Free 免费额度，已阻止提交（详见下方说明）'
+    return
+  }
   confirmOpen.value = true
 }
 
@@ -813,7 +964,13 @@ function onTenantPicked() {
   form.image_id = ''
   form.shape = ''
   presetHint.value = ''
-  // Do not auto-call Oracle — user clicks「加载配置」.
+  quotaPreview.value = null
+  quotaVerdict.value = null
+  quotaLoadError.value = ''
+  // Usage is one cheap-ish read and it is the whole point of the panel, so fetch
+  // it on selection; the heavier image/shape/network metadata still waits for the
+  // explicit 「加载配置」 click.
+  void loadQuotaPreview()
 }
 
 onMounted(async () => {
@@ -835,6 +992,42 @@ onMounted(async () => {
 }
 .warn-text {
   color: var(--warn) !important;
+}
+.quota-panel {
+  padding: 0.7rem 0.8rem;
+}
+.quota-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 0.6rem 1rem;
+  margin-top: 0.5rem;
+}
+.quota-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.quota-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  overflow: hidden;
+  margin: 0.25rem 0;
+}
+.quota-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+.quota-fill.warn {
+  background: var(--warn);
+}
+.quota-fill.critical,
+.quota-fill.over {
+  background: var(--danger, #e5484d);
+}
+.quota-nums {
+  font-size: 12px;
 }
 .password-reveal {
   border: 1px solid var(--warn);

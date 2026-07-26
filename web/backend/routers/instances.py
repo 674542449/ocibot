@@ -28,9 +28,12 @@ from web.backend.oci_bridge import (
     op_result_dict,
 )
 from web.backend.quota_guard import (
+    check_launch_quota,
     enforce_launch_quota,
     enforce_shape_resize_quota,
     format_guard_warnings,
+    free_only_for_tier,
+    usage_snapshot,
 )
 from web.backend.schemas import (
     InstanceOut,
@@ -401,6 +404,57 @@ def free_quota(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"读取免费额度失败: {exc}") from exc
+
+
+@router.post("/tenants/{tenant_id}/launch-quota-check")
+def launch_quota_check(
+    tenant_id: str,
+    body: LaunchInstanceRequest,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    """Dry-run the Always-Free guard for a proposed configuration.
+
+    Deliberately reuses check_launch_quota — the same function the launch path
+    enforces with — so the panel's pre-submit verdict cannot drift from the
+    server's. Returns the guard verdict plus the usage snapshot it was based on,
+    so the UI can show both "what you have used" and "what this would need".
+    """
+    row = _tenant_or_404(db, user.id, tenant_id)
+    try:
+        session = get_session_for_row(row)
+        tier = getattr(row, "account_tier", "") or ""
+        free_only = free_only_for_tier(tier)
+        usage = usage_snapshot(session, free_only_mode=free_only)
+        guard = check_launch_quota(
+            session,
+            account_tier=tier,
+            shape=str(body.shape or ""),
+            ocpus=body.ocpus,
+            memory_in_gbs=body.memory_in_gbs,
+            boot_volume_size_in_gbs=body.boot_volume_size_in_gbs,
+            boot_volume_vpus_per_gb=body.boot_volume_vpus_per_gb or 10,
+            usage=usage,
+        )
+    except OCIClientError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"校验免费额度失败: {exc}") from exc
+
+    out = guard.to_dict()
+    out["free_only_mode"] = free_only
+    out["account_tier"] = str(usage.get("account_tier") or tier or "")
+    # read_incomplete means the numbers below are an undercount; the launch path
+    # refuses outright in that case, so tell the UI rather than showing a total
+    # that looks like plenty of headroom.
+    out["read_incomplete"] = bool(usage.get("read_incomplete"))
+    out["limits"] = usage.get("limits") or {}
+    out["usage"] = usage.get("usage") or {}
+    out["remaining"] = usage.get("remaining") or {}
+    out["buckets"] = usage.get("buckets") or {}
+    out["overall_status"] = usage.get("overall_status") or ""
+    out["summary_lines"] = usage.get("summary_lines") or []
+    return out
 
 
 @router.get("/tenants/{tenant_id}/launch-meta")

@@ -2278,11 +2278,30 @@ class TenantSession:
                         "rules": [self._normalize_firewall_rule(rule) for rule in rules],
                     }
                 )
+            # Most instances have NO NSG on the VNIC — OCI's default networking puts
+            # ingress/egress rules on the SUBNET's security list instead. Reading
+            # only nsg_ids therefore showed an empty firewall panel for any instance
+            # not launched with this panel's managed NSG. Security lists are reported
+            # read-only: the add/delete endpoints operate on NSGs.
+            security_lists = self._subnet_security_lists(network.subnet_id)
+
+            parts = []
+            if groups:
+                parts.append(f"{len(groups)} 个网络安全组（NSG）")
+            if security_lists:
+                parts.append(f"{len(security_lists)} 个子网安全列表（只读）")
+            if parts:
+                message = "已加载 " + " · ".join(parts)
+            else:
+                message = "该实例既未关联 NSG，其子网也没有安全列表规则"
+
             return OperationResult(
                 ok=True,
-                message=f"已加载 {len(groups)} 个关联网络安全组（NSG）",
+                message=message,
                 data={
                     "groups": groups,
+                    "security_lists": security_lists,
+                    "subnet_id": network.subnet_id,
                     "has_ipv6": bool(network.ipv6_addresses),
                     "vnic_id": network.vnic_id,
                     "public_ipv4": network.public_ipv4 or "",
@@ -2295,15 +2314,46 @@ class TenantSession:
         except Exception as exc:  # noqa: BLE001
             return OperationResult(ok=False, message=str(exc))
 
+    def _subnet_security_lists(self, subnet_id: str) -> list[dict]:
+        """Security-list rules for a subnet, normalized like NSG rules (read-only)."""
+        if not subnet_id:
+            return []
+        out: list[dict] = []
+        try:
+            subnet = self.network.get_subnet(subnet_id).data
+        except Exception:  # noqa: BLE001 - best effort; NSGs are still returned
+            return out
+        for sl_id in list(getattr(subnet, "security_list_ids", None) or []):
+            try:
+                sl = self.network.get_security_list(sl_id).data
+            except Exception:  # noqa: BLE001
+                continue
+            rules: list[dict] = []
+            for rule in list(getattr(sl, "ingress_security_rules", None) or []):
+                rules.append(self._normalize_firewall_rule(rule, direction="INGRESS"))
+            for rule in list(getattr(sl, "egress_security_rules", None) or []):
+                rules.append(self._normalize_firewall_rule(rule, direction="EGRESS"))
+            out.append(
+                {
+                    "id": sl_id,
+                    "display_name": getattr(sl, "display_name", "") or sl_id[-8:],
+                    "rules": rules,
+                }
+            )
+        return out
+
     @staticmethod
-    def _normalize_firewall_rule(rule: Any) -> dict:
+    def _normalize_firewall_rule(rule: Any, direction: str = "") -> dict:
         options = getattr(rule, "tcp_options", None) or getattr(rule, "udp_options", None)
         port_range = getattr(options, "destination_port_range", None) if options else None
         port = "全部"
         if port_range:
             start, end = getattr(port_range, "min", None), getattr(port_range, "max", None)
             port = str(start) if start == end else f"{start}-{end}"
-        direction = getattr(rule, "direction", "") or ""
+        # Security-list rules carry no `direction` attribute — it is implied by which
+        # list (ingress_security_rules / egress_security_rules) they came from — so
+        # the caller passes it in. NSG rules have it on the object.
+        direction = direction or (getattr(rule, "direction", "") or "")
         protocol = getattr(rule, "protocol", "") or ""
         return {
             "id": getattr(rule, "id", "") or "",
