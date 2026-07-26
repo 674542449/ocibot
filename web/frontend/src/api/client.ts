@@ -59,6 +59,7 @@ export type Tenant = {
   has_private_key: boolean
   account_tier: string
   budget_monthly_usd: number
+  free_only_mode: boolean
   created_at: string
   updated_at: string
 }

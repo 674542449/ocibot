@@ -9,13 +9,25 @@ from fastapi import HTTPException
 from app import free_quota
 
 
-def free_only_for_tier(account_tier: str = "") -> bool:
-    """Paid accounts may overage (with warnings); everything else stays hard-capped.
+def free_only_for_tenant(row: Any) -> bool:
+    """Whether to hard-enforce the Always-Free caps for this tenant.
 
-    Inverted deliberately: an allowlist of free-ish values meant any unrecognized
-    string (a typo, or a value carried in from an imported backup) silently
-    disabled the Always-Free hard caps and let a launch run up real charges. Only
-    an explicit "paid" opts out.
+    Read from the tenant's explicit ``free_only_mode`` flag (default True) rather
+    than inferred from ``account_tier``. Inferring it was wrong: an Oracle account
+    that was ever upgraded reports "paid", so a user who only wants free resources
+    got a warning instead of a block — e.g. 50GB already used plus a 200GB boot
+    volume (250 > 200) sailed through. Deliberate overage is now an explicit opt-out
+    per tenant instead of a guess about intent.
+    """
+    return bool(getattr(row, "free_only_mode", True))
+
+
+def free_only_for_tier(account_tier: str = "") -> bool:
+    """Tier-only fallback for call sites that have no tenant row.
+
+    Prefer free_only_for_tenant(). Only an explicit "paid" opts out here, because an
+    unrecognized string (a typo, or a value imported from a backup) must not silently
+    disable the caps.
     """
     return (account_tier or "").strip().lower() != "paid"
 

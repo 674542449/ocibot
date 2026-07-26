@@ -16,8 +16,10 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "OCIBot Web"
-    # Bump when shipping user-visible panel features so operators can verify deploy.
-    app_version: str = "0.4.14"
+    # MUST be bumped in the same commit as any shipped change, together with a new
+    # CHANGELOG.md heading — /api/health is how an operator verifies a deploy
+    # actually landed. tests/test_version_bump.py enforces that the two agree.
+    app_version: str = "0.4.15"
     debug: bool = False
 
     # sqlite+pysqlite:////absolute/path.db  or  postgresql+psycopg://user:pass@host/db

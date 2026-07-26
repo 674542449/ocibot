@@ -40,7 +40,7 @@ def _guard_storage_delta(
     # Always-Free 200GB with no way to opt out. Derive it from the tier like the
     # launch path does.
     tier = getattr(row, "account_tier", "") or ""
-    free_only = quota_guard.free_only_for_tier(tier)
+    free_only = quota_guard.free_only_for_tenant(row)
     # usage_snapshot flags a partial/failed read; treating that as zero usage let
     # a throttled read look like a full free quota.
     snap = quota_guard.usage_snapshot(session, free_only_mode=free_only)

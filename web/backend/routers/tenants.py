@@ -45,6 +45,7 @@ def _to_out(row: Tenant) -> TenantOut:
         has_private_key=bool(row.private_key_encrypted),
         account_tier=row.account_tier or "",
         budget_monthly_usd=float(row.budget_monthly_usd or 0.0),
+        free_only_mode=bool(getattr(row, "free_only_mode", True)),
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -197,6 +198,7 @@ def create_tenant(
         color=body.color or "#3B82F6",
         private_key_encrypted=encrypt_text(body.private_key_pem.strip()),
         budget_monthly_usd=float(body.budget_monthly_usd or 0.0),
+        free_only_mode=bool(body.free_only_mode),
     )
     db.add(row)
     db.commit()

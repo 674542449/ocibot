@@ -76,6 +76,7 @@ def export_encrypted_zip(
                 "password_expiry_days": int(row.password_expiry_days or 0),
                 "account_tier": row.account_tier or "",
                 "budget_monthly_usd": float(row.budget_monthly_usd or 0.0),
+                "free_only_mode": bool(getattr(row, "free_only_mode", True)),
             }
         )
     content = json.dumps({"version": 1, "tenants": tenants_payload}, ensure_ascii=False, indent=2).encode(
@@ -240,6 +241,9 @@ def import_encrypted_zip(
             # Read off the archive item: TenantConfig has no budget field, so this
             # was silently dropped and restored tenants lost their budget alerts.
             budget_monthly_usd=_budget(item.get("budget_monthly_usd")),
+            # Default ON when absent (older archives) so a restore never
+            # silently loses the free-tier protection.
+            free_only_mode=bool(item.get("free_only_mode", True)),
         )
         db.add(row)
         db.flush()

@@ -67,6 +67,12 @@ class Tenant(Base):
     password_changed_at: Mapped[str] = mapped_column(String(64), default="")
     password_expiry_days: Mapped[int] = mapped_column(Integer, default=0)
     account_tier: Mapped[str] = mapped_column(String(16), default="")  # paid|free|""
+    # Hard-enforce the Always-Free caps for this tenant, regardless of whether Oracle
+    # reports the account as paid. Defaults ON: an upgraded/PAYG account that only
+    # wants free resources is the common case, and inferring intent from account_tier
+    # meant a paid account got a mere warning while exceeding the free tier.
+    # Turn it off per tenant to deliberately use billable resources.
+    free_only_mode: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     # Monthly cost budget (USD). 0 = alerts off.
     budget_monthly_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     # "YYYY-MM" of the last month a budget-exceeded notification was sent.

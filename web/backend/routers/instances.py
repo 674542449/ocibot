@@ -32,7 +32,7 @@ from web.backend.quota_guard import (
     enforce_launch_quota,
     enforce_shape_resize_quota,
     format_guard_warnings,
-    free_only_for_tier,
+    free_only_for_tenant,
     usage_snapshot,
 )
 from web.backend.schemas import (
@@ -248,6 +248,7 @@ def update_shape(
         guard = enforce_shape_resize_quota(
             session,
             account_tier=getattr(row, "account_tier", "") or "",
+            free_only_mode=free_only_for_tenant(row),
             shape=shape_raw,
             current_ocpus=getattr(info, "ocpus", None),
             current_memory_in_gbs=getattr(info, "memory_gb", None)
@@ -424,7 +425,7 @@ def launch_quota_check(
     try:
         session = get_session_for_row(row)
         tier = getattr(row, "account_tier", "") or ""
-        free_only = free_only_for_tier(tier)
+        free_only = free_only_for_tenant(row)
         usage = usage_snapshot(session, free_only_mode=free_only)
         guard = check_launch_quota(
             session,
@@ -434,6 +435,7 @@ def launch_quota_check(
             memory_in_gbs=body.memory_in_gbs,
             boot_volume_size_in_gbs=body.boot_volume_size_in_gbs,
             boot_volume_vpus_per_gb=body.boot_volume_vpus_per_gb or 10,
+            free_only_mode=free_only,
             usage=usage,
         )
     except OCIClientError as exc:
@@ -514,6 +516,7 @@ def launch_instance(
             boot_volume_size_in_gbs=payload.get("boot_volume_size_in_gbs"),
             boot_volume_vpus_per_gb=boot_vpu,
             fallback_configs=list(built.get("fallback_configs") or body.fallback_configs or []),
+            free_only_mode=free_only_for_tenant(row),
         )
     except HTTPException:
         raise

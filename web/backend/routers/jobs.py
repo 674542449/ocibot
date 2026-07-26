@@ -22,7 +22,7 @@ from web.backend.db import get_db
 from web.backend.launch_service import normalize_fallback_configs, shape_is_flex
 from web.backend.models import CapacityAttempt, CapacityJob, ScheduleJobRow, ScheduleRun, User
 from web.backend.oci_bridge import get_owned_tenant, get_session_for_row
-from web.backend.quota_guard import enforce_launch_quota
+from web.backend.quota_guard import enforce_launch_quota, free_only_for_tenant
 from web.backend.schemas import (
     CapacityAttemptOut,
     CapacityJobCreate,
@@ -111,6 +111,7 @@ def create_capacity_job(
             boot_volume_size_in_gbs=payload.get("boot_volume_size_in_gbs"),
             boot_volume_vpus_per_gb=payload.get("boot_volume_vpus_per_gb") or 10,
             fallback_configs=fallback_configs,
+            free_only_mode=free_only_for_tenant(tenant),
         )
     except HTTPException:
         raise

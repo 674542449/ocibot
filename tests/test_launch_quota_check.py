@@ -88,8 +88,10 @@ def _snapshot(a1_ocpu=2.0, a1_mem=12.0, e2=1, disk=100.0, tier="free", incomplet
     }
 
 
-@pytest.fixture()
-def client(monkeypatch):
+# Module-scoped: a per-test login would trip the login rate limiter (10 / 5 min per
+# IP+username) once this file grew past ten tests.
+@pytest.fixture(scope="module")
+def client():
     init_db()
     username = "quota-check-user"
     with SessionLocal() as db:
@@ -183,8 +185,14 @@ def test_over_quota_configs_are_blocked_with_a_reason(client, monkeypatch, over,
     assert any(needle in e for e in d["errors"]), d["errors"]
 
 
-def test_paid_account_is_not_blocked(client, monkeypatch):
-    """Paid tenancies are not hard-capped — they may overage with a warning."""
+def test_paid_account_is_still_blocked_by_default(client, monkeypatch):
+    """A "paid" tier must NOT silently disable the caps.
+
+    Oracle reports "paid" for any account that was ever upgraded, which is the
+    common case for people who only use free resources. Inferring intent from the
+    tier meant 50GB already used plus a 200GB boot volume (250 > 200) passed with a
+    mere warning. Intent is now the tenant's explicit free_only_mode flag, default on.
+    """
     c, tid = client
     with SessionLocal() as db:
         db.query(Tenant).filter(Tenant.id == tid).update({"account_tier": "paid"})
@@ -192,8 +200,53 @@ def test_paid_account_is_not_blocked(client, monkeypatch):
     try:
         _stub_usage(monkeypatch, _snapshot(tier="paid"))
         d = c.post(f"/api/tenants/{tid}/launch-quota-check", json=_body(ocpus=3)).json()
+        assert d["blocked"] is True, d
+        assert d["free_only_mode"] is True
+    finally:
+        with SessionLocal() as db:
+            db.query(Tenant).filter(Tenant.id == tid).update({"account_tier": ""})
+            db.commit()
+
+
+def test_disabling_free_only_allows_deliberate_overage(client, monkeypatch):
+    """Opting out is explicit and per tenant, so paid use is still possible."""
+    c, tid = client
+    with SessionLocal() as db:
+        db.query(Tenant).filter(Tenant.id == tid).update(
+            {"account_tier": "paid", "free_only_mode": False}
+        )
+        db.commit()
+    try:
+        _stub_usage(monkeypatch, _snapshot(tier="paid"))
+        d = c.post(f"/api/tenants/{tid}/launch-quota-check", json=_body(ocpus=3)).json()
         assert d["blocked"] is False, d
         assert d["free_only_mode"] is False
+        assert d["warnings"], "overage should still be warned about"
+    finally:
+        with SessionLocal() as db:
+            db.query(Tenant).filter(Tenant.id == tid).update(
+                {"account_tier": "", "free_only_mode": True}
+            )
+            db.commit()
+
+
+def test_the_reported_scenario_is_blocked(client, monkeypatch):
+    """Exactly the case reported: 50GB already used on an AMD free instance, then an
+    A1 free instance with 4 OCPU / 24 GB / 200 GB boot. 50 + 200 = 250 > 200."""
+    c, tid = client
+    with SessionLocal() as db:
+        db.query(Tenant).filter(Tenant.id == tid).update({"account_tier": "paid"})
+        db.commit()
+    try:
+        _stub_usage(monkeypatch, _snapshot(a1_ocpu=0.0, a1_mem=0.0, e2=1, disk=50.0, tier="paid"))
+        d = c.post(
+            f"/api/tenants/{tid}/launch-quota-check",
+            json=_body(ocpus=4, memory_in_gbs=24, boot_volume_size_in_gbs=200),
+        ).json()
+        assert d["blocked"] is True, d
+        assert any("块存储" in e for e in d["errors"]), d["errors"]
+        # A1 4/24 alone is exactly the whole free allowance, so only disk should fail.
+        assert not any("A1" in e for e in d["errors"]), d["errors"]
     finally:
         with SessionLocal() as db:
             db.query(Tenant).filter(Tenant.id == tid).update({"account_tier": ""})

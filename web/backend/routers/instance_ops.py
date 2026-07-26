@@ -320,7 +320,8 @@ def boot_volume_update(
             # the tier (True hard-capped paid tenants) and refuse on a partial read
             # instead of reading it as zero usage.
             tier = getattr(row, "account_tier", "") or ""
-            free_only = quota_guard.free_only_for_tier(tier)
+            # Explicit per-tenant flag, not inferred from account_tier.
+            free_only = quota_guard.free_only_for_tenant(row)
             usage = quota_guard.usage_snapshot(session, free_only_mode=free_only)
             blocked = quota_guard._blocked_by_incomplete_read(usage, free_only)
             if blocked:

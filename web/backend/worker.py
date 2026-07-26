@@ -451,9 +451,9 @@ class Worker:
         tier = getattr(tenant, "account_tier", "") or ""
         pre_snapshot: Optional[dict[str, Any]] = None
         try:
-            from web.backend.quota_guard import free_only_for_tier, usage_snapshot
+            from web.backend.quota_guard import free_only_for_tenant, usage_snapshot
 
-            if hasattr(session, "get_free_quota_usage") and free_only_for_tier(tier):
+            if hasattr(session, "get_free_quota_usage") and free_only_for_tenant(tenant):
                 snapshot = usage_snapshot(session, free_only_mode=True)
                 pre_snapshot = snapshot
                 if snapshot.get("read_incomplete"):
@@ -503,6 +503,7 @@ class Worker:
                     memory_in_gbs=payload.get("memory_in_gbs"),
                     boot_volume_size_in_gbs=payload.get("boot_volume_size_in_gbs"),
                     boot_volume_vpus_per_gb=payload.get("boot_volume_vpus_per_gb") or 10,
+                    free_only_mode=free_only_for_tenant(tenant),
                     # Reuse the snapshot the deferral decision was made on. Letting
                     # this take its own read meant the pre-check above was not the
                     # deciding one: a second, throttled read returns zeroed usage

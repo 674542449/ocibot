@@ -122,6 +122,9 @@
               class="badge"
               :class="quotaPreview.overall_status === 'ok' ? 'running' : 'warn'"
             >{{ quotaStatusLabel(quotaPreview.overall_status) }}</span>
+            <span class="badge" :class="freeOnly ? 'running' : 'warn'">
+              {{ freeOnly ? '仅免费额度' : '允许超额计费' }}
+            </span>
           </span>
         </div>
         <p v-if="quotaPreview.read_incomplete" class="muted warn-text" style="margin: 0.3rem 0 0; font-size: 12px">
@@ -158,7 +161,8 @@
         class="card"
         style="padding: 0.6rem; font-size: 12px"
       >
-        <strong>提醒：</strong>{{ (quotaVerdict.warnings || []).join('；') }}
+        <strong>{{ freeOnly ? '提醒：' : '该租户已允许超额（可能计费）：' }}</strong>
+        {{ (quotaVerdict.warnings || []).join('；') }}
       </div>
 
       <div v-if="loadingMeta" class="muted">正在加载镜像 / Shape / 网络…</div>
@@ -439,6 +443,15 @@ const presetHint = ref('')
 const sshFile = ref('')
 const quotaPreview = ref<any>(null)
 const quotaVerdict = ref<any>(null)
+/** Whether this tenant hard-enforces the free caps. Verdict wins; tenant row is the
+ *  fallback before any pre-check has run. */
+const freeOnly = computed(() => {
+  if (quotaVerdict.value && typeof quotaVerdict.value.free_only_mode === 'boolean') {
+    return quotaVerdict.value.free_only_mode
+  }
+  const t = tenants.value.find((x) => x.id === tenantId.value)
+  return t ? t.free_only_mode !== false : true
+})
 const loadingQuota = ref(false)
 
 const QUOTA_ROWS: { key: string; label: string; unit: string }[] = [

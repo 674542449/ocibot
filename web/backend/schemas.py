@@ -91,6 +91,8 @@ class TenantCreate(BaseModel):
     enabled: bool = True
     color: str = Field(default="#3B82F6", max_length=32)
     budget_monthly_usd: float = 0.0
+    # Hard-enforce Always-Free caps for this tenant (default on).
+    free_only_mode: bool = True
 
 
 class TenantPasteImport(BaseModel):
@@ -132,6 +134,7 @@ class TenantUpdate(BaseModel):
     enabled: Optional[bool] = None
     color: Optional[str] = None
     budget_monthly_usd: Optional[float] = None
+    free_only_mode: Optional[bool] = None
 
 
 class TenantOut(BaseModel):
@@ -148,6 +151,7 @@ class TenantOut(BaseModel):
     has_private_key: bool
     account_tier: str
     budget_monthly_usd: float = 0.0
+    free_only_mode: bool = True
     created_at: UtcDatetime
     updated_at: UtcDatetime
 
