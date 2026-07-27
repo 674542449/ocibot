@@ -3981,8 +3981,12 @@ class TenantSession:
                 home = name
             regions.append(
                 {
+                    # Key case is preserved exactly as Oracle returned it (they are
+                    # uppercase: NRT / KIX / FRA). CreateRegionSubscription resolves
+                    # the region BY this key, so a lowercased copy is a different,
+                    # non-existent entity — see subscribe_region.
                     "region_name": name,
-                    "region_key": str(getattr(sub, "region_key", "") or "").strip().lower(),
+                    "region_key": str(getattr(sub, "region_key", "") or "").strip(),
                     "status": str(getattr(sub, "status", "") or ""),
                     "is_home_region": is_home,
                 }
@@ -4007,8 +4011,10 @@ class TenantSession:
             return OperationResult(ok=False, message=str(exc))
         regions = [
             {
+                # Names are genuinely lowercase (ap-osaka-1); keys are uppercase and
+                # must be passed back to Oracle verbatim (see list_subscribed_regions).
                 "region_name": str(getattr(r, "name", "") or "").strip().lower(),
-                "region_key": str(getattr(r, "key", "") or "").strip().lower(),
+                "region_key": str(getattr(r, "key", "") or "").strip(),
             }
             for r in items
         ]
@@ -4019,25 +4025,39 @@ class TenantSession:
     def subscribe_region(self, region: str) -> OperationResult:
         """Subscribe this tenancy to another region.
 
-        ``region`` accepts a region name (``ap-osaka-1``) or its 3-letter key
-        (``kix``). Already-subscribed regions return ok with ``already=True`` so
-        the caller can treat "subscribe" as idempotent.
+        ``region`` accepts a region name (``ap-osaka-1``) or its key (``KIX``,
+        matched case-insensitively). Already-subscribed regions return ok with
+        ``already=True`` so the caller can treat "subscribe" as idempotent.
 
-        Two Oracle constraints shape this:
+        Three Oracle constraints shape this:
           * the call only works against the HOME region endpoint, so it builds a
             dedicated IdentityClient rather than reusing ``self.identity``;
+          * ``region_key`` must be the key exactly as Oracle spells it (uppercase).
+            A lowercased key resolves to nothing and comes back as
+            ``[404] EntityNotFound``, which reads like a permission problem;
           * a subscription cannot be removed once created, which is why the API
             layer above requires an explicit confirmation.
+
+        Each failure names the step it came from: all three calls can answer 404
+        and an unattributed message leaves no way to tell them apart.
         """
         wanted = (region or "").strip().lower()
         if not wanted:
             return OperationResult(ok=False, message="请选择要开通的区域")
 
+        def _matches(item: dict[str, Any]) -> bool:
+            return wanted in {
+                str(item.get("region_name") or "").lower(),
+                str(item.get("region_key") or "").lower(),
+            }
+
         subscribed = self.list_subscribed_regions()
         if not subscribed.ok:
-            return OperationResult(ok=False, message=subscribed.message or "读取已开通区域失败")
+            return OperationResult(
+                ok=False, message=f"读取已开通区域失败：{subscribed.message or '未知错误'}"
+            )
         for item in (subscribed.data or {}).get("regions") or []:
-            if wanted in {item.get("region_name"), item.get("region_key")}:
+            if _matches(item):
                 return OperationResult(
                     ok=True,
                     message=f"该区域已开通：{item.get('region_name')}",
@@ -4050,17 +4070,19 @@ class TenantSession:
 
         catalog = self.list_all_regions()
         if not catalog.ok:
-            return OperationResult(ok=False, message=catalog.message or "读取区域列表失败")
+            return OperationResult(
+                ok=False, message=f"读取区域清单失败：{catalog.message or '未知错误'}"
+            )
         match = next(
-            (
-                r
-                for r in (catalog.data or {}).get("regions") or []
-                if wanted in {r.get("region_name"), r.get("region_key")}
-            ),
+            (r for r in (catalog.data or {}).get("regions") or [] if _matches(r)),
             None,
         )
         if match is None:
             return OperationResult(ok=False, message=f"未知区域：{region}")
+        if not match.get("region_key"):
+            return OperationResult(
+                ok=False, message=f"Oracle 未返回「{match['region_name']}」的区域代码，无法开通"
+            )
 
         try:
             identity = IdentityClient(
@@ -4072,9 +4094,19 @@ class TenantSession:
                 self.tenant.tenancy_ocid.strip(),
             )
         except ServiceError as exc:
-            return OperationResult(ok=False, message=_format_service_error(exc))
+            detail = _format_service_error(exc)
+            if int(getattr(exc, "status", 0) or 0) in (401, 404):
+                # OCI answers 404 for "no permission" as well as "no such thing",
+                # and this call needs tenancy-level rights the panel's other calls
+                # do not — say so instead of leaving the operator on a bare 404.
+                detail += (
+                    f"\n提示：提交开通「{match['region_name']}」({match['region_key']}) 被拒绝。"
+                    "该接口需要 API 用户具备租户级权限（Administrators 组，或 manage tenancies 策略），"
+                    "且账号必须已升级为 PAYG —— 纯 Always Free 账号无法订阅新区域。"
+                )
+            return OperationResult(ok=False, message=detail)
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=f"提交开通失败：{exc}")
         return OperationResult(
             ok=True,
             message=f"已提交开通「{match['region_name']}」，Oracle 通常需要几分钟才能创建资源",

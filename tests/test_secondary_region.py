@@ -92,6 +92,125 @@ def test_opting_into_billing_allows_a_secondary_region_with_a_warning():
     assert "ap-osaka-1" in note and "计费" in note
 
 
+# ------------------------------------------------------- subscribe_region call
+
+
+def _subscribe_self(subscribed=(("ap-tokyo-1", "NRT", True),), catalog=(("ap-osaka-1", "KIX"),)):
+    """Minimal stand-in for a TenantSession, enough for the unbound method."""
+    from app.oci_client import OperationResult
+
+    return SimpleNamespace(
+        tenant=SimpleNamespace(
+            tenancy_ocid="ocid1.tenancy.oc1..aaaa", region="ap-tokyo-1"
+        ),
+        list_subscribed_regions=lambda: OperationResult(
+            ok=True,
+            message="",
+            data={
+                "home_region": "ap-tokyo-1",
+                "regions": [
+                    {"region_name": n, "region_key": k, "status": "READY", "is_home_region": h}
+                    for n, k, h in subscribed
+                ],
+            },
+        ),
+        list_all_regions=lambda: OperationResult(
+            ok=True,
+            message="",
+            data={"regions": [{"region_name": n, "region_key": k} for n, k in catalog]},
+        ),
+        _config_for_region=lambda region: {"region": region},
+        _home_region=lambda: "ap-tokyo-1",
+    )
+
+
+@pytest.fixture()
+def captured_subscribe(monkeypatch):
+    """Capture what create_region_subscription is actually called with."""
+    pytest.importorskip("oci")
+    import app.oci_client as oci_client
+
+    seen: dict = {}
+
+    class _FakeIdentity:
+        def __init__(self, config, **kwargs):
+            seen["config"] = config
+
+        def create_region_subscription(self, details, tenancy_id):
+            seen["region_key"] = details.region_key
+            seen["tenancy_id"] = tenancy_id
+
+    monkeypatch.setattr(oci_client, "IdentityClient", _FakeIdentity)
+    return seen
+
+
+def test_region_key_is_sent_exactly_as_oracle_spells_it(captured_subscribe):
+    """Regression: the key was lowercased on the way in, and CreateRegionSubscription
+    resolves the region BY that key — "kix" is not an entity, so Oracle answered
+    [404] EntityNotFound, which reads like a permissions problem."""
+    from app.oci_client import TenantSession
+
+    result = TenantSession.subscribe_region(_subscribe_self(), "ap-osaka-1")
+    assert result.ok, result.message
+    assert captured_subscribe["region_key"] == "KIX"
+    assert captured_subscribe["tenancy_id"] == "ocid1.tenancy.oc1..aaaa"
+    # The subscription only works against the home-region endpoint.
+    assert captured_subscribe["config"]["region"] == "ap-tokyo-1"
+
+
+@pytest.mark.parametrize("given", ["ap-osaka-1", "AP-OSAKA-1", "KIX", "kix"])
+def test_region_can_be_named_by_id_or_key_in_any_case(captured_subscribe, given):
+    from app.oci_client import TenantSession
+
+    result = TenantSession.subscribe_region(_subscribe_self(), given)
+    assert result.ok, result.message
+    assert captured_subscribe["region_key"] == "KIX"
+
+
+def test_already_subscribed_region_skips_the_oracle_mutation(captured_subscribe):
+    from app.oci_client import TenantSession
+
+    session = _subscribe_self(subscribed=(("ap-tokyo-1", "NRT", True), ("ap-osaka-1", "KIX", False)))
+    result = TenantSession.subscribe_region(session, "ap-osaka-1")
+    assert result.ok and result.data["already"] is True
+    assert "region_key" not in captured_subscribe
+
+
+def test_each_failing_step_names_itself():
+    """All three OCI calls can answer 404; an unattributed message cannot be acted on."""
+    from app.oci_client import OperationResult, TenantSession
+
+    session = _subscribe_self()
+    session.list_subscribed_regions = lambda: OperationResult(ok=False, message="[404] EntityNotFound")
+    assert "读取已开通区域失败" in TenantSession.subscribe_region(session, "ap-osaka-1").message
+
+    session = _subscribe_self()
+    session.list_all_regions = lambda: OperationResult(ok=False, message="[404] EntityNotFound")
+    assert "读取区域清单失败" in TenantSession.subscribe_region(session, "ap-osaka-1").message
+
+    session = _subscribe_self()
+    assert "未知区域" in TenantSession.subscribe_region(session, "no-such-region-9").message
+
+
+def test_permission_hint_is_added_to_a_404_from_the_subscribe_call(monkeypatch):
+    pytest.importorskip("oci")
+    import app.oci_client as oci_client
+    from oci.exceptions import ServiceError
+
+    class _Denied:
+        def __init__(self, config, **kwargs):
+            pass
+
+        def create_region_subscription(self, details, tenancy_id):
+            raise ServiceError(404, "EntityNotFound", {}, "Entity not found")
+
+    monkeypatch.setattr(oci_client, "IdentityClient", _Denied)
+    result = oci_client.TenantSession.subscribe_region(_subscribe_self(), "ap-osaka-1")
+    assert result.ok is False
+    assert "KIX" in result.message
+    assert "Administrators" in result.message and "PAYG" in result.message
+
+
 # ---------------------------------------------------------------- API surface
 
 
