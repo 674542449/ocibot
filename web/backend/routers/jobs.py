@@ -22,7 +22,12 @@ from web.backend.db import get_db
 from web.backend.launch_service import normalize_fallback_configs, shape_is_flex
 from web.backend.models import CapacityAttempt, CapacityJob, ScheduleJobRow, ScheduleRun, User
 from web.backend.oci_bridge import get_owned_tenant, get_session_for_row
-from web.backend.quota_guard import enforce_launch_quota, free_only_for_tenant
+from web.backend.quota_guard import (
+    enforce_launch_quota,
+    enforce_secondary_region,
+    free_only_for_tenant,
+    tenant_is_secondary,
+)
 from web.backend.schemas import (
     CapacityAttemptOut,
     CapacityJobCreate,
@@ -99,20 +104,29 @@ def create_capacity_job(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    # Always Free guard — same rules as the launch wizard.
+    # Always Free guard — same rules as the launch wizard, including the 副区 gate
+    # (free caps are home-region only, so there they are replaced not stacked).
     try:
         session = get_session_for_row(tenant)
-        enforce_launch_quota(
+        free_only = free_only_for_tenant(tenant)
+        secondary = enforce_secondary_region(
             session,
-            account_tier=getattr(tenant, "account_tier", "") or "",
-            shape=str(payload.get("shape") or ""),
-            ocpus=payload.get("ocpus"),
-            memory_in_gbs=payload.get("memory_in_gbs"),
-            boot_volume_size_in_gbs=payload.get("boot_volume_size_in_gbs"),
-            boot_volume_vpus_per_gb=payload.get("boot_volume_vpus_per_gb") or 10,
-            fallback_configs=fallback_configs,
-            free_only_mode=free_only_for_tenant(tenant),
+            free_only_mode=free_only,
+            secondary_hint=tenant_is_secondary(tenant),
+            region_hint=tenant.region or "",
         )
+        if not secondary:
+            enforce_launch_quota(
+                session,
+                account_tier=getattr(tenant, "account_tier", "") or "",
+                shape=str(payload.get("shape") or ""),
+                ocpus=payload.get("ocpus"),
+                memory_in_gbs=payload.get("memory_in_gbs"),
+                boot_volume_size_in_gbs=payload.get("boot_volume_size_in_gbs"),
+                boot_volume_vpus_per_gb=payload.get("boot_volume_vpus_per_gb") or 10,
+                fallback_configs=fallback_configs,
+                free_only_mode=free_only,
+            )
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001

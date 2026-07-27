@@ -3951,6 +3951,140 @@ class TenantSession:
         data = getattr(resp, "data", None)
         return getattr(data, "password_expires_after", None) if data is not None else None
 
+    # ------------------------------------------------------------------
+    # Region subscriptions (副区 / secondary regions)
+    # ------------------------------------------------------------------
+    def home_region(self) -> str:
+        """Public accessor for the tenancy's home region name.
+
+        Callers outside this module need it to tell a home-region session from a
+        secondary-region one — Always Free resources exist only in the home
+        region, so anything launched elsewhere is billable.
+        """
+        return self._home_region()
+
+    def list_subscribed_regions(self) -> OperationResult:
+        """Regions this tenancy is already subscribed to (home region first)."""
+        try:
+            subs = self.identity.list_region_subscriptions(self.tenant.tenancy_ocid.strip()).data or []
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=str(exc))
+
+        home = ""
+        regions: list[dict[str, Any]] = []
+        for sub in subs:
+            name = str(getattr(sub, "region_name", "") or "").strip().lower()
+            is_home = bool(getattr(sub, "is_home_region", False))
+            if is_home and name:
+                home = name
+            regions.append(
+                {
+                    "region_name": name,
+                    "region_key": str(getattr(sub, "region_key", "") or "").strip().lower(),
+                    "status": str(getattr(sub, "status", "") or ""),
+                    "is_home_region": is_home,
+                }
+            )
+        regions.sort(key=lambda r: (not r["is_home_region"], r["region_name"]))
+        if home:
+            # Same answer _home_region() would compute; seed its cache for free.
+            self._home_region_name = home
+        return OperationResult(
+            ok=True,
+            message="",
+            data={"home_region": home or self.tenant.region.strip(), "regions": regions},
+        )
+
+    def list_all_regions(self) -> OperationResult:
+        """Every region OCI exposes — the candidate list for 开通副区."""
+        try:
+            items = self.identity.list_regions().data or []
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=str(exc))
+        regions = [
+            {
+                "region_name": str(getattr(r, "name", "") or "").strip().lower(),
+                "region_key": str(getattr(r, "key", "") or "").strip().lower(),
+            }
+            for r in items
+        ]
+        regions = [r for r in regions if r["region_name"]]
+        regions.sort(key=lambda r: r["region_name"])
+        return OperationResult(ok=True, message="", data={"regions": regions})
+
+    def subscribe_region(self, region: str) -> OperationResult:
+        """Subscribe this tenancy to another region.
+
+        ``region`` accepts a region name (``ap-osaka-1``) or its 3-letter key
+        (``kix``). Already-subscribed regions return ok with ``already=True`` so
+        the caller can treat "subscribe" as idempotent.
+
+        Two Oracle constraints shape this:
+          * the call only works against the HOME region endpoint, so it builds a
+            dedicated IdentityClient rather than reusing ``self.identity``;
+          * a subscription cannot be removed once created, which is why the API
+            layer above requires an explicit confirmation.
+        """
+        wanted = (region or "").strip().lower()
+        if not wanted:
+            return OperationResult(ok=False, message="请选择要开通的区域")
+
+        subscribed = self.list_subscribed_regions()
+        if not subscribed.ok:
+            return OperationResult(ok=False, message=subscribed.message or "读取已开通区域失败")
+        for item in (subscribed.data or {}).get("regions") or []:
+            if wanted in {item.get("region_name"), item.get("region_key")}:
+                return OperationResult(
+                    ok=True,
+                    message=f"该区域已开通：{item.get('region_name')}",
+                    data={
+                        "region_name": item.get("region_name") or "",
+                        "region_key": item.get("region_key") or "",
+                        "already": True,
+                    },
+                )
+
+        catalog = self.list_all_regions()
+        if not catalog.ok:
+            return OperationResult(ok=False, message=catalog.message or "读取区域列表失败")
+        match = next(
+            (
+                r
+                for r in (catalog.data or {}).get("regions") or []
+                if wanted in {r.get("region_name"), r.get("region_key")}
+            ),
+            None,
+        )
+        if match is None:
+            return OperationResult(ok=False, message=f"未知区域：{region}")
+
+        try:
+            identity = IdentityClient(
+                self._config_for_region(self._home_region()),
+                retry_strategy=sdk_default_retry_strategy(),
+            )
+            identity.create_region_subscription(
+                oci.identity.models.CreateRegionSubscriptionDetails(region_key=match["region_key"]),
+                self.tenant.tenancy_ocid.strip(),
+            )
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=str(exc))
+        return OperationResult(
+            ok=True,
+            message=f"已提交开通「{match['region_name']}」，Oracle 通常需要几分钟才能创建资源",
+            data={
+                "region_name": match["region_name"],
+                "region_key": match["region_key"],
+                "already": False,
+            },
+        )
+
     def _home_region(self) -> str:
         """Resolve the tenancy's home region name (cached). Falls back to the
         tenant's configured region. Budgets and some Usage API calls only work

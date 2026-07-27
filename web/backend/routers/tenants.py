@@ -10,6 +10,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config_store import TenantConfig
+from app.formatting import region_area
+from web.backend.audit import write_audit
 from web.backend.auth import get_current_user
 from web.backend.crypto_util import encrypt_text
 from web.backend.db import get_db
@@ -18,10 +20,14 @@ from web.backend.models import Tenant, User
 from web.backend.oci_bridge import drop_session, get_owned_tenant, get_session_for_row
 from web.backend.schemas import (
     OciPasswordPolicyOut,
+    RegionSubscribeRequest,
+    RegionSubscribeResult,
     TenantCreate,
     TenantOut,
     TenantParseResult,
     TenantPasteImport,
+    TenantRegionItem,
+    TenantRegionsOut,
     TenantTestResult,
     TenantUpdate,
 )
@@ -46,6 +52,8 @@ def _to_out(row: Tenant) -> TenantOut:
         account_tier=row.account_tier or "",
         budget_monthly_usd=float(row.budget_monthly_usd or 0.0),
         free_only_mode=bool(getattr(row, "free_only_mode", True)),
+        parent_tenant_id=getattr(row, "parent_tenant_id", "") or "",
+        region_label=region_area(row.region or ""),
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -261,6 +269,234 @@ def update_tenant(
     return _to_out(row)
 
 
+def _root_tenant(db: Session, row: Tenant) -> Tenant:
+    """The primary row of this tenancy — 副区 rows hang off it, never off each other."""
+    parent_id = getattr(row, "parent_tenant_id", "") or ""
+    if not parent_id:
+        return row
+    parent = db.get(Tenant, parent_id)
+    return parent if parent is not None and parent.owner_id == row.owner_id else row
+
+
+def _tenancy_rows(db: Session, row: Tenant) -> list[Tenant]:
+    """Every panel row this owner has for the same Oracle tenancy."""
+    return list(
+        db.scalars(
+            select(Tenant).where(
+                Tenant.owner_id == row.owner_id,
+                Tenant.tenancy_ocid == row.tenancy_ocid,
+            )
+        ).all()
+    )
+
+
+@router.get("/{tenant_id}/regions", response_model=TenantRegionsOut)
+def list_tenant_regions(
+    tenant_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> TenantRegionsOut:
+    """Subscribed regions (副区) plus the regions still available to subscribe.
+
+    Hits Oracle, so it is only called when the user opens the 副区 panel — the
+    tenant list itself stays offline like the rest of the app.
+    """
+    try:
+        row = get_owned_tenant(db, user.id, tenant_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    try:
+        session = get_session_for_row(row)
+        subscribed_result = session.list_subscribed_regions()
+    except Exception as exc:  # noqa: BLE001
+        return TenantRegionsOut(ok=False, message=f"读取已开通区域失败：{exc}")
+    if not subscribed_result.ok:
+        return TenantRegionsOut(ok=False, message=subscribed_result.message or "读取已开通区域失败")
+
+    sub_data = subscribed_result.data if isinstance(subscribed_result.data, dict) else {}
+    home_region = str(sub_data.get("home_region") or row.region or "")
+    # region name -> panel row that already manages it
+    rows_by_region = {
+        (r.region or "").strip().lower(): r for r in _tenancy_rows(db, row)
+    }
+
+    subscribed: list[TenantRegionItem] = []
+    subscribed_names: set[str] = set()
+    for item in sub_data.get("regions") or []:
+        name = str(item.get("region_name") or "")
+        subscribed_names.add(name)
+        existing = rows_by_region.get(name)
+        subscribed.append(
+            TenantRegionItem(
+                region_name=name,
+                region_key=str(item.get("region_key") or ""),
+                region_label=region_area(name),
+                is_home_region=bool(item.get("is_home_region")),
+                status=str(item.get("status") or ""),
+                subscribed=True,
+                tenant_id=existing.id if existing is not None else "",
+            )
+        )
+
+    available: list[TenantRegionItem] = []
+    message = ""
+    try:
+        catalog = session.list_all_regions()
+    except Exception as exc:  # noqa: BLE001
+        catalog = None
+        message = f"区域清单读取失败：{exc}"
+    if catalog is not None and catalog.ok:
+        for item in (catalog.data if isinstance(catalog.data, dict) else {}).get("regions") or []:
+            name = str(item.get("region_name") or "")
+            if not name or name in subscribed_names:
+                continue
+            available.append(
+                TenantRegionItem(
+                    region_name=name,
+                    region_key=str(item.get("region_key") or ""),
+                    region_label=region_area(name),
+                    subscribed=False,
+                )
+            )
+    elif catalog is not None:
+        message = catalog.message or "区域清单读取失败"
+
+    return TenantRegionsOut(
+        ok=True,
+        message=message,
+        home_region=home_region,
+        subscribed=subscribed,
+        available=available,
+    )
+
+
+@router.post("/{tenant_id}/regions/subscribe", response_model=RegionSubscribeResult)
+def subscribe_tenant_region(
+    tenant_id: str,
+    body: RegionSubscribeRequest,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> RegionSubscribeResult:
+    """开通副区: subscribe the tenancy to another region and add a panel row for it.
+
+    Idempotent by design — an already-subscribed region skips the Oracle mutation
+    and only adds the missing panel row, which is the normal path for someone who
+    subscribed in the Oracle console first.
+
+    The new row is created with ``free_only_mode`` off: Always Free exists only in
+    the home region, so every instance in a 副区 is billable and leaving the
+    free-cap guard armed would refuse every launch there. ``confirm`` is the user's
+    acknowledgement of both that cost and the fact that Oracle cannot un-subscribe
+    a region.
+    """
+    try:
+        row = get_owned_tenant(db, user.id, tenant_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="请先确认：副区一经开通无法取消，且副区资源不属于免费额度")
+
+    wanted = body.region.strip().lower()
+    # A 副区 row created by this endpoint only exists because the subscription
+    # succeeded, so a repeat click (or a click while Oracle is still reporting the
+    # brand-new subscription as pending) must not fire a second create_region_subscription.
+    linked = next(
+        (
+            r
+            for r in _tenancy_rows(db, row)
+            if (r.region or "").strip().lower() == wanted and (r.parent_tenant_id or "")
+        ),
+        None,
+    )
+    if linked is not None:
+        return RegionSubscribeResult(
+            ok=True,
+            message=f"该副区已开通并已在面板中：{linked.name}",
+            region_name=wanted,
+            already_subscribed=True,
+            tenant=_to_out(linked),
+        )
+
+    try:
+        session = get_session_for_row(row)
+        result = session.subscribe_region(wanted)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"开通副区失败：{exc}") from exc
+    if not result.ok:
+        write_audit(
+            db,
+            owner_id=user.id,
+            action="tenant.region.subscribe",
+            target=f"{row.name}:{wanted}",
+            detail={"ok": False, "message": result.message},
+        )
+        return RegionSubscribeResult(ok=False, message=result.message or "开通副区失败")
+
+    data = result.data if isinstance(result.data, dict) else {}
+    region_name = str(data.get("region_name") or wanted)
+    already = bool(data.get("already"))
+    message = result.message or ""
+
+    tenant_out = None
+    if body.add_tenant:
+        parent = _root_tenant(db, row)
+        existing = next(
+            (
+                r
+                for r in _tenancy_rows(db, row)
+                if (r.region or "").strip().lower() == region_name
+            ),
+            None,
+        )
+        if existing is not None:
+            tenant_out = _to_out(existing)
+            message += f"；面板中已有该区域租户「{existing.name}」"
+        else:
+            label = region_area(region_name)
+            child = Tenant(
+                owner_id=user.id,
+                name=f"{parent.name} · {label}",
+                user_ocid=parent.user_ocid,
+                tenancy_ocid=parent.tenancy_ocid,
+                fingerprint=parent.fingerprint,
+                region=region_name,
+                # Compartment OCIDs are tenancy-wide, so the parent's still applies.
+                compartment_ocid=parent.compartment_ocid or "",
+                parent_tenant_id=parent.id,
+                description=f"{parent.name} 的副区（{region_name}）· 资源按量计费",
+                enabled=True,
+                color=parent.color or "#3B82F6",
+                private_key_encrypted=parent.private_key_encrypted,
+                account_tier=parent.account_tier or "",
+                free_only_mode=False,
+            )
+            db.add(child)
+            db.commit()
+            db.refresh(child)
+            tenant_out = _to_out(child)
+            message += f"；已添加副区租户「{child.name}」"
+
+    write_audit(
+        db,
+        owner_id=user.id,
+        action="tenant.region.subscribe",
+        target=f"{row.name}:{region_name}",
+        detail={
+            "ok": True,
+            "already_subscribed": already,
+            "tenant_id": tenant_out.id if tenant_out else "",
+        },
+    )
+    return RegionSubscribeResult(
+        ok=True,
+        message=message,
+        region_name=region_name,
+        already_subscribed=already,
+        tenant=tenant_out,
+    )
+
+
 @router.get("/{tenant_id}/oci-password-policy", response_model=OciPasswordPolicyOut)
 def get_oci_password_policy(
     tenant_id: str,
@@ -318,12 +554,25 @@ def delete_tenant(
         row = get_owned_tenant(db, user.id, tenant_id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    drop_session(row.id)
-    # The launch-meta cache keyed on this tenant would otherwise be retained until
-    # its TTL expired (clear_launch_meta_cache had no callers at all).
-    clear_launch_meta_cache(row.id)
-    db.delete(row)
+    # 副区 rows share this row's credentials and would be left pointing at a tenant
+    # the user can no longer edit, so they go with it.
+    children = list(
+        db.scalars(
+            select(Tenant).where(
+                Tenant.owner_id == user.id,
+                Tenant.parent_tenant_id == row.id,
+            )
+        ).all()
+    )
+    for target in [*children, row]:
+        drop_session(target.id)
+        # The launch-meta cache keyed on this tenant would otherwise be retained until
+        # its TTL expired (clear_launch_meta_cache had no callers at all).
+        clear_launch_meta_cache(target.id)
+        db.delete(target)
     db.commit()
+    if children:
+        return {"message": f"已删除（含 {len(children)} 个副区）"}
     return {"message": "已删除"}
 
 

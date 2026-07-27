@@ -31,12 +31,19 @@
           <tr v-if="tenants.length === 0">
             <td colspan="6" class="muted">还没有租户，点击右上角添加，或粘贴原始 API 配置。</td>
           </tr>
-          <tr v-for="t in tenants" :key="t.id">
+          <tr v-for="t in orderedTenants" :key="t.id" :class="{ 'sub-row': !!t.parent_tenant_id }">
             <td>
+              <span v-if="t.parent_tenant_id" class="muted sub-tree">└</span>
               <span class="dot" :style="{ background: t.color }"></span>
               {{ t.name }}
+              <span v-if="t.parent_tenant_id" class="badge sub-badge">副区</span>
             </td>
-            <td>{{ t.region }}</td>
+            <td>
+              {{ t.region }}
+              <span v-if="t.region_label && t.region_label !== t.region" class="muted">
+                · {{ t.region_label }}
+              </span>
+            </td>
             <td>{{ tierLabel(t.account_tier) }}</td>
             <td class="muted" style="font-size: 12px; word-break: break-all">
               {{ shortId(t.tenancy_ocid) }}
@@ -45,11 +52,22 @@
               <span class="badge" :class="t.enabled ? 'running' : 'stopped'">
                 {{ t.enabled ? '启用' : '禁用' }}
               </span>
+              <span v-if="!t.free_only_mode" class="badge warn" title="超出 Always Free 不再拦截">
+                允许计费
+              </span>
             </td>
             <td>
               <div class="row">
                 <button :disabled="busy === t.id" @click="test(t)">测试连接</button>
                 <button :disabled="busy === t.id" @click="detectTier(t)">识别等级</button>
+                <button
+                  v-if="!t.parent_tenant_id"
+                  :disabled="busy === t.id"
+                  title="查看 / 开通该账号的其他国家区域（副区）"
+                  @click="openRegions(t)"
+                >
+                  副区管理
+                </button>
                 <button
                   :disabled="busy === t.id"
                   title="调用 Oracle Identity Domain API，把控制台强制改密周期改为不强制"
@@ -64,6 +82,86 @@
           </tr>
         </tbody>
       </table>
+    </div>
+
+    <!-- 副区 (secondary regions) -->
+    <div v-if="regionsFor" class="card stack">
+      <div class="row" style="justify-content: space-between; align-items: baseline">
+        <h3 style="margin: 0">副区管理 · {{ regionsFor.name }}</h3>
+        <button type="button" @click="closeRegions">关闭</button>
+      </div>
+      <p class="muted" style="margin: 0; font-size: 13px">
+        副区 = 同一个 Oracle 账号订阅的其他国家 / 地区。开通后面板会自动添加一个同凭据的副区租户，
+        实例、存储、WebSSH、创建实例等页面都可直接选它。
+      </p>
+      <p class="warn-text" style="margin: 0; font-size: 13px">
+        ⚠ 两点务必知悉：① Oracle <strong>无法取消</strong>已开通的区域；
+        ② <strong>Always Free 只存在于主区</strong>，副区里创建的实例（包括 A1.Flex）都会按量计费，
+        因此副区租户默认为「允许超额计费」。免费账号通常没有开通副区的权限。
+      </p>
+
+      <div v-if="regionsLoading" class="muted">正在读取区域…</div>
+      <div v-else-if="regionsError" class="error-box">{{ regionsError }}</div>
+      <template v-else-if="regions">
+        <div class="field">
+          <label>已开通区域（主区 {{ regions.home_region || '—' }}）</label>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>区域</th>
+                  <th>状态</th>
+                  <th>面板</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="r in regions.subscribed" :key="r.region_name">
+                  <td>
+                    {{ r.region_name }}
+                    <span class="muted">· {{ r.region_label }}</span>
+                    <span v-if="r.is_home_region" class="badge">主区</span>
+                  </td>
+                  <td class="muted">{{ r.status || '—' }}</td>
+                  <td>
+                    <span v-if="r.tenant_id" class="badge running">已添加</span>
+                    <button
+                      v-else
+                      type="button"
+                      :disabled="regionBusy !== ''"
+                      @click="subscribeRegion(r.region_name, true)"
+                    >
+                      添加到面板
+                    </button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="field">
+          <label>开通新的副区</label>
+          <div class="row">
+            <select v-model="regionToAdd" style="min-width: 16rem">
+              <option value="">选择区域</option>
+              <option v-for="r in regions.available" :key="r.region_name" :value="r.region_name">
+                {{ r.region_name }} · {{ r.region_label }}
+              </option>
+            </select>
+            <button
+              class="primary"
+              type="button"
+              :disabled="!regionToAdd || regionBusy !== ''"
+              @click="subscribeRegion(regionToAdd, false)"
+            >
+              {{ regionBusy ? '提交中…' : '开通并添加' }}
+            </button>
+          </div>
+          <p v-if="regions.message" class="muted" style="margin: 0.35rem 0 0; font-size: 12px">
+            {{ regions.message }}
+          </p>
+        </div>
+      </template>
     </div>
 
     <!-- Create: paste-first -->
@@ -260,8 +358,8 @@ key_file=~/.oci/oci_api_key.pem"
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
-import api, { type Tenant } from '@/api/client'
+import { computed, onMounted, reactive, ref } from 'vue'
+import api, { type Tenant, type TenantRegions } from '@/api/client'
 import { pickAndReadTextFile } from '@/utils/file'
 
 type ParsePreview = {
@@ -310,6 +408,27 @@ const form = reactive({
   description: '',
   budget_monthly_usd: 0,
   free_only_mode: true,
+})
+
+const regionsFor = ref<Tenant | null>(null)
+const regions = ref<TenantRegions | null>(null)
+const regionsLoading = ref(false)
+const regionsError = ref('')
+const regionBusy = ref('')
+const regionToAdd = ref('')
+
+/** Primaries in name order, each immediately followed by its 副区 rows. */
+const orderedTenants = computed(() => {
+  const primaries = tenants.value.filter((t) => !t.parent_tenant_id)
+  const out: Tenant[] = []
+  for (const p of primaries) {
+    out.push(p)
+    out.push(...tenants.value.filter((c) => c.parent_tenant_id === p.id))
+  }
+  // Orphans (parent deleted out-of-band) must still be listed, not silently hidden.
+  const seen = new Set(out.map((t) => t.id))
+  out.push(...tenants.value.filter((t) => !seen.has(t.id)))
+  return out
 })
 
 function tierLabel(t: string) {
@@ -532,6 +651,71 @@ async function saveManual() {
   }
 }
 
+function closeRegions() {
+  regionsFor.value = null
+  regions.value = null
+  regionsError.value = ''
+  regionToAdd.value = ''
+}
+
+async function openRegions(t: Tenant) {
+  regionsFor.value = t
+  regions.value = null
+  regionsError.value = ''
+  regionToAdd.value = ''
+  regionsLoading.value = true
+  try {
+    const { data } = await api.get<TenantRegions>(`/tenants/${t.id}/regions`)
+    if (!data.ok) {
+      regionsError.value = data.message || '读取区域失败'
+      return
+    }
+    regions.value = data
+  } catch (e: any) {
+    regionsError.value = e?.message || '读取区域失败'
+  } finally {
+    regionsLoading.value = false
+  }
+}
+
+/**
+ * Subscribe (or, when `alreadySubscribed`, just add the panel row for) one region.
+ * The server is idempotent about the Oracle side, so both cases hit one endpoint.
+ */
+async function subscribeRegion(region: string, alreadySubscribed: boolean) {
+  const t = regionsFor.value
+  if (!t || !region) return
+  const question = alreadySubscribed
+    ? `把已开通区域「${region}」添加为面板租户？\n\n` +
+      `会用「${t.name}」的同一份 API 凭据创建一个副区租户。\n` +
+      `注意：Always Free 只在主区生效，副区资源按量计费，因此该租户默认允许计费。`
+    : `为「${t.name}」开通区域「${region}」？\n\n` +
+      `① Oracle 开通后无法取消；\n` +
+      `② 副区不属于 Always Free，其中的实例（含 A1.Flex）都会产生费用；\n` +
+      `③ 面板会自动添加对应的副区租户（默认允许计费）。`
+  if (!confirm(question)) return
+  error.value = ''
+  msg.value = ''
+  regionBusy.value = region
+  try {
+    const { data } = await api.post<{ ok: boolean; message: string }>(
+      `/tenants/${t.id}/regions/subscribe`,
+      { region, confirm: true, add_tenant: true },
+    )
+    if (data.ok) {
+      msg.value = data.message || '已开通'
+      await load()
+      await openRegions(t)
+    } else {
+      error.value = data.message || '开通副区失败'
+    }
+  } catch (e: any) {
+    error.value = e?.message || '开通副区失败'
+  } finally {
+    regionBusy.value = ''
+  }
+}
+
 async function test(t: Tenant) {
   error.value = ''
   msg.value = ''
@@ -596,12 +780,19 @@ async function disableOciPasswordExpiry(t: Tenant) {
 }
 
 async function remove(t: Tenant) {
-  if (!confirm(`删除租户「${t.name}」？`)) return
+  // Children share this row's credentials, so the server deletes them with it.
+  const children = tenants.value.filter((c) => c.parent_tenant_id === t.id)
+  const extra = children.length
+    ? `\n\n同时会删除它的 ${children.length} 个副区租户：${children.map((c) => c.region).join('、')}\n` +
+      `（仅移出面板，不会删除 Oracle 上的区域订阅或实例）`
+    : ''
+  if (!confirm(`删除租户「${t.name}」？${extra}`)) return
   error.value = ''
   busy.value = t.id
   try {
-    await api.delete(`/tenants/${t.id}`)
-    msg.value = '已删除'
+    const { data } = await api.delete<{ message: string }>(`/tenants/${t.id}`)
+    msg.value = data?.message || '已删除'
+    if (regionsFor.value?.id === t.id) closeRegions()
     await load()
   } catch (e: any) {
     error.value = e?.message || '删除失败'
@@ -653,6 +844,18 @@ onMounted(async () => {
   border-top: 1px solid var(--border);
   padding-top: 0.85rem;
   margin-top: 0.25rem;
+}
+.warn-text {
+  color: var(--warn);
+}
+.sub-row td:first-child {
+  padding-left: 0.35rem;
+}
+.sub-tree {
+  margin-right: 0.15rem;
+}
+.sub-badge {
+  margin-left: 0.35rem;
 }
 code {
   font-size: 12px;

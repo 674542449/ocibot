@@ -60,8 +60,32 @@ export type Tenant = {
   account_tier: string
   budget_monthly_usd: number
   free_only_mode: boolean
+  /** '' on a primary tenant; the primary's id on a 副区 (secondary region) row. */
+  parent_tenant_id: string
+  /** Localized region name, e.g. 大阪. */
+  region_label: string
   created_at: string
   updated_at: string
+}
+
+/** One region in the 副区 picker. */
+export type TenantRegion = {
+  region_name: string
+  region_key: string
+  region_label: string
+  is_home_region: boolean
+  status: string
+  subscribed: boolean
+  /** Panel tenant row managing this region ('' = not added yet). */
+  tenant_id: string
+}
+
+export type TenantRegions = {
+  ok: boolean
+  message: string
+  home_region: string
+  subscribed: TenantRegion[]
+  available: TenantRegion[]
 }
 
 /** Oracle Identity Domain password-policy mutation result. */

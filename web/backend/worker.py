@@ -450,10 +450,25 @@ class Worker:
         # unreadable quota does not burn attempts during an Oracle API outage.
         tier = getattr(tenant, "account_tier", "") or ""
         pre_snapshot: Optional[dict[str, Any]] = None
+        # A 副区 job has no Always Free allowance to check against — the caps are
+        # home-region only and the per-region snapshot would read as empty
+        # headroom. The API refused to enqueue it unless the tenant opted into
+        # billing, so the free-cap machinery is skipped for the whole attempt.
+        secondary_region = False
+        try:
+            from web.backend.quota_guard import is_secondary_region, tenant_is_secondary
+
+            secondary_region = tenant_is_secondary(tenant) or is_secondary_region(session)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("capacity region probe job=%s failed: %s", job.id, exc)
         try:
             from web.backend.quota_guard import free_only_for_tenant, usage_snapshot
 
-            if hasattr(session, "get_free_quota_usage") and free_only_for_tenant(tenant):
+            if (
+                not secondary_region
+                and hasattr(session, "get_free_quota_usage")
+                and free_only_for_tenant(tenant)
+            ):
                 snapshot = usage_snapshot(session, free_only_mode=True)
                 pre_snapshot = snapshot
                 if snapshot.get("read_incomplete"):
@@ -492,7 +507,9 @@ class Worker:
         try:
             from web.backend.quota_guard import check_launch_quota
 
-            if not hasattr(session, "get_free_quota_usage"):
+            if secondary_region:
+                log.info("capacity quota check skipped job=%s (副区，按量计费)", job.id)
+            elif not hasattr(session, "get_free_quota_usage"):
                 log.warning("capacity quota check skipped job=%s (no get_free_quota_usage)", job.id)
             else:
                 guard = check_launch_quota(

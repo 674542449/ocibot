@@ -55,8 +55,12 @@
       </p>
       <div v-if="quotaPreview" class="card" style="padding: 0.65rem; font-size: 12px">
         <div class="row" style="justify-content: space-between">
-          <strong>免费额度预览</strong>
-          <span class="badge" :class="quotaPreview.overall_status === 'ok' ? 'running' : 'warn'">
+          <strong>{{ quotaPreview.secondary_region ? '副区（按量计费）' : '免费额度预览' }}</strong>
+          <span
+            v-if="!quotaPreview.secondary_region"
+            class="badge"
+            :class="quotaPreview.overall_status === 'ok' ? 'running' : 'warn'"
+          >
             {{ quotaPreview.overall_status || '—' }}
           </span>
         </div>
@@ -82,15 +86,37 @@
       <div class="grid-2">
         <div class="field">
           <label>租户 *</label>
-          <select v-model="tenantId" @change="onTenantPicked">
+          <select v-model="primaryId" @change="onTenantPicked">
             <option disabled value="">选择租户</option>
-            <option v-for="t in tenants" :key="t.id" :value="t.id">{{ t.name }} · {{ t.region }}</option>
+            <option v-for="t in primaryTenants" :key="t.id" :value="t.id">
+              {{ t.name }} · {{ t.region }}
+            </option>
           </select>
+        </div>
+        <div class="field">
+          <label>区域（主区 / 副区）</label>
+          <select v-model="tenantId" :disabled="!primaryId" @change="onRegionPicked">
+            <option v-for="t in regionRows" :key="t.id" :value="t.id">
+              {{ t.region }}{{ t.region_label && t.region_label !== t.region ? ' · ' + t.region_label : '' }}
+              {{ t.parent_tenant_id ? '（副区）' : '（主区）' }}
+            </option>
+          </select>
+          <p class="field-hint">
+            副区需先在「租户」页开通。Always Free 只在主区生效，副区实例按量计费。
+          </p>
         </div>
         <div class="field">
           <label>显示名称</label>
           <input v-model="form.display_name" />
         </div>
+      </div>
+
+      <div v-if="isSecondaryRegion" class="card warn-panel">
+        <strong>已选择副区 {{ selectedTenant?.region }}</strong>
+        <p class="muted" style="margin: 0.25rem 0 0; font-size: 12px">
+          该区域不属于 Always Free：这里创建的实例（包括 A1.Flex）会按量计费，免费额度面板也不适用。
+          若该副区租户仍勾选着「仅使用免费额度」，服务端会拒绝创建。
+        </p>
       </div>
 
       <div class="row" style="margin-top: -0.25rem">
@@ -105,7 +131,12 @@
         <span v-if="!meta && tenantId" class="muted" style="font-size: 12px">
           为减少 API 调用，进入本页不会自动拉取租户元数据
         </span>
-        <button type="button" :disabled="!tenantId || loadingQuota" @click="loadQuotaPreview">
+        <button
+          v-if="!isSecondaryRegion"
+          type="button"
+          :disabled="!tenantId || loadingQuota"
+          @click="loadQuotaPreview"
+        >
           {{ loadingQuota ? '读取额度中…' : '刷新免费额度' }}
         </button>
       </div>
@@ -113,15 +144,18 @@
       <!-- Account free-tier usage, visible while configuring (not only at confirm). -->
       <div v-if="quotaPreview" class="card quota-panel">
         <div class="row" style="justify-content: space-between; align-items: baseline">
-          <strong>该账号 Always Free 已用额度</strong>
+          <strong v-if="quotaPreview.secondary_region">副区额度说明</strong>
+          <strong v-else>该账号 Always Free 已用额度</strong>
           <span class="row" style="gap: 0.4rem; align-items: center">
-            <span v-if="quotaPreview.account_tier" class="badge">
-              {{ quotaPreview.account_tier === 'paid' ? '付费账号' : '免费账号' }}
-            </span>
-            <span
-              class="badge"
-              :class="quotaPreview.overall_status === 'ok' ? 'running' : 'warn'"
-            >{{ quotaStatusLabel(quotaPreview.overall_status) }}</span>
+            <template v-if="!quotaPreview.secondary_region">
+              <span v-if="quotaPreview.account_tier" class="badge">
+                {{ quotaPreview.account_tier === 'paid' ? '付费账号' : '免费账号' }}
+              </span>
+              <span
+                class="badge"
+                :class="quotaPreview.overall_status === 'ok' ? 'running' : 'warn'"
+              >{{ quotaStatusLabel(quotaPreview.overall_status) }}</span>
+            </template>
             <span class="badge" :class="freeOnly ? 'running' : 'warn'">
               {{ freeOnly ? '仅免费额度' : '允许超额计费' }}
             </span>
@@ -130,7 +164,13 @@
         <p v-if="quotaPreview.read_incomplete" class="muted warn-text" style="margin: 0.3rem 0 0; font-size: 12px">
           ⚠ 用量读取不完整（Oracle API 报错或限流），下列数字可能偏低，提交时服务端会拒绝创建。
         </p>
-        <div class="quota-grid">
+        <!-- A 副区 has no free allowance of its own, so per-region gauges would be
+             read as free headroom that does not exist. -->
+        <p v-if="quotaPreview.secondary_region" class="muted warn-text" style="margin: 0.3rem 0 0; font-size: 12px">
+          副区 {{ quotaPreview.region }} 不适用 Always Free 额度（主区 {{ quotaPreview.home_region }}），
+          此处资源按量计费。
+        </p>
+        <div v-else class="quota-grid">
           <div v-for="q in quotaRows" :key="q.key" class="quota-item">
             <div class="quota-label">{{ q.label }}</div>
             <div class="quota-bar">
@@ -420,6 +460,14 @@ const route = useRoute()
 const router = useRouter()
 
 const tenants = ref<Tenant[]>([])
+/** Selected primary tenant (the 租户 dropdown). */
+const primaryId = ref('')
+/**
+ * The tenant row every request actually uses. For the home region that is the
+ * primary itself; for a 副区 it is the linked secondary-region row, which carries
+ * its own OCI region — sessions are bound to one region, so switching region means
+ * switching row.
+ */
 const tenantId = ref('')
 const meta = ref<any>(null)
 const loadingMeta = ref(false)
@@ -453,6 +501,22 @@ const freeOnly = computed(() => {
   return t ? t.free_only_mode !== false : true
 })
 const loadingQuota = ref(false)
+
+/** Rows shown in the 租户 dropdown. A 副区 whose primary is missing (disabled, or
+ *  restored from a backup without it) is listed on its own rather than hidden. */
+const primaryTenants = computed(() =>
+  tenants.value.filter(
+    (t) => !t.parent_tenant_id || !tenants.value.some((p) => p.id === t.parent_tenant_id),
+  ),
+)
+/** The selected primary plus its 副区 rows — the 区域 dropdown. */
+const regionRows = computed(() => {
+  const primary = tenants.value.find((t) => t.id === primaryId.value)
+  if (!primary) return []
+  return [primary, ...tenants.value.filter((t) => t.parent_tenant_id === primary.id)]
+})
+const selectedTenant = computed(() => tenants.value.find((t) => t.id === tenantId.value))
+const isSecondaryRegion = computed(() => !!selectedTenant.value?.parent_tenant_id)
 
 const QUOTA_ROWS: { key: string; label: string; unit: string }[] = [
   { key: 'a1_ocpu', label: 'A1.Flex OCPU', unit: '' },
@@ -588,8 +652,12 @@ async function loadTenants() {
   const { data } = await api.get<Tenant[]>('/tenants')
   tenants.value = data.filter((t) => t.enabled)
   const q = String(route.query.tenant || '')
-  if (q && tenants.value.some((t) => t.id === q)) tenantId.value = q
-  else if (tenants.value[0]) tenantId.value = tenants.value[0].id
+  // ?tenant= may name a 副区 row; select its primary so both dropdowns agree.
+  const wanted = tenants.value.find((t) => t.id === q) || primaryTenants.value[0]
+  if (!wanted) return
+  const parentListed = tenants.value.some((p) => p.id === wanted.parent_tenant_id)
+  primaryId.value = parentListed ? wanted.parent_tenant_id : wanted.id
+  tenantId.value = wanted.id
 }
 
 let metaSeq = 0
@@ -771,6 +839,12 @@ const confirmRows = computed(() => {
         : 'root 密码（将自动生成）'
   return [
     ['租户', tenant ? `${tenant.name} · ${tenant.region}` : tenantId.value],
+    [
+      '区域',
+      tenant
+        ? `${tenant.region}${isSecondaryRegion.value ? '（副区 · 按量计费）' : '（主区）'}`
+        : '—',
+    ],
     ['显示名称', form.display_name || '—'],
     ['AD', form.availability_domain || '—'],
     ['镜像', img?.label || img?.display_name || form.image_id || '—'],
@@ -845,6 +919,11 @@ async function checkQuotaForForm(): Promise<boolean> {
         remaining: data.remaining,
         buckets: data.buckets,
         summary_lines: data.summary_lines,
+        // Carried through so the panel shows the 副区 note instead of four
+        // all-zero gauges that would read as free headroom.
+        secondary_region: data.secondary_region,
+        region: data.region,
+        home_region: data.home_region,
       }
     }
     return !data?.blocked
@@ -971,6 +1050,12 @@ async function doLaunch() {
 }
 
 function onTenantPicked() {
+  // Switching tenant resets the region to that tenant's own (home) region.
+  tenantId.value = primaryId.value
+  onRegionPicked()
+}
+
+function onRegionPicked() {
   // Clear previous tenant's meta so we never create with stale AD/image/shape.
   meta.value = null
   form.availability_domain = ''
@@ -980,6 +1065,17 @@ function onTenantPicked() {
   quotaPreview.value = null
   quotaVerdict.value = null
   quotaLoadError.value = ''
+  if (isSecondaryRegion.value) {
+    // A 副区 has no Always Free allowance, so the (expensive) usage enumeration
+    // would only produce numbers that must not be read as free headroom.
+    quotaPreview.value = {
+      secondary_region: true,
+      region: selectedTenant.value?.region || '',
+      home_region: regionRows.value[0]?.region || '',
+      buckets: {},
+    }
+    return
+  }
   // Usage is one cheap-ish read and it is the whole point of the panel, so fetch
   // it on selection; the heavier image/shape/network metadata still waits for the
   // explicit 「加载配置」 click.
@@ -1008,6 +1104,10 @@ onMounted(async () => {
 }
 .quota-panel {
   padding: 0.7rem 0.8rem;
+}
+.warn-panel {
+  padding: 0.6rem 0.8rem;
+  border-color: var(--warn);
 }
 .quota-grid {
   display: grid;

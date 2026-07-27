@@ -59,6 +59,12 @@ class Tenant(Base):
     fingerprint: Mapped[str] = mapped_column(String(128), nullable=False, default="")
     region: Mapped[str] = mapped_column(String(64), nullable=False, default="ap-tokyo-1")
     compartment_ocid: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    # Set on a 副区 (secondary-region) row: the id of the primary tenant whose
+    # credentials it reuses. Empty on primary rows. A secondary region is modelled
+    # as its own tenant row rather than a per-request region override so that every
+    # existing per-tenant page (instances, storage, WebSSH, jobs, quota) works there
+    # unchanged — an OCI session is bound to exactly one region.
+    parent_tenant_id: Mapped[str] = mapped_column(String(36), nullable=False, default="")
     description: Mapped[str] = mapped_column(String(512), nullable=False, default="")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     color: Mapped[str] = mapped_column(String(32), default="#3B82F6")

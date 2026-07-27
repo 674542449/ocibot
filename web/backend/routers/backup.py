@@ -77,6 +77,9 @@ def export_encrypted_zip(
                 "account_tier": row.account_tier or "",
                 "budget_monthly_usd": float(row.budget_monthly_usd or 0.0),
                 "free_only_mode": bool(getattr(row, "free_only_mode", True)),
+                # 副区 link. Ids are reissued on restore, so it is remapped there
+                # via the exported "id" above.
+                "parent_tenant_id": getattr(row, "parent_tenant_id", "") or "",
             }
         )
     content = json.dumps({"version": 1, "tenants": tenants_payload}, ensure_ascii=False, indent=2).encode(
@@ -191,9 +194,15 @@ def import_encrypted_zip(
         return max(0, min(value, 36500))
 
     imported_ids: list[str] = []
+    # archive id -> newly issued row id, so 副区 rows can be re-linked to their
+    # primary after every row exists (ids are reissued, never restored as-is).
+    id_map: dict[str, str] = {}
+    parent_of: dict[str, str] = {}
     for item in items:
         if not isinstance(item, dict):
             continue
+        archive_id = str(item.get("id") or "")
+        archive_parent = str(item.get("parent_tenant_id") or "")
         # Never honor attacker-chosen owner/id from the archive.
         item.pop("owner_id", None)
         # Validate via TenantConfig
@@ -248,6 +257,19 @@ def import_encrypted_zip(
         db.add(row)
         db.flush()
         imported_ids.append(row.id)
+        if archive_id:
+            id_map[archive_id] = row.id
+        if archive_parent:
+            parent_of[row.id] = archive_parent
+
+    # Second pass: a 副区 whose primary is missing from the archive stays unlinked
+    # rather than pointing at a row that does not exist.
+    for child_id, archive_parent in parent_of.items():
+        new_parent = id_map.get(archive_parent, "")
+        if new_parent and new_parent != child_id:
+            child = db.get(Tenant, child_id)
+            if child is not None:
+                child.parent_tenant_id = new_parent
 
     db.commit()
     write_audit(

@@ -2,11 +2,88 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 
 from fastapi import HTTPException
 
 from app import free_quota
+
+# An OCI region id: realm-city-index, e.g. ap-tokyo-1 / eu-frankfurt-1.
+_REGION_ID = re.compile(r"^[a-z]{2,3}-[a-z]+-\d+$")
+
+
+def region_pair(session: Any) -> tuple[str, str]:
+    """``(session_region, home_region)`` — both "" unless BOTH look like real region ids.
+
+    Deliberately strict: callers use a mismatch to decide that a launch is
+    billable, so an unreadable or stubbed value must fall back to "treat as home
+    region" rather than block every launch.
+    """
+    try:
+        current = str(getattr(getattr(session, "tenant", None), "region", "") or "").strip().lower()
+        home = str(session.home_region() or "").strip().lower()
+    except Exception:  # noqa: BLE001
+        return "", ""
+    if not _REGION_ID.match(current) or not _REGION_ID.match(home):
+        return "", ""
+    return current, home
+
+
+def tenant_is_secondary(row: Any) -> bool:
+    """True for a 副区 tenant row (one created by 开通副区, linked to a primary).
+
+    Second, independent signal to ``region_pair``: it holds even when the Oracle
+    region-subscription read fails, which is the case where the probe alone would
+    fall back to "home region" and let the free-cap guard run on a region whose
+    usage is not the tenancy's.
+    """
+    return bool(getattr(row, "parent_tenant_id", "") or "")
+
+
+def is_secondary_region(session: Any) -> bool:
+    """True when this session targets a 副区 rather than the tenancy's home region."""
+    current, home = region_pair(session)
+    return bool(current and home and current != home)
+
+
+def enforce_secondary_region(
+    session: Any,
+    *,
+    free_only_mode: bool,
+    secondary_hint: bool = False,
+    region_hint: str = "",
+) -> str:
+    """Gate a create in a 副区. Returns a warning to surface, or raises HTTP 400.
+
+    Always Free resources exist **only in the tenancy's home region** — Oracle
+    bills everything created in a subscribed secondary region, whatever the shape
+    is called. The per-region usage snapshot cannot see that: read from a fresh
+    副区 it reports zero A1 usage and would happily wave through a second
+    "free" 4 OCPU / 24 GB machine on top of the home region's.
+
+    So the tenant's explicit ``free_only_mode`` flag decides, exactly as it does
+    for oversized configurations: on = refuse, off = allow with a billing warning.
+
+    ``secondary_hint`` / ``region_hint`` let a caller add what the DB already
+    knows (see ``tenant_is_secondary``) so the verdict does not depend on an OCI
+    read succeeding.
+    """
+    current, home = region_pair(session)
+    if not secondary_hint and (not current or current == home):
+        return ""
+    region_text = current or (region_hint or "").strip() or "副区"
+    home_text = home or "主区"
+    if free_only_mode:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"副区「{region_text}」不在 Always Free 范围内，创建的资源会按量计费。"
+                f"（主区为 {home_text}）如确需在副区创建，请先在「租户」页取消该副区租户的"
+                "「仅使用免费额度」勾选。"
+            ),
+        )
+    return f"副区「{region_text}」不属于 Always Free（主区 {home_text}），该实例会按量计费"
 
 
 def free_only_for_tenant(row: Any) -> bool:

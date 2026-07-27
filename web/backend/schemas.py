@@ -152,10 +152,55 @@ class TenantOut(BaseModel):
     account_tier: str
     budget_monthly_usd: float = 0.0
     free_only_mode: bool = True
+    # Empty on a primary tenant; the primary's id on a 副区 (secondary region) row.
+    parent_tenant_id: str = ""
+    region_label: str = ""
     created_at: UtcDatetime
     updated_at: UtcDatetime
 
     model_config = {"from_attributes": True}
+
+
+# ---- Regions (副区) ----
+
+
+class TenantRegionItem(BaseModel):
+    region_name: str
+    region_key: str = ""
+    region_label: str = ""  # localized city name, e.g. 大阪
+    is_home_region: bool = False
+    status: str = ""
+    subscribed: bool = False
+    # Id of the panel tenant row that manages this region ("" = not added yet).
+    tenant_id: str = ""
+
+
+class TenantRegionsOut(BaseModel):
+    ok: bool
+    message: str = ""
+    home_region: str = ""
+    subscribed: list[TenantRegionItem] = Field(default_factory=list)
+    available: list[TenantRegionItem] = Field(default_factory=list)
+
+
+class RegionSubscribeRequest(BaseModel):
+    """Subscribe the tenancy to a region and add a panel row for it.
+
+    ``confirm`` must be true: an OCI region subscription cannot be undone.
+    """
+
+    region: str = Field(min_length=2, max_length=64)
+    confirm: bool = False
+    # Add the linked 副区 tenant row (leave off to only perform the subscription).
+    add_tenant: bool = True
+
+
+class RegionSubscribeResult(BaseModel):
+    ok: bool
+    message: str
+    region_name: str = ""
+    already_subscribed: bool = False
+    tenant: Optional[TenantOut] = None
 
 
 class OciPasswordPolicyOut(BaseModel):

@@ -30,9 +30,12 @@ from web.backend.oci_bridge import (
 from web.backend.quota_guard import (
     check_launch_quota,
     enforce_launch_quota,
+    enforce_secondary_region,
     enforce_shape_resize_quota,
     format_guard_warnings,
     free_only_for_tenant,
+    region_pair,
+    tenant_is_secondary,
     usage_snapshot,
 )
 from web.backend.schemas import (
@@ -396,10 +399,21 @@ def free_quota(
     try:
         session = get_session_for_row(row)
         result = session.get_free_quota_usage(free_only_mode=free_only_mode)
+        data = result.data if isinstance(result.data, dict) else {}
+        # A 副区 has no Always Free allowance of its own; the numbers below are a
+        # per-region count and must not be read as free headroom.
+        region, home_region = region_pair(session)
+        if (region and home_region and region != home_region) or tenant_is_secondary(row):
+            data = {
+                **data,
+                "secondary_region": True,
+                "region": region or (row.region or ""),
+                "home_region": home_region or "主区",
+            }
         return {
             "ok": bool(result.ok),
             "message": result.message or "",
-            "data": result.data if isinstance(result.data, dict) else {},
+            "data": data,
         }
     except OCIClientError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -426,6 +440,46 @@ def launch_quota_check(
         session = get_session_for_row(row)
         tier = getattr(row, "account_tier", "") or ""
         free_only = free_only_for_tenant(row)
+        # Mirror the launch path's 副区 gate here so the panel's verdict matches
+        # what submitting would actually do (see enforce_secondary_region).
+        region, home_region = region_pair(session)
+        secondary = bool(region and home_region and region != home_region) or tenant_is_secondary(row)
+        if secondary:
+            region = region or (row.region or "")
+            home_region = home_region or "主区"
+            blocked_reason = ""
+            try:
+                region_note = enforce_secondary_region(
+                    session,
+                    free_only_mode=free_only,
+                    secondary_hint=True,
+                    region_hint=row.region or "",
+                )
+            except HTTPException as exc:
+                region_note = ""
+                blocked_reason = str(exc.detail)
+            return {
+                "ok": not blocked_reason,
+                "blocked": bool(blocked_reason),
+                "errors": [blocked_reason] if blocked_reason else [],
+                "warnings": [region_note] if region_note else [],
+                "issues": [],
+                "projected": {},
+                "free_only_mode": free_only,
+                "account_tier": tier,
+                "read_incomplete": False,
+                "secondary_region": True,
+                "region": region,
+                "home_region": home_region,
+                "limits": {},
+                "usage": {},
+                "remaining": {},
+                "buckets": {},
+                "overall_status": "",
+                # 副区 has no Always Free allowance at all, so there is no usage
+                # gauge to show — say so instead of rendering four empty bars.
+                "summary_lines": [f"副区 {region} 不适用 Always Free 额度（主区 {home_region}）"],
+            }
         usage = usage_snapshot(session, free_only_mode=free_only)
         guard = check_launch_quota(
             session,
@@ -446,6 +500,9 @@ def launch_quota_check(
     out = guard.to_dict()
     out["free_only_mode"] = free_only
     out["account_tier"] = str(usage.get("account_tier") or tier or "")
+    out["secondary_region"] = False
+    out["region"] = region
+    out["home_region"] = home_region
     # read_incomplete means the numbers below are an undercount; the launch path
     # refuses outright in that case, so tell the UI rather than showing a total
     # that looks like plenty of headroom.
@@ -506,18 +563,34 @@ def launch_instance(
     boot_vpu = int(payload.get("boot_volume_vpus_per_gb") or 10)
 
     # Always Free guard BEFORE network/NSG prep so we don't leave orphan resources.
+    free_only = free_only_for_tenant(row)
+    launch_guard = None
+    extra_warnings: list[str] = []
     try:
-        launch_guard = enforce_launch_quota(
+        # 副区: Always Free only exists in the home region, and the free-usage
+        # snapshot is per-region — from a secondary region it reads zero and would
+        # wave through a second "free" machine. So the region gate replaces the
+        # cap check there instead of running alongside it.
+        region_warning = enforce_secondary_region(
             session,
-            account_tier=getattr(row, "account_tier", "") or "",
-            shape=str(payload.get("shape") or ""),
-            ocpus=payload.get("ocpus"),
-            memory_in_gbs=payload.get("memory_in_gbs"),
-            boot_volume_size_in_gbs=payload.get("boot_volume_size_in_gbs"),
-            boot_volume_vpus_per_gb=boot_vpu,
-            fallback_configs=list(built.get("fallback_configs") or body.fallback_configs or []),
-            free_only_mode=free_only_for_tenant(row),
+            free_only_mode=free_only,
+            secondary_hint=tenant_is_secondary(row),
+            region_hint=row.region or "",
         )
+        if region_warning:
+            extra_warnings.append(region_warning)
+        else:
+            launch_guard = enforce_launch_quota(
+                session,
+                account_tier=getattr(row, "account_tier", "") or "",
+                shape=str(payload.get("shape") or ""),
+                ocpus=payload.get("ocpus"),
+                memory_in_gbs=payload.get("memory_in_gbs"),
+                boot_volume_size_in_gbs=payload.get("boot_volume_size_in_gbs"),
+                boot_volume_vpus_per_gb=boot_vpu,
+                fallback_configs=list(built.get("fallback_configs") or body.fallback_configs or []),
+                free_only_mode=free_only,
+            )
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -603,7 +676,7 @@ def launch_instance(
             f"（最多 {job.max_attempts} 次）。请在「任务中心」查看进度与日志"
             "（需保持 worker 进程运行）。"
         )
-        warns = format_guard_warnings(launch_guard)
+        warns = extra_warnings + format_guard_warnings(launch_guard)
         if warns:
             retry_msg += " 提醒：" + "；".join(warns)
         return LaunchInstanceResult(
@@ -637,7 +710,7 @@ def launch_instance(
         msg = result.message or "创建成功"
         if boot_vpu != 10 and instance_id:
             msg += f"；引导卷性能 {boot_vpu} VPUs/GB 将在后台自动调整（hydration 完成后）"
-        warns = format_guard_warnings(launch_guard)
+        warns = extra_warnings + format_guard_warnings(launch_guard)
         if warns:
             msg += "；提醒：" + "；".join(warns)
         _audit_launch(True, msg, instance_id)

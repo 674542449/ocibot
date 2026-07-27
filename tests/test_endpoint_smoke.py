@@ -138,6 +138,30 @@ def make_session():
     s.delete_reserved_public_ip.return_value = R(True, "已删除", {})
     s.attach_reserved_public_ip.return_value = R(True, "已绑定", {})
     s.detach_reserved_public_ip.return_value = R(True, "已解绑", {})
+    s.home_region.return_value = "ap-tokyo-1"
+    s.list_subscribed_regions.return_value = R(
+        True,
+        "",
+        {
+            "home_region": "ap-tokyo-1",
+            "regions": [
+                {"region_name": "ap-tokyo-1", "region_key": "nrt", "status": "READY", "is_home_region": True}
+            ],
+        },
+    )
+    s.list_all_regions.return_value = R(
+        True,
+        "",
+        {
+            "regions": [
+                {"region_name": "ap-tokyo-1", "region_key": "nrt"},
+                {"region_name": "ap-osaka-1", "region_key": "kix"},
+            ]
+        },
+    )
+    s.subscribe_region.return_value = R(
+        True, "已提交开通", {"region_name": "ap-osaka-1", "region_key": "kix", "already": False}
+    )
     s.list_console_password_policies.return_value = R(True, "", {"policies": []})
     s.disable_console_password_expiry.return_value = R(True, "已关闭", {})
     s.resolve_compartment.return_value = "ocid1.compartment.oc1..c1"
@@ -258,6 +282,7 @@ def test_every_endpoint_is_wired() -> None:
             f"/api/tenants/{tid}/object-storage/buckets",
             f"/api/tenants/{tid}/object-storage/buckets/b1/objects",
             f"/api/tenants/{tid}/oci-password-policy",
+            f"/api/tenants/{tid}/regions",
             f"/api/tenants/{tid}/instances/{iid}/console",
             f"/api/tenants/{tid}/instances/{iid}/firewall",
             f"/api/tenants/{tid}/instances/{iid}/boot-volume",
@@ -269,6 +294,8 @@ def test_every_endpoint_is_wired() -> None:
 
         posts = [
             (f"/api/tenants/{tid}/test", {}),
+            (f"/api/tenants/{tid}/regions/subscribe",
+             {"region": "ap-osaka-1", "confirm": True, "add_tenant": True}),
             (f"/api/tenants/{tid}/instances/{iid}/power", {"action": "SOFTSTOP"}),
             (f"/api/tenants/{tid}/instances/{iid}/rename", {"display_name": "renamed"}),
             (f"/api/tenants/{tid}/instances/{iid}/shape", {"ocpus": 2, "memory_in_gbs": 12}),
