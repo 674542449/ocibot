@@ -161,3 +161,38 @@ def test_billing_api_is_gone():
     assert not hasattr(TenantSession, "get_monthly_cost_summary")
     assert not hasattr(TenantSession, "get_cost_summary")
     assert not hasattr(TenantSession, "_detect_billed_spend")
+
+
+def test_reference_quota_lists_only_always_free_shapes(monkeypatch):
+    """账户用量 → 计算配额 is a reference table, and Oracle reports non-zero limits
+    for paid families even on a free account — listing E3/E4/E5 there was quota the
+    operator cannot use. Only the shapes the panel can actually launch are kept."""
+    import oci
+
+    # The real helper needs pagination headers on the response; this test only
+    # cares about the filtering applied to the values it returns.
+    monkeypatch.setattr(
+        oci.pagination, "list_call_get_all_results", lambda fn, *a, **kw: fn(*a, **kw)
+    )
+    s = _session("Pay as you go", monkeypatch=monkeypatch)
+    s._limits = SimpleNamespace(
+        list_limit_values=lambda t, service_name=None: SimpleNamespace(
+            data=[
+                SimpleNamespace(name="standard-a1-core-count", value=4),
+                SimpleNamespace(name="standard-a1-memory-count", value=24),
+                SimpleNamespace(name="standard-e2-micro-core-count", value=2),
+                SimpleNamespace(name="standard-e3-core-count", value=20),
+                SimpleNamespace(name="standard-e4-core-count", value=20),
+                SimpleNamespace(name="standard-e5-core-count", value=20),
+                SimpleNamespace(name="standard3-core-count", value=20),
+                # Not a "-count" limit: filtered out before the shape check.
+                SimpleNamespace(name="standard-a1-core-percentage", value=50),
+            ]
+        )
+    )
+    names = [row["name"] for row in s.get_account_status().data["limits"]]
+    assert names == [
+        "standard-a1-core-count",
+        "standard-a1-memory-count",
+        "standard-e2-micro-core-count",
+    ]

@@ -102,6 +102,13 @@ FREE_TIER_SHAPES = {
     "VM.Standard.E2.1.Micro": "免费 AMD",
 }
 
+# Service-Limit name fragments for the shapes above, used to filter the account
+# page's reference quota table down to what the panel can actually launch.
+# The paid families (E3/E4/E5/standard3) were listed too, but Oracle reports
+# non-zero limits for those even on a free account, so they were rows of quota the
+# operator has no use for.
+FREE_TIER_LIMIT_TAGS = ("a1", "e2-micro")
+
 # Oracle Always Free resource caps (tenancy-wide reference; not region-scoped).
 # Source: Oracle Cloud Always Free resources documentation.
 ALWAYS_FREE_LIMITS = {
@@ -3538,7 +3545,7 @@ class TenantSession:
             info["limits"] = [
                 {"name": n, "value": val}
                 for n, val in sorted(shown.items(), key=lambda kv: kv[0])
-                if any(tag in n for tag in ("a1", "e2-micro", "e3", "e4", "e5", "standard3"))
+                if any(tag in n for tag in FREE_TIER_LIMIT_TAGS)
             ][:12]
         except (ServiceError, Exception):  # noqa: BLE001
             info["limits"] = []

@@ -68,7 +68,10 @@
       <p style="margin: 0; font-size: 13px">{{ data.tier_reason }}</p>
       <p class="muted" style="margin: 0; font-size: 12px">{{ data.tier_note }}</p>
 
-      <h3 style="margin: 0.5rem 0 0">计算配额（参考）</h3>
+      <!-- Filtered to the Always Free shapes server-side (FREE_TIER_LIMIT_TAGS):
+           Oracle reports non-zero limits for paid families on free accounts too,
+           so listing them was quota the operator has no use for. -->
+      <h3 style="margin: 0.5rem 0 0">计算配额（参考 · 仅免费套餐 A1 / E2.1.Micro）</h3>
       <div class="table-wrap">
         <table>
           <thead>

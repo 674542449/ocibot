@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.18 — 2026-07-28
+
+### 功能
+- **「计算配额（参考）」只列免费套餐**：该表来自 OCI Service Limits，此前把
+  E3/E4/E5/standard3 等付费 shape 也一并列出。Oracle 对免费账号同样会返回这些
+  付费 shape 的非零配额，所以它们是一堆用不到的数字。现在只保留
+  A1 与 E2.1.Micro（`FREE_TIER_LIMIT_TAGS`，与 `FREE_TIER_SHAPES` 对应），
+  标题也改为「计算配额（参考 · 仅免费套餐 A1 / E2.1.Micro）」
+
+### 维护
+- `tests/test_account_tier.py` 新增该过滤规则的测试
+
+### 升级
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.18
+```
+
+---
+
 ## 0.4.17 — 2026-07-28
 
 ### 修复
