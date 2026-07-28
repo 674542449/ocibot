@@ -149,7 +149,8 @@ docker compose up -d --build
    - 主密钥经单次 SHA-256 派生 Fernet 密钥：短密钥在数据库泄露后可被离线爆破
 2. 前置 HTTPS 反代，设置 `OCIBOT_COOKIE_SECURE=1`（同时才会下发 HSTS），并设 `OCIBOT_BIND=127.0.0.1`
    —— **注意**：反代若也是 Docker 容器，它访问不到宿主机的 `127.0.0.1`，需让它接入面板所在的
-   Docker 网络后按容器名转发。逐步操作见 [docs/NPM-REVERSE-PROXY.md](docs/NPM-REVERSE-PROXY.md)
+   Docker 网络后按容器名转发。一键配置：`bash scripts/setup-proxy.sh <你的域名>`；
+   手动步骤与排查见 [docs/NPM-REVERSE-PROXY.md](docs/NPM-REVERSE-PROXY.md)
 3. 限制 `OCIBOT_CORS_ORIGINS` 为真实访问域名。**`*` 会被忽略**：通配符 + Cookie 凭据
    等于任意站点都能以登录用户身份读取 API
 4. 首用户注册后保持关闭开放注册；需要加用户时再临时打开

@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.4.25 — 2026-07-28
+
+### 功能
+- **新增 `scripts/setup-proxy.sh`：一键配置域名 + HTTPS 反代**
+  ```bash
+  cd ~/ocibot && bash scripts/setup-proxy.sh panel.example.com
+  ```
+  它会自动完成：按镜像找到 Nginx Proxy Manager（没有就装一个，且把它自己的
+  管理后台 81 端口只绑回环）、接入面板的 Docker 网络、按反代场景改好 `web/.env`
+  （Cookie 仅 HTTPS、端口只监听回环、限流按真实客户端 IP）、重启并自检，
+  最后打印 NPM 网页里要填的字段。用户只需在网页上填几个框
+- 自检含一条**「公网还能不能直连 8000」**——这是唯一能证明隔离真的生效的检查
+- 改 `web/.env` 前会带时间戳备份，结尾打印还原命令
+
+### 修复（写脚本时测出来的）
+- 域名统一转小写后再写入 `OCIBOT_CORS_ORIGINS`。该项是**精确字符串比对**，
+  而浏览器发出的 Origin 主机名永远是小写 —— 用户输入 `Panel.Example.com`
+  会导致比对不上
+- 文档里检测反代容器的命令按名字 grep `nginx-proxy-manager`，
+  而官方 compose 的服务名是 `app`，容器实际叫 `npm-app-1` 之类，
+  正常安装反而搜不到。改为按镜像匹配
+
+### 升级
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.25
+```
+
+---
+
 ## 0.4.24 — 2026-07-28
 
 ### 文档
