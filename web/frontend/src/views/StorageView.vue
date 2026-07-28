@@ -14,7 +14,7 @@
             {{ t.name }} · {{ t.region }}
           </option>
         </select>
-        <button class="primary" :disabled="loading || !tenantId" @click="refreshAll">
+        <button class="primary" :disabled="loading || !tenantId" @click="refreshAll(true)">
           {{ loading ? '加载中…' : '刷新' }}
         </button>
       </div>
@@ -61,7 +61,7 @@
     <div v-if="tab === 'boot'" class="stack">
       <div class="page-tools">
         <label class="choice muted" style="flex: 0 0 auto">
-          <input v-model="includeSub" type="checkbox" @change="loadBoot" />
+          <input v-model="includeSub" type="checkbox" @change="loadBoot(true)" />
           <span>含子 Compartment</span>
         </label>
         <input v-model="bootSearch" type="search" placeholder="搜索引导卷" />
@@ -389,11 +389,13 @@ function beginLoad(key: string): { stale: () => boolean } {
   return { stale: () => seq !== loadSeq[key] || tenantId.value !== wanted }
 }
 
-async function loadQuota() {
+async function loadQuota(force = false) {
   if (!tenantId.value) return
   const guard = beginLoad('quota')
   try {
-    const { data } = await api.get(`/tenants/${tenantId.value}/free-quota`)
+    const { data } = await api.get(`/tenants/${tenantId.value}/free-quota`, {
+      params: { force },
+    })
     if (guard.stale()) return
     quota.value = data.data || null
   } catch {
@@ -402,11 +404,11 @@ async function loadQuota() {
   }
 }
 
-async function loadBoot() {
+async function loadBoot(force = false) {
   if (!tenantId.value) return
   const guard = beginLoad('boot')
   const { data } = await api.get(`/tenants/${tenantId.value}/boot-volumes`, {
-    params: { include_subcompartments: includeSub.value },
+    params: { include_subcompartments: includeSub.value, force },
   })
   if (guard.stale()) return
   // Surface a tenant-level failure instead of rendering it as "no volumes".
@@ -414,11 +416,11 @@ async function loadBoot() {
   bootVolumes.value = data.data?.volumes || []
 }
 
-async function loadBlock() {
+async function loadBlock(force = false) {
   if (!tenantId.value) return
   const guard = beginLoad('block')
   const { data } = await api.get(`/tenants/${tenantId.value}/block-volumes`, {
-    params: { include_subcompartments: true },
+    params: { include_subcompartments: true, force },
   })
   if (guard.stale()) return
   if (data.ok === false) error.value = data.message || '读取块卷失败'
@@ -443,13 +445,14 @@ async function loadBuckets() {
   objectNs.value = data.data?.namespace || ''
 }
 
-async function refreshAll() {
+/** `force` bypasses the server's short read cache — what 刷新 does. */
+async function refreshAll(force = false) {
   if (!tenantId.value) return
   loading.value = true
   error.value = ''
   msg.value = ''
   try {
-    await Promise.all([loadQuota(), loadBoot(), loadBlock(), loadBuckets()])
+    await Promise.all([loadQuota(force), loadBoot(force), loadBlock(force), loadBuckets()])
   } catch (e: any) {
     error.value = e?.message || '加载失败'
   } finally {
@@ -460,12 +463,13 @@ async function refreshAll() {
 function onTenantChange() {
   activeBucket.value = ''
   objects.value = []
-  // Clear previous tenant data; user must click 刷新 to hit OCI.
+  // Clear previous tenant data, then load the newly selected one (0.4.20).
   bootVolumes.value = []
   blockVolumes.value = []
   buckets.value = []
   quota.value = null
   router.replace({ query: { ...route.query, tenant: tenantId.value, tab: tab.value } })
+  void refreshAll()
 }
 
 async function createBlock() {
@@ -689,7 +693,8 @@ watch(tab, (t) => {
 onMounted(async () => {
   try {
     await loadTenants()
-    // No automatic multi-API fan-out on enter; user clicks 刷新.
+    // Auto-load on entry (0.4.20); the reads are cached server-side for a minute.
+    await refreshAll()
   } catch (e: any) {
     error.value = e?.message || '初始化失败'
   }

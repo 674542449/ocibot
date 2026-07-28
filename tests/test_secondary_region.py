@@ -526,3 +526,27 @@ def test_launch_into_a_free_only_secondary_tenant_is_refused(client, monkeypatch
         with SessionLocal() as db:
             db.query(Tenant).filter(Tenant.id == sub_id).update({"free_only_mode": False})
             db.commit()
+
+
+def test_rotating_the_primary_key_updates_its_secondary_rows(client, monkeypatch):
+    """副区 rows hold a COPY of the primary's credentials — the same Oracle API key
+    by construction. Without propagation, rotating the primary's key left every
+    secondary region authenticating with the old one until it failed as a 401."""
+    c, tid = client
+    sub_id = _secondary_tenant()
+    new_pem = "-----BEGIN PRIVATE KEY-----\nROTATEDKEYMATERIAL\n-----END PRIVATE KEY-----"
+
+    r = c.patch(
+        f"/api/tenants/{tid}",
+        json={"private_key_pem": new_pem, "fingerprint": "aa:" * 15 + "aa"},
+    )
+    assert r.status_code == 200, r.text
+
+    with SessionLocal() as db:
+        parent = db.get(Tenant, tid)
+        child = db.get(Tenant, sub_id)
+        assert child.private_key_encrypted == parent.private_key_encrypted
+        assert child.fingerprint == parent.fingerprint
+        # Still linked, still its own region.
+        assert child.parent_tenant_id == tid
+        assert child.region == "ap-osaka-1"

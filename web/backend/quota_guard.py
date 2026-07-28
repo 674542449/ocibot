@@ -47,6 +47,23 @@ def is_secondary_region(session: Any) -> bool:
     return bool(current and home and current != home)
 
 
+def secondary_region_gate(session: Any, row: Any, *, free_only_mode: bool) -> str:
+    """``enforce_secondary_region`` for callers that hold the tenant row.
+
+    Returns a warning (副区, billing accepted), "" (home region), or raises 400.
+    A non-empty return means the Always-Free caps do not apply and the caller must
+    skip them rather than stack them: in a 副区 the usage snapshot counts only that
+    region, so a free-cap check there compares a paid resource against an allowance
+    it does not have — blocking a resize the user is deliberately paying for.
+    """
+    return enforce_secondary_region(
+        session,
+        free_only_mode=free_only_mode,
+        secondary_hint=tenant_is_secondary(row),
+        region_hint=str(getattr(row, "region", "") or ""),
+    )
+
+
 def enforce_secondary_region(
     session: Any,
     *,

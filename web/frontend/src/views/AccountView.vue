@@ -4,7 +4,7 @@
       <div>
         <h2>账号用量</h2>
         <p class="muted" style="margin: 0.2rem 0 0">
-          订阅等级 / 配额 / 费用 · 点击「刷新」才请求 Oracle
+          订阅等级 / 配额 / 费用 · 进入自动加载（服务端短缓存），点「刷新用量」强制重新请求
         </p>
       </div>
       <div class="page-tools">
@@ -13,7 +13,7 @@
           <option :value="30">30 天</option>
           <option :value="90">90 天</option>
         </select>
-        <button class="primary" :disabled="loading || !tenantId" @click="loadAll">
+        <button class="primary" :disabled="loading || !tenantId" @click="loadAll(true)">
           {{ loading ? '加载中…' : '刷新用量' }}
         </button>
       </div>
@@ -22,14 +22,14 @@
     <div class="card stack">
       <div class="field">
         <label>租户</label>
-        <select v-model="tenantId">
+        <select v-model="tenantId" @change="loadAll()">
           <option disabled value="">选择租户</option>
           <option v-for="t in tenants" :key="t.id" :value="t.id">
             {{ t.name }} · {{ t.region }} · {{ tierLabel(t.account_tier) }}
           </option>
         </select>
         <p class="muted" style="margin: 0.35rem 0 0; font-size: 12px">
-          切换租户不会自动请求 API；选定后请点右上角「刷新用量」。
+          切换租户会自动加载该租户的用量。
         </p>
       </div>
     </div>
@@ -376,9 +376,9 @@ async function loadTenants() {
   else if (rows[0]) tenantId.value = rows[0].id
 }
 
-async function loadAccount() {
+async function loadAccount(force = false) {
   if (!tenantId.value) return
-  const res = await api.get(`/tenants/${tenantId.value}/account`)
+  const res = await api.get(`/tenants/${tenantId.value}/account`, { params: { force } })
   data.value = res.data.data || {}
   msg.value = res.data.message || ''
 }
@@ -399,22 +399,24 @@ async function loadUsage() {
   }
 }
 
-async function loadQuota() {
+async function loadQuota(force = false) {
   if (!tenantId.value) return
   try {
-    const res = await api.get(`/tenants/${tenantId.value}/free-quota`)
+    const res = await api.get(`/tenants/${tenantId.value}/free-quota`, { params: { force } })
     quota.value = res.data.data || null
   } catch {
     quota.value = null
   }
 }
 
-async function loadAll() {
+/** `force` bypasses the server's short read cache — what 刷新 does. Entering the
+ *  page loads without it, so navigating back and forth costs no Oracle calls. */
+async function loadAll(force = false) {
   if (!tenantId.value) return
   error.value = ''
   loading.value = true
   try {
-    await Promise.all([loadAccount(), loadUsage(), loadQuota()])
+    await Promise.all([loadAccount(force), loadUsage(), loadQuota(force)])
   } catch (e: any) {
     error.value = e?.message || '加载失败'
   } finally {
@@ -425,7 +427,9 @@ async function loadAll() {
 onMounted(async () => {
   try {
     await loadTenants()
-    // Do not auto-hit Oracle on enter; user clicks 刷新 / 加载.
+    // Auto-load on entry (0.4.20). Served from the server's short read cache, so
+    // revisiting the page does not repeat the Oracle fan-out.
+    await loadAll()
   } catch (e: any) {
     error.value = e?.message || '初始化失败'
   }

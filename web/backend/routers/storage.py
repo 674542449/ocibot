@@ -15,6 +15,7 @@ from web.backend.auth import get_current_user
 from web.backend.db import get_db
 from web.backend.models import User
 from web.backend.oci_bridge import get_owned_tenant, get_session_for_row, op_result_dict
+from web.backend.read_cache import cache_key, get_or_load, invalidate
 from web.backend.uploads import read_upload_limited
 
 router = APIRouter(tags=["storage"])
@@ -41,6 +42,10 @@ def _guard_storage_delta(
     # launch path does.
     tier = getattr(row, "account_tier", "") or ""
     free_only = quota_guard.free_only_for_tenant(row)
+    # 副区: Always Free does not reach it and the snapshot is per-region, so the
+    # cap below would measure a paid volume against an allowance it never had.
+    if quota_guard.secondary_region_gate(session, row, free_only_mode=free_only):
+        return
     # usage_snapshot flags a partial/failed read; treating that as zero usage let
     # a throttled read look like a full free quota.
     snap = quota_guard.usage_snapshot(session, free_only_mode=free_only)
@@ -91,19 +96,26 @@ def list_block_volumes(
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
     include_subcompartments: bool = Query(True),
+    force: bool = Query(False),
 ) -> dict[str, Any]:
     row = _row(db, user.id, tenant_id)
     try:
         session = get_session_for_row(row)
-        result = session.list_block_volumes(
-            include_subcompartments=include_subcompartments,
-            include_attachments=True,
-        )
-        return {
-            "ok": bool(result.ok),
-            "message": result.message or "",
-            "data": result.data if isinstance(result.data, dict) else {},
-        }
+
+        def _load() -> dict[str, Any]:
+            result = session.list_block_volumes(
+                include_subcompartments=include_subcompartments,
+                include_attachments=True,
+            )
+            return {
+                "ok": bool(result.ok),
+                "message": result.message or "",
+                "data": result.data if isinstance(result.data, dict) else {},
+            }
+
+        key = cache_key(row.id, "block-volumes", include_subcompartments)
+        payload, age = get_or_load(key, _load, force=force)
+        return {**payload, "cached": age > 0, "cache_age_sec": age}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -126,6 +138,7 @@ def create_block_volume(
             display_name=body.display_name,
             vpus_per_gb=int(body.vpus_per_gb or 10),
         )
+        invalidate(tenant_id)
         write_audit(
             db,
             owner_id=user.id,
@@ -152,6 +165,7 @@ def delete_block_volume(
     try:
         session = get_session_for_row(row)
         result = session.delete_block_volume(volume_id)
+        invalidate(tenant_id)
         write_audit(
             db,
             owner_id=user.id,
@@ -192,6 +206,7 @@ def update_block_volume(
             size_in_gbs=body.size_in_gbs,
             vpus_per_gb=body.vpus_per_gb,
         )
+        invalidate(tenant_id)
         write_audit(
             db,
             owner_id=user.id,
@@ -223,6 +238,7 @@ def attach_block_volume(
             volume_id,
             type=(body.type or "PARAVIRTUALIZED"),
         )
+        invalidate(tenant_id)
         write_audit(
             db,
             owner_id=user.id,
@@ -247,6 +263,7 @@ def detach_block_volume(
     try:
         session = get_session_for_row(row)
         result = session.detach_volume(body.attachment_id.strip())
+        invalidate(tenant_id)
         write_audit(
             db,
             owner_id=user.id,
@@ -343,6 +360,7 @@ def create_bucket(
             compartment_id=body.compartment_id,
             public_access_type=body.public_access_type,
         )
+        invalidate(tenant_id)
         write_audit(
             db,
             owner_id=user.id,
@@ -367,6 +385,7 @@ def delete_bucket(
     try:
         session = get_session_for_row(row)
         result = session.delete_bucket(name)
+        invalidate(tenant_id)
         write_audit(
             db,
             owner_id=user.id,
@@ -413,6 +432,7 @@ def delete_object(
     try:
         session = get_session_for_row(row)
         result = session.delete_object(name, object_name)
+        invalidate(tenant_id)
         write_audit(
             db,
             owner_id=user.id,
@@ -457,6 +477,7 @@ def put_object(
             content_type=file.content_type or "application/octet-stream",
             max_bytes=_MAX_UPLOAD,
         )
+        invalidate(tenant_id)
         write_audit(
             db,
             owner_id=user.id,

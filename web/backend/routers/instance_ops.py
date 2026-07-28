@@ -16,6 +16,7 @@ from web.backend.auth import get_current_user
 from web.backend.db import get_db
 from web.backend.models import SshHostKey, User
 from web.backend.oci_bridge import get_owned_tenant, get_session_for_row, op_result_dict
+from web.backend.read_cache import cache_key, get_or_load, invalidate
 from web.backend.schemas import PowerActionResult
 from web.backend.ssh_hostkey import UNREACHABLE as HOSTKEY_UNREACHABLE
 from web.backend.ssh_hostkey import check_instance_host_key, forget_host_key, known_hosts_for
@@ -246,21 +247,28 @@ def list_boot_volumes(
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
     include_subcompartments: bool = True,
+    force: bool = False,
 ) -> dict[str, Any]:
     """List all boot volumes under the tenant (optionally including subcompartments)."""
     row = _row(db, user.id, tenant_id)
     try:
         session = get_session_for_row(row)
-        result = session.list_boot_volumes(
-            compartment_id=row.compartment_ocid or row.tenancy_ocid,
-            include_subcompartments=include_subcompartments,
-            include_attachments=True,
-        )
-        return {
-            "ok": bool(result.ok),
-            "message": result.message or "",
-            "data": result.data if isinstance(result.data, dict) else {},
-        }
+
+        def _load() -> dict[str, Any]:
+            result = session.list_boot_volumes(
+                compartment_id=row.compartment_ocid or row.tenancy_ocid,
+                include_subcompartments=include_subcompartments,
+                include_attachments=True,
+            )
+            return {
+                "ok": bool(result.ok),
+                "message": result.message or "",
+                "data": result.data if isinstance(result.data, dict) else {},
+            }
+
+        key = cache_key(row.id, "boot-volumes", include_subcompartments)
+        payload, age = get_or_load(key, _load, force=force)
+        return {**payload, "cached": age > 0, "cache_age_sec": age}
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -322,22 +330,29 @@ def boot_volume_update(
             tier = getattr(row, "account_tier", "") or ""
             # Explicit per-tenant flag, not inferred from account_tier.
             free_only = quota_guard.free_only_for_tenant(row)
-            usage = quota_guard.usage_snapshot(session, free_only_mode=free_only)
-            blocked = quota_guard._blocked_by_incomplete_read(usage, free_only)
-            if blocked:
-                raise HTTPException(status_code=503, detail=blocked)
-            guard = free_quota.validate_boot_resize_against_quota(
-                current_size_gb=current_size,
-                new_size_gb=body.size_in_gbs,
-                free_only_mode=free_only,
-                account_tier=tier,
-                usage=usage,
+            # A 副区 has no free storage allowance to measure against, and the
+            # snapshot only counts that region — see secondary_region_gate. It
+            # refuses outright if the tenant still has free-only on.
+            in_secondary = bool(
+                quota_guard.secondary_region_gate(session, row, free_only_mode=free_only)
             )
-            if not guard.ok:
-                raise HTTPException(
-                    status_code=400,
-                    detail="；".join(guard.error_messages()) or "超出免费块存储额度",
+            if not in_secondary:
+                usage = quota_guard.usage_snapshot(session, free_only_mode=free_only)
+                blocked = quota_guard._blocked_by_incomplete_read(usage, free_only)
+                if blocked:
+                    raise HTTPException(status_code=503, detail=blocked)
+                guard = free_quota.validate_boot_resize_against_quota(
+                    current_size_gb=current_size,
+                    new_size_gb=body.size_in_gbs,
+                    free_only_mode=free_only,
+                    account_tier=tier,
+                    usage=usage,
                 )
+                if not guard.ok:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="；".join(guard.error_messages()) or "超出免费块存储额度",
+                    )
 
         ssh_auth = None
         if body.auto_grow_fs:
@@ -366,6 +381,7 @@ def boot_volume_update(
             timeout=60,
             hydration_timeout=120,
         )
+        invalidate(tenant_id)
         oci_ok = bool(result.ok)
         data: dict[str, Any] = dict(result.data) if isinstance(result.data, dict) else {}
         data["oci_ok"] = oci_ok
@@ -565,6 +581,7 @@ def create_reserved_ip(
     try:
         session = get_session_for_row(row)
         result = session.create_reserved_public_ip(display_name=body.display_name)
+        invalidate(tenant_id)
         write_audit(
             db,
             owner_id=user.id,
@@ -588,6 +605,7 @@ def delete_reserved_ip(
     try:
         session = get_session_for_row(row)
         result = session.delete_reserved_public_ip(public_ip_id)
+        invalidate(tenant_id)
         write_audit(
             db,
             owner_id=user.id,
@@ -613,6 +631,7 @@ def attach_reserved_ip(
         session = get_session_for_row(row)
         info = session.get_instance(instance_id, resolve_ips=False)
         result = session.attach_reserved_public_ip(instance_id, info.compartment_id, body.public_ip_id)
+        invalidate(tenant_id)
         write_audit(
             db,
             owner_id=user.id,
@@ -636,6 +655,7 @@ def detach_reserved_ip(
     try:
         session = get_session_for_row(row)
         result = session.detach_reserved_public_ip(public_ip_id)
+        invalidate(tenant_id)
         write_audit(
             db,
             owner_id=user.id,
@@ -695,6 +715,7 @@ def create_boot_volume_backup(
         result = session.create_boot_volume_backup(
             body.boot_volume_id, display_name=body.display_name, backup_type=backup_type
         )
+        invalidate(tenant_id)
         write_audit(
             db,
             owner_id=user.id,
@@ -718,6 +739,7 @@ def delete_boot_volume_backup(
     try:
         session = get_session_for_row(row)
         result = session.delete_boot_volume_backup(backup_id)
+        invalidate(tenant_id)
         write_audit(
             db,
             owner_id=user.id,
@@ -772,6 +794,7 @@ def delete_custom_image(
     try:
         session = get_session_for_row(row)
         result = session.delete_custom_image(image_id)
+        invalidate(tenant_id)
         write_audit(
             db,
             owner_id=user.id,
