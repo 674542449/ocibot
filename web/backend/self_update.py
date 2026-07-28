@@ -39,6 +39,35 @@ _lock = threading.Lock()
 _worker: Optional[threading.Thread] = None
 
 
+# Env vars whose VALUES must never reach a command line, a log line, or the
+# admin-visible update log. OCIBOT_MASTER_KEY is the one that matters most: it
+# derives the Fernet key that decrypts every stored OCI private key.
+SECRET_ENV_KEYS = (
+    "OCIBOT_MASTER_KEY",
+    "OCIBOT_JWT_SECRET",
+    "POSTGRES_PASSWORD",
+    "OCIBOT_GITHUB_TOKEN",
+    "GITHUB_TOKEN",
+)
+
+
+def _redact(text: str) -> str:
+    """Replace any configured secret value found in ``text`` with a placeholder.
+
+    Defence in depth for everything that is logged or returned to an admin: the
+    command builders below pass secrets by name rather than by value, but a
+    docker/compose error message can still echo an interpolated value back.
+    Short values are skipped — replacing a 3-character string would corrupt
+    unrelated output without protecting anything.
+    """
+    out = text or ""
+    for key in SECRET_ENV_KEYS:
+        value = (os.environ.get(key) or "").strip()
+        if len(value) >= 8 and value in out:
+            out = out.replace(value, f"***{key}***")
+    return out
+
+
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -179,7 +208,7 @@ def local_build_info() -> dict[str, str]:
 
 
 def _run_cmd(cmd: list[str], *, cwd: Optional[str] = None, timeout: int = 600) -> tuple[int, str]:
-    log.info("update cmd: %s (cwd=%s)", " ".join(cmd), cwd or "")
+    log.info("update cmd: %s (cwd=%s)", _redact(" ".join(cmd)), cwd or "")
     try:
         p = subprocess.run(
             cmd,
@@ -310,7 +339,9 @@ def check_for_update(db: Session) -> dict[str, Any]:
 
 
 def _append_log(existing: str, chunk: str, limit: int = 20000) -> str:
-    text = (existing or "") + chunk
+    # Redacted on the way in: log_tail is persisted and returned by
+    # GET /api/admin/update, and command output can echo interpolated values.
+    text = (existing or "") + _redact(chunk)
     if len(text) > limit:
         return text[-limit:]
     return text
@@ -355,6 +386,13 @@ def _compose_env_flags(host_repo: str) -> list[str]:
         "-e",
         f"OCIBOT_DOCKER_CLI_IMAGE={DOCKER_CLI_IMAGE}",
     ]
+    # Passed by NAME, not value: `docker run -e KEY` makes the CLI read KEY from
+    # its own environment, which _run_cmd already forwards via env=. Writing
+    # `-e KEY=value` put OCIBOT_MASTER_KEY into the argv — visible in the host
+    # process table for the life of the call, and written verbatim into the API
+    # log, since _run_cmd logs the command it runs. The master key derives the
+    # Fernet key for every stored OCI private key, so a log shipper or a
+    # `docker logs` was enough to walk away with all of them.
     for key in (
         "POSTGRES_PASSWORD",
         "OCIBOT_CORS_ORIGINS",
@@ -369,7 +407,7 @@ def _compose_env_flags(host_repo: str) -> list[str]:
     ):
         val = os.environ.get(key)
         if val is not None and str(val).strip() != "":
-            flags.extend(["-e", f"{key}={val}"])
+            flags.extend(["-e", key])
     return flags
 
 
@@ -677,11 +715,17 @@ def _apply_job(username: str) -> None:
                 save("error", "git fetch 失败（检查服务器访问 GitHub）", last_error=out[-800:], log_tail=log_buf)
                 return
 
+        # Held in memory, never written to /tmp. The previous version copied
+        # web/.env — which holds OCIBOT_MASTER_KEY, the JWT secret and the DB
+        # password — to /tmp/ocibot.env.backup.<pid> and only deleted it on the
+        # success path, so every early return after a failed git reset left the
+        # master key sitting in a world-readable directory indefinitely. Same
+        # reasoning as TenantSession keeping decrypted keys out of temp files.
         env_src = host / "web" / ".env"
-        env_bak = Path(f"/tmp/ocibot.env.backup.{os.getpid()}")
+        env_backup: Optional[bytes] = None
         if env_src.is_file():
             try:
-                shutil.copy2(env_src, env_bak)
+                env_backup = env_src.read_bytes()
             except Exception as exc:  # noqa: BLE001
                 log.warning("backup .env failed: %s", exc)
 
@@ -704,15 +748,24 @@ def _apply_job(username: str) -> None:
             )
             return
 
-        if env_bak.is_file():
+        if env_backup is not None:
             try:
                 (host / "web").mkdir(parents=True, exist_ok=True)
-                shutil.copy2(env_bak, env_src)
-                env_bak.unlink(missing_ok=True)
+                existed = env_src.is_file()
+                env_src.write_bytes(env_backup)
+                if not existed:
+                    # Recreated by us, so it would otherwise take the process
+                    # umask. This file holds the master key.
+                    try:
+                        env_src.chmod(0o600)
+                    except OSError:
+                        pass
                 log_buf = _append_log(log_buf, "restored web/.env\n")
                 _load_dotenv_into_environ(env_src)
             except Exception as exc:  # noqa: BLE001
                 log_buf = _append_log(log_buf, f"[warn] restore .env failed: {exc}\n")
+            finally:
+                env_backup = None
 
         code, out = _run_cmd(["git", "-C", str(host), "rev-parse", "HEAD"], timeout=20)
         new_sha = out.strip() if code == 0 else ""

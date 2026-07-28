@@ -118,12 +118,51 @@ def test_host_repo_prefers_absolute_env(monkeypatch):
 
 def test_compose_env_flags_skip_empty_secrets(monkeypatch):
     monkeypatch.setenv("POSTGRES_PASSWORD", "")
-    monkeypatch.setenv("OCIBOT_MASTER_KEY", "real-key")
+    monkeypatch.setenv("OCIBOT_MASTER_KEY", "super-secret-master-key-value")
     flags = self_update._compose_env_flags("/root/ocibot")
     joined = " ".join(flags)
-    assert "POSTGRES_PASSWORD=" not in joined
-    assert "OCIBOT_MASTER_KEY=real-key" in joined
+    # An empty secret is still skipped: injecting KEY= would override the value
+    # the compose file would otherwise default.
+    assert "POSTGRES_PASSWORD" not in joined
+    # The secret VALUE must not reach the argv. This assertion previously read
+    # `"OCIBOT_MASTER_KEY=real-key" in joined` — it encoded the defect: argv is
+    # visible in the host process table and _run_cmd logs the command, so the key
+    # that decrypts every stored OCI private key was written to the API log on
+    # every update. Docker takes `-e KEY` (no value) from the CLI's own
+    # environment, which _run_cmd already forwards.
+    assert "super-secret-master-key-value" not in joined
+    assert flags[flags.index("OCIBOT_MASTER_KEY") - 1] == "-e"
+    # Computed, non-secret values are still passed explicitly.
     assert "OCIBOT_HOST_REPO=/root/ocibot" in joined
+
+
+def test_run_cmd_log_line_redacts_secrets(monkeypatch, caplog):
+    """_run_cmd logs what it runs; that line must never carry a secret."""
+    import logging
+
+    monkeypatch.setenv("OCIBOT_MASTER_KEY", "super-secret-master-key-value")
+    with caplog.at_level(logging.INFO, logger="ocibot.update"):
+        self_update._run_cmd(
+            ["echo", "OCIBOT_MASTER_KEY=super-secret-master-key-value"], timeout=10
+        )
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "super-secret-master-key-value" not in logged
+    assert "***OCIBOT_MASTER_KEY***" in logged
+
+
+def test_admin_visible_log_redacts_secrets(monkeypatch):
+    """log_tail is persisted and returned by GET /api/admin/update, and command
+    output can echo an interpolated value back."""
+    monkeypatch.setenv("OCIBOT_JWT_SECRET", "jwt-secret-value-long-enough")
+    tail = self_update._append_log("", "error: OCIBOT_JWT_SECRET=jwt-secret-value-long-enough\n")
+    assert "jwt-secret-value-long-enough" not in tail
+    assert "***OCIBOT_JWT_SECRET***" in tail
+
+
+def test_redact_leaves_short_values_alone(monkeypatch):
+    """Replacing a 3-character secret would corrupt unrelated output for no gain."""
+    monkeypatch.setenv("OCIBOT_MASTER_KEY", "abc")
+    assert self_update._redact("abcdef") == "abcdef"
 
 
 def test_compose_base_args_include_env_file(tmp_path, monkeypatch):

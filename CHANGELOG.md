@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.4.23 — 2026-07-28
+
+### 安全（第 9 轮审查：单独审 `self_update.py`）
+- **主密钥被写进日志**（重要）：更新时构造的 `docker run` 命令里带着
+  `-e OCIBOT_MASTER_KEY=<明文>`（还有 JWT 密钥、数据库密码），而 `_run_cmd`
+  会把完整命令 `log.info` 出来。**于是每次更新都把解密所有 OCI 私钥的主密钥
+  明文写进了 API 日志**，同时在宿主机 `ps` 里也能看到。
+  能读日志（日志采集、`docker logs`、导出的排查包）就等于拿到所有租户私钥。
+  现在改为按**变量名**传递（`docker run -e KEY`，值由 docker CLI 从自身环境读取，
+  `_run_cmd` 本来就转发了 `os.environ`），日志行另做脱敏
+- **`web/.env` 备份残留在 `/tmp`**：`git reset --hard` 前会把含主密钥 / JWT 密钥 /
+  数据库密码的 `.env` 复制到 `/tmp/ocibot.env.backup.<pid>`，但**只有成功路径才删除**。
+  reset 失败等提前返回的分支会把它永久留在 /tmp。现在改为**只在内存里暂存**，
+  不再落盘；若需重建该文件则以 0600 写入
+- **管理员可见的更新日志未脱敏**：`log_tail` 会存库并由 `GET /api/admin/update` 返回，
+  而它由命令原始输出拼成，docker/compose 报错可能回显插值后的密钥。现在写入时即脱敏
+
+### 明确记录为「接受的风险」
+- **更新不校验代码完整性**：`git fetch` + `reset --hard origin/<branch>` 只信任
+  TLS 和 GitHub，不验签，也不比对检查时 API 返回的 SHA 与实际检出的 SHA。
+  能对配置的仓库提供不同内容的人（仓库账号失陷、宿主机信任了恶意 CA、
+  或把 `OCIBOT_UPDATE_REPO` 指向别处）可在下次更新时获得宿主机 root。
+  彻底解决需要签名标签 + 固定验证密钥。当前缓解：`OCIBOT_UPDATE_ENABLED` 默认关闭、
+  仅管理员可操作且写审计。**不用面板内更新的运维请保持关闭，改用 SSH 更新**
+
+### 维护
+- `tests/test_self_update.py` 原有断言 `"OCIBOT_MASTER_KEY=real-key" in joined`
+  **正是在固化上述缺陷**，已改写为断言密钥值不出现在命令行；
+  另新增日志脱敏、管理员日志脱敏、短值不误伤三项测试
+- `web/AUDIT.md` 记录第 9 轮
+
+### 升级
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.23
+```
+
+---
+
 ## 0.4.22 — 2026-07-28
 
 ### 修复（第 8 轮审查，针对 0.4.16–0.4.21 新增代码）

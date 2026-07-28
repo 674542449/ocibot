@@ -1,5 +1,44 @@
 # Web audit notes
 
+## Pass 9 — self_update.py, line by line (0.4.23, 2026-07-28)
+
+Reviewed on its own because it is the only path that escalates a panel session to
+host root: it drives the mounted docker socket and, on the preferred path, runs
+`docker run --privileged --pid=host` + `nsenter -t 1` to execute `install.sh update`
+in the host namespaces.
+
+### Fixed
+
+| Issue | Severity | Notes |
+|-------|----------|-------|
+| `_compose_env_flags` emitted `-e OCIBOT_MASTER_KEY=<value>` (and JWT secret, Postgres password) into the `docker run` argv, and `_run_cmd` logs the command it runs. **The key that derives the Fernet key for every stored OCI private key was written verbatim into the API log on every update**, and was visible in the host process table for the duration of the call. A log shipper, a support bundle or `docker logs ocibot-api` was enough to walk away with every tenant's private key. | **High** | Secrets are passed by NAME (`docker run -e KEY`), which makes the CLI read the value from its own environment — `_run_cmd` already forwards `os.environ`. The log line is redacted as well. Same class as the `sync_db_password` fix in pass 7, in a place that pass did not reach. |
+| `web/.env` — master key, JWT secret, DB password — was copied to `/tmp/ocibot.env.backup.<pid>` before `git reset --hard`, and unlinked **only on the success path**. Every early return after a failed reset, and any failure during restore, left it in a world-readable directory indefinitely. `copy2` also preserved a possibly-permissive source mode. | Medium-High | Held in memory for the duration of the reset instead; no temp file is created at all. Mirrors the pass-4 decision to keep decrypted OCI keys out of the temp directory. If the file has to be recreated it is written 0600. |
+| `log_tail` is persisted and returned by `GET /api/admin/update`, and is assembled from raw command output that can echo an interpolated value back. | Medium | `_append_log` redacts on the way in. |
+
+### Reviewed and found correct
+
+`subprocess` is always invoked with a list argv and never `shell=True`. The two
+places that do build shell strings (`_write_restart_script`, `_detach_host_install_sh`)
+put every interpolated value through `_sh_quote`, and those values come from env /
+`/proc/self/mountinfo`, not from HTTP input. `_repo()` / `_branch()` are validated
+against strict allowlist regexes before being placed in the GitHub URL. Concurrency
+is handled by a process lock plus a `SELECT … FOR UPDATE` on the status row with
+`populate_existing`, because the API runs multiple processes. All three endpoints
+require `get_admin_user`, and apply is audit-logged.
+
+### Accepted risk — no integrity verification of the fetched code
+
+The updater trusts TLS and GitHub: `git fetch` + `git reset --hard origin/<branch>`,
+with no commit-signature check, and the SHA the GitHub API reported at check time is
+never compared against what git actually checked out. Anyone able to serve different
+content for the configured repo — a compromised repository account, a host that
+trusts a rogue CA, or an operator-set `OCIBOT_UPDATE_REPO` pointing elsewhere — gets
+host root on the next apply. Closing it properly needs signed tags plus a pinned
+verification key. Mitigations today: `OCIBOT_UPDATE_ENABLED` defaults to 0 (the
+supported installer opts in explicitly), the action is admin-only and audit-logged.
+**Operators who do not use in-panel update should leave it disabled and update over
+SSH.**
+
 ## Pass 8 — review of the 0.4.16–0.4.21 code (0.4.22, 2026-07-28)
 
 Scope note: passes 4–7 covered the pre-0.4.16 codebase, including an adversarial
