@@ -745,29 +745,36 @@ class Worker:
             log.exception("daily-check gate failed")
             return
         log.info("running daily checks (%s)", today)
-        # Budget checks hit Usage API — run them strictly one tenant at a time
-        # with a short pause to avoid multi-account bursts.
+        # These hit Usage API / Monitoring — run them strictly one tenant at a time
+        # with a short pause to avoid multi-account bursts. The pause is driven by
+        # whether a check ACTUALLY called Oracle, not by budget_monthly_usd: the
+        # egress check calls regardless of the budget setting, so keying the sleep
+        # on the budget meant a user with no budget set got every tenant's
+        # Monitoring query back to back — the exact burst this guards against.
         tenants = db.scalars(select(Tenant).where(Tenant.enabled.is_(True))).all()
         for tenant in tenants:
+            called = False
             try:
-                self._check_tenant_budget(db, tenant)
+                called = self._check_tenant_budget(db, tenant) or called
             except Exception:  # noqa: BLE001
                 log.exception("budget check failed tenant=%s", tenant.id)
+                called = True
             try:
-                self._check_tenant_egress(db, tenant)
+                called = self._check_tenant_egress(db, tenant) or called
             except Exception:  # noqa: BLE001
                 log.exception("egress check failed tenant=%s", tenant.id)
-            # Gentle spacing between tenants that may call OCI Usage.
-            if float(tenant.budget_monthly_usd or 0.0) > 0:
+                called = True
+            if called:
                 time.sleep(1.5)
 
-    def _check_tenant_budget(self, db: Session, tenant: Tenant) -> None:
+    def _check_tenant_budget(self, db: Session, tenant: Tenant) -> bool:
+        """Returns whether an OCI call was made (drives the inter-tenant pause)."""
         budget = float(tenant.budget_monthly_usd or 0.0)
         if budget <= 0:
-            return
+            return False
         month = _local_now().strftime("%Y-%m")
         if tenant.budget_notified_month == month:
-            return
+            return False
         from web.backend.oci_bridge import tenant_row_to_config
 
         session = self.sessions.get(tenant_row_to_config(tenant))
@@ -779,7 +786,7 @@ class Worker:
         except (TypeError, ValueError):
             total = 0.0
         if not result.ok or total < budget:
-            return
+            return True
         currency = str(data.get("currency") or "USD")
         tenant.budget_notified_month = month
         # Commit before sending: a flush alone could be rolled back by a later
@@ -797,8 +804,9 @@ class Worker:
                 "请到「账号用量」页查看服务明细，必要时清理付费资源。"
             ),
         )
+        return True
 
-    def _check_tenant_egress(self, db: Session, tenant: Tenant) -> None:
+    def _check_tenant_egress(self, db: Session, tenant: Tenant) -> bool:
         """Warn once a month when outbound traffic nears the free 10 TB.
 
         Fires at 80% rather than on overage: the whole point is to leave room to
@@ -811,7 +819,7 @@ class Worker:
 
         month = _local_now().strftime("%Y-%m")
         if tenant.egress_notified_month == month:
-            return
+            return False
         from web.backend.oci_bridge import tenant_row_to_config
 
         session = self.sessions.get(tenant_row_to_config(tenant))
@@ -819,13 +827,13 @@ class Worker:
         data = result.data if isinstance(result.data, dict) else {}
         if not result.ok:
             log.warning("egress read failed tenant=%s: %s", tenant.id, result.message)
-            return
+            return True
         try:
             used_gb = float(data.get("egress_gb") or 0.0)
         except (TypeError, ValueError):
-            return
+            return True
         if used_gb < FREE_EGRESS_GB * EGRESS_ALERT_RATIO:
-            return
+            return True
         tenant.egress_notified_month = month
         # Commit before sending, same as the budget alert: a later failure in this
         # tick would otherwise un-mark a month whose alert already went out.
@@ -843,6 +851,7 @@ class Worker:
                 "且包含区域内互通等免费流量），超出免费额度的部分 Oracle 会计费。"
             ),
         )
+        return True
 
 
 def main() -> int:

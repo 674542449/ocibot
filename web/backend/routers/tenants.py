@@ -260,7 +260,6 @@ def update_tenant(
     )
     if isinstance(new_pem, str) and new_pem.strip():
         row.private_key_encrypted = encrypt_text(new_pem.strip())
-        drop_session(row.id)
 
     # 副区 rows hold a COPY of this row's credentials — they are the same Oracle
     # API key by construction. Without this, rotating the primary's key (or fixing
@@ -280,16 +279,18 @@ def update_tenant(
         child.fingerprint = row.fingerprint
         child.private_key_encrypted = row.private_key_encrypted
         child.updated_at = datetime.now(timezone.utc)
-        drop_session(child.id)
-        clear_launch_meta_cache(child.id)
 
     row.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(row)
-    drop_session(row.id)
-    # Region / compartment may have changed, so the launch metadata cached for
-    # this tenant no longer describes it.
-    clear_launch_meta_cache(row.id)
+    # Cache eviction strictly AFTER the commit. Dropping first leaves a window in
+    # which a concurrent request rebuilds the session from the not-yet-committed
+    # row and re-caches the OLD credentials, which would then outlive the update.
+    for target in [row, *children]:
+        drop_session(target.id)
+        # Region / compartment may have changed, so the launch metadata cached for
+        # this tenant no longer describes it.
+        clear_launch_meta_cache(target.id)
     return _to_out(row)
 
 
@@ -478,9 +479,15 @@ def subscribe_tenant_region(
             message += f"；面板中已有该区域租户「{existing.name}」"
         else:
             label = region_area(region_name)
+            # Tenant.name is VARCHAR(128) and the parent may already be that long.
+            # SQLite silently overflows, PostgreSQL raises "value too long" and the
+            # subscription would already have been made at Oracle by then — an
+            # irreversible action followed by a 500.
+            suffix = f" · {label}"
+            child_name = (parent.name[: 128 - len(suffix)] + suffix)[:128]
             child = Tenant(
                 owner_id=user.id,
-                name=f"{parent.name} · {label}",
+                name=child_name,
                 user_ocid=parent.user_ocid,
                 tenancy_ocid=parent.tenancy_ocid,
                 fingerprint=parent.fingerprint,
@@ -589,12 +596,15 @@ def delete_tenant(
         ).all()
     )
     for target in [*children, row]:
+        db.delete(target)
+    db.commit()
+    # After the commit, for the same reason as update_tenant: a concurrent request
+    # could otherwise rebuild and re-cache a session for a row that is going away.
+    for target in [*children, row]:
         drop_session(target.id)
         # The launch-meta cache keyed on this tenant would otherwise be retained until
         # its TTL expired (clear_launch_meta_cache had no callers at all).
         clear_launch_meta_cache(target.id)
-        db.delete(target)
-    db.commit()
     if children:
         return {"message": f"已删除（含 {len(children)} 个副区）"}
     return {"message": "已删除"}

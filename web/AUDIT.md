@@ -1,5 +1,46 @@
 # Web audit notes
 
+## Pass 8 — review of the 0.4.16–0.4.21 code (0.4.22, 2026-07-28)
+
+Scope note: passes 4–7 covered the pre-0.4.16 codebase, including an adversarial
+20-agent sweep. This pass targets the code added since — 副区 (secondary regions),
+outbound-traffic tracking, and the read cache that came and went — which had never
+been through one. The older surfaces were spot-checked rather than re-reviewed
+(no raw SQL outside model-derived DDL, no shell=True / eval / pickle, no v-html or
+innerHTML in the SPA, cookie flags and SSH command construction re-confirmed).
+
+### Fixed
+
+| Issue | Severity | Notes |
+|-------|----------|-------|
+| A 副区 row keeps a **copy** of its primary's credentials, but updating the primary's private key / fingerprint / OCIDs did not propagate. Every secondary region kept authenticating with the old key until it surfaced as a 401 — with no indication of why. | High (silent breakage) | Credential fields propagate to linked rows on update. |
+| Shape resize, boot-volume growth and block-volume create/resize in a 副区 were refused by the Always-Free guard. A child inherits `account_tier` from its parent, and an empty tier means "hard cap", so a resize the user was deliberately paying for failed with 超过免费上限 — in a region with no free allowance at all, judged against a usage snapshot that only counts that one region. | Medium | All three now use `quota_guard.secondary_region_gate`, the same gate as launch; it still refuses outright if the tenant has free-only mode on. |
+| The daily worker sweep paused between tenants only when `budget_monthly_usd > 0`. The 0.4.19 egress check calls Monitoring regardless of any budget, so an operator with no budgets set got every tenant's query back to back — the exact multi-account burst that pause exists to prevent. | Medium | Both checks now report whether they actually called Oracle, and the pause keys on that. |
+| `subscribe_region` built the 副区 row name as `f"{parent.name} · {label}"` against a `VARCHAR(128)` column whose parent may already be 128 chars. SQLite silently overflows; **PostgreSQL raises**, and by then the Oracle subscription — which cannot be undone — has already been made, so the operator sees a 500 after an irreversible action. | Medium | Name truncated to fit; regression test with a 128-char parent. |
+| `update_tenant` / `delete_tenant` evicted the cached OCI session **before** committing. A concurrent request could rebuild it from the uncommitted row and re-cache the old credentials, which then outlive the update (or, on delete, are never evicted again). | Low | Eviction moved strictly after the commit, for the row and its 副区 children. |
+| Entering the instances page with `?tenant=` fetched twice concurrently: assigning `tenantId` queues the watcher, Vue flushes it on nextTick — inside the initial load's `await`. | Low (0.4.20 only) | Moot after the 0.4.21 revert to manual refresh; noted so it is not reintroduced. |
+
+### Reviewed and found correct
+
+Ownership is enforced before every tenant-scoped read and write, and cross-user
+access answers 404 rather than 403 (`tests/test_user_isolation.py`, with both users
+deliberately pointed at the same Oracle tenancy OCID — the case where a leak would
+be plausible, since rows are then distinguishable only by their own uuid). The
+region-subscription endpoint requires an explicit confirmation, is audit-logged, is
+idempotent against a repeat click, and cannot fire a second `CreateRegionSubscription`
+while Oracle still reports the new subscription as pending. `region_pair` fails
+towards "home region" so an unreadable region lookup cannot block every launch, with
+the tenant row's own parent link as an independent second signal. Egress is tracked
+for visibility only: `validate_launch_against_quota` never reads it and its bucket is
+soft, so it cannot make an unrelated launch look blocked.
+
+### Not covered by this pass
+
+The self-update path (`self_update.py`, which drives the mounted docker socket) and
+the WebSSH terminal were reviewed in passes 4–7 and only spot-checked here. The two
+gaps recorded below — DNS rebinding on outbound notifications, and the per-process
+rate limiter — are unchanged.
+
 ## Pass 4 — full-codebase bug + security review (0.4.14, 2026-07-26)
 
 Reviewed every router, the worker, the shared OCI layer entry points, the SPA and

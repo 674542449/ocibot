@@ -248,7 +248,12 @@ def client():
 
 def _stub_regions(monkeypatch, *, subscribed=("ap-tokyo-1",)):
     """Stub the tenants router's OCI session with a small region catalogue."""
-    catalog = {"ap-tokyo-1": "nrt", "ap-osaka-1": "kix", "eu-frankfurt-1": "fra"}
+    catalog = {
+        "ap-tokyo-1": "NRT",
+        "ap-osaka-1": "KIX",
+        "eu-frankfurt-1": "FRA",
+        "ap-seoul-1": "ICN",
+    }
     session = MagicMock()
     session.home_region.return_value = "ap-tokyo-1"
     session.list_subscribed_regions.return_value = _Result(
@@ -550,3 +555,112 @@ def test_rotating_the_primary_key_updates_its_secondary_rows(client, monkeypatch
         # Still linked, still its own region.
         assert child.parent_tenant_id == tid
         assert child.region == "ap-osaka-1"
+
+
+# ------------------------------------------------- storage guards in a 副区
+
+
+def _stub_storage_session(monkeypatch, region: str = "ap-osaka-1", home: str = "ap-tokyo-1"):
+    """A 副区 session for the storage router, with a FULL free-storage snapshot.
+
+    200 GB already used means any free-cap check would refuse — so if the request
+    succeeds, the 副区 gate really did replace that check rather than stack with it.
+    """
+    import web.backend.routers.storage as storage_router
+
+    session = MagicMock()
+    session.tenant = SimpleNamespace(region=region)
+    session.home_region.return_value = home
+    session.resolve_compartment.return_value = "ocid1.compartment.oc1..c1"
+    session.get_free_quota_usage.return_value = _Result(
+        True,
+        "",
+        {
+            "account_tier": "",
+            "usage": {"block_storage_gb": 200.0},
+            "remaining": {"block_storage_gb": 0.0},
+            "buckets": {},
+        },
+    )
+    session.create_block_volume.return_value = _Result(True, "已创建", {"id": "v1"})
+    monkeypatch.setattr(storage_router, "get_session_for_row", lambda row: session)
+    return session
+
+
+def test_secondary_region_volume_creation_skips_the_free_storage_cap(client, monkeypatch):
+    """The snapshot says the free 200GB is fully used, but that allowance does not
+    exist in a 副区 and the snapshot only counts one region anyway."""
+    c, _tid = client
+    sub_id = _secondary_tenant()
+    session = _stub_storage_session(monkeypatch)
+    r = c.post(
+        f"/api/tenants/{sub_id}/block-volumes",
+        json={"availability_domain": "AD-1", "size_in_gbs": 500},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["ok"] is True
+    session.create_block_volume.assert_called_once()
+
+
+def test_free_only_secondary_tenant_cannot_create_volumes(client, monkeypatch):
+    c, _tid = client
+    sub_id = _secondary_tenant()
+    with SessionLocal() as db:
+        db.query(Tenant).filter(Tenant.id == sub_id).update({"free_only_mode": True})
+        db.commit()
+    try:
+        session = _stub_storage_session(monkeypatch)
+        r = c.post(
+            f"/api/tenants/{sub_id}/block-volumes",
+            json={"availability_domain": "AD-1", "size_in_gbs": 60},
+        )
+        # The 400 must survive the router's broad except -> 502 wrapper.
+        assert r.status_code == 400, r.text
+        assert "副区" in r.json()["detail"]
+        session.create_block_volume.assert_not_called()
+    finally:
+        with SessionLocal() as db:
+            db.query(Tenant).filter(Tenant.id == sub_id).update({"free_only_mode": False})
+            db.commit()
+
+
+def test_home_region_tenant_still_hits_the_free_storage_cap(client, monkeypatch):
+    """The gate must not have disabled the cap for ordinary tenants."""
+    c, tid = client
+    session = _stub_storage_session(monkeypatch, region="ap-tokyo-1", home="ap-tokyo-1")
+    r = c.post(
+        f"/api/tenants/{tid}/block-volumes",
+        json={"availability_domain": "AD-1", "size_in_gbs": 500},
+    )
+    assert r.status_code == 400, r.text
+    assert "块存储" in r.json()["detail"]
+    session.create_block_volume.assert_not_called()
+
+
+def test_long_primary_name_does_not_overflow_the_child_name_column(client, monkeypatch):
+    """Tenant.name is VARCHAR(128). PostgreSQL raises on overflow, and by then the
+    Oracle subscription — which cannot be undone — has already been made."""
+    c, _tid = client
+    _stub_regions(monkeypatch, subscribed=("ap-tokyo-1", "ap-seoul-1"))
+    with SessionLocal() as db:
+        user = db.query(User).filter(User.username == "subregion-user").one()
+        parent = Tenant(
+            owner_id=user.id,
+            name="X" * 128,
+            region="ap-tokyo-1",
+            user_ocid="ocid1.user.oc1..aaaabbbbccccddddeeeeffffgggghhhh",
+            tenancy_ocid="ocid1.tenancy.oc1..longname",
+            fingerprint="11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00",
+            private_key_encrypted=encrypt_text(_PEM),
+        )
+        db.add(parent)
+        db.commit()
+        parent_id = parent.id
+
+    d = c.post(
+        f"/api/tenants/{parent_id}/regions/subscribe",
+        json={"region": "ap-seoul-1", "confirm": True},
+    ).json()
+    assert d["ok"] is True, d
+    assert len(d["tenant"]["name"]) <= 128
+    assert d["tenant"]["name"].endswith("首尔")
