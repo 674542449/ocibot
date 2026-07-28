@@ -71,6 +71,9 @@ irm https://raw.githubusercontent.com/674542449/ocibot/main/scripts/install.ps1 
 3. 进入 **租户**，粘贴 OCI API 配置与私钥
 4. 在 **实例 / 创建实例** 开始使用
 
+> 换机器重装 / 想挂域名走 HTTPS：[docs/REDEPLOY.md](docs/REDEPLOY.md) 是从零到可用的
+> 完整步骤（含旧机器备份导出、Oracle 云放行 80/443、域名反代与完工检查）。
+
 ### 更新
 
 ```bash
