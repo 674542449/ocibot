@@ -325,6 +325,9 @@ const gauges = [
   { key: 'block_storage_gb', label: '块存储（引导+块卷）', unit: 'GB' },
   { key: 'object_storage_gb', label: '对象存储', unit: 'GB' },
   { key: 'public_ip_soft', label: '公网 IP（软）', unit: '个' },
+  // Absent unless the server was asked for it (include_egress); visibleGauges
+  // drops it rather than rendering an empty bar that reads as "10TB free".
+  { key: 'egress_gb', label: '出网流量（本月·估算）', unit: 'GB' },
 ]
 const visibleGauges = computed(() => gauges.filter((g) => (quota.value?.buckets || {})[g.key]))
 function bucket(key: string) {

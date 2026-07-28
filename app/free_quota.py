@@ -17,6 +17,14 @@ FREE_BLOCK_STORAGE_GB = 200.0
 FREE_OBJECT_STORAGE_GB = 20.0
 # Soft visibility only — ephemeral public IPs on free VMs are free; not a hard block.
 FREE_PUBLIC_IP_SOFT = 2
+# Outbound data transfer included per month (10 TB, binary units to match the byte
+# counter it is compared against). Tracked for visibility/alerting only: the figure
+# it is compared with is an upper bound from VCN metrics, not a bill, and egress is
+# not knowable at launch time — so it never blocks a create. See
+# TenantSession.get_network_egress_usage.
+FREE_EGRESS_GB = 10240.0
+# Fraction of the allowance that triggers the monthly notification.
+EGRESS_ALERT_RATIO = 0.8
 
 # Default boot size assumed when the launch form leaves size empty (~Ubuntu image).
 DEFAULT_BOOT_GB_ASSUMED = 47
@@ -205,8 +213,15 @@ def build_quota_snapshot(
     account_tier: str = "",
     notes: Optional[list[str]] = None,
     object_usage: Optional[dict[str, Any]] = None,
+    egress_usage: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    """Combine instance + volume (+ optional object) usage into a dashboard snapshot."""
+    """Combine instance + volume (+ optional object / egress) usage into a snapshot.
+
+    ``egress_usage`` is optional because it costs an extra Monitoring query and can
+    never block a create: callers on the launch/guard hot path omit it, and the
+    bucket is then absent rather than present-and-zero, which would read as
+    "10 TB still free" on a page that could not check.
+    """
     compute = summarize_instances(instances)
     storage = summarize_storage(volumes)
     object_usage = object_usage or {}
@@ -252,6 +267,12 @@ def build_quota_snapshot(
         "object_storage_gb": _bucket(object_used, FREE_OBJECT_STORAGE_GB),
         "public_ip_soft": _bucket(float(public_ips), float(FREE_PUBLIC_IP_SOFT), soft=True),
     }
+    # Soft: the reading is an upper bound over one region, so it must never push the
+    # overall status to "over" and make an unrelated launch look blocked.
+    egress_used: Optional[float] = None
+    if egress_usage:
+        egress_used = _as_float(egress_usage.get("egress_gb"), 0.0)
+        buckets["egress_gb"] = _bucket(egress_used, FREE_EGRESS_GB, soft=True)
     # Hard overall ignores soft-only buckets.
     overall = "ok"
     for key, b in buckets.items():
@@ -273,37 +294,50 @@ def build_quota_snapshot(
         f"对象存储 {buckets['object_storage_gb']['remaining']:g}/{FREE_OBJECT_STORAGE_GB:g} GB 剩余",
         f"公网 IP {int(buckets['public_ip_soft']['remaining'])}/{FREE_PUBLIC_IP_SOFT}（软追踪）",
     ]
+    if egress_used is not None:
+        lines.append(
+            f"出网流量 本月约 {egress_used:g}/{FREE_EGRESS_GB:g} GB（估算上限）"
+        )
+    limits = {
+        "a1_ocpu": FREE_A1_OCPU,
+        "a1_memory_gb": FREE_A1_MEMORY_GB,
+        "e2_micro_count": FREE_E2_MICRO_COUNT,
+        "block_storage_gb": FREE_BLOCK_STORAGE_GB,
+        "object_storage_gb": FREE_OBJECT_STORAGE_GB,
+        "public_ip_soft": FREE_PUBLIC_IP_SOFT,
+    }
+    usage_out: dict[str, Any] = {
+        "a1_ocpu": a1_ocpu_used,
+        "a1_memory_gb": a1_mem_used,
+        "e2_micro_count": e2_used,
+        "block_storage_gb": disk_used,
+        "boot_volume_gb": storage["boot_volume_gb_used"],
+        "block_volume_gb": storage["block_volume_gb_used"],
+        "object_storage_gb": object_used,
+        "public_ip_count": public_ips,
+        "instance_count": compute["instance_count"],
+        "orphan_boot_count": storage["orphan_boot_count"],
+    }
+    remaining_out = {
+        "a1_ocpu": buckets["a1_ocpu"]["remaining"],
+        "a1_memory_gb": buckets["a1_memory_gb"]["remaining"],
+        "e2_micro_count": buckets["e2_micro_count"]["remaining"],
+        "block_storage_gb": buckets["block_storage_gb"]["remaining"],
+        "object_storage_gb": buckets["object_storage_gb"]["remaining"],
+        "public_ip_soft": buckets["public_ip_soft"]["remaining"],
+    }
+    if egress_used is not None:
+        limits["egress_gb"] = FREE_EGRESS_GB
+        usage_out["egress_gb"] = egress_used
+        usage_out["egress_region"] = str((egress_usage or {}).get("region") or "")
+        usage_out["egress_approximate"] = True
+        remaining_out["egress_gb"] = buckets["egress_gb"]["remaining"]
     return {
         "free_only_mode": bool(free_only_mode),
         "account_tier": account_tier or "",
-        "limits": {
-            "a1_ocpu": FREE_A1_OCPU,
-            "a1_memory_gb": FREE_A1_MEMORY_GB,
-            "e2_micro_count": FREE_E2_MICRO_COUNT,
-            "block_storage_gb": FREE_BLOCK_STORAGE_GB,
-            "object_storage_gb": FREE_OBJECT_STORAGE_GB,
-            "public_ip_soft": FREE_PUBLIC_IP_SOFT,
-        },
-        "usage": {
-            "a1_ocpu": a1_ocpu_used,
-            "a1_memory_gb": a1_mem_used,
-            "e2_micro_count": e2_used,
-            "block_storage_gb": disk_used,
-            "boot_volume_gb": storage["boot_volume_gb_used"],
-            "block_volume_gb": storage["block_volume_gb_used"],
-            "object_storage_gb": object_used,
-            "public_ip_count": public_ips,
-            "instance_count": compute["instance_count"],
-            "orphan_boot_count": storage["orphan_boot_count"],
-        },
-        "remaining": {
-            "a1_ocpu": buckets["a1_ocpu"]["remaining"],
-            "a1_memory_gb": buckets["a1_memory_gb"]["remaining"],
-            "e2_micro_count": buckets["e2_micro_count"]["remaining"],
-            "block_storage_gb": buckets["block_storage_gb"]["remaining"],
-            "object_storage_gb": buckets["object_storage_gb"]["remaining"],
-            "public_ip_soft": buckets["public_ip_soft"]["remaining"],
-        },
+        "limits": limits,
+        "usage": usage_out,
+        "remaining": remaining_out,
         "buckets": buckets,
         "overall_status": overall,
         "summary_lines": lines,

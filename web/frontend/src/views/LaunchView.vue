@@ -523,6 +523,9 @@ const QUOTA_ROWS: { key: string; label: string; unit: string }[] = [
   { key: 'a1_memory_gb', label: 'A1.Flex 内存', unit: ' GB' },
   { key: 'e2_micro_count', label: 'E2.1.Micro 实例', unit: ' 台' },
   { key: 'block_storage_gb', label: '块存储（含引导卷）', unit: ' GB' },
+  // Only present on the full /free-quota read; the pre-submit check omits egress
+  // because it cannot affect the verdict.
+  { key: 'egress_gb', label: '出网流量（本月·估算）', unit: ' GB' },
 ]
 
 function fmtNum(n: unknown): string {
@@ -537,10 +540,12 @@ function quotaStatusLabel(status: string): string {
   )
 }
 
-/** Per-resource used/limit/remaining rows for the usage panel. */
+/** Per-resource used/limit/remaining rows for the usage panel.
+ *  A row whose bucket the server did not return is dropped — rendering it as
+ *  「已用 — / —」 just looks broken. */
 const quotaRows = computed(() => {
   const buckets = quotaPreview.value?.buckets || {}
-  return QUOTA_ROWS.map((r) => {
+  return QUOTA_ROWS.filter((r) => buckets[r.key]).map((r) => {
     const b = buckets[r.key] || {}
     return {
       key: r.key,

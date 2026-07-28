@@ -393,12 +393,20 @@ def free_quota(
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
     free_only_mode: bool = Query(True),
+    include_egress: bool = Query(True),
 ) -> dict[str, Any]:
-    """Always-Free usage gauges (compute + storage) for the dashboard."""
+    """Always-Free usage gauges (compute + storage + outbound traffic) for the dashboard.
+
+    This is the only caller that asks for egress: it is an explicit user refresh,
+    whereas the launch guard takes the same snapshot on every submit and must not
+    pay for a Monitoring query that cannot change its verdict.
+    """
     row = _tenant_or_404(db, user.id, tenant_id)
     try:
         session = get_session_for_row(row)
-        result = session.get_free_quota_usage(free_only_mode=free_only_mode)
+        result = session.get_free_quota_usage(
+            free_only_mode=free_only_mode, include_egress=include_egress
+        )
         data = result.data if isinstance(result.data, dict) else {}
         # A 副区 has no Always Free allowance of its own; the numbers below are a
         # per-region count and must not be read as free headroom.

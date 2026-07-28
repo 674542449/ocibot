@@ -753,6 +753,10 @@ class Worker:
                 self._check_tenant_budget(db, tenant)
             except Exception:  # noqa: BLE001
                 log.exception("budget check failed tenant=%s", tenant.id)
+            try:
+                self._check_tenant_egress(db, tenant)
+            except Exception:  # noqa: BLE001
+                log.exception("egress check failed tenant=%s", tenant.id)
             # Gentle spacing between tenants that may call OCI Usage.
             if float(tenant.budget_monthly_usd or 0.0) > 0:
                 time.sleep(1.5)
@@ -793,6 +797,53 @@ class Worker:
                 "请到「账号用量」页查看服务明细，必要时清理付费资源。"
             ),
         )
+
+    def _check_tenant_egress(self, db: Session, tenant: Tenant) -> None:
+        """Warn once a month when outbound traffic nears the free 10 TB.
+
+        Fires at 80% rather than on overage: the whole point is to leave room to
+        react, and unlike the storage caps this one cannot be enforced at create
+        time. The reading is an upper bound over a single region (see
+        get_network_egress_usage), so the message says so instead of presenting it
+        as a bill.
+        """
+        from app.free_quota import EGRESS_ALERT_RATIO, FREE_EGRESS_GB
+
+        month = _local_now().strftime("%Y-%m")
+        if tenant.egress_notified_month == month:
+            return
+        from web.backend.oci_bridge import tenant_row_to_config
+
+        session = self.sessions.get(tenant_row_to_config(tenant))
+        result = session.get_network_egress_usage()
+        data = result.data if isinstance(result.data, dict) else {}
+        if not result.ok:
+            log.warning("egress read failed tenant=%s: %s", tenant.id, result.message)
+            return
+        try:
+            used_gb = float(data.get("egress_gb") or 0.0)
+        except (TypeError, ValueError):
+            return
+        if used_gb < FREE_EGRESS_GB * EGRESS_ALERT_RATIO:
+            return
+        tenant.egress_notified_month = month
+        # Commit before sending, same as the budget alert: a later failure in this
+        # tick would otherwise un-mark a month whose alert already went out.
+        db.commit()
+        notify_user(
+            db,
+            tenant.owner_id,
+            "budget",
+            "📡 OCIBot 出网流量提醒",
+            (
+                f"租户「{tenant.name}」本月出网流量约 {used_gb:.0f} GB，"
+                f"已达免费额度 {FREE_EGRESS_GB:.0f} GB 的 "
+                f"{used_gb / FREE_EGRESS_GB * 100:.0f}%。\n"
+                f"该数字为估算上限（仅统计区域 {data.get('region') or '—'}，"
+                "且包含区域内互通等免费流量），超出免费额度的部分 Oracle 会计费。"
+            ),
+        )
+
 
 def main() -> int:
     Worker().run_forever()

@@ -2705,11 +2705,22 @@ class TenantSession:
             },
         )
 
-    def get_free_quota_usage(self, *, free_only_mode: bool = True, include_block: bool = True) -> OperationResult:
+    def get_free_quota_usage(
+        self,
+        *,
+        free_only_mode: bool = True,
+        include_block: bool = True,
+        include_egress: bool = False,
+    ) -> OperationResult:
         """Aggregate Always-Free usage (compute + storage) for the quota dashboard.
 
         Reuses app.free_quota.build_quota_snapshot so the same caps/thresholds apply
         everywhere. Returns the snapshot dict in ``.data``.
+
+        ``include_egress`` is off by default: it costs an extra Monitoring query and
+        outbound traffic can never block a create, so the launch guard and the worker
+        (which take this snapshot on every attempt) skip it. Read-only dashboards
+        turn it on.
         """
         from app import free_quota
 
@@ -2769,6 +2780,21 @@ class TenantSession:
         except Exception as exc:  # noqa: BLE001
             notes.append(f"对象存储读取失败：{exc}")
 
+        egress_usage: dict[str, Any] = {}
+        if include_egress:
+            try:
+                egress = self.get_network_egress_usage()
+                if egress.ok and isinstance(egress.data, dict):
+                    egress_usage = egress.data
+                    if egress.data.get("note"):
+                        notes.append(str(egress.data["note"]))
+                elif egress.message:
+                    # Informational only — an unreadable egress figure must not set
+                    # read_incomplete, which would fail-closed on every launch.
+                    notes.append(f"出网流量读取失败：{egress.message}")
+            except Exception as exc:  # noqa: BLE001
+                notes.append(f"出网流量读取失败：{exc}")
+
         snapshot = free_quota.build_quota_snapshot(
             instances=instances,
             volumes=volumes,
@@ -2776,6 +2802,7 @@ class TenantSession:
             account_tier=getattr(self.tenant, "account_tier", "") or "",
             notes=notes,
             object_usage=object_usage,
+            egress_usage=egress_usage,
         )
         # Consumed by web.backend.quota_guard to fail closed instead of treating an
         # undercount as free headroom.
@@ -3496,6 +3523,75 @@ class TenantSession:
                 message=str(exc),
                 data={"daily": [], "by_service": [], "total": 0, "currency": "", "days": days},
             )
+
+    def get_network_egress_usage(self) -> OperationResult:
+        """Outbound bytes for the current calendar month, from VCN metrics.
+
+        Always Free includes 10 TB/month of outbound data transfer — the one free
+        allowance the quota guard never tracked, and a realistic way to be billed
+        by surprise (a download box or a proxy reaches it easily).
+
+        Deliberately an UPPER BOUND, not a bill:
+          * ``VnicToNetworkBytes`` counts everything leaving the VNIC, including
+            intra-VCN and intra-region traffic that Oracle does not charge for;
+          * the allowance is tenancy-wide while this query is per region, so a
+            tenancy with 副区 sees each region separately.
+        Both are stated in the returned note rather than silently rounded away.
+        Unlike ``NetworksBytesOut`` in oci_computeagent (a cumulative counter that
+        needs ``.rate()``), this metric is a per-interval byte count, so the hourly
+        buckets are summed directly — and it needs no agent on the instance.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        end = datetime.now(timezone.utc)
+        start = end.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        # Monitoring keeps ~90 days; a calendar month is always within range, but
+        # clamp anyway so a clock skew cannot produce a rejected query.
+        if (end - start) > timedelta(days=32):
+            start = end - timedelta(days=32)
+        compartment = self.resolve_compartment()
+        try:
+            details = oci.monitoring.models.SummarizeMetricsDataDetails(
+                namespace="oci_vcn",
+                query="VnicToNetworkBytes[1h].sum()",
+                start_time=start,
+                end_time=end,
+            )
+            resp = self.monitoring.summarize_metrics_data(
+                compartment, details, compartment_id_in_subtree=True
+            ).data
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=str(exc))
+
+        total_bytes = 0.0
+        for metric in resp or []:
+            for dp in getattr(metric, "aggregated_datapoints", None) or []:
+                try:
+                    value = float(getattr(dp, "value", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if value != value or value < 0:  # NaN / counter reset
+                    continue
+                total_bytes += value
+
+        egress_gb = total_bytes / (1024**3)
+        return OperationResult(
+            ok=True,
+            message="",
+            data={
+                "egress_gb": round(egress_gb, 3),
+                "region": self.tenant.region.strip(),
+                "since": start.isoformat(),
+                "until": end.isoformat(),
+                "approximate": True,
+                "note": (
+                    f"出网流量为估算上限（含区域内互通等免费流量），且只统计当前区域 "
+                    f"{self.tenant.region.strip()}；10TB/月 免费额度按整个租户计算。"
+                ),
+            },
+        )
 
     def get_account_status(self) -> OperationResult:
         """Return tenancy info plus an Always-Free / PAYG classification.

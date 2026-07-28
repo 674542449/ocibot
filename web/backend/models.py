@@ -83,6 +83,8 @@ class Tenant(Base):
     budget_monthly_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     # "YYYY-MM" of the last month a budget-exceeded notification was sent.
     budget_notified_month: Mapped[str] = mapped_column(String(8), default="", nullable=False)
+    # Same, for the monthly outbound-traffic (10TB Always Free) alert.
+    egress_notified_month: Mapped[str] = mapped_column(String(8), default="", nullable=False)
     # Legacy: last local password-expiry notify day (unused).
     pwd_expiry_notified_on: Mapped[str] = mapped_column(String(16), default="", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
