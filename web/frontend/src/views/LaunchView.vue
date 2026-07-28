@@ -4,7 +4,7 @@
       <div>
         <h2>创建实例</h2>
         <p class="muted" style="margin: 0.2rem 0 0">
-          进入自动加载镜像 / Shape / 网络与额度 · 点「重新加载配置」强制刷新 API
+          选择租户后点「加载配置」再创建 · 不自动请求 Oracle API
         </p>
       </div>
       <div class="page-tools">
@@ -128,14 +128,14 @@
         >
           {{ loadingMeta ? '加载中…' : meta ? '重新加载配置' : '加载配置（镜像 / Shape / 网络）' }}
         </button>
-        <span v-if="!meta && tenantId && !loadingMeta" class="muted" style="font-size: 12px">
-          元数据尚未加载，点左侧按钮重试
+        <span v-if="!meta && tenantId" class="muted" style="font-size: 12px">
+          为减少 API 调用，进入本页不会自动拉取租户元数据
         </span>
         <button
           v-if="!isSecondaryRegion"
           type="button"
           :disabled="!tenantId || loadingQuota"
-          @click="loadQuotaPreview(true)"
+          @click="loadQuotaPreview"
         >
           {{ loadingQuota ? '读取额度中…' : '刷新免费额度' }}
         </button>
@@ -877,14 +877,12 @@ const confirmRows = computed(() => {
   ] as [string, string][]
 })
 
-async function loadQuotaPreview(force = false) {
+async function loadQuotaPreview() {
   if (!tenantId.value || loadingQuota.value) return
   loadingQuota.value = true
   quotaLoadError.value = ''
   try {
-    const { data } = await api.get(`/tenants/${tenantId.value}/free-quota`, {
-      params: { force },
-    })
+    const { data } = await api.get(`/tenants/${tenantId.value}/free-quota`)
     quotaPreview.value = data.data || null
   } catch (e: any) {
     quotaPreview.value = null
@@ -1093,10 +1091,7 @@ onMounted(async () => {
   try {
     await loadTenants()
     form.display_name = padName()
-    // Auto-load on entry (0.4.20). launch-meta has its own 15-minute cache and the
-    // quota read a short one, so this is not a fresh Oracle fan-out every visit.
-    await loadMeta()
-    void loadQuotaPreview()
+    // No automatic launch-meta fetch on enter.
   } catch (e: any) {
     error.value = e?.message || '初始化失败'
   }

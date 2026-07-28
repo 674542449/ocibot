@@ -21,7 +21,6 @@ from web.backend.launch_service import (
     schedule_post_launch_adjustments,
 )
 from web.backend.models import CapacityJob, Tenant, User
-from web.backend.read_cache import cache_key, get_or_load, invalidate
 from web.backend.oci_bridge import (
     get_owned_tenant,
     get_session_for_row,
@@ -77,33 +76,22 @@ def list_instances(
     # Default False: IP resolution multiplies OCI calls; opt in from the UI.
     resolve_ips: bool = Query(False),
     include_terminated: bool = Query(False),
-    force: bool = Query(False),
 ) -> list[InstanceOut]:
-    # Ownership is settled here, before any cache lookup — entries are keyed by
-    # tenant id alone, so serving one to a non-owner would be a data leak.
     row = _tenant_or_404(db, user.id, tenant_id)
     if not row.enabled:
         raise HTTPException(status_code=400, detail="租户已禁用")
     try:
         session = get_session_for_row(row)
-
-        def _load() -> list[InstanceOut]:
-            if include_subcompartments:
-                infos = session.list_instances_tree(resolve_ips=resolve_ips)
-            else:
-                infos = session.list_instances(resolve_ips=resolve_ips)
-            if not include_terminated:
-                infos = _visible_instances(infos)
-            return [
-                InstanceOut(**instance_to_dict(i, tenant_id=row.id, tenant_name=row.name))
-                for i in infos
-            ]
-
-        key = cache_key(
-            row.id, "instances", include_subcompartments, resolve_ips, include_terminated
-        )
-        items, _age = get_or_load(key, _load, force=force)
-        return items
+        if include_subcompartments:
+            infos = session.list_instances_tree(resolve_ips=resolve_ips)
+        else:
+            infos = session.list_instances(resolve_ips=resolve_ips)
+        if not include_terminated:
+            infos = _visible_instances(infos)
+        return [
+            InstanceOut(**instance_to_dict(i, tenant_id=row.id, tenant_name=row.name))
+            for i in infos
+        ]
     except OCIClientError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
@@ -171,8 +159,6 @@ def power_action(
     try:
         session = get_session_for_row(row)
         result = session.instance_action(instance_id, action)
-        # Lifecycle state just changed; the cached list would still say the old one.
-        invalidate(tenant_id)
         write_audit(
             db,
             owner_id=user.id,
@@ -202,7 +188,6 @@ def terminate_instance(
             instance_id,
             preserve_boot_volume=body.preserve_boot_volume,
         )
-        invalidate(tenant_id)
         write_audit(
             db,
             owner_id=user.id,
@@ -234,7 +219,6 @@ def rename_instance(
     try:
         session = get_session_for_row(row)
         result = session.rename_instance(instance_id, body.display_name.strip())
-        invalidate(tenant_id)
         return PowerActionResult(**op_result_dict(result))
     except OCIClientError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -276,7 +260,6 @@ def update_shape(
             region_hint=row.region or "",
         ):
             result = session.update_instance_shape(instance_id, body.ocpus, body.memory_in_gbs)
-            invalidate(tenant_id)
             return PowerActionResult(**op_result_dict(result))
         guard = enforce_shape_resize_quota(
             session,
@@ -291,7 +274,6 @@ def update_shape(
             new_memory_in_gbs=body.memory_in_gbs,
         )
         result = session.update_instance_shape(instance_id, body.ocpus, body.memory_in_gbs)
-        invalidate(tenant_id)
         out = PowerActionResult(**op_result_dict(result))
         warns = format_guard_warnings(guard)
         if warns and out.ok:
@@ -320,7 +302,6 @@ def replace_public_ip(
         session = get_session_for_row(row)
         info = session.get_instance(instance_id, resolve_ips=False)
         result = session.replace_ephemeral_public_ip(instance_id, info.compartment_id)
-        invalidate(tenant_id)
         return PowerActionResult(**op_result_dict(result))
     except OCIClientError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -343,7 +324,6 @@ def assign_ipv6(
         session = get_session_for_row(row)
         info = session.get_instance(instance_id, resolve_ips=False)
         result = session.assign_public_ipv6(instance_id, info.compartment_id)
-        invalidate(tenant_id)
         return PowerActionResult(**op_result_dict(result))
     except OCIClientError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -380,34 +360,18 @@ def account_status(
     tenant_id: str,
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
-    force: bool = Query(False),
 ) -> dict[str, Any]:
     row = _tenant_or_404(db, user.id, tenant_id)
     try:
         session = get_session_for_row(row)
-
-        def _load() -> dict[str, Any]:
-            result = session.get_account_status()
-            return {
-                "ok": bool(result.ok),
-                "message": result.message or "",
-                "data": result.data if isinstance(result.data, dict) else {},
-            }
-
-        payload, age = get_or_load(cache_key(row.id, "account"), _load, force=force)
-        data = payload.get("data") or {}
+        result = session.get_account_status()
+        data = result.data if isinstance(result.data, dict) else {}
         # cache tier on tenant row when known
         tier_code = str(data.get("tier_code") or "")
         if tier_code in {"free", "paid"} and row.account_tier != tier_code:
             row.account_tier = tier_code
             db.commit()
-        return {
-            "ok": bool(payload.get("ok")),
-            "message": str(payload.get("message") or ""),
-            "data": data,
-            "cached": age > 0,
-            "cache_age_sec": age,
-        }
+        return {"ok": bool(result.ok), "message": result.message or "", "data": data}
     except OCIClientError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
@@ -443,7 +407,6 @@ def free_quota(
     db: Annotated[Session, Depends(get_db)],
     free_only_mode: bool = Query(True),
     include_egress: bool = Query(True),
-    force: bool = Query(False),
 ) -> dict[str, Any]:
     """Always-Free usage gauges (compute + storage + outbound traffic) for the dashboard.
 
@@ -454,20 +417,10 @@ def free_quota(
     row = _tenant_or_404(db, user.id, tenant_id)
     try:
         session = get_session_for_row(row)
-
-        def _load() -> dict[str, Any]:
-            result = session.get_free_quota_usage(
-                free_only_mode=free_only_mode, include_egress=include_egress
-            )
-            return {
-                "ok": bool(result.ok),
-                "message": result.message or "",
-                "data": result.data if isinstance(result.data, dict) else {},
-            }
-
-        key = cache_key(row.id, "free-quota", free_only_mode, include_egress)
-        payload, age = get_or_load(key, _load, force=force)
-        data = dict(payload.get("data") or {})
+        result = session.get_free_quota_usage(
+            free_only_mode=free_only_mode, include_egress=include_egress
+        )
+        data = dict(result.data if isinstance(result.data, dict) else {})
         # A 副区 has no Always Free allowance of its own; the numbers below are a
         # per-region count and must not be read as free headroom.
         region, home_region = region_pair(session)
@@ -479,11 +432,9 @@ def free_quota(
                 "home_region": home_region or "主区",
             }
         return {
-            "ok": bool(payload.get("ok")),
-            "message": str(payload.get("message") or ""),
+            "ok": bool(result.ok),
+            "message": result.message or "",
             "data": data,
-            "cached": age > 0,
-            "cache_age_sec": age,
         }
     except OCIClientError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -771,9 +722,6 @@ def launch_instance(
     data = result.data if isinstance(result.data, dict) else {}
     instance_id = str(data.get("instance_id") or "")
     if result.ok:
-        # New instance + new boot volume: both the list and the quota snapshot are
-        # now wrong, and the UI navigates straight to the list after this.
-        invalidate(tenant_id)
         schedule_post_launch_adjustments(
             session,
             instance_id=instance_id,

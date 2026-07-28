@@ -18,7 +18,6 @@ from web.backend.db import get_db
 from web.backend.launch_service import clear_launch_meta_cache
 from web.backend.models import Tenant, User
 from web.backend.oci_bridge import drop_session, get_owned_tenant, get_session_for_row
-from web.backend.read_cache import invalidate
 from web.backend.schemas import (
     OciPasswordPolicyOut,
     RegionSubscribeRequest,
@@ -283,16 +282,14 @@ def update_tenant(
         child.updated_at = datetime.now(timezone.utc)
         drop_session(child.id)
         clear_launch_meta_cache(child.id)
-        invalidate(child.id)
 
     row.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(row)
     drop_session(row.id)
-    # Region / compartment may have changed, which changes what every cached read
-    # for this tenant returns.
+    # Region / compartment may have changed, so the launch metadata cached for
+    # this tenant no longer describes it.
     clear_launch_meta_cache(row.id)
-    invalidate(row.id)
     return _to_out(row)
 
 
@@ -593,7 +590,6 @@ def delete_tenant(
     )
     for target in [*children, row]:
         drop_session(target.id)
-        invalidate(target.id)
         # The launch-meta cache keyed on this tenant would otherwise be retained until
         # its TTL expired (clear_launch_meta_cache had no callers at all).
         clear_launch_meta_cache(target.id)

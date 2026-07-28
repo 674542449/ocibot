@@ -4,7 +4,7 @@
       <div>
         <h2>实例</h2>
         <p class="muted" style="margin: 0.2rem 0 0">
-          进入自动加载（服务端短缓存）· 点「刷新」强制重新请求 · 点名称进详情
+          选择租户后点击「刷新」加载 · 点名称进详情
         </p>
       </div>
       <div class="page-tools">
@@ -29,6 +29,9 @@
 
     <div v-if="error" class="error-box">{{ error }}</div>
     <div v-if="msg" class="success-box">{{ msg }}</div>
+    <div v-if="!loading && !loadedOnce && tenantId" class="card muted" style="font-size: 13px">
+      为减少 Oracle API 调用，进入本页<strong>不会自动拉取实例</strong>。选择租户后点击右上角「刷新」。
+    </div>
 
     <div v-if="selected.size > 0" class="card row batch-bar">
       <strong>已选 {{ selected.size }} 台</strong>
@@ -389,14 +392,14 @@ async function loadTenants() {
 
 let loadSeq = 0
 
-/** Manual 刷新: clear the banners, then force a fresh read past the server cache. */
+/** Manual 刷新: clear the banners, then load. */
 function refresh() {
   error.value = ''
   msg.value = ''
-  void load(true)
+  void load()
 }
 
-async function load(force = false) {
+async function load() {
   // Deliberately does NOT clear msg/error: power, rename, terminate and the bulk
   // actions all call load() right after succeeding, so clearing here wiped the
   // very success message (and the bulk failure list) before it could be read.
@@ -418,7 +421,7 @@ async function load(force = false) {
   const superseded = () => seq !== loadSeq || tenantId.value !== wanted
   try {
     const res = await api.get<Instance[]>(`/tenants/${tenantId.value}/instances`, {
-      params: { resolve_ips: resolveIps.value, include_subcompartments: true, force },
+      params: { resolve_ips: resolveIps.value, include_subcompartments: true },
     })
     // Discard out-of-order responses from a superseded tenant switch.
     if (superseded()) return
@@ -520,8 +523,7 @@ async function terminate(ins: Instance) {
 let bootstrapped = false
 
 watch(tenantId, (id) => {
-  // Changing tenant loads that tenant's list (0.4.20). The read is cached
-  // server-side for a minute, so flipping between tenants is not a fan-out.
+  // Changing tenant clears the previous list; user must click 刷新 to hit OCI.
   instances.value = []
   loadedOnce.value = false
   selected.clear()
@@ -529,14 +531,14 @@ watch(tenantId, (id) => {
     error.value = '还没有租户。请先到「租户」页添加 API 配置。'
   } else {
     error.value = ''
-    if (bootstrapped && id) void load()
   }
 })
 
-// Toggling IP resolution changes what the server returns, so reload — but force
-// past the cache, whose key includes resolve_ips and would otherwise just miss.
+// Toggling IP resolution only applies on the next manual refresh.
 watch(resolveIps, () => {
-  if (loadedOnce.value) void load(true)
+  if (loadedOnce.value) {
+    msg.value = '已切换「解析 IP」；请点击「刷新」重新加载实例列表。'
+  }
 })
 
 onMounted(async () => {
@@ -546,13 +548,7 @@ onMounted(async () => {
     if (q && tenants.value.some((t) => t.id === q) && q !== tenantId.value) {
       tenantId.value = q
     }
-    // Auto-load on entry (0.4.20); server-side cache absorbs repeat visits.
-    // `bootstrapped` stays false until this finishes on purpose: assigning
-    // tenantId above queues the watcher (Vue flushes it on nextTick, i.e. inside
-    // the await below), and it would fire a SECOND concurrent OCI fan-out for the
-    // same tenant. The watcher only takes over once the initial load is done.
-    await load()
-    bootstrapped = true
+    // Intentionally do NOT auto-call OCI list on enter.
   } catch (e: any) {
     error.value = e?.message || '初始化失败'
   } finally {

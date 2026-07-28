@@ -38,13 +38,12 @@ changed under 功能 / 修复 / 维护 and the upgrade snippet.
 
 ## Things that are deliberate — do not "fix" them
 
-- Pages **do** auto-fetch on entry (0.4.20, reversing 0.4.13). The API-volume concern
-  that motivated manual refresh is now handled by `web/backend/read_cache.py` instead:
-  entry loads are served from a 60s per-tenant cache, an explicit 刷新 sends
-  `force=1` to bypass it, and every mutating handler calls `invalidate(tenant_id)`.
-  If you add a read that pages load on entry, cache it; if you add a mutation, add the
-  `invalidate` — a stale list outliving the change that made it wrong is the failure
-  mode this trades for.
+- Pages do not auto-fetch from Oracle on entry; the user clicks 刷新 / 加载配置.
+  This is to keep OCI API call volume down (CHANGELOG 0.4.13). **Auto-loading was
+  tried in 0.4.20 and reverted in 0.4.21** — even with a server-side read cache in
+  front of it, spending request budget on page navigation competes with the capacity
+  retry loop for the same rate limit, and OCI's usage terms are the operator's
+  liability. Do not reintroduce it.
 - `GET /api/instances` (all-tenant aggregate) returns 400 on purpose.
 - `POST .../create-image` returns 403 on purpose.
 - WebSSH host keys are keyed on the **instance OCID**, not the address, so routine
