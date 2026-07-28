@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.24 — 2026-07-28
+
+### 文档
+- 新增 [docs/NPM-REVERSE-PROXY.md](docs/NPM-REVERSE-PROXY.md)：用 Nginx Proxy Manager
+  挂域名 + HTTPS 的逐步配置，面向「装好就想用、不想研究安全参数」的场景
+  - 明确了一个会直接踩坑的点：README 让设 `OCIBOT_BIND=127.0.0.1`，
+    但**反代若也是 Docker 容器，它访问不到宿主机的回环地址**，照做会 502。
+    正确做法是让反代接入面板的 Docker 网络、按容器名转发，端口则完全不对外
+  - 给出完整 `.env` 取值与每个参数「不设会怎样」的说明
+  - NPM 三个标签页的逐项填法，含**必须打开 Websockets**（否则网页终端连不上，
+    但其余功能正常，极易误判成终端坏了）与 `client_max_body_size 50m;`
+    （否则备份导入 / 对象上传会以看不懂的方式失败）
+  - 完成后 4 条自检命令，含「公网直连 8000 应该失败」这条验证隔离是否真的生效
+- README 安全清单补上同一处提醒并链到该文档
+
+### 升级
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.24
+```
+
+---
+
 ## 0.4.23 — 2026-07-28
 
 ### 安全（第 9 轮审查：单独审 `self_update.py`）
