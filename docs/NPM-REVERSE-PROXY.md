@@ -16,11 +16,18 @@ README 的安全清单让你设 `OCIBOT_BIND=127.0.0.1`，让面板端口不对�
 所以下面分两种情况，**先确认你的 NPM 是怎么装的**：
 
 ```bash
-docker ps --format '{{.Names}}\t{{.Image}}' | grep -i nginx-proxy-manager
+docker ps --format '{{.Names}}	{{.Image}}'
 ```
 
-- **有输出** → NPM 在 Docker 里 → 走 **方案 A**（推荐，也最安全）
-- **没输出**（NPM 直接装在宿主机 / 在另一台机器）→ 走 **方案 B**
+在输出里找**镜像**是 `jc21/nginx-proxy-manager` 的那一行，左边就是容器名。
+
+> 按容器名去 grep 是不可靠的：NPM 官方 compose 的服务名叫 `app`，容器通常是
+> `npm-app-1` 或 `nginx-proxy-manager-app-1`，取决于 compose 文件放在哪个目录。
+> 认镜像才准。
+
+- **找到了** → NPM 在 Docker 里 → 走 **方案 A**（推荐，也最安全）
+- **没有这行** → 要么还没装 NPM（见文末「附：还没装 NPM」），
+  要么装在宿主机 / 另一台机器 → 走 **方案 B**
 
 ---
 
@@ -193,3 +200,43 @@ curl -sI https://panel.example.com | grep -i strict-transport
 | 登录后立刻被登出 | `OCIBOT_COOKIE_SECURE=1` 但实际用 HTTP 访问；确认 Force SSL 已开 |
 | 备份导入报错/上传失败 | Advanced 里没加 `client_max_body_size 50m;` |
 | 登录提示请求过于频繁 | `TRUST_PROXY=1` 但 `FORWARDED_ALLOW_IPS` 不含 NPM 的来源，所有人被算作同一个 IP |
+
+---
+
+## 附：还没装 NPM
+
+在服务器上任意目录（例如 `~/npm`）建 `docker-compose.yml`：
+
+```yaml
+services:
+  app:
+    image: jc21/nginx-proxy-manager:latest
+    restart: unless-stopped
+    ports:
+      - '80:80'
+      - '443:443'
+      - '127.0.0.1:81:81'
+    volumes:
+      - ./data:/data
+      - ./letsencrypt:/etc/letsencrypt
+```
+
+```bash
+cd ~/npm && docker compose up -d
+```
+
+**81 是 NPM 自己的管理后台，不要对公网开放。** 上面写成 `127.0.0.1:81:81` 后它只监听
+回环，从你自己电脑用 SSH 隧道连过去管理：
+
+```bash
+ssh -L 8181:127.0.0.1:81 root@<服务器IP>
+```
+
+然后本机浏览器打开 `http://127.0.0.1:8181`。初始账号 `admin@example.com`，
+密码 `changeme`，首次登录会强制修改。
+
+> 这个后台能签发证书、能改所有反代规则，且默认密码众所周知 —— 在一篇讲「不要暴露端口」
+> 的文档里把它开在公网上是自相矛盾的。确实想直接开 81，至少先改掉默认账号密码，
+> 并限制来源 IP。
+
+装好后回到 **方案 A** 第 1 步。
