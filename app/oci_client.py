@@ -3717,6 +3717,158 @@ class TenantSession:
             data={"domains": domains, "policies": policies, "errors": errors},
         )
 
+    def get_console_password_status(self) -> OperationResult:
+        """Real console-password expiry state: the policy AND the actual date.
+
+        ``list_console_password_policies`` answers "how many days does the policy
+        say", which is not the same question as "when does MY password expire" —
+        and after clicking 关闭强制改密 the operator needs to see the second one to
+        know whether it took. The date comes from the user's own passwordState
+        (``lastSuccessfulSetDate``) plus the policy that actually applies to them.
+
+        Never raises for a missing piece: a tenancy on classic IAM, or an API user
+        without permission to read domain users, still gets the policy half with a
+        note saying why the date is absent.
+        """
+        result = self.list_console_password_policies()
+        data = dict(result.data if isinstance(result.data, dict) else {})
+        policies = list(data.get("policies") or [])
+        notes: list[str] = list(data.get("errors") or [])
+
+        user_info: dict[str, Any] = {"found": False}
+        for domain in data.get("domains") or []:
+            try:
+                found = self._find_domain_user(domain.get("url") or "")
+            except Exception as exc:  # noqa: BLE001
+                notes.append(f"{domain.get('name') or '域'}: 读取用户密码状态失败：{exc}")
+                continue
+            if found:
+                user_info = {**found, "found": True, "domain_name": domain.get("name") or ""}
+                break
+        if not user_info.get("found") and not notes:
+            notes.append("未能在 Identity Domain 中找到当前 API 用户，无法计算真实到期时间")
+
+        data["policies"] = policies
+        data["user"] = user_info
+        data["effective"] = self._effective_password_expiry(policies, user_info)
+        data["errors"] = notes
+        return OperationResult(ok=bool(result.ok or policies), message=result.message or "", data=data)
+
+    def _find_domain_user(self, domain_url: str) -> Optional[dict[str, Any]]:
+        """Look up this tenant's API user in a domain and return its password state."""
+        ocid = self.tenant.user_ocid.strip()
+        if not domain_url or not ocid:
+            return None
+        client = self._identity_domains_client(domain_url)
+        # SCIM filter on the OCI-specific `ocid` attribute: the domain's own user id
+        # is a SCIM uuid, not the ocid1.user… value the tenant is configured with.
+        resp = client.list_users(
+            filter=f'ocid eq "{ocid}"',
+            attribute_sets=["all"],
+            count=1,
+        )
+        payload = getattr(resp, "data", None)
+        resources = getattr(payload, "resources", None) or []
+        if not resources:
+            return None
+        user = resources[0]
+        state = getattr(
+            user,
+            "urn_ietf_params_scim_schemas_oracle_idcs_extension_password_state_user",
+            None,
+        )
+        applicable = getattr(state, "applicable_password_policy", None) if state else None
+        return {
+            "user_name": str(getattr(user, "user_name", "") or ""),
+            "last_set": str(getattr(state, "last_successful_set_date", "") or "") if state else "",
+            "expired": bool(getattr(state, "expired", False)) if state else False,
+            "cant_expire": bool(getattr(state, "cant_expire", False)) if state else False,
+            "applicable_policy_id": str(getattr(applicable, "value", "") or "") if applicable else "",
+            "applicable_policy_name": str(getattr(applicable, "display", "") or "") if applicable else "",
+        }
+
+    @staticmethod
+    def _effective_password_expiry(
+        policies: list[dict[str, Any]], user: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Combine policy + user state into the one answer the operator wants."""
+        from datetime import datetime, timedelta, timezone
+
+        out: dict[str, Any] = {
+            "expires": False,
+            "days": None,
+            "expires_at": "",
+            "days_left": None,
+            "policy_name": "",
+            "summary": "",
+        }
+
+        def _as_days(value: Any) -> int:
+            """Policy value as a day count; anything unparseable means "no expiry".
+
+            Oracle returns an int here, but this must not be the thing that breaks
+            the whole status read — an odd value on one policy would otherwise
+            take down the answer for all of them.
+            """
+            try:
+                return int(value) if value not in (None, "") else 0
+            except (TypeError, ValueError):
+                return 0
+
+        chosen: Optional[dict[str, Any]] = None
+        wanted = str(user.get("applicable_policy_id") or "")
+        if wanted:
+            chosen = next((p for p in policies if str(p.get("id") or "") == wanted), None)
+        if chosen is None:
+            # No applicable policy reported (or it was not in the list): fall back to
+            # the strictest one, so the answer errs towards "it still expires"
+            # rather than reassuring the operator wrongly.
+            expiring = [p for p in policies if _as_days(p.get("password_expires_after")) > 0]
+            chosen = min(
+                expiring,
+                key=lambda p: _as_days(p.get("password_expires_after")),
+                default=None,
+            )
+        if chosen is None and policies:
+            chosen = policies[0]
+        if chosen is not None:
+            out["policy_name"] = str(chosen.get("name") or "")
+
+        days = _as_days(chosen.get("password_expires_after") if chosen else None)
+
+        if user.get("cant_expire"):
+            out["summary"] = "永不过期（该用户被标记为密码不会过期）"
+            return out
+        if days <= 0:
+            out["summary"] = "永不过期（策略未设置有效期）"
+            return out
+
+        out["expires"] = True
+        out["days"] = days
+        last_set = str(user.get("last_set") or "")
+        if not last_set:
+            out["summary"] = f"{days} 天后过期（未能读取上次改密时间，无法算出具体日期）"
+            return out
+        try:
+            text = last_set.replace("Z", "+00:00")
+            base = datetime.fromisoformat(text)
+            if base.tzinfo is None:
+                base = base.replace(tzinfo=timezone.utc)
+        except ValueError:
+            out["summary"] = f"{days} 天后过期（上次改密时间格式无法解析：{last_set}）"
+            return out
+
+        expires_at = base + timedelta(days=days)
+        left = (expires_at - datetime.now(timezone.utc)).days
+        out["expires_at"] = expires_at.isoformat()
+        out["days_left"] = left
+        date_text = expires_at.strftime("%Y-%m-%d")
+        if user.get("expired") or left < 0:
+            out["summary"] = f"已过期（{date_text}）"
+        else:
+            out["summary"] = f"{date_text} 到期（还有 {left} 天）"
+        return out
+
     # Built-in Identity Domains policies that Oracle marks protected (PATCH → 403).
     # StandardPasswordPolicy is a system template; console logins use Default/defaultPasswordPolicy.
     _PROTECTED_PASSWORD_POLICY_IDS = frozenset(

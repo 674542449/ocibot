@@ -541,7 +541,10 @@ def get_oci_password_policy(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     try:
         session = get_session_for_row(row)
-        result = session.list_console_password_policies()
+        # Richer than the raw policy list: also resolves the user's own
+        # lastSuccessfulSetDate so the panel can show the REAL expiry date, which
+        # is what tells an operator whether 关闭强制改密 actually took effect.
+        result = session.get_console_password_status()
         return OciPasswordPolicyOut(
             ok=bool(result.ok),
             message=result.message or "",

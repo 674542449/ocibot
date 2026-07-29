@@ -58,6 +58,13 @@
               <span v-if="!t.free_only_mode" class="badge warn" title="超出 Always Free 不再拦截">
                 允许计费
               </span>
+              <div v-if="pwdStatus[t.id]" class="pwd-line">
+                <span
+                  class="badge"
+                  :class="pwdStatus[t.id].expires ? 'warn' : 'running'"
+                >{{ pwdStatus[t.id].expires ? '会过期' : '永不过期' }}</span>
+                <span class="muted">{{ pwdStatus[t.id].summary }}</span>
+              </div>
             </td>
             <td>
               <div class="row">
@@ -79,6 +86,13 @@
                   @click="openRegions(t)"
                 >
                   副区管理
+                </button>
+                <button
+                  :disabled="busy === t.id"
+                  title="从 Oracle 读取该账号控制台密码的真实到期时间"
+                  @click="loadPasswordStatus(t)"
+                >
+                  查改密状态
                 </button>
                 <button
                   :disabled="busy === t.id"
@@ -444,6 +458,51 @@ const orderedTenants = computed(() => {
   return out
 })
 
+/** 每个租户的真实改密状态（点「查改密状态」后填充）。 */
+type PwdStatus = { expires: boolean; summary: string; policy: string; user: string }
+const pwdStatus = reactive<Record<string, PwdStatus>>({})
+
+/**
+ * 读取 Oracle 上真实的控制台密码到期时间。
+ *
+ * 这是判断「关闭强制改密」是否生效的唯一依据：那个操作返回成功只代表 PATCH 被接受，
+ * 而实际生效与否要看策略的 passwordExpiresAfter 和该用户的密码状态。
+ */
+async function loadPasswordStatus(t: Tenant) {
+  error.value = ''
+  msg.value = ''
+  busy.value = t.id
+  try {
+    const { data } = await api.get<{
+      ok: boolean
+      message: string
+      data?: {
+        effective?: { expires?: boolean; summary?: string; policy_name?: string }
+        user?: { user_name?: string; found?: boolean }
+        errors?: string[]
+      }
+    }>(`/tenants/${t.id}/oci-password-policy`)
+    const eff = data.data?.effective
+    if (!eff) {
+      error.value = `${t.name}: ${data.message || '未能读取密码策略'}`
+      return
+    }
+    pwdStatus[t.id] = {
+      expires: !!eff.expires,
+      summary: eff.summary || '',
+      policy: eff.policy_name || '',
+      user: data.data?.user?.user_name || '',
+    }
+    // 读到了策略但没找到用户时，到期日是算不出来的 —— 说清楚，别让人以为“永不过期”。
+    const notes = data.data?.errors || []
+    if (notes.length) msg.value = `${t.name}: ${notes.join('；')}`
+  } catch (e: any) {
+    error.value = e?.message || '读取改密状态失败'
+  } finally {
+    busy.value = ''
+  }
+}
+
 function tierLabel(t: string) {
   return { paid: '已升级', free: '免费' }[t] || '未知'
 }
@@ -795,6 +854,10 @@ async function disableOciPasswordExpiry(t: Tenant) {
     }>(`/tenants/${t.id}/oci-password-policy/disable-expiry`)
     if (data.ok) {
       msg.value = `${t.name}: ${data.message || '已关闭 Oracle 强制改密'}`
+      // 立刻回读真实状态：PATCH 返回成功只说明请求被接受了。
+      busy.value = ''
+      await loadPasswordStatus(t)
+      return
     } else {
       error.value = `${t.name}: ${data.message || '关闭强制改密失败'}`
     }
@@ -882,6 +945,14 @@ onMounted(async () => {
 }
 .sub-badge {
   margin-left: 0.35rem;
+}
+.pwd-line {
+  margin-top: 0.25rem;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-wrap: wrap;
 }
 code {
   font-size: 12px;

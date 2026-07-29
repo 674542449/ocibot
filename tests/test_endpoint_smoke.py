@@ -163,6 +163,17 @@ def make_session():
         True, "已提交开通", {"region_name": "ap-osaka-1", "region_key": "kix", "already": False}
     )
     s.list_console_password_policies.return_value = R(True, "", {"policies": []})
+    s.get_console_password_status.return_value = R(
+        True,
+        "",
+        {
+            "domains": [],
+            "policies": [{"id": "p1", "name": "Default", "password_expires_after": None}],
+            "user": {"found": True, "user_name": "u", "last_set": "", "cant_expire": False},
+            "effective": {"expires": False, "summary": "永不过期（策略未设置有效期）"},
+            "errors": [],
+        },
+    )
     s.disable_console_password_expiry.return_value = R(True, "已关闭", {})
     s.resolve_compartment.return_value = "ocid1.compartment.oc1..c1"
     s.launch_from_payload.return_value = R(True, "创建成功", {"instance_id": "ocid1.instance.oc1..new"})
