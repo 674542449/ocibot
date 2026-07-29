@@ -64,6 +64,18 @@
                   :class="pwdStatus[t.id].expires ? 'warn' : 'running'"
                 >{{ pwdStatus[t.id].expires ? '会过期' : '永不过期' }}</span>
                 <span class="muted">{{ pwdStatus[t.id].summary }}</span>
+                <!-- 原始策略值：判断「关闭强制改密」是否生效时，
+                     用户要看的就是 defaultPasswordPolicy 的这个数字本身。 -->
+                <span
+                  v-for="pol in pwdStatus[t.id].policies"
+                  :key="pol.name"
+                  class="pwd-pol"
+                  :class="{ 'pwd-pol-main': pol.is_default }"
+                  :title="pol.is_template ? 'Oracle 内置模板，不是控制台登录实际生效的策略' : '控制台登录生效的策略'"
+                >
+                  {{ pol.name }}=<strong>{{ pol.days > 0 ? pol.days + ' 天' : '未设置' }}</strong>
+                  <span v-if="pol.is_template" class="muted">（模板）</span>
+                </span>
               </div>
             </td>
             <td>
@@ -459,7 +471,14 @@ const orderedTenants = computed(() => {
 })
 
 /** 每个租户的真实改密状态（点「查改密状态」后填充）。 */
-type PwdStatus = { expires: boolean; summary: string; policy: string; user: string }
+type PwdPolicy = { name: string; days: number; is_default: boolean; is_template: boolean }
+type PwdStatus = {
+  expires: boolean
+  summary: string
+  policy: string
+  user: string
+  policies: PwdPolicy[]
+}
 const pwdStatus = reactive<Record<string, PwdStatus>>({})
 
 /**
@@ -477,7 +496,12 @@ async function loadPasswordStatus(t: Tenant) {
       ok: boolean
       message: string
       data?: {
-        effective?: { expires?: boolean; summary?: string; policy_name?: string }
+        effective?: {
+        expires?: boolean
+        summary?: string
+        policy_name?: string
+        all_policies?: PwdPolicy[]
+      }
         user?: { user_name?: string; found?: boolean }
         errors?: string[]
       }
@@ -492,6 +516,7 @@ async function loadPasswordStatus(t: Tenant) {
       summary: eff.summary || '',
       policy: eff.policy_name || '',
       user: data.data?.user?.user_name || '',
+      policies: eff.all_policies || [],
     }
     // 读到了策略但没找到用户时，到期日是算不出来的 —— 说清楚，别让人以为“永不过期”。
     const notes = data.data?.errors || []
@@ -953,6 +978,17 @@ onMounted(async () => {
   align-items: center;
   gap: 0.35rem;
   flex-wrap: wrap;
+}
+.pwd-pol {
+  padding: 0.05rem 0.35rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.pwd-pol-main {
+  border-color: var(--accent);
+  color: var(--text);
 }
 code {
   font-size: 12px;

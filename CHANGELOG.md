@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.4.31 — 2026-07-29
+
+### 修复
+- **改密状态可能显示错误的策略**（重要）：一个 Identity Domain 里通常有多条密码策略，
+  而**控制台登录实际生效的是 `defaultPasswordPolicy`**。上一版在无法确定用户适用策略时
+  取"最严格的一条"，于是可能报出 `StandardPasswordPolicy` 的数字 ——
+  那是 Oracle 的内置模板（面板也改不了它，PATCH 会 403），
+  和用户在 Oracle 控制台里看到的值对不上。
+  选取顺序改为：**用户自身的适用策略 → `defaultPasswordPolicy` → 其余策略中最严格的**，
+  内置模板一律排除
+  - 直接后果：关闭强制改密成功后，`defaultPasswordPolicy` 已无有效期而模板仍写着 N 天，
+    现在正确显示「永不过期」，而不是被模板的值盖掉
+
+### 功能
+- **直接显示策略原始值**：查改密状态时列出每条策略的天数，
+  如 `defaultPasswordPolicy=未设置`、`StandardPasswordPolicy=120 天（模板）`。
+  判断关闭是否生效时，要看的就是这个数字本身，而不只是面板给出的结论。
+  生效的那条会高亮，内置模板标注「模板」
+
+### 维护
+- `tests/test_password_expiry.py` 增加 5 项：默认策略优先于模板、
+  关闭后模板值不再盖住结论、用户自身策略仍最优先、原始值输出、模板不参与兜底
+
+### 升级
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.31
+```
+
+---
+
 ## 0.4.30 — 2026-07-29
 
 ### 性能（接上一版，按实测网络瀑布图继续优化）

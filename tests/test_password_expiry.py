@@ -133,3 +133,67 @@ def test_no_policies_at_all_is_reported_as_never_not_as_a_crash():
 def test_garbage_policy_value_is_treated_as_no_expiry(bad):
     out = effective([_policy("p1", bad)], _user(last_set=_iso(1)))
     assert out["expires"] is False
+
+
+# ------------------------------------------- which policy actually governs login
+
+
+def test_default_password_policy_wins_over_the_system_template():
+    """Reported by the operator: defaultPasswordPolicy is the value Oracle's own
+    console shows, and it is what console logins are subject to.
+    StandardPasswordPolicy is a protected system template — picking it because it
+    happened to be stricter reported a number the tenancy is not actually under."""
+    policies = [
+        _policy("StandardPasswordPolicy", 30, "StandardPasswordPolicy"),
+        _policy("defaultPasswordPolicy", 120, "defaultPasswordPolicy"),
+    ]
+    out = effective(policies, _user(last_set=_iso(0)))
+    assert out["days"] == 120
+    assert out["policy_name"] == "defaultPasswordPolicy"
+
+
+def test_default_policy_with_no_expiry_reports_never_even_if_template_expires():
+    """After 关闭强制改密 succeeds, defaultPasswordPolicy has no expiry while the
+    untouched template still says 30 days. The answer must be 永不过期."""
+    policies = [
+        _policy("StandardPasswordPolicy", 30, "StandardPasswordPolicy"),
+        _policy("defaultPasswordPolicy", None, "defaultPasswordPolicy"),
+    ]
+    out = effective(policies, _user(last_set=_iso(0)))
+    assert out["expires"] is False
+    assert "永不过期" in out["summary"]
+
+
+def test_the_users_own_policy_still_outranks_the_default_one():
+    policies = [
+        _policy("defaultPasswordPolicy", 120, "defaultPasswordPolicy"),
+        _policy("custom", 45, "Custom"),
+    ]
+    out = effective(policies, _user(applicable_policy_id="custom", last_set=_iso(0)))
+    assert out["days"] == 45
+    assert out["policy_name"] == "Custom"
+
+
+def test_raw_policy_values_are_returned_for_display():
+    """The operator asked to simply see the number, not only a derived verdict."""
+    policies = [
+        _policy("defaultPasswordPolicy", 120, "defaultPasswordPolicy"),
+        _policy("StandardPasswordPolicy", 30, "StandardPasswordPolicy"),
+    ]
+    out = effective(policies, _user())
+    listed = {p["name"]: p for p in out["all_policies"]}
+    assert listed["defaultPasswordPolicy"]["days"] == 120
+    assert listed["defaultPasswordPolicy"]["is_default"] is True
+    assert listed["StandardPasswordPolicy"]["is_template"] is True
+
+
+def test_template_is_not_used_as_the_strictest_fallback():
+    """No default policy present and no applicable one: the template must still be
+    skipped rather than becoming the answer."""
+    policies = [
+        _policy("StandardPasswordPolicy", 30, "StandardPasswordPolicy"),
+        _policy("other", 90, "Other"),
+    ]
+    out = effective(policies, _user(last_set=_iso(0)))
+    assert out["days"] == 90
+    assert out["policy_name"] == "Other"

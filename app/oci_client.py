@@ -3787,9 +3787,9 @@ class TenantSession:
             "applicable_policy_name": str(getattr(applicable, "display", "") or "") if applicable else "",
         }
 
-    @staticmethod
+    @classmethod
     def _effective_password_expiry(
-        policies: list[dict[str, Any]], user: dict[str, Any]
+        cls, policies: list[dict[str, Any]], user: dict[str, Any]
     ) -> dict[str, Any]:
         """Combine policy + user state into the one answer the operator wants."""
         from datetime import datetime, timedelta, timezone
@@ -3801,6 +3801,9 @@ class TenantSession:
             "days_left": None,
             "policy_name": "",
             "summary": "",
+            # Raw per-policy values so the panel can show the actual
+            # defaultPasswordPolicy number instead of only a derived verdict.
+            "all_policies": [],
         }
 
         def _as_days(value: Any) -> int:
@@ -3815,22 +3818,44 @@ class TenantSession:
             except (TypeError, ValueError):
                 return 0
 
+        out["all_policies"] = [
+            {
+                "name": str(p.get("name") or p.get("id") or "?"),
+                "days": _as_days(p.get("password_expires_after")),
+                "is_default": cls._is_default_password_policy(p),
+                "is_template": cls._is_protected_password_policy(p),
+            }
+            for p in policies
+        ]
+
         chosen: Optional[dict[str, Any]] = None
         wanted = str(user.get("applicable_policy_id") or "")
         if wanted:
             chosen = next((p for p in policies if str(p.get("id") or "") == wanted), None)
         if chosen is None:
-            # No applicable policy reported (or it was not in the list): fall back to
-            # the strictest one, so the answer errs towards "it still expires"
-            # rather than reassuring the operator wrongly.
-            expiring = [p for p in policies if _as_days(p.get("password_expires_after")) > 0]
+            # Console logins are governed by defaultPasswordPolicy — this is the
+            # number the operator sees in Oracle's own console, so it is what the
+            # panel must report when the user's applicable policy is unknown.
+            chosen = next((p for p in policies if cls._is_default_password_policy(p)), None)
+        if chosen is None:
+            # Still nothing: fall back to the strictest REAL policy, so the answer
+            # errs towards "it still expires" rather than reassuring wrongly. The
+            # protected system template is excluded — its value is not something
+            # the tenancy is actually subject to.
+            candidates = [
+                p
+                for p in policies
+                if not cls._is_protected_password_policy(p)
+                and _as_days(p.get("password_expires_after")) > 0
+            ]
             chosen = min(
-                expiring,
+                candidates,
                 key=lambda p: _as_days(p.get("password_expires_after")),
                 default=None,
             )
         if chosen is None and policies:
-            chosen = policies[0]
+            real = [p for p in policies if not cls._is_protected_password_policy(p)]
+            chosen = (real or policies)[0]
         if chosen is not None:
             out["policy_name"] = str(chosen.get("name") or "")
 
@@ -3884,6 +3909,20 @@ class TenantSession:
             "standard",
         }
     )
+
+    # The policy that actually governs console login. The protected
+    # StandardPasswordPolicy above is a system template, so reporting ITS number
+    # would tell the operator a value they cannot change and that does not match
+    # what Oracle's console shows them.
+    _DEFAULT_PASSWORD_POLICY_NAMES = frozenset({"defaultpasswordpolicy", "default"})
+
+    @classmethod
+    def _is_default_password_policy(cls, pol: dict[str, Any]) -> bool:
+        pid = str(pol.get("id") or "").strip().lower().replace(" ", "")
+        name = str(pol.get("name") or "").strip().lower().replace(" ", "")
+        if name in cls._DEFAULT_PASSWORD_POLICY_NAMES:
+            return True
+        return "defaultpasswordpolicy" in pid or "defaultpasswordpolicy" in name
 
     @classmethod
     def _is_protected_password_policy(cls, pol: dict[str, Any]) -> bool:
