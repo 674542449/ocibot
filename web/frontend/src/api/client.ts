@@ -111,6 +111,8 @@ export type Instance = {
   ipv6_addresses: string[]
   boot_volume_size_in_gbs: number | null
   free_tier_tag: string
+  /** 创建时若选了 root 密码模式，密码会写进实例标签，这里带回来。密钥模式为空。 */
+  root_password: string
   tenant_id: string
   tenant_name: string
 }

@@ -62,12 +62,13 @@
             <th>Shape</th>
             <th>公网 IP</th>
             <th>私网 IP</th>
+            <th>root 密码</th>
             <th>操作</th>
           </tr>
         </thead>
         <tbody>
           <tr v-if="!loading && filtered.length === 0">
-            <td colspan="8" class="muted">
+            <td colspan="9" class="muted">
               {{ instances.length ? '没有匹配搜索的实例' : '暂无实例。请先在「租户」添加 API，再「创建实例」。' }}
             </td>
           </tr>
@@ -133,6 +134,21 @@
                 @click="copyIp(ins.private_ip, $event)"
                 @keydown.enter.prevent="copyIp(ins.private_ip)"
               >{{ ins.private_ip || '—' }}</span>
+            </td>
+            <td>
+              <!-- 密码模式创建时写在实例标签里；密钥模式没有这个值。
+                   默认打码，点一下才显示 —— 列表常开着，也常被截图。 -->
+              <template v-if="ins.root_password">
+                <span
+                  class="copyable pwd-cell"
+                  :title="revealed.has(ins.id) ? '单击复制 root 密码' : '单击显示 root 密码'"
+                  role="button"
+                  tabindex="0"
+                  @click="onPasswordClick(ins, $event)"
+                  @keydown.enter.prevent="onPasswordClick(ins)"
+                >{{ revealed.has(ins.id) ? ins.root_password : '••••••••' }}</span>
+              </template>
+              <span v-else class="muted">—</span>
             </td>
             <td>
               <div class="btn-group" role="group" :aria-label="`${ins.display_name} 操作`">
@@ -206,6 +222,10 @@
 </template>
 
 <style scoped>
+.pwd-cell {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: nowrap;
+}
 .batch-bar {
   position: sticky;
   top: 0.5rem;
@@ -390,6 +410,20 @@ async function loadTenants() {
   if (data.length && (!tenantId.value || !data.some((t) => t.id === tenantId.value))) {
     tenantId.value = pickTenantId(data, route.query.tenant)
   }
+}
+
+/** 已点开显示明文的实例 id。刷新列表不清空，避免每次刷新又要重点一遍。 */
+const revealed = reactive(new Set<string>())
+
+/** 第一次点显示，之后点复制。 */
+async function onPasswordClick(ins: Instance, ev?: MouseEvent) {
+  if (!ins.root_password) return
+  if (!revealed.has(ins.id)) {
+    revealed.add(ins.id)
+    return
+  }
+  await copyText(ins.root_password, 'root 密码已复制')
+  void ev
 }
 
 let loadSeq = 0

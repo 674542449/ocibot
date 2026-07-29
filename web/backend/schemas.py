@@ -235,6 +235,9 @@ class InstanceOut(BaseModel):
     ipv6_addresses: list[str] = Field(default_factory=list)
     boot_volume_size_in_gbs: Optional[int] = None
     free_tier_tag: str = ""
+    # root password recorded on the instance's freeform tags at launch, when the
+    # instance was created in password mode. Empty for key-mode instances.
+    root_password: str = ""
     tenant_id: str = ""
     tenant_name: str = ""
 

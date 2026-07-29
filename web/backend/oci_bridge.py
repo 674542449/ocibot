@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.config_store import TenantConfig
 from app.oci_client import (
+    ROOT_PASSWORD_TAG,
     InstanceInfo,
     OperationResult,
     SessionManager,
@@ -72,6 +73,13 @@ def instance_to_dict(info: InstanceInfo, *, tenant_id: str = "", tenant_name: st
         "ipv6_addresses": list(info.ipv6_addresses or []),
         "boot_volume_size_in_gbs": info.boot_volume_gb,
         "free_tier_tag": free_tier_tag(info.shape),
+        # Written at launch for password-mode instances (see ROOT_PASSWORD_TAG).
+        # It rides along with the instance object, so surfacing it costs no extra
+        # OCI call. Plaintext by nature: an OCI freeform tag is readable by anyone
+        # with instance-read on the tenancy.
+        "root_password": str(
+            (getattr(info, "freeform_tags", None) or {}).get(ROOT_PASSWORD_TAG, "") or ""
+        ),
         "tenant_id": tenant_id or (info.tenant_id or ""),
         "tenant_name": tenant_name or (info.tenant_name or ""),
     }
