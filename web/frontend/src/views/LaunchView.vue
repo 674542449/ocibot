@@ -424,6 +424,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import api, { type Tenant } from '@/api/client'
+import { pickTenantId } from '@/stores/tenantLock'
 import { pickAndReadTextFile } from '@/utils/file'
 import { copyText } from '@/utils/toast'
 
@@ -656,9 +657,10 @@ function padName() {
 async function loadTenants() {
   const { data } = await api.get<Tenant[]>('/tenants')
   tenants.value = data.filter((t) => t.enabled)
-  const q = String(route.query.tenant || '')
-  // ?tenant= may name a 副区 row; select its primary so both dropdowns agree.
-  const wanted = tenants.value.find((t) => t.id === q) || primaryTenants.value[0]
+  // ?tenant= (or the locked tenant) may name a 副区 row; select its primary so
+  // both dropdowns agree.
+  const picked = pickTenantId(tenants.value, route.query.tenant)
+  const wanted = tenants.value.find((t) => t.id === picked) || primaryTenants.value[0]
   if (!wanted) return
   const parentListed = tenants.value.some((p) => p.id === wanted.parent_tenant_id)
   primaryId.value = parentListed ? wanted.parent_tenant_id : wanted.id

@@ -286,6 +286,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import api, { type Tenant } from '@/api/client'
+import { pickTenantId } from '@/stores/tenantLock'
 
 type TabId = 'boot' | 'block' | 'object'
 const tabDefs = [
@@ -365,9 +366,7 @@ function formatBytes(n: number) {
 async function loadTenants() {
   const { data } = await api.get<Tenant[]>('/tenants')
   tenants.value = data.filter((t) => t.enabled)
-  const q = String(route.query.tenant || '')
-  if (q && tenants.value.some((t) => t.id === q)) tenantId.value = q
-  else if (tenants.value[0]) tenantId.value = tenants.value[0].id
+  tenantId.value = pickTenantId(tenants.value, route.query.tenant)
   const t = String(route.query.tab || '')
   if (t === 'boot' || t === 'block' || t === 'object') tab.value = t
 }

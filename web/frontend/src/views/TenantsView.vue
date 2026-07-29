@@ -4,7 +4,7 @@
       <div>
         <h2>租户 / API 配置</h2>
         <p class="muted" style="margin: 0.2rem 0 0">
-          粘贴 OCI config；私钥仅服务端加密存储
+          粘贴 OCI config；私钥仅服务端加密存储 · 「锁定为默认」后其他页面不用再选租户
         </p>
       </div>
       <div class="page-tools">
@@ -37,6 +37,9 @@
               <span class="dot" :style="{ background: t.color }"></span>
               {{ t.name }}
               <span v-if="t.parent_tenant_id" class="badge sub-badge">副区</span>
+              <span v-if="isTenantLocked(t.id)" class="badge running" title="其他页面默认使用该租户">
+                🔒 默认
+              </span>
             </td>
             <td>
               {{ t.region }}
@@ -58,6 +61,15 @@
             </td>
             <td>
               <div class="row">
+                <button
+                  :class="{ primary: !isTenantLocked(t.id) }"
+                  :title="isTenantLocked(t.id)
+                    ? '取消后各页面恢复为默认选第一个租户'
+                    : '锁定后，实例 / 存储 / 创建实例 / 账号用量 进入时都自动选它'"
+                  @click="toggleLock(t)"
+                >
+                  {{ isTenantLocked(t.id) ? '取消锁定' : '锁定为默认' }}
+                </button>
                 <button :disabled="busy === t.id" @click="test(t)">测试连接</button>
                 <button :disabled="busy === t.id" @click="detectTier(t)">识别等级</button>
                 <button
@@ -360,6 +372,7 @@ key_file=~/.oci/oci_api_key.pem"
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import api, { type Tenant, type TenantRegions } from '@/api/client'
+import { isTenantLocked, lockTenant, unlockTenant } from '@/stores/tenantLock'
 import { pickAndReadTextFile } from '@/utils/file'
 
 type ParsePreview = {
@@ -649,6 +662,19 @@ async function saveManual() {
   } finally {
     saving.value = false
   }
+}
+
+/** 锁定/取消锁定：其他页面进入时默认选中被锁定的租户。 */
+function toggleLock(t: Tenant) {
+  msg.value = ''
+  error.value = ''
+  if (isTenantLocked(t.id)) {
+    unlockTenant()
+    msg.value = `已取消锁定「${t.name}」，各页面恢复为默认选第一个租户`
+    return
+  }
+  lockTenant(t)
+  msg.value = `已锁定「${t.name}」：实例 / 存储 / 创建实例 / 账号用量 进入时都会自动选它`
 }
 
 function closeRegions() {

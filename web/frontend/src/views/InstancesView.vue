@@ -221,6 +221,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import api, { type Instance, type Tenant } from '@/api/client'
+import { pickTenantId } from '@/stores/tenantLock'
 import { copyText, showToast } from '@/utils/toast'
 
 const route = useRoute()
@@ -384,9 +385,10 @@ function copyIp(text?: string | null, ev?: Event) {
 async function loadTenants() {
   const { data } = await api.get<Tenant[]>('/tenants')
   tenants.value = data
-  // Default to first tenant; if current selection was deleted, fall back.
+  // Default to the locked tenant (else the first); if the current selection was
+  // deleted, fall back the same way.
   if (data.length && (!tenantId.value || !data.some((t) => t.id === tenantId.value))) {
-    tenantId.value = data[0].id
+    tenantId.value = pickTenantId(data, route.query.tenant)
   }
 }
 
@@ -544,10 +546,6 @@ watch(resolveIps, () => {
 onMounted(async () => {
   try {
     await loadTenants()
-    const q = String(route.query.tenant || '')
-    if (q && tenants.value.some((t) => t.id === q) && q !== tenantId.value) {
-      tenantId.value = q
-    }
     // Intentionally do NOT auto-call OCI list on enter.
   } catch (e: any) {
     error.value = e?.message || '初始化失败'

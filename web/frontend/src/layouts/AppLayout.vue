@@ -37,6 +37,14 @@
         </button>
       </div>
 
+      <!-- Always visible: a default tenant that silently applies on four pages
+           would otherwise be an unexplained behaviour with no obvious way out. -->
+      <div v-if="hasLockedTenant" class="locked-tenant" :title="`各页面默认使用「${lockedTenantName}」`">
+        <span class="lock-ico" aria-hidden="true">🔒</span>
+        <span class="truncate">{{ lockedTenantName }}</span>
+        <button type="button" class="lock-x" title="取消锁定" @click="unlockTenant()">✕</button>
+      </div>
+
       <nav class="nav">
         <div class="nav-section">工作台</div>
         <router-link
@@ -109,6 +117,7 @@ import { useRoute, useRouter } from 'vue-router'
 import api from '@/api/client'
 import Icon from '@/components/Icon.vue'
 import { useAuthStore } from '@/stores/auth'
+import { hasLockedTenant, lockedTenantName, unlockTenant } from '@/stores/tenantLock'
 
 const auth = useAuthStore()
 const router = useRouter()
@@ -275,6 +284,34 @@ onBeforeUnmount(() => {
   align-items: center;
   padding: 1rem 1rem 0.85rem;
   border-bottom: 1px solid var(--border);
+}
+
+.locked-tenant {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0 0.75rem 0.5rem;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+  font-size: 12px;
+}
+.lock-ico {
+  flex: 0 0 auto;
+}
+.lock-x {
+  margin-left: auto;
+  flex: 0 0 auto;
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 0 0.2rem;
+  line-height: 1;
+}
+.lock-x:hover {
+  color: var(--text);
 }
 
 .brand-text {

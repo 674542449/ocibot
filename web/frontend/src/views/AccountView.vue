@@ -281,6 +281,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import api, { type Tenant } from '@/api/client'
+import { pickTenantId } from '@/stores/tenantLock'
 
 const route = useRoute()
 const tenants = ref<Tenant[]>([])
@@ -368,12 +369,10 @@ function quotaStatusText(s: string) {
 async function loadTenants() {
   const { data: rows } = await api.get<Tenant[]>('/tenants')
   tenants.value = rows
-  const q = String(route.query.tenant || '')
   // Preserve the user's current selection; only pick a default when it is unset
   // or no longer exists (otherwise a refresh would snap the dropdown back).
   if (tenantId.value && rows.some((t) => t.id === tenantId.value)) return
-  if (q && rows.some((t) => t.id === q)) tenantId.value = q
-  else if (rows[0]) tenantId.value = rows[0].id
+  tenantId.value = pickTenantId(rows, route.query.tenant)
 }
 
 async function loadAccount() {
