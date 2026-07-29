@@ -1,4 +1,12 @@
 import { createRouter, createWebHistory } from 'vue-router'
+// Statically imported, unlike every other view: the layout and the landing route
+// are needed on virtually every visit, and as dynamic imports the browser could
+// not even discover them until the entry bundle had downloaded and parsed —
+// a whole extra round trip before anything rendered. Together they add ~9kB
+// gzipped to the entry, which on a high-latency link is far cheaper than the
+// trip they cost.
+import AppLayout from '@/layouts/AppLayout.vue'
+import InstancesView from '@/views/InstancesView.vue'
 import { useAuthStore } from '@/stores/auth'
 
 const router = createRouter({
@@ -12,12 +20,12 @@ const router = createRouter({
     },
     {
       path: '/',
-      component: () => import('@/layouts/AppLayout.vue'),
+      component: AppLayout,
       children: [
         {
           path: '',
           name: 'instances',
-          component: () => import('@/views/InstancesView.vue'),
+          component: InstancesView,
         },
         {
           path: 'instances/:tenantId/:instanceId',

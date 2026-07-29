@@ -240,8 +240,9 @@ function onResize() {
  * so this costs one download per deploy rather than per visit.
  */
 function prefetchRoutes() {
+  // InstancesView and this layout ship in the entry bundle (see router), so the
+  // list here is only the routes that are still split out.
   const load = [
-    () => import('@/views/InstancesView.vue'),
     () => import('@/views/LaunchView.vue'),
     () => import('@/views/StorageView.vue'),
     () => import('@/views/AccountView.vue'),

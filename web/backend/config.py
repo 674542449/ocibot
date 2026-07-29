@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     # MUST be bumped in the same commit as any shipped change, together with a new
     # CHANGELOG.md heading — /api/health is how an operator verifies a deploy
     # actually landed. tests/test_version_bump.py enforces that the two agree.
-    app_version: str = "0.4.29"
+    app_version: str = "0.4.30"
     debug: bool = False
 
     # sqlite+pysqlite:////absolute/path.db  or  postgresql+psycopg://user:pass@host/db
