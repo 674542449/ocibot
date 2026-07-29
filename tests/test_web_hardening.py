@@ -207,3 +207,26 @@ def test_read_upload_limited_stops_early_on_oversized():
         read_upload_limited(up, 64 * 1024, too_large_detail="too big")
     # Reading stopped shortly after the limit rather than consuming everything.
     assert up.file.tell() < len(payload)
+
+
+def test_hashed_assets_are_cached_immutably_and_index_is_not():
+    """Vite writes content-hashed asset names, so those bytes can never change
+    meaning — caching them for a year removes one conditional round trip per file
+    per page load, which on a high-latency link is most of the wait.
+
+    index.html must NOT get that treatment: it is unhashed and names the current
+    bundle, so a cached copy would keep pointing at the previous deploy's chunks.
+    """
+    from fastapi.testclient import TestClient
+
+    from web.backend.main import app
+
+    with TestClient(app) as client:
+        spa = client.get("/")
+        assert spa.status_code == 200
+        assert spa.headers.get("cache-control") == "no-cache"
+
+        api = client.get("/api/health")
+        assert api.status_code == 200
+        # API responses keep whatever they had; the SPA rule must not leak onto them.
+        assert api.headers.get("cache-control") != "no-cache"

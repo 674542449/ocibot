@@ -168,6 +168,23 @@ def create_app() -> FastAPI:
             "connect-src 'self' ws: wss:; "
             "form-action 'self'",
         )
+        # Caching for the SPA bundle. Vite writes content-hashed filenames under
+        # /assets, so those bytes can never change meaning — cache them for a year
+        # and skip revalidation entirely. Without this StaticFiles only sends
+        # etag/last-modified, so every page load spent one conditional round trip
+        # per file just to be told "not modified"; on a high-latency link that is
+        # most of the wait before anything renders.
+        path = request.url.path
+        if path.startswith("/assets/"):
+            response.headers.setdefault(
+                "Cache-Control", "public, max-age=31536000, immutable"
+            )
+        elif not path.startswith("/api/"):
+            # index.html is NOT hashed and points at the current bundle, so it must
+            # be revalidated. Left to heuristic caching it could keep serving the
+            # previous deploy's asset names after an update — the "更新后版本不变，
+            # 浏览器强刷" line in README's troubleshooting table.
+            response.headers.setdefault("Cache-Control", "no-cache")
         return response
 
     if _DIST_DIR.is_dir() and (_DIST_DIR / "index.html").is_file():

@@ -229,11 +229,49 @@ function onResize() {
   if (window.innerWidth > 900) navOpen.value = false
 }
 
+/**
+ * Warm the other routes' chunks while the browser is idle.
+ *
+ * Views are lazy-loaded, so the FIRST click on each nav item pays for a download
+ * before anything renders — on a high-latency link that reads as "the panel is
+ * slow" even though the server answered in milliseconds. Fetching them ahead of
+ * time turns that into an instant switch. Runs on idle so it never competes with
+ * the page the user is actually looking at, and the files are immutably cached,
+ * so this costs one download per deploy rather than per visit.
+ */
+function prefetchRoutes() {
+  const load = [
+    () => import('@/views/InstancesView.vue'),
+    () => import('@/views/LaunchView.vue'),
+    () => import('@/views/StorageView.vue'),
+    () => import('@/views/AccountView.vue'),
+    () => import('@/views/JobsView.vue'),
+    () => import('@/views/TenantsView.vue'),
+    // Heaviest chunk (bundles the terminal), and the one most annoying to wait
+    // for, so it is warmed too — just last.
+    () => import('@/views/InstanceDetailView.vue'),
+  ]
+  let i = 0
+  const step = () => {
+    if (i >= load.length) return
+    // A failed prefetch is not an error the user should ever see; the real
+    // navigation will retry it.
+    load[i++]().catch(() => {}).finally(() => schedule())
+  }
+  const schedule = () => {
+    const ric = (window as any).requestIdleCallback
+    if (typeof ric === 'function') ric(step, { timeout: 3000 })
+    else window.setTimeout(step, 300)
+  }
+  schedule()
+}
+
 onMounted(() => {
   applyTheme()
   checkWorker()
   timer = window.setInterval(checkWorker, 30_000)
   window.addEventListener('resize', onResize)
+  prefetchRoutes()
 })
 
 onBeforeUnmount(() => {
