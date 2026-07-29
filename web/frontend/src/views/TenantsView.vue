@@ -58,28 +58,16 @@
               <span v-if="!t.free_only_mode" class="badge warn" title="超出 Always Free 不再拦截">
                 允许计费
               </span>
+              <!-- 只显示 defaultPasswordPolicy 的数值：这是控制台登录真正生效的
+                   那条，也是判断强制改密有没有关掉时唯一要看的数字。 -->
               <div v-if="pwdStatus[t.id]" class="pwd-line">
-                <span
-                  class="badge"
-                  :class="pwdStatus[t.id].expires ? 'warn' : 'running'"
-                >{{ pwdStatus[t.id].expires ? '会过期' : '永不过期' }}</span>
-                <span class="muted">{{ pwdStatus[t.id].summary }}</span>
-                <!-- 原始策略值：判断「关闭强制改密」是否生效时，
-                     用户要看的就是 defaultPasswordPolicy 的这个数字本身。 -->
-                <span
-                  v-for="pol in pwdStatus[t.id].policies"
-                  :key="pol.name"
-                  class="pwd-pol"
-                  :class="{ 'pwd-pol-main': pol.is_default }"
-                  :title="pol.is_template ? 'Oracle 内置模板，不是控制台登录实际生效的策略' : '控制台登录生效的策略'"
-                >
-                  {{ pol.name }}=<strong>{{ pol.days > 0 ? pol.days + ' 天' : '未设置' }}</strong>
-                  <span v-if="pol.is_template" class="muted">（模板）</span>
+                <span class="badge" :class="pwdStatus[t.id].days > 0 ? 'warn' : 'running'">
+                  密码到期 {{ pwdStatus[t.id].days > 0 ? pwdStatus[t.id].days + ' 天' : '未设置' }}
                 </span>
               </div>
             </td>
             <td>
-              <div class="row">
+              <div class="row row-actions">
                 <button
                   :class="{ primary: !isTenantLocked(t.id) }"
                   :title="isTenantLocked(t.id)
@@ -89,8 +77,7 @@
                 >
                   {{ isTenantLocked(t.id) ? '取消锁定' : '锁定为默认' }}
                 </button>
-                <button :disabled="busy === t.id" @click="test(t)">测试连接</button>
-                <button :disabled="busy === t.id" @click="detectTier(t)">识别等级</button>
+                <button :disabled="busy === t.id" @click="detectTier(t)">等级查询</button>
                 <button
                   v-if="!t.parent_tenant_id"
                   :disabled="busy === t.id"
@@ -101,17 +88,10 @@
                 </button>
                 <button
                   :disabled="busy === t.id"
-                  title="从 Oracle 读取该账号控制台密码的真实到期时间"
-                  @click="loadPasswordStatus(t)"
+                  title="读取 defaultPasswordPolicy 的到期天数；若仍在强制改密，会自动关闭后再读一次"
+                  @click="passwordExpiry(t)"
                 >
-                  查改密状态
-                </button>
-                <button
-                  :disabled="busy === t.id"
-                  title="调用 Oracle Identity Domain API，把控制台强制改密周期改为不强制"
-                  @click="disableOciPasswordExpiry(t)"
-                >
-                  关闭强制改密
+                  密码到期查询
                 </button>
                 <button :disabled="busy === t.id" @click="openEdit(t)">编辑</button>
                 <button class="danger" :disabled="busy === t.id" @click="remove(t)">删除</button>
@@ -470,59 +450,60 @@ const orderedTenants = computed(() => {
   return out
 })
 
-/** 每个租户的真实改密状态（点「查改密状态」后填充）。 */
-type PwdPolicy = { name: string; days: number; is_default: boolean; is_template: boolean }
-type PwdStatus = {
-  expires: boolean
-  summary: string
-  policy: string
-  user: string
-  policies: PwdPolicy[]
-}
+/** 每个租户的 defaultPasswordPolicy 到期天数（0 = 未设置 = 永不过期）。 */
+type PwdStatus = { days: number }
 const pwdStatus = reactive<Record<string, PwdStatus>>({})
 
+type PwdPolicy = { name: string; days: number; is_default: boolean; is_template: boolean }
+
+/** 读取 defaultPasswordPolicy 的天数；读不到就退回面板算出的结论。 */
+async function readPasswordDays(tenantId: string): Promise<number | null> {
+  const { data } = await api.get<{
+    ok: boolean
+    message: string
+    data?: {
+      effective?: { expires?: boolean; days?: number; all_policies?: PwdPolicy[] }
+      errors?: string[]
+    }
+  }>(`/tenants/${tenantId}/oci-password-policy`)
+  const eff = data.data?.effective
+  if (!eff) throw new Error(data.message || '未能读取密码策略')
+  const def = (eff.all_policies || []).find((p) => p.is_default)
+  // defaultPasswordPolicy 是控制台登录真正生效的那条；找不到它时才退回结论值。
+  return def ? def.days : eff.expires ? eff.days ?? 0 : 0
+}
+
 /**
- * 读取 Oracle 上真实的控制台密码到期时间。
+ * 密码到期查询：读 defaultPasswordPolicy 的天数。
  *
- * 这是判断「关闭强制改密」是否生效的唯一依据：那个操作返回成功只代表 PATCH 被接受，
- * 而实际生效与否要看策略的 passwordExpiresAfter 和该用户的密码状态。
+ * 若仍设着有效期，顺手调用关闭强制改密再读一次 —— 这两步合并成一个按钮是
+ * 操作者要求的工作流（他要的结果始终是「关掉」）。按钮提示里写明了会执行关闭，
+ * 免得一个叫「查询」的动作意外改了 Oracle 配置。
  */
-async function loadPasswordStatus(t: Tenant) {
+async function passwordExpiry(t: Tenant) {
   error.value = ''
   msg.value = ''
   busy.value = t.id
   try {
-    const { data } = await api.get<{
-      ok: boolean
-      message: string
-      data?: {
-        effective?: {
-        expires?: boolean
-        summary?: string
-        policy_name?: string
-        all_policies?: PwdPolicy[]
+    let days = await readPasswordDays(t.id)
+    if (days && days > 0) {
+      const { data } = await api.post<{ ok: boolean; message: string }>(
+        `/tenants/${t.id}/oci-password-policy/disable-expiry`,
+      )
+      if (!data.ok) {
+        error.value = `${t.name}: 当前 ${days} 天后过期，关闭失败：${data.message || '未知原因'}`
+        pwdStatus[t.id] = { days }
+        return
       }
-        user?: { user_name?: string; found?: boolean }
-        errors?: string[]
-      }
-    }>(`/tenants/${t.id}/oci-password-policy`)
-    const eff = data.data?.effective
-    if (!eff) {
-      error.value = `${t.name}: ${data.message || '未能读取密码策略'}`
-      return
+      days = await readPasswordDays(t.id)
     }
-    pwdStatus[t.id] = {
-      expires: !!eff.expires,
-      summary: eff.summary || '',
-      policy: eff.policy_name || '',
-      user: data.data?.user?.user_name || '',
-      policies: eff.all_policies || [],
-    }
-    // 读到了策略但没找到用户时，到期日是算不出来的 —— 说清楚，别让人以为“永不过期”。
-    const notes = data.data?.errors || []
-    if (notes.length) msg.value = `${t.name}: ${notes.join('；')}`
+    pwdStatus[t.id] = { days: days ?? 0 }
+    msg.value =
+      (days ?? 0) > 0
+        ? `${t.name}: defaultPasswordPolicy = ${days} 天`
+        : `${t.name}: defaultPasswordPolicy 未设置有效期（密码不会过期）`
   } catch (e: any) {
-    error.value = e?.message || '读取改密状态失败'
+    error.value = e?.message || '密码到期查询失败'
   } finally {
     busy.value = ''
   }
@@ -826,21 +807,6 @@ async function subscribeRegion(region: string, alreadySubscribed: boolean) {
   }
 }
 
-async function test(t: Tenant) {
-  error.value = ''
-  msg.value = ''
-  busy.value = t.id
-  try {
-    const { data } = await api.post<{ ok: boolean; message: string }>(`/tenants/${t.id}/test`)
-    if (data.ok) msg.value = `${t.name}: ${data.message}`
-    else error.value = `${t.name}: ${data.message}`
-  } catch (e: any) {
-    error.value = e?.message || '测试失败'
-  } finally {
-    busy.value = ''
-  }
-}
-
 async function detectTier(t: Tenant) {
   error.value = ''
   msg.value = ''
@@ -853,41 +819,6 @@ async function detectTier(t: Tenant) {
     await load()
   } catch (e: any) {
     error.value = e?.message || '识别失败'
-  } finally {
-    busy.value = ''
-  }
-}
-
-async function disableOciPasswordExpiry(t: Tenant) {
-  if (
-    !confirm(
-      `对租户「${t.name}」调用 Oracle API，关闭控制台强制改密（默认约 120 天）？\n\n` +
-        `会修改 Identity Domain 的 PasswordPolicy.passwordExpiresAfter。\n` +
-        `需要 API 用户具备 Domain / 密码策略管理权限。`,
-    )
-  ) {
-    return
-  }
-  error.value = ''
-  msg.value = ''
-  busy.value = t.id
-  try {
-    const { data } = await api.post<{
-      ok: boolean
-      message: string
-      data?: Record<string, unknown>
-    }>(`/tenants/${t.id}/oci-password-policy/disable-expiry`)
-    if (data.ok) {
-      msg.value = `${t.name}: ${data.message || '已关闭 Oracle 强制改密'}`
-      // 立刻回读真实状态：PATCH 返回成功只说明请求被接受了。
-      busy.value = ''
-      await loadPasswordStatus(t)
-      return
-    } else {
-      error.value = `${t.name}: ${data.message || '关闭强制改密失败'}`
-    }
-  } catch (e: any) {
-    error.value = e?.message || '关闭强制改密失败'
   } finally {
     busy.value = ''
   }
@@ -979,16 +910,14 @@ onMounted(async () => {
   gap: 0.35rem;
   flex-wrap: wrap;
 }
-.pwd-pol {
-  padding: 0.05rem 0.35rem;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text-secondary);
-  white-space: nowrap;
+/* 操作按钮保持一行：表格外层已有横向滚动，宁可让这一列滚动，
+   也不让按钮折成两行把每行撑高一倍。 */
+.row-actions {
+  flex-wrap: nowrap;
+  gap: 0.35rem;
 }
-.pwd-pol-main {
-  border-color: var(--accent);
-  color: var(--text);
+.row-actions button {
+  white-space: nowrap;
 }
 code {
   font-size: 12px;
