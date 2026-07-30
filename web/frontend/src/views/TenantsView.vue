@@ -351,10 +351,6 @@ key_file=~/.oci/oci_api_key.pem"
         <input v-model="form.description" />
       </div>
       <div class="field">
-        <label>月度预算 USD（0=关闭超额提醒；由 Worker 每日检查并推送）</label>
-        <input v-model.number="form.budget_monthly_usd" type="number" min="0" step="0.5" />
-      </div>
-      <div class="field">
         <label class="choice">
           <input v-model="form.free_only_mode" type="checkbox" />
           <span>仅使用免费额度（超出 Always Free 时直接拦截创建 / 扩容）</span>
@@ -425,7 +421,6 @@ const form = reactive({
   private_key_pem: '',
   compartment_ocid: '',
   description: '',
-  budget_monthly_usd: 0,
   free_only_mode: true,
 })
 
@@ -532,7 +527,6 @@ function resetForm() {
   form.private_key_pem = ''
   form.compartment_ocid = ''
   form.description = ''
-  form.budget_monthly_usd = 0
   form.free_only_mode = true
 }
 
@@ -595,7 +589,6 @@ function openEdit(t: Tenant) {
   form.private_key_pem = ''
   form.compartment_ocid = t.compartment_ocid
   form.description = t.description
-  form.budget_monthly_usd = t.budget_monthly_usd ?? 0
   form.free_only_mode = t.free_only_mode ?? true
   formKeyFile.value = ''
   showForm.value = true
@@ -694,9 +687,6 @@ async function saveManual() {
         region: form.region,
         compartment_ocid: form.compartment_ocid,
         description: form.description,
-        // Clearing the field yields '' which fails float validation with a raw
-        // English 422 and rejects the entire edit; treat blank as 0 (alerts off).
-        budget_monthly_usd: Number(form.budget_monthly_usd) || 0,
         free_only_mode: form.free_only_mode,
       }
       if (form.private_key_pem.trim()) {
@@ -715,7 +705,6 @@ async function saveManual() {
         private_key_pem: form.private_key_pem,
         compartment_ocid: form.compartment_ocid,
         description: form.description,
-        budget_monthly_usd: Number(form.budget_monthly_usd) || 0,
         free_only_mode: form.free_only_mode,
       })
       msg.value = '已添加'

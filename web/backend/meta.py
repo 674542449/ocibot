@@ -13,7 +13,6 @@ from web.backend.models import AppMeta
 KEY_WORKER_HEARTBEAT = "worker_heartbeat"  # ISO timestamp, updated by worker every tick
 KEY_WORKER_ID = "worker_heartbeat_worker_id"
 KEY_OPEN_REGISTRATION = "allow_open_registration"  # "true"/"false"; overrides env when set
-KEY_DAILY_CHECKS_DATE = "daily_checks_date"  # YYYY-MM-DD of the last daily-check run
 
 
 def get_meta(db: Session, key: str) -> Optional[str]:

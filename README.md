@@ -19,7 +19,7 @@
 | 终端 | 浏览器 WebSSH；串口 / VNC 控制台连接 |
 | 存储 | 引导卷扩容与备份、块存储、对象存储 |
 | 网络 | NSG 防火墙规则、保留公网 IP |
-| 任务 | 容量重试任务、定时开关机 |
+| 任务 | 容量重试（抢机）任务 |
 | 通知 | Telegram / Bark / ServerChan / Webhook / SMTP（含 SSRF 防护） |
 | 运维 | 加密租户备份、面板内一键更新（Docker 部署） |
 
@@ -139,7 +139,7 @@ docker compose up -d --build
 | `OCIBOT_API_WORKERS` | 默认 `2` | API 进程数 |
 | `OCIBOT_PORT` | 默认 `8000` | 宿主机映射端口 |
 | `OCIBOT_BIND` | 反代后设 `127.0.0.1` | 端口绑定的宿主机网卡，默认 `0.0.0.0` |
-| `OCIBOT_WORKER_BACKGROUND_OCI` | 默认 `1` | 设 `0` 则 Worker 完全不主动请求 OCI；抢机与定时任务将**不执行**（面板会明确提示） |
+| `OCIBOT_WORKER_BACKGROUND_OCI` | 默认 `1` | 设 `0` 则 Worker 完全不主动请求 OCI；抢机任务将**不执行**（面板会明确提示） |
 | `OCIBOT_UPDATE_ENABLED` | 默认 `0` | 面板内自更新开关（`install.sh` 会置 `1`） |
 | `OCIBOT_HOST_REPO` | 宿主机绝对路径 | 自更新绑定的代码目录 |
 
@@ -224,7 +224,8 @@ ocibot/
 
 - **实例列表**默认显示第一个租户；可在下拉框切换，不再默认聚合全部租户
 - **密码到期提醒**是面板本地策略（可改天数，`0` 关闭），不会替你修改 Oracle 控制台密码
-- **容量重试**由 Worker 执行；侧栏会提示 Worker 是否在线
+- **容量重试**由 Worker 执行；侧栏会提示 Worker 是否在线。它是唯一会主动请求 OCI 的
+  后台功能，且仅在存在任务时运行；`OCIBOT_WORKER_BACKGROUND_OCI=0` 可完全停掉
 - **备份恢复**导出加密 ZIP，导入只创建当前用户名下的新租户，不会覆盖他人数据
 - **副区**（其他国家区域）在「租户 → 副区管理」开通，面板会自动添加一个同凭据的副区租户，
   各页面把它当普通租户使用；注意 Oracle 无法取消已开通的区域，且 **Always Free 只在主区生效**，

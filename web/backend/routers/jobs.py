@@ -1,4 +1,4 @@
-"""Capacity retry + schedule job APIs."""
+"""Capacity retry APIs. Power schedules were removed in 0.4.36 (unused)."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from app.scheduler import (
 from web.backend.auth import get_current_user
 from web.backend.db import get_db
 from web.backend.launch_service import normalize_fallback_configs, shape_is_flex
-from web.backend.models import CapacityAttempt, CapacityJob, ScheduleJobRow, ScheduleRun, User
+from web.backend.models import CapacityAttempt, CapacityJob, User
 from web.backend.oci_bridge import get_owned_tenant, get_session_for_row
 from web.backend.quota_guard import (
     enforce_launch_quota,
@@ -33,9 +33,6 @@ from web.backend.schemas import (
     CapacityJobCreate,
     CapacityJobOut,
     MessageOut,
-    ScheduleJobCreate,
-    ScheduleJobOut,
-    ScheduleRunOut,
 )
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -273,98 +270,3 @@ def delete_capacity_job(
 
 
 # ---- schedules ----
-
-
-@router.get("/schedules", response_model=list[ScheduleJobOut])
-def list_schedules(
-    user: Annotated[User, Depends(get_current_user)],
-    db: Annotated[Session, Depends(get_db)],
-) -> list[ScheduleJobOut]:
-    rows = db.scalars(
-        select(ScheduleJobRow).where(ScheduleJobRow.owner_id == user.id).order_by(ScheduleJobRow.name)
-    ).all()
-    return [ScheduleJobOut.model_validate(r) for r in rows]
-
-
-@router.post("/schedules", response_model=ScheduleJobOut, status_code=201)
-def create_schedule(
-    body: ScheduleJobCreate,
-    user: Annotated[User, Depends(get_current_user)],
-    db: Annotated[Session, Depends(get_db)],
-) -> ScheduleJobOut:
-    try:
-        get_owned_tenant(db, user.id, body.tenant_id)
-    except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    action = (body.action or "SOFTSTOP").strip().upper()
-    if action not in {"START", "STOP", "SOFTSTOP", "RESET", "SOFTRESET"}:
-        raise HTTPException(status_code=400, detail=f"不支持的动作: {action}")
-    kind = (body.kind or "weekly").strip().lower()
-    if kind not in {"weekly", "once"}:
-        raise HTTPException(status_code=400, detail="kind 必须为 weekly 或 once")
-
-    tod = (body.time_of_day or "22:00").strip()
-    run_at = body.run_at
-    if kind == "weekly":
-        # "24:00" / "99:99" passed the old length+colon check, then never matched
-        # the worker's strftime("%H:%M"), so the schedule silently never fired.
-        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", tod):
-            raise HTTPException(
-                status_code=400, detail="time_of_day 格式应为 HH:MM（00:00–23:59）"
-            )
-        if not body.weekdays:
-            raise HTTPException(status_code=400, detail="每周任务需要至少选择一个星期")
-        run_at = None
-    else:
-        if run_at is None:
-            raise HTTPException(status_code=400, detail="一次性任务需要提供 run_at 时间")
-        if run_at.tzinfo is None:
-            run_at = run_at.replace(tzinfo=timezone.utc)
-        if run_at <= datetime.now(timezone.utc):
-            raise HTTPException(status_code=400, detail="run_at 必须是将来的时间")
-
-    row = ScheduleJobRow(
-        owner_id=user.id,
-        tenant_id=body.tenant_id,
-        name=body.name.strip(),
-        enabled=bool(body.enabled),
-        kind=kind,
-        time_of_day=tod,
-        weekdays=list(body.weekdays or []),
-        run_at=run_at,
-        action=action,
-        instance_ids=list(body.instance_ids or []),
-    )
-    db.add(row)
-    db.commit()
-    db.refresh(row)
-    return ScheduleJobOut.model_validate(row)
-
-
-@router.get("/schedules/runs", response_model=list[ScheduleRunOut])
-def list_schedule_runs(
-    user: Annotated[User, Depends(get_current_user)],
-    db: Annotated[Session, Depends(get_db)],
-    job_id: str = Query(""),
-    limit: int = Query(50, ge=1, le=200),
-) -> list[ScheduleRunOut]:
-    stmt = select(ScheduleRun).where(ScheduleRun.owner_id == user.id)
-    if job_id:
-        stmt = stmt.where(ScheduleRun.job_id == job_id)
-    rows = db.scalars(stmt.order_by(ScheduleRun.created_at.desc()).limit(limit)).all()
-    return [ScheduleRunOut.model_validate(r) for r in rows]
-
-
-@router.delete("/schedules/{job_id}", response_model=MessageOut)
-def delete_schedule(
-    job_id: str,
-    user: Annotated[User, Depends(get_current_user)],
-    db: Annotated[Session, Depends(get_db)],
-) -> MessageOut:
-    row = db.get(ScheduleJobRow, job_id)
-    if row is None or row.owner_id != user.id:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    db.delete(row)
-    db.commit()
-    return MessageOut(message="已删除")

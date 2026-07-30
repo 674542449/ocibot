@@ -23,8 +23,6 @@ FREE_PUBLIC_IP_SOFT = 2
 # not knowable at launch time — so it never blocks a create. See
 # TenantSession.get_network_egress_usage.
 FREE_EGRESS_GB = 10240.0
-# Fraction of the allowance that triggers the monthly notification.
-EGRESS_ALERT_RATIO = 0.8
 
 # Default boot size assumed when the launch form leaves size empty (~Ubuntu image).
 DEFAULT_BOOT_GB_ASSUMED = 47

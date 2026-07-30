@@ -221,8 +221,6 @@ const router = useRouter()
 
 const EVENTS = [
   { key: 'capacity', label: '抢机结果' },
-  { key: 'schedule', label: '定时任务失败' },
-  { key: 'budget', label: '预算超额' },
 ]
 
 const channels = ref<Channel[]>([])

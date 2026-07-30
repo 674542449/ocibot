@@ -195,25 +195,12 @@ def test_one_user_reading_first_does_not_open_the_door_for_the_other(two_users, 
     _ = tid_a
 
 
-def test_capacity_and_schedule_jobs_are_per_owner(two_users, sessions):
+def test_capacity_jobs_are_per_owner(two_users, sessions):
     _tid_a, tid_b = two_users
     with TestClient(app) as c:
         _login(c, "iso-alice")
-        # Alice cannot attach a job to Bob's tenant.
-        r = c.post(
-            "/api/jobs/schedules",
-            json={
-                "tenant_id": tid_b,
-                "name": "nightly",
-                "kind": "weekly",
-                "time_of_day": "22:00",
-                "weekdays": [0],
-                "action": "SOFTSTOP",
-            },
-        )
-        assert r.status_code == 404, r.text
         assert c.get("/api/jobs/capacity").json() == []
-        assert c.get("/api/jobs/schedules").json() == []
+        _ = tid_b
 
 
 def test_backup_export_contains_only_your_own_tenants(two_users, sessions):

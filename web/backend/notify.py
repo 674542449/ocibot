@@ -27,7 +27,9 @@ from web.backend.url_safety import assert_safe_outbound_url, validate_public_htt
 log = logging.getLogger("ocibot.notify")
 
 CHANNEL_KINDS = ("telegram", "bark", "serverchan", "webhook", "smtp")
-EVENT_KEYS = ("capacity", "schedule", "budget")
+# Only capacity retry pushes notifications since 0.4.36 (schedules and budget
+# alerts were removed). Channels stored with the old keys keep them harmlessly.
+EVENT_KEYS = ("capacity",)
 
 _HTTP_TIMEOUT = 15.0
 # Fan-out limits for one notify_user() call.

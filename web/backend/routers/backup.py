@@ -75,7 +75,6 @@ def export_encrypted_zip(
                 "password_changed_at": row.password_changed_at or "",
                 "password_expiry_days": int(row.password_expiry_days or 0),
                 "account_tier": row.account_tier or "",
-                "budget_monthly_usd": float(row.budget_monthly_usd or 0.0),
                 "free_only_mode": bool(getattr(row, "free_only_mode", True)),
                 # 副区 link. Ids are reissued on restore, so it is remapped there
                 # via the exported "id" above.
@@ -171,16 +170,6 @@ def import_encrypted_zip(
         raise HTTPException(status_code=400, detail="备份内容格式无效")
     if len(items) > 200:
         raise HTTPException(status_code=400, detail="单次备份租户过多（上限 200）")
-    def _budget(raw: Any) -> float:
-        """Archive-supplied budget, coerced and clamped (Float column)."""
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            return 0.0
-        if value != value or value in (float("inf"), float("-inf")):  # NaN / inf
-            return 0.0
-        return max(0.0, min(value, 1_000_000.0))
-
     def _clean_tier(raw: Any) -> str:
         tier = str(raw or "").strip().lower()
         return tier if tier in {"free", "paid"} else ""
@@ -247,9 +236,6 @@ def import_encrypted_zip(
             password_changed_at=cfg.password_changed_at or "",
             password_expiry_days=int(cfg.password_expiry_days or 0),
             account_tier=cfg.account_tier or "",
-            # Read off the archive item: TenantConfig has no budget field, so this
-            # was silently dropped and restored tenants lost their budget alerts.
-            budget_monthly_usd=_budget(item.get("budget_monthly_usd")),
             # Default ON when absent (older archives) so a restore never
             # silently loses the free-tier protection.
             free_only_mode=bool(item.get("free_only_mode", True)),

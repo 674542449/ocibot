@@ -106,10 +106,10 @@
            never fires looks like a bug. -->
       <div v-if="workerChecked && workerAlive && !backgroundOci" class="worker-banner bg-off">
         后台 OCI 请求已关闭（<code>OCIBOT_WORKER_BACKGROUND_OCI=0</code>）。
-        抢机与定时开关机<strong>不会执行</strong>，面板只在你操作时请求 Oracle。
+        抢机任务<strong>不会执行</strong>，面板只在你操作时请求 Oracle。
       </div>
       <div v-if="workerChecked && !workerAlive" class="error-box worker-banner">
-        后台 Worker 离线（{{ heartbeatText }}）。容量重试 / 定时任务不会执行。请运行
+        后台 Worker 离线（{{ heartbeatText }}）。容量重试不会执行。请运行
         <code>python -m web.backend.worker</code>
         或检查容器状态。
       </div>

@@ -1,9 +1,9 @@
 """Outbound data transfer (10 TB/month Always Free) tracking.
 
-This is the one free allowance the quota guard never watched, and a realistic way
-to be billed by surprise. It is tracked for visibility and a monthly alert only —
-egress is not knowable at create time, so it must never block a launch, and the
-figure is an upper bound rather than a bill (see TenantSession.get_network_egress_usage).
+Shown on demand in the quota panel. The automatic daily check was removed in
+0.4.36 — it was the only thing calling Oracle without the operator asking — so this
+is now a read that happens when somebody looks at it, and never blocks a launch.
+The figure is an upper bound rather than a bill (see get_network_egress_usage).
 """
 
 from __future__ import annotations
@@ -144,17 +144,3 @@ def test_launch_validation_ignores_egress_entirely():
         usage=_snapshot({"egress_gb": free_quota.FREE_EGRESS_GB * 5}),
     )
     assert guard.ok is True, guard.error_messages()
-
-
-@pytest.mark.parametrize(
-    "used,should_alert",
-    [
-        (0.0, False),
-        (free_quota.FREE_EGRESS_GB * 0.79, False),
-        (free_quota.FREE_EGRESS_GB * 0.8, True),
-        (free_quota.FREE_EGRESS_GB * 1.5, True),
-    ],
-)
-def test_alert_threshold_leaves_room_to_react(used, should_alert):
-    """Alerting only on overage would be useless — by then the bill exists."""
-    assert (used >= free_quota.FREE_EGRESS_GB * free_quota.EGRESS_ALERT_RATIO) is should_alert

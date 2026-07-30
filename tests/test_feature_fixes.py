@@ -22,8 +22,6 @@ from web.backend.db import SessionLocal, init_db  # noqa: E402
 from web.backend.models import (  # noqa: E402
     CapacityJob,
     NotificationChannel,
-    ScheduleJobRow,
-    ScheduleRun,
     Tenant,
     User,
 )
@@ -33,8 +31,6 @@ from web.backend.models import (  # noqa: E402
 def _db():
     init_db()
     with SessionLocal() as db:
-        db.query(ScheduleRun).delete()
-        db.query(ScheduleJobRow).delete()
         db.query(CapacityJob).delete()
         db.query(NotificationChannel).delete()
         db.query(Tenant).delete()
@@ -143,83 +139,6 @@ def test_resume_works_for_a_normal_stopped_job():
 
 
 # ---------------------------------------------------------------------------
-# Schedules: reject a time that can never match
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("bad", ["24:00", "99:99", "7:00", "07:60", "0700", "aa:bb"])
-def test_weekly_schedule_rejects_unmatchable_time(bad):
-    """The worker matches strftime('%H:%M'); anything else never fires."""
-    from web.backend.routers.jobs import create_schedule
-    from web.backend.schemas import ScheduleJobCreate
-
-    owner_id, tenant_id = _seed()
-    body = ScheduleJobCreate(
-        tenant_id=tenant_id, name="s", kind="weekly", time_of_day=bad, weekdays=[0]
-    )
-    with SessionLocal() as db:
-        user = db.get(User, owner_id)
-        with pytest.raises(HTTPException) as exc:
-            create_schedule(body, user, db)
-    assert exc.value.status_code == 400
-    assert "HH:MM" in exc.value.detail
-
-
-@pytest.mark.parametrize("good", ["00:00", "07:05", "23:59", "12:30"])
-def test_weekly_schedule_accepts_valid_times(good):
-    from web.backend.routers.jobs import create_schedule
-    from web.backend.schemas import ScheduleJobCreate
-
-    owner_id, tenant_id = _seed()
-    body = ScheduleJobCreate(
-        tenant_id=tenant_id, name="s", kind="weekly", time_of_day=good, weekdays=[0]
-    )
-    with SessionLocal() as db:
-        user = db.get(User, owner_id)
-        out = create_schedule(body, user, db)
-    assert out.time_of_day == good
-
-
-def test_failed_schedule_fire_is_recorded():
-    """A raising fire left no history row, so the run vanished from 运行历史."""
-    from web.backend.worker import Worker
-
-    owner_id, tenant_id = _seed()
-    now_local = datetime.now().astimezone()
-    with SessionLocal() as db:
-        db.add(
-            ScheduleJobRow(
-                owner_id=owner_id,
-                tenant_id=tenant_id,
-                name="nightly",
-                enabled=True,
-                kind="weekly",
-                time_of_day=now_local.strftime("%H:%M"),
-                weekdays=[now_local.weekday()],
-                action="SOFTSTOP",
-                instance_ids=["i1"],
-            )
-        )
-        db.commit()
-
-    worker = Worker()
-
-    def boom(db, job):
-        raise RuntimeError("OCI 认证失败")
-
-    worker._fire_schedule = boom
-    with SessionLocal() as db:
-        worker.tick_schedules(db)
-        db.commit()
-
-    with SessionLocal() as db:
-        runs = db.query(ScheduleRun).all()
-        assert len(runs) == 1, "a failed fire must still leave a history row"
-        assert runs[0].ok is False
-        assert "OCI" in runs[0].message
-
-
-# ---------------------------------------------------------------------------
 # Notifications: an empty event selection means none
 # ---------------------------------------------------------------------------
 
@@ -272,90 +191,10 @@ def test_notify_respects_an_empty_event_list():
     notify_mod.notify_user(_DB([_Row(["capacity"])]), "o", "capacity", "t", "b")
     assert len(sent) == 1
     sent.clear()
-    notify_mod.notify_user(_DB([_Row(["schedule"])]), "o", "capacity", "t", "b")
+    notify_mod.notify_user(_DB([_Row(["some-other-event"])]), "o", "capacity", "t", "b")
     assert sent == []
 
 
-# ---------------------------------------------------------------------------
-# Backup: budget survives a round trip
-# ---------------------------------------------------------------------------
-
-
-def test_backup_round_trip_preserves_budget():
-    """budget_monthly_usd was absent from the export, so restores lost budget alerts.
-
-    Driven through the real ASGI stack: export returns a StreamingResponse, and the
-    import path is a multipart upload.
-    """
-    import io
-    import json
-
-    pyzipper = pytest.importorskip("pyzipper")
-    from fastapi.testclient import TestClient
-
-    from web.backend.auth import hash_password
-    from web.backend.crypto_util import encrypt_text
-    from web.backend.main import app
-
-    # A real key is required: the import validates via TenantConfig and skips a
-    # tenant without one.
-    pem = (
-        "-----BEGIN PRIVATE KEY-----\n"
-        "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7\n"
-        "-----END PRIVATE KEY-----"
-    )
-
-    with SessionLocal() as db:
-        user = User(username="bkfeat", password_hash=hash_password("supersecret123"))
-        db.add(user)
-        db.flush()
-        db.add(
-            Tenant(
-                owner_id=user.id,
-                name="T-budget",
-                region="ap-tokyo-1",
-                user_ocid="ocid1.user.oc1..aaaabbbbccccddddeeeeffffgggghhhh",
-                tenancy_ocid="ocid1.tenancy.oc1..aaaabbbbccccddddeeeeffffgggghhhh",
-                fingerprint="11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00",
-                private_key_encrypted=encrypt_text(pem),
-                budget_monthly_usd=42.5,
-            )
-        )
-        db.commit()
-
-    with TestClient(app) as c:
-        r = c.post("/api/auth/login", json={"username": "bkfeat", "password": "supersecret123"})
-        assert r.status_code == 200, r.text
-        r = c.post("/api/backup/export", json={"password": "hunter22"})
-        assert r.status_code == 200, r.text
-        blob = r.content
-
-        with pyzipper.AESZipFile(io.BytesIO(blob), "r") as zf:
-            zf.setpassword(b"hunter22")
-            payload = json.loads(zf.read("tenants.json"))
-        exported = payload["tenants"][0]
-        assert exported["budget_monthly_usd"] == 42.5, exported
-
-        # And a hostile value in the archive must be coerced, not crash the import.
-        exported["budget_monthly_usd"] = "not-a-number"
-        exported["name"] = "T-restored"
-        buf = io.BytesIO()
-        with pyzipper.AESZipFile(
-            buf, "w", compression=pyzipper.ZIP_DEFLATED, encryption=pyzipper.WZ_AES
-        ) as zf:
-            zf.setpassword(b"hunter22")
-            zf.writestr("tenants.json", json.dumps({"version": 1, "tenants": [exported]}))
-        r = c.post(
-            "/api/backup/import",
-            data={"password": "hunter22"},
-            files={"file": ("b.zip", buf.getvalue(), "application/zip")},
-        )
-        assert r.status_code == 200, r.text
-
-    with SessionLocal() as db:
-        restored = db.query(Tenant).filter(Tenant.name == "T-restored").one_or_none()
-        assert restored is not None, "hostile budget must not skip the tenant"
-        assert restored.budget_monthly_usd == 0.0
 
 
 # ---------------------------------------------------------------------------

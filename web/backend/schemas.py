@@ -90,7 +90,6 @@ class TenantCreate(BaseModel):
     description: str = Field(default="", max_length=512)
     enabled: bool = True
     color: str = Field(default="#3B82F6", max_length=32)
-    budget_monthly_usd: float = 0.0
     # Hard-enforce Always-Free caps for this tenant (default on).
     free_only_mode: bool = True
 
@@ -133,7 +132,6 @@ class TenantUpdate(BaseModel):
     description: Optional[str] = None
     enabled: Optional[bool] = None
     color: Optional[str] = None
-    budget_monthly_usd: Optional[float] = None
     free_only_mode: Optional[bool] = None
 
 
@@ -150,7 +148,6 @@ class TenantOut(BaseModel):
     color: str
     has_private_key: bool
     account_tier: str
-    budget_monthly_usd: float = 0.0
     free_only_mode: bool = True
     # Empty on a primary tenant; the primary's id on a 副区 (secondary region) row.
     parent_tenant_id: str = ""
@@ -359,50 +356,6 @@ class CapacityAttemptOut(BaseModel):
     message: str
     availability_domain: str
     config_label: str
-    created_at: UtcDatetime
-
-    model_config = {"from_attributes": True}
-
-
-class ScheduleRunOut(BaseModel):
-    id: str
-    job_id: str
-    job_name: str
-    action: str
-    ok: bool
-    instance_count: int
-    success_count: int
-    message: str
-    created_at: UtcDatetime
-
-    model_config = {"from_attributes": True}
-
-
-class ScheduleJobCreate(BaseModel):
-    tenant_id: str
-    name: str = Field(max_length=128)
-    kind: str = "weekly"  # weekly | once
-    time_of_day: str = "22:00"
-    weekdays: list[int] = Field(default_factory=lambda: [0, 1, 2, 3, 4])
-    run_at: Optional[datetime] = None  # required when kind == "once"
-    action: str = "SOFTSTOP"
-    # Bounded: the worker fires these serially, one OCI call each.
-    instance_ids: list[str] = Field(default_factory=list, max_length=200)
-    enabled: bool = True
-
-
-class ScheduleJobOut(BaseModel):
-    id: str
-    tenant_id: str
-    name: str
-    enabled: bool
-    kind: str = "weekly"
-    time_of_day: str
-    weekdays: list[Any]
-    run_at: Optional[UtcDatetime] = None
-    action: str
-    instance_ids: list[Any]
-    last_run_date: str
     created_at: UtcDatetime
 
     model_config = {"from_attributes": True}

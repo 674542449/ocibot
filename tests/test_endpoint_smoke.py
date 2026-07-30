@@ -282,7 +282,7 @@ def test_every_endpoint_is_wired() -> None:
         for p in [
             "/api/health", "/api/auth/me", "/api/tenants", "/api/audit", "/api/notifications",
             "/api/system/status", "/api/admin/users", "/api/admin/settings", "/api/admin/update",
-            "/api/jobs/capacity", "/api/jobs/schedules", "/api/jobs/schedules/runs",
+            "/api/jobs/capacity",
             f"/api/tenants/{tid}", f"/api/tenants/{tid}/instances",
             f"/api/tenants/{tid}/instances/{iid}", f"/api/tenants/{tid}/account",
             f"/api/tenants/{tid}/usage", f"/api/tenants/{tid}/free-quota",
@@ -338,9 +338,6 @@ def test_every_endpoint_is_wired() -> None:
              {"shape": "VM.Standard.A1.Flex", "image_id": "ocid1.image.oc1..img", "auth_mode": "key",
               "ssh_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIfake", "ocpus": 2,
               "memory_in_gbs": 12}),
-            ("/api/jobs/schedules",
-             {"tenant_id": tid, "name": "nightly", "kind": "weekly", "time_of_day": "22:00",
-              "weekdays": [0], "action": "SOFTSTOP"}),
         ]
         for p, body in posts:
             check("POST", p, c.post(p, json=body) if body is not None else c.post(p))

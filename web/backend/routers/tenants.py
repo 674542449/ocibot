@@ -50,7 +50,6 @@ def _to_out(row: Tenant) -> TenantOut:
         color=row.color or "#3B82F6",
         has_private_key=bool(row.private_key_encrypted),
         account_tier=row.account_tier or "",
-        budget_monthly_usd=float(row.budget_monthly_usd or 0.0),
         free_only_mode=bool(getattr(row, "free_only_mode", True)),
         parent_tenant_id=getattr(row, "parent_tenant_id", "") or "",
         region_label=region_area(row.region or ""),
@@ -205,7 +204,6 @@ def create_tenant(
         enabled=body.enabled,
         color=body.color or "#3B82F6",
         private_key_encrypted=encrypt_text(body.private_key_pem.strip()),
-        budget_monthly_usd=float(body.budget_monthly_usd or 0.0),
         free_only_mode=bool(body.free_only_mode),
     )
     db.add(row)

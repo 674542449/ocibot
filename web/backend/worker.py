@@ -1,14 +1,16 @@
-"""Background worker: capacity retry + power schedules (DB-driven).
+"""Background worker: capacity retry (DB-driven).
 
 Reuses compliance helpers from app.scheduler and OCI launch path from app.oci_client.
 Run: python -m web.backend.worker  (from repo root)
 
 Responsibilities:
 - capacity retry with AD × config (downgrade) rotation, per-attempt logging
-- weekly + one-shot power schedules with execution history
 - worker heartbeat (AppMeta) so the panel can show liveness
-- daily checks: budget alerts
-- push notifications (Telegram / Bark / ServerChan / Webhook / SMTP)
+- push notifications for capacity results (Telegram / Bark / ServerChan / Webhook / SMTP)
+
+Power schedules, budget alerts and the daily outbound-traffic check were removed in
+0.4.36: unused, and they were the only things making Oracle calls without the
+operator asking. Capacity retry stays because it only runs while a job exists.
 """
 
 from __future__ import annotations
@@ -46,17 +48,13 @@ from web.backend.config import get_settings  # noqa: E402
 from web.backend.crypto_util import decrypt_text  # noqa: E402
 from web.backend.db import SessionLocal, init_db  # noqa: E402
 from web.backend.meta import (  # noqa: E402
-    KEY_DAILY_CHECKS_DATE,
     KEY_WORKER_HEARTBEAT,
     KEY_WORKER_ID,
-    get_meta,
     set_meta,
 )
 from web.backend.models import (  # noqa: E402
     CapacityAttempt,
     CapacityJob,
-    ScheduleJobRow,
-    ScheduleRun,
     Tenant,
 )
 from web.backend.notify import notify_user  # noqa: E402
@@ -98,22 +96,19 @@ class Worker:
     def run_forever(self) -> None:
         init_db()
         log.info("Worker %s started (poll=%ss)", self.worker_id, self.settings.worker_poll_sec)
-        # Every phase below except the heartbeat calls Oracle. With background OCI
-        # switched off the worker still runs and still beats — so the panel reports
-        # it as online rather than as broken — but performs no OCI work at all.
+        # Capacity retry is the only phase that calls Oracle, and only while a job
+        # exists. The heartbeat writes to the database only, so it keeps running even
+        # with background OCI off — the panel then reports the worker as online
+        # rather than as broken.
         background = bool(self.settings.worker_background_oci)
         if not background:
             log.warning(
-                "OCIBOT_WORKER_BACKGROUND_OCI=0: capacity retry, power schedules, "
-                "budget and egress checks will NOT run (no background OCI calls)"
+                "OCIBOT_WORKER_BACKGROUND_OCI=0: capacity retry will NOT run "
+                "(no background OCI calls)"
             )
-        phases = (
-            ("beat", self.beat),
-        ) + ((
-            ("schedules", self.tick_schedules),
-            ("capacity", self.tick_capacity),
-            ("daily_checks", self.tick_daily_checks),
-        ) if background else ())
+        phases = (("beat", self.beat),) + (
+            (("capacity", self.tick_capacity),) if background else ()
+        )
         while True:
             for name, phase in phases:
                 try:
@@ -134,160 +129,6 @@ class Worker:
         except Exception:  # noqa: BLE001
             log.exception("heartbeat write failed")
 
-    # ------------------------------------------------------------------
-    # Schedules
-    # ------------------------------------------------------------------
-    def tick_schedules(self, db: Session) -> None:
-        now_local = _local_now()
-        today = now_local.strftime("%Y-%m-%d")
-        hm = now_local.strftime("%H:%M")
-        weekday = now_local.weekday()
-        now_utc = _utcnow()
-
-        rows = db.scalars(
-            select(ScheduleJobRow).where(ScheduleJobRow.enabled.is_(True))
-        ).all()
-        for job in rows:
-            kind = (job.kind or "weekly").lower()
-            if kind == "once":
-                run_at = _as_utc(job.run_at)
-                if run_at is None or run_at > now_utc:
-                    continue
-                # Claim the job with a conditional UPDATE committed BEFORE the OCI
-                # calls: two workers (or an API restart mid-tick) previously both
-                # saw enabled=True and fired the same power action twice, because
-                # flush() alone is invisible to other connections until commit.
-                claimed = db.execute(
-                    update(ScheduleJobRow)
-                    .where(ScheduleJobRow.id == job.id, ScheduleJobRow.enabled.is_(True))
-                    .values(enabled=False, last_run_date=today)
-                    .execution_options(synchronize_session=False)
-                ).rowcount
-                if not claimed:
-                    continue
-                db.commit()
-                db.refresh(job)
-            else:
-                if weekday not in (job.weekdays or []):
-                    continue
-                if job.time_of_day != hm:
-                    continue
-                if job.last_run_date == today:
-                    continue
-                claimed = db.execute(
-                    update(ScheduleJobRow)
-                    .where(
-                        ScheduleJobRow.id == job.id,
-                        (ScheduleJobRow.last_run_date.is_(None))
-                        | (ScheduleJobRow.last_run_date != today),
-                    )
-                    .values(last_run_date=today)
-                    .execution_options(synchronize_session=False)
-                ).rowcount
-                if not claimed:
-                    continue
-                db.commit()
-                db.refresh(job)
-            try:
-                self._fire_schedule(db, job)
-            except Exception as exc:  # noqa: BLE001
-                log.error("schedule %s failed: %s", job.id, exc)
-                # The day was already claimed, so without a history row the run
-                # vanished: no record in 运行历史 and no retry until tomorrow.
-                self._record_schedule_run(
-                    db, job, ok=False, total=0, success=0, message=str(exc)[:2000]
-                )
-                notify_user(
-                    db,
-                    job.owner_id,
-                    "schedule",
-                    "OCIBot 定时任务执行失败",
-                    f"任务「{job.name}」动作 {job.action} 执行失败：{exc}",
-                )
-                db.commit()
-
-    def _fire_schedule(self, db: Session, job: ScheduleJobRow) -> None:
-        tenant = db.get(Tenant, job.tenant_id)
-        if tenant is None or not tenant.enabled:
-            log.warning("schedule %s: tenant missing/disabled", job.id)
-            self._record_schedule_run(db, job, ok=False, total=0, success=0, message="租户不存在或已禁用")
-            return
-        # Ownership guard: tenant must belong to the schedule owner
-        if tenant.owner_id != job.owner_id:
-            log.error("schedule %s ownership mismatch tenant=%s", job.id, job.tenant_id)
-            job.enabled = False
-            return
-        from web.backend.oci_bridge import tenant_row_to_config
-
-        cfg = tenant_row_to_config(tenant)
-        session = self.sessions.get(cfg)
-        action = (job.action or "SOFTSTOP").upper()
-        allowed = {"START", "STOP", "SOFTSTOP", "RESET", "SOFTRESET"}
-        if action not in allowed:
-            log.error("schedule %s invalid action %s", job.id, action)
-            self._record_schedule_run(db, job, ok=False, total=0, success=0, message=f"不支持的动作 {action}")
-            return
-        target_ids = list(job.instance_ids or [])
-        if not target_ids:
-            infos = session.list_instances_tree(resolve_ips=False)
-            target_ids = [i.id for i in infos if i.lifecycle_state not in ("TERMINATED", "TERMINATING")]
-        log.info("schedule fire %s action=%s count=%s", job.name, action, len(target_ids))
-        success = 0
-        failures: list[str] = []
-        for iid in target_ids:
-            try:
-                result = session.instance_action(iid, action)
-                if getattr(result, "ok", True):
-                    success += 1
-                else:
-                    failures.append(f"{iid[-8:]}: {getattr(result, 'message', '') or '失败'}")
-            except Exception as exc:  # noqa: BLE001
-                failures.append(f"{iid[-8:]}: {exc}")
-                log.warning("schedule action %s on %s failed: %s", action, iid, exc)
-        ok = not failures
-        message = "全部成功" if ok else "; ".join(failures)[:1500]
-        self._record_schedule_run(
-            db, job, ok=ok, total=len(target_ids), success=success, message=message
-        )
-        if not ok:
-            notify_user(
-                db,
-                job.owner_id,
-                "schedule",
-                "OCIBot 定时任务部分失败",
-                f"任务「{job.name}」动作 {action}：{success}/{len(target_ids)} 成功。\n{message}",
-            )
-
-    def _record_schedule_run(
-        self,
-        db: Session,
-        job: ScheduleJobRow,
-        *,
-        ok: bool,
-        total: int,
-        success: int,
-        message: str,
-    ) -> None:
-        try:
-            db.add(
-                ScheduleRun(
-                    job_id=job.id,
-                    owner_id=job.owner_id,
-                    job_name=job.name or "",
-                    action=job.action or "",
-                    ok=ok,
-                    instance_count=total,
-                    success_count=success,
-                    message=message[:2000],
-                )
-            )
-            db.flush()
-        except Exception:  # noqa: BLE001
-            log.exception("record schedule run failed")
-
-    # ------------------------------------------------------------------
-    # Capacity retry
-    # ------------------------------------------------------------------
     def tick_capacity(self, db: Session) -> None:
         now = _utcnow()
         # Release stale locks durably (a crashed worker's lease expires here).
@@ -737,131 +578,6 @@ class Worker:
     # ------------------------------------------------------------------
     # Daily checks: budget + password expiry
     # ------------------------------------------------------------------
-    def tick_daily_checks(self, db: Session) -> None:
-        today = _local_now().strftime("%Y-%m-%d")
-        try:
-            if get_meta(db, KEY_DAILY_CHECKS_DATE) == today:
-                return
-            set_meta(db, KEY_DAILY_CHECKS_DATE, today)
-            # Commit the day claim immediately. It used to be flushed only, so the
-            # whole tenant sweep (Usage API calls plus notification sends, tens of
-            # seconds) ran inside one open write transaction: on SQLite that blocks
-            # every API write with "database is locked", and a restart mid-sweep
-            # re-ran every call and re-sent every alert.
-            db.commit()
-        except Exception:  # noqa: BLE001
-            log.exception("daily-check gate failed")
-            return
-        log.info("running daily checks (%s)", today)
-        # These hit Usage API / Monitoring — run them strictly one tenant at a time
-        # with a short pause to avoid multi-account bursts. The pause is driven by
-        # whether a check ACTUALLY called Oracle, not by budget_monthly_usd: the
-        # egress check calls regardless of the budget setting, so keying the sleep
-        # on the budget meant a user with no budget set got every tenant's
-        # Monitoring query back to back — the exact burst this guards against.
-        tenants = db.scalars(select(Tenant).where(Tenant.enabled.is_(True))).all()
-        for tenant in tenants:
-            called = False
-            try:
-                called = self._check_tenant_budget(db, tenant) or called
-            except Exception:  # noqa: BLE001
-                log.exception("budget check failed tenant=%s", tenant.id)
-                called = True
-            try:
-                called = self._check_tenant_egress(db, tenant) or called
-            except Exception:  # noqa: BLE001
-                log.exception("egress check failed tenant=%s", tenant.id)
-                called = True
-            if called:
-                time.sleep(1.5)
-
-    def _check_tenant_budget(self, db: Session, tenant: Tenant) -> bool:
-        """Returns whether an OCI call was made (drives the inter-tenant pause)."""
-        budget = float(tenant.budget_monthly_usd or 0.0)
-        if budget <= 0:
-            return False
-        month = _local_now().strftime("%Y-%m")
-        if tenant.budget_notified_month == month:
-            return False
-        from web.backend.oci_bridge import tenant_row_to_config
-
-        session = self.sessions.get(tenant_row_to_config(tenant))
-        days_into_month = max(1, _local_now().day)
-        result = session.get_usage_summary(days=days_into_month)
-        data = result.data if isinstance(result.data, dict) else {}
-        try:
-            total = float(data.get("total") or 0.0)
-        except (TypeError, ValueError):
-            total = 0.0
-        if not result.ok or total < budget:
-            return True
-        currency = str(data.get("currency") or "USD")
-        tenant.budget_notified_month = month
-        # Commit before sending: a flush alone could be rolled back by a later
-        # failure in the same tick, un-marking a month whose alert was already
-        # delivered and re-sending it on the next run.
-        db.commit()
-        notify_user(
-            db,
-            tenant.owner_id,
-            "budget",
-            "💰 OCIBot 预算超额提醒",
-            (
-                f"租户「{tenant.name}」本月费用约 {total:.2f} {currency}，"
-                f"已达到预算 {budget:.2f}。\n"
-                "请到「账号用量」页查看服务明细，必要时清理付费资源。"
-            ),
-        )
-        return True
-
-    def _check_tenant_egress(self, db: Session, tenant: Tenant) -> bool:
-        """Warn once a month when outbound traffic nears the free 10 TB.
-
-        Fires at 80% rather than on overage: the whole point is to leave room to
-        react, and unlike the storage caps this one cannot be enforced at create
-        time. The reading is an upper bound over a single region (see
-        get_network_egress_usage), so the message says so instead of presenting it
-        as a bill.
-        """
-        from app.free_quota import EGRESS_ALERT_RATIO, FREE_EGRESS_GB
-
-        month = _local_now().strftime("%Y-%m")
-        if tenant.egress_notified_month == month:
-            return False
-        from web.backend.oci_bridge import tenant_row_to_config
-
-        session = self.sessions.get(tenant_row_to_config(tenant))
-        result = session.get_network_egress_usage()
-        data = result.data if isinstance(result.data, dict) else {}
-        if not result.ok:
-            log.warning("egress read failed tenant=%s: %s", tenant.id, result.message)
-            return True
-        try:
-            used_gb = float(data.get("egress_gb") or 0.0)
-        except (TypeError, ValueError):
-            return True
-        if used_gb < FREE_EGRESS_GB * EGRESS_ALERT_RATIO:
-            return True
-        tenant.egress_notified_month = month
-        # Commit before sending, same as the budget alert: a later failure in this
-        # tick would otherwise un-mark a month whose alert already went out.
-        db.commit()
-        notify_user(
-            db,
-            tenant.owner_id,
-            "budget",
-            "📡 OCIBot 出网流量提醒",
-            (
-                f"租户「{tenant.name}」本月出网流量约 {used_gb:.0f} GB，"
-                f"已达免费额度 {FREE_EGRESS_GB:.0f} GB 的 "
-                f"{used_gb / FREE_EGRESS_GB * 100:.0f}%。\n"
-                f"该数字为估算上限（仅统计区域 {data.get('region') or '—'}，"
-                "且包含区域内互通等免费流量），超出免费额度的部分 Oracle 会计费。"
-            ),
-        )
-        return True
-
-
 def main() -> int:
     Worker().run_forever()
     return 0

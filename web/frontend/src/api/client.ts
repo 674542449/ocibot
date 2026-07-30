@@ -58,7 +58,6 @@ export type Tenant = {
   color: string
   has_private_key: boolean
   account_tier: string
-  budget_monthly_usd: number
   free_only_mode: boolean
   /** '' on a primary tenant; the primary's id on a 副区 (secondary region) row. */
   parent_tenant_id: string
@@ -137,21 +136,6 @@ export type CapacityJob = {
   launch_payload: Record<string, unknown>
   fallback_configs: Record<string, unknown>[]
   has_user_data: boolean
-}
-
-export type ScheduleJob = {
-  id: string
-  tenant_id: string
-  name: string
-  enabled: boolean
-  kind: string
-  time_of_day: string
-  weekdays: number[]
-  run_at: string | null
-  action: string
-  instance_ids: string[]
-  last_run_date: string
-  created_at: string
 }
 
 export type AuditItem = {

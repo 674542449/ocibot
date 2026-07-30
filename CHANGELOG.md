@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.4.36 — 2026-07-29
+
+### 移除（用不上的功能，按使用者要求删除）
+- **定时开关机**：整套删除 —— `ScheduleJobRow` / `ScheduleRun` 模型、
+  `/jobs/schedules*` 四个接口、Worker 的 `tick_schedules`、任务中心的整块界面与运行历史
+- **预算告警**：删除 Worker 的每日 Usage API 检查、`Tenant.budget_monthly_usd`
+  与 `budget_notified_month`、租户表单里的预算字段、备份的相关字段。
+  **「账号用量」页的费用查询保留**——那是你点了才读，不是后台告警
+- **每日自动出网流量检查**：删除 Worker 的每日 Monitoring 查询与
+  `Tenant.egress_notified_month`。**面板里 10TB 出网流量的进度条保留**——
+  那是你打开页面才读，闲置时零开销
+- 推送事件只剩 `capacity` 一项（原为 capacity / schedule / budget）
+
+### 保留
+- **抢机（容量重试）**：使用者明确要留。它只在存在任务时才请求 Oracle，
+  没建任务就零调用，所以 `OCIBOT_WORKER_BACKGROUND_OCI` 保持 `1` 也不产生任何请求
+- `app/scheduler.py` 里的旧 `ScheduleJob` / `JobStore` 未动 ——
+  `app/runtime_paths.py` 用 `JobStore` 做数据目录可写性探测，那部分仍在生效
+
+### 结果
+Worker 现在只有两个阶段：心跳（只写数据库）+ 抢机（仅在有任务时）。
+**没有抢机任务时，面板对 Oracle 的请求 100% 由你的点击触发。**
+
+### 数据库
+旧表 `schedule_jobs` / `schedule_runs` 和那三个列不会被自动删除
+（自动迁移只加不减），留在库里无害。想彻底清掉可手动 `DROP TABLE`。
+
+### 维护
+- 删除 `tests/test_schedule_single_fire.py`，清理其余测试中相关用例
+- 373 passed；另外把构建产物实际跑起来确认渲染正常（任务中心的模板做了大面积删除）
+
+### 升级
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.36
+```
+既然只剩抢机，可以把开关打开备用（不建任务就不会有请求）：
+```bash
+sed -i 's/^OCIBOT_WORKER_BACKGROUND_OCI=0/OCIBOT_WORKER_BACKGROUND_OCI=1/' ~/ocibot/web/.env
+cd ~/ocibot && docker compose up -d
+```
+
+---
+
 ## 0.4.35 — 2026-07-29
 
 ### 功能

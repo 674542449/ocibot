@@ -79,12 +79,6 @@ class Tenant(Base):
     # meant a paid account got a mere warning while exceeding the free tier.
     # Turn it off per tenant to deliberately use billable resources.
     free_only_mode: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    # Monthly cost budget (USD). 0 = alerts off.
-    budget_monthly_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
-    # "YYYY-MM" of the last month a budget-exceeded notification was sent.
-    budget_notified_month: Mapped[str] = mapped_column(String(8), default="", nullable=False)
-    # Same, for the monthly outbound-traffic (10TB Always Free) alert.
-    egress_notified_month: Mapped[str] = mapped_column(String(8), default="", nullable=False)
     # Legacy: last local password-expiry notify day (unused).
     pwd_expiry_notified_on: Mapped[str] = mapped_column(String(16), default="", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
@@ -128,27 +122,6 @@ class CapacityJob(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
 
 
-class ScheduleJobRow(Base):
-    """Recurring power schedule (local wall-clock semantics stored as HH:MM + weekdays)."""
-
-    __tablename__ = "schedule_jobs"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    owner_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
-    name: Mapped[str] = mapped_column(String(128), nullable=False)
-    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    # weekly = repeat on weekdays at time_of_day; once = fire at run_at then disable.
-    kind: Mapped[str] = mapped_column(String(16), default="weekly", nullable=False)
-    time_of_day: Mapped[str] = mapped_column(String(8), default="22:00")  # HH:MM
-    weekdays: Mapped[list[Any]] = mapped_column(JSON, default=list)  # 0=Mon .. 6=Sun
-    run_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    action: Mapped[str] = mapped_column(String(32), default="SOFTSTOP")
-    instance_ids: Mapped[list[Any]] = mapped_column(JSON, default=list)
-    last_run_date: Mapped[str] = mapped_column(String(16), default="")  # YYYY-MM-DD local
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
-
-
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 
@@ -182,25 +155,6 @@ class CapacityAttempt(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, index=True)
 
 
-class ScheduleRun(Base):
-    """Execution record for a schedule job firing."""
-
-    __tablename__ = "schedule_runs"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    job_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("schedule_jobs.id", ondelete="CASCADE"), index=True
-    )
-    owner_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), index=True)
-    job_name: Mapped[str] = mapped_column(String(128), default="")
-    action: Mapped[str] = mapped_column(String(32), default="")
-    ok: Mapped[bool] = mapped_column(Boolean, default=True)
-    instance_count: Mapped[int] = mapped_column(Integer, default=0)
-    success_count: Mapped[int] = mapped_column(Integer, default=0)
-    message: Mapped[str] = mapped_column(Text, default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, index=True)
-
-
 class NotificationChannel(Base):
     """Per-user push channel. Secrets (tokens/SMTP password) are Fernet-encrypted."""
 
@@ -214,10 +168,9 @@ class NotificationChannel(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     # Encrypted JSON dict of channel-specific config (bot_token/chat_id/url/...).
     config_encrypted: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    # Event switches (all default on): capacity / schedule / budget
-    events: Mapped[list[Any]] = mapped_column(
-        JSON, default=lambda: ["capacity", "schedule", "budget"]
-    )
+    # Event switches. Only capacity results are pushed since 0.4.36; rows created
+    # earlier may still list removed event names, which are simply never matched.
+    events: Mapped[list[Any]] = mapped_column(JSON, default=lambda: ["capacity"])
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
 

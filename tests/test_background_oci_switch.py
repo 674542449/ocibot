@@ -61,7 +61,7 @@ def _phases(background: bool) -> list[str]:
             return None
 
     worker_mod.SessionLocal = lambda: _NullSession()  # type: ignore[assignment]
-    for name in ("beat", "tick_schedules", "tick_capacity", "tick_daily_checks"):
+    for name in ("beat", "tick_capacity"):
         setattr(w, name, (lambda n: lambda _db: names.append(n))(name))
     try:
         w.run_forever()
@@ -75,13 +75,13 @@ def _phases(background: bool) -> list[str]:
 
 
 def test_switch_on_runs_every_phase():
-    assert _phases(True) == ["beat", "tick_schedules", "tick_capacity", "tick_daily_checks"]
+    assert _phases(True) == ["beat", "tick_capacity"]
 
 
 def test_switch_off_leaves_only_the_heartbeat():
-    """Everything except beat calls Oracle; beat writes to the database only, and
-    keeping it means the panel still reports the worker as online rather than
-    broken."""
+    """Capacity retry is the only phase that calls Oracle; beat writes to the
+    database only, and keeping it means the panel still reports the worker as
+    online rather than broken."""
     assert _phases(False) == ["beat"]
 
 

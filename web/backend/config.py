@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     # MUST be bumped in the same commit as any shipped change, together with a new
     # CHANGELOG.md heading — /api/health is how an operator verifies a deploy
     # actually landed. tests/test_version_bump.py enforces that the two agree.
-    app_version: str = "0.4.35"
+    app_version: str = "0.4.36"
     debug: bool = False
 
     # sqlite+pysqlite:////absolute/path.db  or  postgresql+psycopg://user:pass@host/db
@@ -49,13 +49,14 @@ class Settings(BaseSettings):
     worker_poll_sec: float = Field(default=5.0, alias="OCIBOT_WORKER_POLL_SEC")
     worker_id: str = Field(default="worker-1", alias="OCIBOT_WORKER_ID")
 
-    # Master switch for every background call the worker makes to Oracle: capacity
-    # retry, power schedules, budget alerts and the outbound-traffic check. Set to 0
-    # for a panel that must touch OCI only while somebody is actually using it.
+    # Master switch for the worker's background Oracle calls. Since 0.4.36 that is
+    # capacity retry alone, and it only runs while a job exists — so leaving this on
+    # costs nothing until you create one. Set to 0 to guarantee the panel touches OCI
+    # only while somebody is using it.
     #
-    # Turning it off does NOT disable those features in the UI — it stops them
-    # EXECUTING. The panel says so on the jobs page and in the sidebar, because a
-    # capacity-retry job that silently never fires is worse than one that errors.
+    # Turning it off does NOT hide capacity retry in the UI — it stops it EXECUTING.
+    # The panel says so on the task page and in the sidebar, because a job that
+    # silently never fires is worse to diagnose than one that errors.
     worker_background_oci: bool = Field(default=True, alias="OCIBOT_WORKER_BACKGROUND_OCI")
 
     # PostgreSQL connection pool (ignored for SQLite)

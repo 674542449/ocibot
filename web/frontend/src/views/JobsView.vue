@@ -4,7 +4,7 @@
       <div>
         <h2>任务中心</h2>
         <p class="muted" style="margin: 0.2rem 0 0">
-          容量重试与定时开关机由后台 Worker 执行
+          容量重试由后台 Worker 执行
         </p>
       </div>
       <div class="page-tools">
@@ -24,7 +24,7 @@
     <div v-if="backgroundOff" class="card bg-off-box">
       <strong>⚠ 后台 OCI 请求已关闭，本页任务不会执行</strong>
       <p class="muted" style="margin: 0.3rem 0 0; font-size: 12px">
-        任务可以照常创建和保存，但 Worker 不会去调用 Oracle，抢机与定时开关机都不会触发。
+        任务可以照常创建和保存，但 Worker 不会去调用 Oracle，抢机不会触发。
         要恢复：在 <code>web/.env</code> 里设 <code>OCIBOT_WORKER_BACKGROUND_OCI=1</code>
         后执行 <code>docker compose up -d</code>。
       </p>
@@ -100,143 +100,12 @@
         </table>
       </div>
     </div>
-
-    <div class="card stack">
-      <div class="row" style="justify-content: space-between">
-        <h3 style="margin: 0">定时开关机</h3>
-        <button class="primary" @click="showSchedule = !showSchedule">
-          {{ showSchedule ? '收起' : '新建' }}
-        </button>
-      </div>
-
-      <div v-if="showSchedule" class="stack" style="border-top: 1px solid var(--border); padding-top: 0.75rem">
-        <div class="grid-2">
-          <div class="field">
-            <label>名称</label>
-            <input v-model="schedForm.name" />
-          </div>
-          <div class="field">
-            <label>租户</label>
-            <select v-model="schedForm.tenant_id">
-              <option disabled value="">选择租户</option>
-              <option v-for="t in tenants" :key="t.id" :value="t.id">{{ t.name }}</option>
-            </select>
-          </div>
-          <div class="field">
-            <label>类型</label>
-            <select v-model="schedForm.kind">
-              <option value="weekly">每周循环</option>
-              <option value="once">一次性（指定时间）</option>
-            </select>
-          </div>
-          <div class="field">
-            <label>动作</label>
-            <select v-model="schedForm.action">
-              <option value="SOFTSTOP">正常关机</option>
-              <option value="STOP">强制关机</option>
-              <option value="START">开机</option>
-              <option value="SOFTRESET">正常重启</option>
-              <option value="RESET">强制重启</option>
-            </select>
-          </div>
-          <div v-if="schedForm.kind === 'weekly'" class="field">
-            <label>时间（本地 HH:MM）</label>
-            <input v-model="schedForm.time_of_day" placeholder="22:00" />
-          </div>
-          <div v-else class="field">
-            <label>执行时间</label>
-            <input v-model="schedForm.run_at_local" type="datetime-local" />
-          </div>
-        </div>
-        <div v-if="schedForm.kind === 'weekly'" class="field">
-          <label>星期</label>
-          <div class="choice-group">
-            <label v-for="(w, i) in WEEKDAYS" :key="i" class="choice muted">
-              <input v-model="schedForm.weekdays" type="checkbox" :value="i" />
-              <span>{{ w }}</span>
-            </label>
-          </div>
-        </div>
-        <p class="muted" style="font-size: 12px; margin: 0">
-          实例列表为空表示该租户下全部非终止实例。一次性任务执行后自动停用。
-        </p>
-        <button class="primary" :disabled="saving" @click="createSchedule">创建定时任务</button>
-      </div>
-
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>名称</th>
-              <th>类型</th>
-              <th>时间</th>
-              <th>动作</th>
-              <th>上次执行</th>
-              <th>操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-if="schedules.length === 0">
-              <td colspan="6" class="muted">暂无定时任务</td>
-            </tr>
-            <tr v-for="s in schedules" :key="s.id">
-              <td>{{ s.name }}</td>
-              <td>{{ s.kind === 'once' ? '一次性' : '每周' }}</td>
-              <td class="muted" style="font-size: 12px">
-                <template v-if="s.kind === 'once'">{{ fmt(s.run_at) }}</template>
-                <template v-else>{{ s.time_of_day }} · 周{{ (s.weekdays || []).map(wd).join('/') }}</template>
-              </td>
-              <td>{{ s.action }}</td>
-              <td>{{ s.last_run_date || '—' }}</td>
-              <td>
-                <button class="danger" @click="deleteSchedule(s)">删除</button>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-
-      <details>
-        <summary class="muted" style="cursor: pointer">执行历史（最近 {{ runs.length }} 条）</summary>
-        <div class="table-wrap" style="margin-top: 0.5rem">
-          <table>
-            <thead>
-              <tr>
-                <th>时间</th>
-                <th>任务</th>
-                <th>动作</th>
-                <th>结果</th>
-                <th>详情</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-if="runs.length === 0">
-                <td colspan="5" class="muted">暂无执行记录</td>
-              </tr>
-              <tr v-for="r in runs" :key="r.id">
-                <td class="muted" style="font-size: 12px">{{ fmt(r.created_at) }}</td>
-                <td>{{ r.job_name }}</td>
-                <td>{{ r.action }}</td>
-                <td>
-                  <span class="badge" :class="r.ok ? 'running' : 'err'">
-                    {{ r.success_count }}/{{ r.instance_count }}
-                  </span>
-                </td>
-                <td class="muted" style="font-size: 12px; max-width: 320px; word-break: break-all">
-                  {{ r.message }}
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </details>
-    </div>
   </div>
 </template>
 
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import api, { type CapacityJob, type ScheduleJob, type Tenant } from '@/api/client'
+import api, { type CapacityJob, type Tenant } from '@/api/client'
 
 type Attempt = {
   id: string
@@ -251,22 +120,10 @@ type Attempt = {
   created_at: string
 }
 
-type Run = {
-  id: string
-  job_name: string
-  action: string
-  ok: boolean
-  instance_count: number
-  success_count: number
-  message: string
-  created_at: string
-}
 
 const WEEKDAYS = ['一', '二', '三', '四', '五', '六', '日']
 
 const capacityJobs = ref<CapacityJob[]>([])
-const schedules = ref<ScheduleJob[]>([])
-const runs = ref<Run[]>([])
 const tenants = ref<Tenant[]>([])
 const attempts = ref<Record<string, Attempt[]>>({})
 const openLog = ref('')
@@ -285,19 +142,9 @@ async function checkBackground() {
 const autoRefresh = ref(false)
 const error = ref('')
 const msg = ref('')
-const showSchedule = ref(false)
 const saving = ref(false)
 let timer: number | undefined
 
-const schedForm = reactive({
-  name: '工作日关机',
-  tenant_id: '',
-  kind: 'weekly',
-  time_of_day: '22:00',
-  run_at_local: '',
-  action: 'SOFTSTOP',
-  weekdays: [0, 1, 2, 3, 4] as number[],
-})
 
 function wd(i: number) {
   return WEEKDAYS[i] ?? String(i)
@@ -343,17 +190,12 @@ function fmt(v: string | null | undefined) {
 
 async function load() {
   error.value = ''
-  const [c, s, t, r] = await Promise.all([
+  const [jobs, tenantList] = await Promise.all([
     api.get<CapacityJob[]>('/jobs/capacity'),
-    api.get<ScheduleJob[]>('/jobs/schedules'),
     api.get<Tenant[]>('/tenants'),
-    api.get<Run[]>('/jobs/schedules/runs', { params: { limit: 50 } }),
   ])
-  capacityJobs.value = c.data
-  schedules.value = s.data
-  tenants.value = t.data
-  runs.value = r.data
-  if (!schedForm.tenant_id && t.data[0]) schedForm.tenant_id = t.data[0].id
+  capacityJobs.value = jobs.data
+  tenants.value = tenantList.data
   if (openLog.value) await loadAttempts(openLog.value)
 }
 
@@ -379,7 +221,7 @@ async function toggleLog(j: CapacityJob) {
 
 async function refreshCapacity() {
   // Lightweight tick for the auto-refresh: only capacity jobs (and the open log)
-  // change during retries — no need to re-pull tenants/schedules/runs every 5s.
+  // change during retries — no need to re-pull tenants every 5s.
   const { data } = await api.get<CapacityJob[]>('/jobs/capacity')
   capacityJobs.value = data
   if (openLog.value) await loadAttempts(openLog.value)
@@ -414,48 +256,6 @@ async function deleteJob(j: CapacityJob) {
     await api.delete(`/jobs/capacity/${j.id}`)
     msg.value = '已删除'
     if (openLog.value === j.id) openLog.value = ''
-    await load()
-  } catch (e: any) {
-    error.value = e?.message || '删除失败'
-  }
-}
-
-async function createSchedule() {
-  error.value = ''
-  saving.value = true
-  try {
-    const body: Record<string, unknown> = {
-      name: schedForm.name,
-      tenant_id: schedForm.tenant_id,
-      kind: schedForm.kind,
-      action: schedForm.action,
-      enabled: true,
-      instance_ids: [],
-    }
-    if (schedForm.kind === 'weekly') {
-      body.time_of_day = schedForm.time_of_day
-      body.weekdays = schedForm.weekdays
-    } else {
-      if (!schedForm.run_at_local) throw new Error('请选择执行时间')
-      body.run_at = new Date(schedForm.run_at_local).toISOString()
-    }
-    await api.post('/jobs/schedules', body)
-    msg.value = '定时任务已创建'
-    showSchedule.value = false
-    await load()
-  } catch (e: any) {
-    error.value = e?.message || '创建失败'
-  } finally {
-    saving.value = false
-  }
-}
-
-async function deleteSchedule(s: ScheduleJob) {
-  if (!confirm(`删除「${s.name}」？`)) return
-  error.value = ''
-  try {
-    await api.delete(`/jobs/schedules/${s.id}`)
-    msg.value = '已删除'
     await load()
   } catch (e: any) {
     error.value = e?.message || '删除失败'
