@@ -418,7 +418,6 @@ def validate_launch_against_quota(
     a1_rem = _as_float(rem.get("a1_ocpu"), max(0.0, FREE_A1_OCPU - a1_used))
     a1_mem_rem = _as_float(rem.get("a1_memory_gb"), max(0.0, FREE_A1_MEMORY_GB - a1_mem_used))
     e2_rem = _as_int(rem.get("e2_micro_count"), max(0, FREE_E2_MICRO_COUNT - e2_used))
-    disk_rem = _as_float(rem.get("block_storage_gb"), max(0.0, FREE_BLOCK_STORAGE_GB - disk_used))
 
     free_only = bool(free_only_mode)
     tier = (account_tier or "").strip().lower()

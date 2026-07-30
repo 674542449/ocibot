@@ -20,6 +20,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from web.backend.body_limit import BodySizeLimitMiddleware
 from web.backend.config import get_settings
+from web.backend.origin_guard import UNSAFE_METHODS, origin_allowed
 from web.backend.db import SessionLocal, init_db
 from web.backend.routers import (
     admin,
@@ -133,6 +134,44 @@ def create_app() -> FastAPI:
     @app.get("/api/health", response_model=HealthOut, tags=["system"])
     def health() -> HealthOut:
         return HealthOut(status="ok", version=settings.app_version, app=settings.app_name)
+
+    # Registered before security_headers so it ends up *inside* it: a rejected
+    # request still gets the hardening headers on its 403.
+    @app.middleware("http")
+    async def csrf_origin_guard(request, call_next):
+        """Reject cross-site state-changing requests.
+
+        The auth cookie alone used to authorize these. See origin_guard.py for why
+        SameSite is not enough on its own.
+        """
+        if settings.origin_check and request.method in UNSAFE_METHODS:
+            origin = request.headers.get("origin") or ""
+            if not origin_allowed(
+                origin,
+                host=request.headers.get("host") or "",
+                forwarded_host=request.headers.get("x-forwarded-host") or "",
+            ):
+                log.warning(
+                    "rejected cross-site %s %s: origin=%r host=%r x-forwarded-host=%r",
+                    request.method,
+                    request.url.path,
+                    origin,
+                    request.headers.get("host"),
+                    request.headers.get("x-forwarded-host"),
+                )
+                # Say what to do about it: if a reverse proxy rewrote Host this
+                # looks like the whole panel breaking, and the fix is not guessable.
+                return JSONResponse(
+                    {
+                        "detail": (
+                            "跨站请求被拒绝：请求的 Origin 与本站不一致。若这是反向代理配置"
+                            "问题，请把面板的公开地址（如 https://panel.example.com）加入 "
+                            "OCIBOT_CORS_ORIGINS；应急可设 OCIBOT_ORIGIN_CHECK=0。"
+                        )
+                    },
+                    status_code=403,
+                )
+        return await call_next(request)
 
     @app.middleware("http")
     async def security_headers(request, call_next):

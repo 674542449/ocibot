@@ -44,6 +44,7 @@ from app.scheduler import (  # noqa: E402
     clamp_retry_interval,
     rate_limit_backoff_sec,
 )
+from web.backend.audit import prune_audit_log  # noqa: E402
 from web.backend.config import get_settings  # noqa: E402
 from web.backend.crypto_util import decrypt_text  # noqa: E402
 from web.backend.db import SessionLocal, init_db  # noqa: E402
@@ -87,6 +88,8 @@ def _as_utc(value: Optional[datetime]) -> Optional[datetime]:
 
 
 class Worker:
+    _audit_pruned_at: Optional[float] = None
+
     def __init__(self) -> None:
         self.settings = get_settings()
         self.worker_id = self.settings.worker_id
@@ -128,6 +131,30 @@ class Worker:
             set_meta(db, KEY_WORKER_ID, self.worker_id)
         except Exception:  # noqa: BLE001
             log.exception("heartbeat write failed")
+        self._prune_audit(db)
+
+    def _prune_audit(self, db: Session) -> None:
+        """Enforce audit retention. Database only — no Oracle call, so this runs
+        even with OCIBOT_WORKER_BACKGROUND_OCI=0.
+
+        Hourly rather than every poll: the heartbeat fires every few seconds, and
+        a COUNT(*) over the audit table that often is pure waste.
+        """
+        now = time.monotonic()
+        last = self._audit_pruned_at
+        if last is not None and now - last < 3600.0:
+            return
+        self._audit_pruned_at = now
+        try:
+            removed = prune_audit_log(
+                db,
+                retention_days=int(self.settings.audit_retention_days),
+                max_rows=int(self.settings.audit_max_rows),
+            )
+            if removed:
+                log.info("pruned %d audit rows", removed)
+        except Exception:  # noqa: BLE001
+            log.exception("audit prune failed")
 
     def tick_capacity(self, db: Session) -> None:
         now = _utcnow()

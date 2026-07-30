@@ -1,5 +1,91 @@
 # Changelog
 
+## 0.4.37 — 2026-07-30
+
+全功能自检 + 第 10 轮安全审查。修掉 2 个安全问题（1 中危、1 中危可用性），
+清理 12 处死代码；确认除抢机外没有任何自发请求 Oracle 的代码路径。
+
+### 修复（安全）
+- **跨站写请求可借用你的会话（CSRF，中危）**：所有 POST/PUT/PATCH/DELETE 过去
+  只靠会话 Cookie 授权，唯一屏障是 `SameSite=Lax`。这不够——
+  - `OCIBOT_COOKIE_SAMESITE=none` 是受支持的配置，一开就完全没有防护；
+  - 即使是 `Lax`，Cookie 的作用域是**站点**而不是来源：面板在
+    `panel.example.com`，攻击者拿到同域下任意一台 `blog.example.com`，
+    从那里发出的跨来源 POST 依然会带上你的登录态。
+
+  WebSSH 的 WebSocket 早在第 4 轮就自己校验了 `Origin`，REST 侧却一直没有。
+  现在两边共用同一份策略（`web/backend/origin_guard.py`），不会再各走各的：
+  写请求的 `Origin` 必须匹配 `Host` / `X-Forwarded-Host` / `OCIBOT_CORS_ORIGINS`。
+  没有 `Origin` 的请求（curl、脚本）照旧放行——它们本来就不带受害者的 Cookie。
+  读请求（GET/HEAD）和 CORS 预检（OPTIONS）不受影响。
+
+  新增 `OCIBOT_ORIGIN_CHECK`（默认 `1`）。**这是应急开关，不是常规选项**：
+  只有当反代把 `Host` 改写成上游名、又不发 `X-Forwarded-Host` 时才会误拦，
+  正确做法是把面板公开地址加进 `OCIBOT_CORS_ORIGINS`。403 的返回文案会直接
+  把这两条路写出来——否则整站 POST 全挂，光看现象根本猜不到原因。
+
+- **审计日志可被未认证流量撑爆磁盘（中危，0.4.34 引入）**：登录审计会记录失败
+  尝试，包括针对**不存在**用户名的尝试。也就是说未登录的人就能往表里写行，
+  写多少由对方决定，而这张表原先没有任何上限。面板暴露在公网上被撞库时，
+  `audit_logs` 会一直长到磁盘写满，Postgres 和整个栈一起倒。
+  新增 `OCIBOT_AUDIT_RETENTION_DAYS`（默认 180）与 `OCIBOT_AUDIT_MAX_ROWS`
+  （默认 50000），两条同时生效：只留时间窗挡不住窗口内的洪峰，只留行数上限
+  又会让冷清的实例永久堆着老数据。清理跑在 Worker 心跳里（**只碰数据库、
+  绝不碰 Oracle**），所以 `OCIBOT_WORKER_BACKGROUND_OCI=0` 时同样生效；
+  每小时一次，避免心跳每几秒就 `COUNT(*)` 一遍。
+
+### 主动请求 Oracle 的排查结果
+逐个入口清点完毕，**除抢机外没有自发请求**：
+- API 进程启动钩子（`lifespan`）：建表、提升首个管理员、检查弱密钥 —— 无 OCI
+- Worker 只有两个阶段：心跳（数据库，本版起附带审计清理）+ 抢机；
+  抢机在没有启用任务时 `candidates` 为空，一次调用都不会发出
+- 全部 OCI SDK 调用都收口在 `app/oci_client.py`；进程内只有两个会话管理器
+  （`oci_bridge`
+  给请求用、`worker` 给抢机用）
+- API 进程里的其余后台线程都不碰 OCI：WebSSH 的三个协程只走 SSH，
+  自更新线程只跑 docker compose
+- 唯一的"响应返回后仍在跑"的 OCI 调用：`launch_service.schedule_post_launch_adjustments`
+  —— 你点了创建实例、且引导卷性能不是默认 10 VPU 时，后台线程等卷 hydration
+  完成再改性能。这是你那次点击的延续，不是自发轮询；代价是 API 重启会让
+  正在等待的那次调整无声丢弃（已知，不改：改成同步会让创建请求阻塞十分钟）
+
+### 安全审查覆盖面（本轮无发现的项）
+无原始 SQL / `text()`、无 `eval` / `exec` / `pickle` / `yaml.load`、无 `shell=True`；
+前端全无 `v-html` / `innerHTML`（审计日志里攻击者可控的 User-Agent 因此只会被
+转义显示）；每个 REST 路由都注入了用户依赖，8 个管理端点全部走 `get_admin_user`；
+审计查询里非管理员只能看到自己的行；租户输出模型只暴露 `has_private_key`，
+私钥不出现在任何响应里；备份恢复用 `zf.open(member)` 逐项读取，不落盘解压，
+无 zip slip；SPA 兜底路由拦 `..` 且用 `relative_to` 收敛到 dist 目录；
+JWT 算法硬编码 HS256（不可被环境变量降级）、带 `exp`、改密递增 `token_version`；
+登录限速在校验口令**之前**执行，配合 6 位动态码使 TOTP 爆破不可行。
+
+### 修复（死代码）
+`pyflakes` 全量扫描后清理 12 处：0.4.36 删功能留下的 `models.py` 未用 `Float`、
+`jobs.py` 未用 `re`、两个测试文件的未用导入，以及历史遗留的 `app/free_quota.py`
+死变量 `disk_rem`、`oci_client.py` 的 `tempfile`、`url_safety.py` 的 `Optional`、
+`webssh.py` 的 `select`，和 3 处只读的 `nonlocal` / `global` 声明。
+逐个确认过后者不是"本想赋值却漏了"的真 bug——真正的赋值都在别的作用域里。
+
+### 维护
+- 新增 `web/backend/origin_guard.py`（入站跨站策略单一来源）
+- 新增 `tests/test_origin_guard.py`（15 例）、`tests/test_audit_retention.py`（11 例）
+- `tests/test_web_hardening.py` 的 WebSocket 用例改打新接缝
+- 399 passed
+
+### 升级
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.37
+```
+两项修复都是**默认生效**的，`web/.env` 不用改。若更新后所有写操作都返回
+403「跨站请求被拒绝」，说明反代改写了 `Host`：
+```bash
+echo 'OCIBOT_CORS_ORIGINS=https://你的域名' >> ~/ocibot/web/.env
+cd ~/ocibot && docker compose up -d
+```
+
+---
+
 ## 0.4.36 — 2026-07-29
 
 ### 移除（用不上的功能，按使用者要求删除）

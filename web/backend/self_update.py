@@ -653,7 +653,6 @@ def _apply_job(username: str) -> None:
         _write_status(db, st)
 
     def save(state: str, message: str, **extra: Any) -> None:
-        nonlocal log_buf
         with SessionLocal() as db:
             st = _read_status_raw(db)
             st["state"] = state
@@ -834,7 +833,6 @@ def _apply_job(username: str) -> None:
 
 
 def _worker_alive_unlocked() -> bool:
-    global _worker
     return _worker is not None and _worker.is_alive()
 
 

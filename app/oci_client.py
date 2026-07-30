@@ -6,7 +6,6 @@ import base64
 import ipaddress
 import re
 import secrets
-import tempfile
 import threading
 import time
 import uuid

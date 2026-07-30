@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     # MUST be bumped in the same commit as any shipped change, together with a new
     # CHANGELOG.md heading — /api/health is how an operator verifies a deploy
     # actually landed. tests/test_version_bump.py enforces that the two agree.
-    app_version: str = "0.4.36"
+    app_version: str = "0.4.37"
     debug: bool = False
 
     # sqlite+pysqlite:////absolute/path.db  or  postgresql+psycopg://user:pass@host/db
@@ -40,10 +40,25 @@ class Settings(BaseSettings):
     cookie_secure: bool = Field(default=False, alias="OCIBOT_COOKIE_SECURE")
     cookie_samesite: str = Field(default="lax", alias="OCIBOT_COOKIE_SAMESITE")  # lax|strict|none
 
+    # Reject state-changing requests whose Origin is not this host (see
+    # origin_guard.py). Escape hatch only: a reverse proxy that rewrites Host to
+    # the upstream name without sending X-Forwarded-Host would make every POST
+    # fail, and an operator locked out of their own panel needs a way back in.
+    # Add the public origin to OCIBOT_CORS_ORIGINS rather than leaving this off.
+    origin_check: bool = Field(default=True, alias="OCIBOT_ORIGIN_CHECK")
+
     cors_origins: str = Field(
         default="http://localhost:5173,http://127.0.0.1:5173,http://localhost:8080",
         alias="OCIBOT_CORS_ORIGINS",
     )
+
+    # Audit log retention. Failed logins are recorded, and an unauthenticated
+    # attacker chooses how many of those happen — so the table needs a ceiling or
+    # a credential-stuffing run becomes unbounded disk growth. Both limits apply;
+    # 0 disables that one. Pruning runs in the worker's heartbeat (database only,
+    # never Oracle), so it also happens with OCIBOT_WORKER_BACKGROUND_OCI=0.
+    audit_retention_days: int = Field(default=180, alias="OCIBOT_AUDIT_RETENTION_DAYS")
+    audit_max_rows: int = Field(default=50_000, alias="OCIBOT_AUDIT_MAX_ROWS")
 
     # Worker
     worker_poll_sec: float = Field(default=5.0, alias="OCIBOT_WORKER_POLL_SEC")

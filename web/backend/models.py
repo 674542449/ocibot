@@ -9,7 +9,6 @@ from uuid import uuid4
 from sqlalchemy import (
     Boolean,
     DateTime,
-    Float,
     ForeignKey,
     Integer,
     String,

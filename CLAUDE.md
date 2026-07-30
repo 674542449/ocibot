@@ -59,6 +59,6 @@ changed under 功能 / 修复 / 维护 and the upgrade snippet.
 
 ## Security review history
 
-`web/AUDIT.md` records seven audit passes, what was fixed, and the gaps that are
+`web/AUDIT.md` records ten audit passes, what was fixed, and the gaps that are
 knowingly accepted (notably DNS rebinding on outbound notifications, and the
 in-process rate limiter being per-worker). Read it before reporting a finding.

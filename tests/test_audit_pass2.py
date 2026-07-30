@@ -19,7 +19,6 @@ os.environ.setdefault("OCIBOT_JWT_SECRET", "audit2-test-jwt-secret-0123456789abc
 
 pytest.importorskip("fastapi")
 
-from fastapi import HTTPException  # noqa: E402
 
 from app.oci_client import build_root_cloud_init, sanitize_launch_payload  # noqa: E402
 from web.backend.launch_service import normalize_fallback_configs  # noqa: E402

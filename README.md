@@ -133,6 +133,9 @@ docker compose up -d --build
 | `OCIBOT_REQUIRE_SECURE_SECRETS` | 生产 `1` | 拒绝使用内置弱密钥启动 |
 | `OCIBOT_COOKIE_SECURE` | HTTPS 下 `1` | 仅通过 HTTPS 发送登录 Cookie |
 | `OCIBOT_CORS_ORIGINS` | 精确来源列表 | 浏览器跨域白名单 |
+| `OCIBOT_ORIGIN_CHECK` | 默认 `1` | 拒绝 Origin 与本站不符的写请求（防 CSRF）。若反代改写了 `Host` 且未发 `X-Forwarded-Host`，先把公开地址加进 `OCIBOT_CORS_ORIGINS`，应急才设 `0` |
+| `OCIBOT_AUDIT_RETENTION_DAYS` | 默认 `180` | 审计日志保留天数，`0` 为不限 |
+| `OCIBOT_AUDIT_MAX_ROWS` | 默认 `50000` | 审计日志行数上限，超出删最旧；`0` 为不限 |
 | `OCIBOT_ALLOW_OPEN_REGISTRATION` | 默认 `0` | 首用户后是否开放注册 |
 | `OCIBOT_TRUST_PROXY` | 默认 `0` | 是否信任 `X-Forwarded-For`（仅反代后开启） |
 | `OCIBOT_FORWARDED_ALLOW_IPS` | 反代地址/CIDR | 允许携带代理头的来源，默认回环；勿用 `*` |

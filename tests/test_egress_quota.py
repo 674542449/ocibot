@@ -11,7 +11,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
-import pytest
 
 from app import free_quota
 from app.oci_client import TenantSession

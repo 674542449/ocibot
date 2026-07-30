@@ -155,10 +155,12 @@ def test_ws_allows_missing_origin_for_cli_clients():
 
 def test_ws_allows_configured_cors_origin(monkeypatch):
     """A separate dev frontend origin stays usable when explicitly allowlisted."""
-    import web.backend.routers.webssh as webssh_mod
+    # The allowlist lookup now lives in origin_guard, shared with the REST
+    # middleware, so that is the seam to stub.
+    import web.backend.origin_guard as origin_guard_mod
 
     monkeypatch.setattr(
-        webssh_mod,
+        origin_guard_mod,
         "get_settings",
         lambda: Settings(OCIBOT_CORS_ORIGINS="http://localhost:5173"),
     )

@@ -1,5 +1,87 @@
 # Web audit notes
 
+## Pass 10 — full sweep: bugs, proactive OCI calls, common vulns (0.4.37, 2026-07-30)
+
+Requested as three questions: are there bugs, is anything calling Oracle without
+being asked, and do the usual vulnerability classes hold up.
+
+### Fixed
+
+| Issue | Severity | Notes |
+| --- | --- | --- |
+| Every state-changing REST endpoint was authorized by the session cookie alone, with `SameSite=Lax` as the only barrier. `OCIBOT_COOKIE_SAMESITE=none` is a supported setting that removes it entirely; and even on `Lax`, cookies are scoped to a **site**, so an attacker-controlled sibling host under the same registrable domain (`blog.example.com` vs `panel.example.com`) can POST with the victim's session. The WebSocket had checked `Origin` since pass 4 — the REST API never did. | Medium | New `web/backend/origin_guard.py` holds one policy for both callers, so they cannot drift apart again. POST/PUT/PATCH/DELETE require `Origin` to match `Host`, `X-Forwarded-Host`, or an `OCIBOT_CORS_ORIGINS` entry. Absent `Origin` still passes (non-browser clients carry no victim cookie). GET/HEAD/OPTIONS untouched. `OCIBOT_ORIGIN_CHECK=0` is an escape hatch for a proxy that rewrites Host without `X-Forwarded-Host`; the 403 body names both the real fix and the hatch, because otherwise every write fails at once and the cause is unguessable. |
+| The login audit added in 0.4.34 records failed attempts, including ones against usernames that do not exist — so unauthenticated traffic writes rows and the attacker chooses how many. `audit_logs` had no ceiling of any kind, so credential stuffing against an exposed panel grows it until the disk fills, taking Postgres and the stack with it. | Medium (availability) | `prune_audit_log()` enforces `OCIBOT_AUDIT_RETENTION_DAYS` (180) **and** `OCIBOT_AUDIT_MAX_ROWS` (50 000). Both, because a window alone does not bound a burst inside it and a row cap alone keeps ancient rows on a quiet install. Runs in `Worker.beat` — database only, never Oracle — so it survives `OCIBOT_WORKER_BACKGROUND_OCI=0`; throttled to hourly since beat fires every few seconds. |
+
+### Proactive Oracle calls — inventory
+
+The answer is **capacity retry only**, which the operator wants kept.
+
+- API `lifespan`: `init_db`, first-admin promotion, weak-secret warning. No OCI.
+- Worker: `beat` (database; now also audit pruning) + `tick_capacity`. With no
+  enabled job the candidate query returns empty and nothing reaches a client, so
+  an install with no capacity job issues zero background requests.
+- All OCI SDK usage is confined to `app/oci_client.py`. Exactly two session
+  managers exist: `oci_bridge._sessions` (request handlers) and `Worker.sessions`
+  (capacity retry).
+- Other background threads in the API process touch no OCI: the three WebSSH
+  coroutines speak SSH, and the self-update thread runs docker compose.
+- One asynchronous continuation, reported rather than changed:
+  `launch_service.schedule_post_launch_adjustments` spawns a daemon thread that
+  waits for boot-volume hydration and then resizes VPUs. It fires only when the
+  operator launched an instance with a non-default boot VPU — a continuation of
+  that click, not a poll. Accepted cost: an API restart mid-flight abandons the
+  adjustment silently. Making it synchronous would block the launch response for
+  up to ten minutes.
+
+### Checked, no finding
+
+- No raw SQL / `text()`, no `eval` / `exec` / `pickle` / `yaml.load`, no
+  `shell=True`, no `os.system`.
+- No `v-html` or `innerHTML` anywhere in the SPA, so the attacker-controlled
+  User-Agent stored with each login attempt renders escaped.
+- Every REST route takes a user dependency; all 8 admin routes use
+  `get_admin_user`. The only route without `Depends` is the WebSocket, which
+  authenticates manually from the cookie (never a query-string token).
+- Audit query: non-admins see only their own rows; admins additionally see
+  `owner_id IS NULL` (anonymous events), not other accounts' rows.
+- No response model carries `private_key_pem` — `TenantOut` and
+  `TenantParseResult` expose `has_private_key` only.
+- Backup restore reads members with `zf.open(member)` and never extracts to
+  disk: no zip slip.
+- SPA fallback rejects `..` and confines the resolved path with
+  `relative_to(dist_root)`.
+- JWT: HS256 hardcoded (not env-overridable, so no algorithm confusion), `exp`
+  present and verified, `token_version` invalidates issued tokens on password
+  change and logout-all.
+- Login: rate limiter runs **before** password verification, keyed per IP and per
+  IP+username; bcrypt runs on a dummy hash for unknown users to flatten timing;
+  `LoginRequest.username` is bounded so the limiter dict cannot be grown without
+  limit. With 10 attempts / 5 min and a 6-digit code, TOTP brute force is not
+  feasible.
+
+### Accepted, unchanged
+
+- The default `OCIBOT_CORS_ORIGINS` ships with `localhost:5173`, `127.0.0.1:5173`
+  and `localhost:8080` for the Vite dev server. Those origins therefore satisfy
+  the new Origin check too. Exploiting it requires already running code on the
+  victim's machine that serves from one of those ports, and removing them breaks
+  the documented dev workflow. Operators who care should set the variable to
+  their own origin (the README row and `.env.example` say so).
+- TOTP codes are accepted with `valid_window=1` and are not single-use, so an
+  observed code is replayable for roughly 90 seconds. Standard for the library
+  and bounded by the login limiter.
+- Everything already listed under "Remaining gaps / operator responsibilities"
+  below, notably DNS rebinding on outbound notifications and the in-process rate
+  limiter being per-worker.
+
+### Also cleaned
+
+`pyflakes` over `app/ web/backend/ tests/` found 12 dead imports / variables,
+including leftovers from the 0.4.36 feature removal. Three were read-only
+`nonlocal` / `global` declarations — each checked individually to confirm it was
+not an intended assignment silently landing in the wrong scope (the real
+assignments live elsewhere in every case). Removed.
+
 ## Pass 9 — self_update.py, line by line (0.4.23, 2026-07-28)
 
 Reviewed on its own because it is the only path that escalates a panel session to
@@ -307,5 +389,8 @@ business layer that the web backend imports. Changes in this pass:
 - [ ] HTTPS + `OCIBOT_COOKIE_SECURE=1`, bind API behind a reverse proxy
 - [ ] If behind reverse proxy: `OCIBOT_TRUST_PROXY=1` and ensure proxy **overwrites** `X-Forwarded-For`
 - [ ] Restrict `OCIBOT_CORS_ORIGINS`
+- [ ] Leave `OCIBOT_ORIGIN_CHECK=1` (default). If writes 403 after a proxy change,
+      add the public origin to `OCIBOT_CORS_ORIGINS` — do not disable the check
+- [ ] Audit retention suits the disk: `OCIBOT_AUDIT_RETENTION_DAYS` / `OCIBOT_AUDIT_MAX_ROWS`
 - [ ] Keep the worker on a private host only
 - [ ] Admin self-update mounts docker.sock — treat admin compromise as host compromise; disable with `OCIBOT_UPDATE_ENABLED=0` if multi-admin untrusted
