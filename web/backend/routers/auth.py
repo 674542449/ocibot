@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import func, select
@@ -159,10 +159,30 @@ def login(
 ) -> TokenResponse:
     ip = _client_ip(request)
     username = body.username.strip()
+    # Enough to tell a scripted stuffing run from a human mistyping their own
+    # password. The submitted password is deliberately NOT recorded: on a failed
+    # attempt it is overwhelmingly someone else's real (leaked) credential, or this
+    # operator's own password with one character wrong — and this log is served to a
+    # browser, stored in Postgres and copied into every backup archive. It also adds
+    # nothing: attribution comes from username + IP + outcome.
+    agent = (request.headers.get("user-agent") or "").strip()[:200]
+
+    def _audit(action: str, reason: str, owner_id: Optional[str] = None) -> None:
+        write_audit(
+            db,
+            owner_id=owner_id,
+            action=action,
+            target=username or "(empty)",
+            detail={"ip": ip, "reason": reason, "ua": agent},
+        )
+
     ok_ip, retry_ip = login_ip_limiter.check(f"login-ip:{ip}")
     ok_user, retry_user = login_user_limiter.check(f"login-user:{ip}:{username.lower()}")
     if not ok_ip or not ok_user:
         retry = max(retry_ip, retry_user)
+        # A burst tripping the limiter is the clearest single sign of an automated
+        # run, and it was the one outcome not recorded at all.
+        _audit("auth.login_blocked", "rate_limited")
         raise HTTPException(
             status_code=429,
             detail=f"登录尝试过多，请 {int(retry) + 1} 秒后重试",
@@ -174,9 +194,18 @@ def login(
     stored_hash = user.password_hash if user is not None else _DUMMY_PASSWORD_HASH
     password_ok = verify_password(body.password, stored_hash)
     if user is None or not password_ok:
-        write_audit(db, owner_id=None, action="auth.login_failed", target=username, detail=f"ip={ip}")
+        # no_such_user vs bad_password separates a leaked list being sprayed at
+        # invented names from someone working on an account that really exists. The
+        # row is attributed to that account when the name matches one, so its owner
+        # sees attempts against it without needing to be an admin.
+        _audit(
+            "auth.login_failed",
+            "no_such_user" if user is None else "bad_password",
+            owner_id=user.id if user is not None else None,
+        )
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码错误")
     if not user.is_active:
+        _audit("auth.login_disabled", "account_disabled", owner_id=user.id)
         raise HTTPException(status_code=403, detail="账号已禁用")
     if bool(user.totp_enabled):
         code = (body.totp_code or "").strip()
@@ -184,9 +213,11 @@ def login(
             # Structured marker so the frontend can show the 2FA input.
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="totp_required")
         if not _verify_totp(user, code):
-            write_audit(db, owner_id=user.id, action="auth.totp_failed", target=username, detail=f"ip={ip}")
+            # The password already verified above, so someone HAS the correct
+            # password and only 2FA stopped them. Highest-signal event in this log.
+            _audit("auth.totp_failed", "bad_totp_password_was_correct", owner_id=user.id)
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="两步验证码错误")
-    write_audit(db, owner_id=user.id, action="auth.login", target=user.username, detail=f"ip={ip}")
+    _audit("auth.login", "ok", owner_id=user.id)
     return _issue(response, user)
 
 
