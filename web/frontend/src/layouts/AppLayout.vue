@@ -101,6 +101,13 @@
     </aside>
 
     <main class="main stack">
+      <!-- Distinct from "worker offline": the worker IS running, it is just not
+           allowed to call Oracle. Without saying so, a capacity-retry job that
+           never fires looks like a bug. -->
+      <div v-if="workerChecked && workerAlive && !backgroundOci" class="worker-banner bg-off">
+        后台 OCI 请求已关闭（<code>OCIBOT_WORKER_BACKGROUND_OCI=0</code>）。
+        抢机与定时开关机<strong>不会执行</strong>，面板只在你操作时请求 Oracle。
+      </div>
       <div v-if="workerChecked && !workerAlive" class="error-box worker-banner">
         后台 Worker 离线（{{ heartbeatText }}）。容量重试 / 定时任务不会执行。请运行
         <code>python -m web.backend.worker</code>
@@ -171,6 +178,7 @@ function isNavActive(item: NavItem): boolean {
 }
 
 const workerAlive = ref(true)
+const backgroundOci = ref(true)
 const workerChecked = ref(false)
 const heartbeatText = ref('从未收到心跳')
 const buildLabel = ref('')
@@ -195,6 +203,8 @@ async function checkWorker() {
   try {
     const { data } = await api.get('/system/status')
     workerAlive.value = !!data.worker_alive
+    // Absent on an older backend -> assume on, matching the shipped default.
+    backgroundOci.value = data.background_oci !== false
     if (data.heartbeat_age_sec == null) {
       heartbeatText.value = '从未收到心跳'
     } else {
@@ -323,6 +333,19 @@ onBeforeUnmount(() => {
   align-items: center;
   padding: 1rem 1rem 0.85rem;
   border-bottom: 1px solid var(--border);
+}
+
+.worker-banner.bg-off {
+  margin: 0 0.75rem 0.5rem;
+  padding: 0.4rem 0.55rem;
+  border: 1px solid var(--warn);
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.worker-banner.bg-off code {
+  font-size: 11px;
+  word-break: break-all;
 }
 
 .locked-tenant {

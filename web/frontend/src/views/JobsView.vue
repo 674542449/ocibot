@@ -19,6 +19,17 @@
     <div v-if="error" class="error-box">{{ error }}</div>
     <div v-if="msg" class="success-box">{{ msg }}</div>
 
+    <!-- The jobs on this page are exactly what the switch stops. Saying it here
+         means a task sitting at "idle" forever is explainable. -->
+    <div v-if="backgroundOff" class="card bg-off-box">
+      <strong>⚠ 后台 OCI 请求已关闭，本页任务不会执行</strong>
+      <p class="muted" style="margin: 0.3rem 0 0; font-size: 12px">
+        任务可以照常创建和保存，但 Worker 不会去调用 Oracle，抢机与定时开关机都不会触发。
+        要恢复：在 <code>web/.env</code> 里设 <code>OCIBOT_WORKER_BACKGROUND_OCI=1</code>
+        后执行 <code>docker compose up -d</code>。
+      </p>
+    </div>
+
     <div class="card stack">
       <h3 style="margin: 0">容量重试</h3>
       <div class="table-wrap">
@@ -259,6 +270,18 @@ const runs = ref<Run[]>([])
 const tenants = ref<Tenant[]>([])
 const attempts = ref<Record<string, Attempt[]>>({})
 const openLog = ref('')
+/** 后台 OCI 是否被关掉；关掉时本页的任务永远不会跑，必须说清楚。 */
+const backgroundOff = ref(false)
+
+async function checkBackground() {
+  try {
+    const { data } = await api.get('/system/status')
+    backgroundOff.value = data.background_oci === false
+  } catch {
+    // 状态读不到不是本页的重点，静默即可
+  }
+}
+
 const autoRefresh = ref(false)
 const error = ref('')
 const msg = ref('')
@@ -442,6 +465,7 @@ async function deleteSchedule(s: ScheduleJob) {
 onMounted(async () => {
   try {
     await load()
+    void checkBackground()
   } catch (e: any) {
     error.value = e?.message || '加载失败'
   }
@@ -464,6 +488,13 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
+.bg-off-box {
+  padding: 0.65rem 0.8rem;
+  border-color: var(--warn);
+}
+.bg-off-box code {
+  font-size: 11px;
+}
 .attempt-log {
   max-height: 320px;
   overflow: auto;

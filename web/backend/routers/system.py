@@ -55,4 +55,8 @@ def system_status(
         "server_time": now.isoformat(),
         "app_version": settings.app_version,
         "git_sha": git_sha,
+        # False = the worker makes no background Oracle calls, so capacity retry and
+        # power schedules will not fire. Surfaced so a job that never runs is
+        # explainable instead of a mystery.
+        "background_oci": bool(settings.worker_background_oci),
     }

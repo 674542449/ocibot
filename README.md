@@ -139,6 +139,7 @@ docker compose up -d --build
 | `OCIBOT_API_WORKERS` | 默认 `2` | API 进程数 |
 | `OCIBOT_PORT` | 默认 `8000` | 宿主机映射端口 |
 | `OCIBOT_BIND` | 反代后设 `127.0.0.1` | 端口绑定的宿主机网卡，默认 `0.0.0.0` |
+| `OCIBOT_WORKER_BACKGROUND_OCI` | 默认 `1` | 设 `0` 则 Worker 完全不主动请求 OCI；抢机与定时任务将**不执行**（面板会明确提示） |
 | `OCIBOT_UPDATE_ENABLED` | 默认 `0` | 面板内自更新开关（`install.sh` 会置 `1`） |
 | `OCIBOT_HOST_REPO` | 宿主机绝对路径 | 自更新绑定的代码目录 |
 

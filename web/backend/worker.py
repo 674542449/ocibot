@@ -98,14 +98,22 @@ class Worker:
     def run_forever(self) -> None:
         init_db()
         log.info("Worker %s started (poll=%ss)", self.worker_id, self.settings.worker_poll_sec)
-        # Each phase runs in its own transaction so one phase failing (or a slow
-        # OCI call) cannot roll back another phase's committed work.
+        # Every phase below except the heartbeat calls Oracle. With background OCI
+        # switched off the worker still runs and still beats — so the panel reports
+        # it as online rather than as broken — but performs no OCI work at all.
+        background = bool(self.settings.worker_background_oci)
+        if not background:
+            log.warning(
+                "OCIBOT_WORKER_BACKGROUND_OCI=0: capacity retry, power schedules, "
+                "budget and egress checks will NOT run (no background OCI calls)"
+            )
         phases = (
             ("beat", self.beat),
+        ) + ((
             ("schedules", self.tick_schedules),
             ("capacity", self.tick_capacity),
             ("daily_checks", self.tick_daily_checks),
-        )
+        ) if background else ())
         while True:
             for name, phase in phases:
                 try:
