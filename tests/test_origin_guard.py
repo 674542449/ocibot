@@ -72,11 +72,61 @@ def test_scheme_mismatch_still_matches():
     assert origin_allowed(f"https://{PANEL}", host=PANEL) is True
 
 
-def test_port_is_part_of_the_comparison():
+def test_a_real_port_difference_is_rejected():
     # Not 5173/8080: those are in the default OCIBOT_CORS_ORIGINS dev allowlist
     # and would pass on that route instead, which is not what this pins.
-    assert origin_allowed(f"https://{PANEL}:8443", host=PANEL) is False
-    assert origin_allowed(f"https://{PANEL}:8443", host=f"{PANEL}:8443") is True
+    assert origin_allowed(f"https://{PANEL}:9999", host=f"{PANEL}:8443") is False
+
+
+# ---------------------------------------------------------------------------
+# Default-port normalization
+#
+# Shipped broken in 0.4.37: the comparison was a literal host[:port] string
+# match, so three ordinary reverse-proxy setups 403'd every write. A browser
+# never puts the scheme's default port in Origin, but a proxy may well keep it in
+# Host ($http_host does, $host does not), and the two must still compare equal.
+# ---------------------------------------------------------------------------
+
+
+def test_host_keeping_443_still_matches():
+    assert origin_allowed(f"https://{PANEL}", host=f"{PANEL}:443") is True
+
+
+def test_host_keeping_80_still_matches():
+    assert origin_allowed(f"http://{PANEL}", host=f"{PANEL}:80") is True
+
+
+def test_origin_stating_443_matches_a_bare_host():
+    assert origin_allowed(f"https://{PANEL}:443", host=PANEL) is True
+
+
+def test_proxy_that_strips_a_nonstandard_port_still_matches():
+    """nginx's $host drops the port. Rejecting on a port the proxy withheld would
+    lock the operator out; the hostname match carries the security value."""
+    assert origin_allowed(f"https://{PANEL}:8443", host=PANEL) is True
+
+
+def test_matching_ports_match():
+    assert origin_allowed("http://localhost:8000", host="localhost:8000") is True
+
+
+def test_ipv6_literal_is_not_split_on_its_colons():
+    assert origin_allowed("http://[::1]:8000", host="[::1]:8000") is True
+    assert origin_allowed("http://[::1]", host="[::1]") is True
+
+
+def test_allowlist_entry_is_normalized_too():
+    """`OCIBOT_CORS_ORIGINS=https://panel.example.com` must match a browser Origin
+    of the same URL even though neither states :443."""
+    import web.backend.origin_guard as mod
+
+    monkey = Settings(OCIBOT_CORS_ORIGINS=f"https://{PANEL}:443")
+    mod_get = mod.get_settings
+    mod.get_settings = lambda: monkey  # type: ignore[assignment]
+    try:
+        assert origin_allowed(f"https://{PANEL}", host="ocibot-api:8000") is True
+    finally:
+        mod.get_settings = mod_get  # type: ignore[assignment]
 
 
 def test_forwarded_host_is_accepted(monkeypatch):

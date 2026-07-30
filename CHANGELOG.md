@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.4.38 — 2026-07-30
+
+修复 0.4.37 的回归：**添加租户等所有写操作可能被自己的防 CSRF 校验误拦**。
+
+### 修复
+- **Origin 校验没有归一化默认端口（0.4.37 引入的回归）**：上一版的比较是
+  `host[:port]` 字面串相等。浏览器的 `Origin` 从不带 scheme 的默认端口
+  （只会是 `https://panel.example.com`，绝不会是 `:443`），而反代传过来的
+  `Host` 可能带着它——nginx 的 `$http_host` 带、`$host` 不带。两者一旦不一致，
+  **每一个 POST/PUT/PATCH/DELETE 都会返回 403**，表现就是"添加租户失效了"。
+
+  已确认会被误拦的三种普通配置：
+  - `Origin: https://域名` + `Host: 域名:443`
+  - `Origin: http://域名` + `Host: 域名:80`
+  - 浏览器用非标端口（`https://域名:8443`）而反代用 `$host` 去掉了端口
+
+  现在按 scheme 归一化默认端口再比对主机名；反代**没给**端口时不拿端口否决
+  （`$host` 会去掉端口，拿一个代理压根没传的信息把运维锁在门外是错的），
+  主机名匹配才是这个校验的安全价值所在。`OCIBOT_CORS_ORIGINS` 里的条目
+  同样走归一化，所以写成 `https://域名` 或 `https://域名:443` 都能匹配。
+
+  真实的端口差异（`:9999` vs `:8443`）、跨域、同域不同子域、
+  `Origin: null` 仍然一律拦住 —— 这些都有回归测试钉住。
+
+### 已核对无问题
+排查时把租户添加的两条路径都用真实格式的 OCID / fingerprint / PEM 跑通了：
+手动表单 `POST /tenants` 返回 201，粘贴导入 `POST /tenants/parse` + `/tenants/import`
+返回 200 / 201，带反代形态的 `Origin` 也正常。前端 `openCreate` / `importPaste` /
+`saveManual` 逻辑完好。所以后端与前端本身没有缺陷，问题只在上面那处端口比对。
+
+### 维护
+- `tests/test_origin_guard.py` 增加 7 例（默认端口归一化、IPv6 字面量不被冒号切错、
+  允许列表条目同样归一化），共 22 例
+- 406 passed
+
+### 升级
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.38
+```
+若更新后写操作仍然 403，请把这行的输出发我，它会直接打印出实际收到的
+`Origin` / `Host` / `X-Forwarded-Host`：
+```bash
+docker logs ocibot-api-1 --tail 80 2>&1 | grep "rejected cross-site"
+```
+
+---
+
 ## 0.4.37 — 2026-07-30
 
 全功能自检 + 第 10 轮安全审查。修掉 2 个安全问题（1 中危、1 中危可用性），
