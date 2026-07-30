@@ -9,6 +9,7 @@ from uuid import uuid4
 from sqlalchemy import (
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -80,6 +81,17 @@ class Tenant(Base):
     free_only_mode: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     # Legacy: last local password-expiry notify day (unused).
     pwd_expiry_notified_on: Mapped[str] = mapped_column(String(16), default="", nullable=False)
+    # Budget alerts and the daily egress check were removed in 0.4.36, but these
+    # columns MUST stay mapped. They are NOT NULL with no *database* default —
+    # SQLAlchemy's `default=` is applied client-side — so dropping them from the
+    # model stopped the INSERT from supplying them, and every "add tenant" on an
+    # existing install failed with a not-null violation (a bare 500). Reads and
+    # updates were unaffected, which is why only adding broke. `_ensure_schema()`
+    # never drops columns, so they are still in every upgraded database.
+    # Do not remove without a migration that drops them from the database too.
+    budget_monthly_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    budget_notified_month: Mapped[str] = mapped_column(String(8), default="", nullable=False)
+    egress_notified_month: Mapped[str] = mapped_column(String(8), default="", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
 

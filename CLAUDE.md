@@ -20,6 +20,25 @@ Bump the patch component for fixes and for feature batches within the current
 minor line (this project has been doing `0.4.x`). Add a CHANGELOG section with what
 changed under 功能 / 修复 / 维护 and the upgrade snippet.
 
+## Never unmap a column that deployed databases still have
+
+`_ensure_schema()` only ADDS columns — it never drops. So a column removed from a
+model still exists in every upgraded install. If it is `nullable=False`, the INSERT
+stops supplying it (SQLAlchemy's `default=` is **client-side**, so the database
+column has no default of its own) and the write fails a not-null constraint.
+
+This shipped: 0.4.36 deleted the budget/egress columns with the features, and every
+"add tenant" on an existing database returned a bare `500` while list / edit /
+delete kept working — an UPDATE need not supply columns it is not changing, only an
+INSERT does. That asymmetry makes it look like one feature broke rather than a
+schema mismatch. Fixed in 0.4.39 by keeping them mapped and marked legacy, the same
+convention the older `password_changed_at` / `pwd_expiry_notified_on` columns use.
+
+When a feature goes away, delete its routes, worker phases and UI — but leave its
+columns mapped unless you also write a migration that drops them from the database.
+`tests/test_legacy_columns.py` builds a pre-0.4.36 schema and inserts into it, so
+unmapping one again fails the suite instead of production.
+
 ## Verification expectations
 
 - `python -m pytest tests -q` must stay green (uses `.venv/Scripts/python.exe` on

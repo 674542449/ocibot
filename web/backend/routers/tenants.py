@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
+
 from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.config_store import TenantConfig
@@ -34,6 +37,37 @@ from web.backend.schemas import (
 from web.backend.tenant_import import parse_pasted_oci_bundle
 
 router = APIRouter(prefix="/tenants", tags=["tenants"])
+
+log = logging.getLogger("ocibot.tenants")
+
+
+def _commit_new_tenant(db: Session, row: Tenant) -> None:
+    """Commit a tenant INSERT, turning a database rejection into a message.
+
+    Without this a rejected INSERT is an empty `500 Internal Server Error` in the
+    browser, and the only copy of the reason is a traceback in the container log.
+    That happened for real: 0.4.36 unmapped three NOT NULL columns that every
+    upgraded database still has, so adding a tenant failed a not-null constraint
+    while every read and update kept working. Diagnosing it needed shell access to
+    a server the operator was not looking at.
+    """
+    try:
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        log.exception("tenant insert rejected by the database")
+        reason = str(getattr(exc, "orig", None) or exc).strip().splitlines()
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "保存租户失败，数据库拒绝写入："
+                + (reason[0][:300] if reason else exc.__class__.__name__)
+                + "。这通常说明数据库结构与当前版本不一致；请把这句话和 "
+                "/api/health 显示的版本号一起反馈。"
+            ),
+        ) from exc
 
 
 def _to_out(row: Tenant) -> TenantOut:
@@ -161,9 +195,7 @@ def import_tenant_from_paste(
         color="#3B82F6",
         private_key_encrypted=encrypt_text(str(result["private_key_pem"]).strip()),
     )
-    db.add(row)
-    db.commit()
-    db.refresh(row)
+    _commit_new_tenant(db, row)
 
     if body.test_connection:
         try:
@@ -206,9 +238,7 @@ def create_tenant(
         private_key_encrypted=encrypt_text(body.private_key_pem.strip()),
         free_only_mode=bool(body.free_only_mode),
     )
-    db.add(row)
-    db.commit()
-    db.refresh(row)
+    _commit_new_tenant(db, row)
     return _to_out(row)
 
 
