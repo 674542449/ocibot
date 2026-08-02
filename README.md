@@ -1,10 +1,10 @@
-# OCIBot
+# 自托管云实例管理面板
 
-自托管的 **Oracle Cloud Infrastructure（OCI）** 多租户管理面板。
+一个部署在自己服务器上的多账号云资源管理面板。
 
-用于在一台服务器上统一管理多个 OCI 账号：创建与维护 Always Free / 付费实例、容量重试抢机、定时开关机、WebSSH、存储与防火墙，以及备份恢复。
+用于在一处统一管理多个云账号：创建与维护实例、容量不足时自动重试、WebSSH、存储与防火墙规则，以及备份恢复。
 
-当前主线为 Web 版（FastAPI + Vue 3 + PostgreSQL）。面板版本以 `/api/health` 的 `version` 与 [CHANGELOG.md](CHANGELOG.md) 为准。
+技术栈为 FastAPI + Vue 3 + PostgreSQL。面板版本以 `/api/health` 的 `version` 与 [CHANGELOG.md](CHANGELOG.md) 为准。
 
 ---
 
@@ -13,13 +13,13 @@
 | 模块 | 能力 |
 |------|------|
 | 账号 | 注册 / 登录、HttpOnly Cookie 会话、可选 TOTP、管理员用户管理 |
-| 租户 | 多 OCI API 配置、私钥 Fernet 加密存库、连接测试、账号等级识别、开通副区（其他国家区域） |
+| 租户 | 多组 API 配置、私钥 Fernet 加密存库、连接测试、账号等级识别、开通附加区域（其他国家 / 地区） |
 | 实例 | 列表 / 详情、电源操作、重命名、监控曲线、公网 IP / IPv6 |
-| 创建 | 免费套餐预设、自动默认网络、容量不足自动重试（Worker 执行）、可创建副区机器 |
+| 创建 | 免费额度预设、自动默认网络、容量不足自动重试（Worker 执行）、可批量创建、可在附加区域创建 |
 | 终端 | 浏览器 WebSSH；串口 / VNC 控制台连接 |
 | 存储 | 引导卷扩容与备份、块存储、对象存储 |
 | 网络 | NSG 防火墙规则、保留公网 IP |
-| 任务 | 容量重试（抢机）任务 |
+| 任务 | 容量重试任务 |
 | 通知 | Telegram / Bark / ServerChan / Webhook / SMTP（含 SSRF 防护） |
 | 运维 | 加密租户备份、面板内一键更新（Docker 部署） |
 
@@ -37,12 +37,12 @@
         └── Worker 容器（容量重试 / 定时 / 通知）
                 │
                 ▼
-           Oracle Cloud API
+            云服务商 API
 ```
 
 - 生产推荐：`docker compose` 启动 `db` + `api` + `worker`
 - API 进程同时托管前端构建产物，单入口访问
-- OCI 私钥仅服务端加密存储，不回传浏览器
+- API 私钥仅服务端加密存储，不回传浏览器
 
 ---
 
@@ -68,11 +68,11 @@ irm https://raw.githubusercontent.com/674542449/ocibot/main/scripts/install.ps1 
 
 1. 打开 `http://127.0.0.1:8000`
 2. **注册第一个账号**（自动成为管理员）
-3. 进入 **租户**，粘贴 OCI API 配置与私钥
+3. 进入 **租户**，粘贴云账号的 API 配置与私钥
 4. 在 **实例 / 创建实例** 开始使用
 
 > 换机器重装 / 想挂域名走 HTTPS：[docs/REDEPLOY.md](docs/REDEPLOY.md) 是从零到可用的
-> 完整步骤（含旧机器备份导出、Oracle 云放行 80/443、域名反代与完工检查）。
+> 完整步骤（含旧机器备份导出、云端安全组放行 80/443、域名反代与完工检查）。
 
 ### 更新
 
@@ -128,7 +128,7 @@ docker compose up -d --build
 | 变量 | 建议 | 说明 |
 |------|------|------|
 | `POSTGRES_PASSWORD` | 强随机 | 数据库密码 |
-| `OCIBOT_MASTER_KEY` | ≥24 位随机 | 加密 OCI 私钥 / TOTP 等 |
+| `OCIBOT_MASTER_KEY` | ≥24 位随机 | 加密 API 私钥 / TOTP 等 |
 | `OCIBOT_JWT_SECRET` | ≥24 位随机 | 签发会话 JWT |
 | `OCIBOT_REQUIRE_SECURE_SECRETS` | 生产 `1` | 拒绝使用内置弱密钥启动 |
 | `OCIBOT_COOKIE_SECURE` | HTTPS 下 `1` | 仅通过 HTTPS 发送登录 Cookie |
@@ -142,7 +142,7 @@ docker compose up -d --build
 | `OCIBOT_API_WORKERS` | 默认 `2` | API 进程数 |
 | `OCIBOT_PORT` | 默认 `8000` | 宿主机映射端口 |
 | `OCIBOT_BIND` | 反代后设 `127.0.0.1` | 端口绑定的宿主机网卡，默认 `0.0.0.0` |
-| `OCIBOT_WORKER_BACKGROUND_OCI` | 默认 `1` | 设 `0` 则 Worker 完全不主动请求 OCI；抢机任务将**不执行**（面板会明确提示） |
+| `OCIBOT_WORKER_BACKGROUND_OCI` | 默认 `1` | 设 `0` 则 Worker 完全不主动发起云 API 请求；容量重试任务将**不执行**（面板会明确提示） |
 | `OCIBOT_UPDATE_ENABLED` | 默认 `0` | 面板内自更新开关（`install.sh` 会置 `1`） |
 | `OCIBOT_HOST_REPO` | 宿主机绝对路径 | 自更新绑定的代码目录 |
 
@@ -169,7 +169,7 @@ docker compose up -d --build
 7. Webhook / Bark / SMTP 目标已拦截私网、元数据、NAT64/6to4 等地址，仍建议只给受信用户开通知配置
    - 已知残留风险：DNS rebinding（校验与连接之间 DNS 可变）；详见 [web/AUDIT.md](web/AUDIT.md)
 8. **WebSSH 会校验主机密钥**（首次连接记录指纹，之后不符即拒绝，且在发送任何凭据之前）。
-   指纹按**实例 OCID** 记录，所以换公网 IP 不会误报。重装系统后需在实例详情页
+   指纹按**实例 ID** 记录，所以换公网 IP 不会误报。重装系统后需在实例详情页
    「重置主机密钥」再连接
 
 更细的审计说明见 [web/AUDIT.md](web/AUDIT.md)。
@@ -208,7 +208,7 @@ python -m pytest tests -q
 
 ```
 ocibot/
-├── app/                 # OCI 业务层（与 Web 共用）
+├── app/                 # 云 API 业务层（与 Web 共用）
 ├── web/
 │   ├── backend/         # FastAPI、Worker、认证、通知、自更新
 │   ├── frontend/        # Vue 3 控制台
@@ -226,13 +226,13 @@ ocibot/
 ## 使用提示
 
 - **实例列表**默认显示第一个租户；可在下拉框切换，不再默认聚合全部租户
-- **密码到期提醒**是面板本地策略（可改天数，`0` 关闭），不会替你修改 Oracle 控制台密码
-- **容量重试**由 Worker 执行；侧栏会提示 Worker 是否在线。它是唯一会主动请求 OCI 的
-  后台功能，且仅在存在任务时运行；`OCIBOT_WORKER_BACKGROUND_OCI=0` 可完全停掉
+- **密码到期提醒**是面板本地策略（可改天数，`0` 关闭），不会替你修改云控制台密码
+- **容量重试**由 Worker 执行；侧栏会提示 Worker 是否在线。它是唯一会主动发起云 API
+  请求的后台功能，且仅在存在任务时运行；`OCIBOT_WORKER_BACKGROUND_OCI=0` 可完全停掉
 - **备份恢复**导出加密 ZIP，导入只创建当前用户名下的新租户，不会覆盖他人数据
-- **副区**（其他国家区域）在「租户 → 副区管理」开通，面板会自动添加一个同凭据的副区租户，
-  各页面把它当普通租户使用；注意 Oracle 无法取消已开通的区域，且 **Always Free 只在主区生效**，
-  副区资源按量计费（副区租户因此默认为「允许超额计费」）
+- **附加区域**（其他国家 / 地区）在「租户 → 副区管理」开通，面板会自动添加一条同凭据的
+  租户记录，各页面把它当普通租户使用；注意已开通的区域**无法取消**，且**免费额度只在主区域生效**，
+  附加区域的资源按量计费（因此默认为「允许超额计费」）
 
 ---
 
@@ -250,7 +250,7 @@ ocibot/
 
 ## 许可证与免责
 
-本项目按仓库内许可证条款提供。请遵守 Oracle Cloud 服务条款与当地法规；容量重试、自动操作等能力由使用者自行配置与承担风险。
+本项目按仓库内许可证条款提供。请遵守所用云服务商的服务条款与当地法规；容量重试、自动操作等能力由使用者自行配置与承担风险。
 
 ---
 
