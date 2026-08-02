@@ -14,6 +14,7 @@ from web.backend.audit import write_audit
 from web.backend.auth import get_current_user
 from web.backend.crypto_util import encrypt_text
 from web.backend.db import get_db
+from app.oci_client import generate_root_password
 from web.backend.launch_service import (
     build_launch_request,
     fetch_launch_meta,
@@ -512,6 +513,7 @@ def launch_quota_check(
             boot_volume_vpus_per_gb=body.boot_volume_vpus_per_gb or 10,
             free_only_mode=free_only,
             usage=usage,
+            count=max(1, int(body.count or 1)),
         )
     except OCIClientError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -583,6 +585,16 @@ def launch_instance(
     custom_user_data = str(built.get("custom_user_data") or "")
     boot_vpu = int(payload.get("boot_volume_vpus_per_gb") or 10)
 
+    count = max(1, int(body.count or 1))
+    if count > 1 and built["as_retry"]:
+        # Capacity retry is one machine per job by design (one active job per
+        # tenant, and the worker owns every LaunchInstance call). Silently
+        # creating one would look like the count field was ignored.
+        raise HTTPException(
+            status_code=400,
+            detail="容量重试每次只能抢 1 台。请把数量改回 1，或关闭「加入容量重试」后再批量创建。",
+        )
+
     # Always Free guard BEFORE network/NSG prep so we don't leave orphan resources.
     free_only = free_only_for_tenant(row)
     launch_guard = None
@@ -611,6 +623,7 @@ def launch_instance(
                 boot_volume_vpus_per_gb=boot_vpu,
                 fallback_configs=list(built.get("fallback_configs") or body.fallback_configs or []),
                 free_only_mode=free_only,
+                count=count,
             )
     except HTTPException:
         raise
@@ -706,56 +719,129 @@ def launch_instance(
             capacity_job_id=job.id,
         )
 
-    # Direct launch
-    try:
-        result = session.launch_from_payload(
-            payload, root_password=root_password, custom_user_data=custom_user_data
+    # Direct launch. One LaunchInstance call per instance — OCI has no batch API.
+    base_name = str(payload.get("display_name") or "instance")
+    # A password the operator typed is reused for the batch; an auto-generated one
+    # is fresh per instance, so a single leak does not hand over every machine.
+    # Each lands in that instance's own tag (see ROOT_PASSWORD_TAG), and the
+    # instance list already shows it per row.
+    user_supplied_password = bool(str(body.root_password or "").strip())
+    auth_mode = str(payload.get("auth_mode") or "key")
+
+    created: list[dict[str, Any]] = []
+    first_result = None
+    failure_message = ""
+    failure_capacity = False
+
+    for index in range(count):
+        item_payload = dict(payload)
+        if count > 1:
+            item_payload["display_name"] = f"{base_name}-{index + 1}"
+        if index == 0 or user_supplied_password or auth_mode != "password":
+            item_password = root_password
+        else:
+            item_password = generate_root_password(16)
+
+        try:
+            result = session.launch_from_payload(
+                item_payload, root_password=item_password, custom_user_data=custom_user_data
+            )
+        except Exception as exc:  # noqa: BLE001
+            if not created and item_payload.get("managed_nsg_id"):
+                try:
+                    session.delete_managed_nsg(str(item_payload.get("managed_nsg_id")))
+                except Exception:
+                    pass
+            if not created:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+            failure_message = str(exc)
+            break
+
+        data = result.data if isinstance(result.data, dict) else {}
+        instance_id = str(data.get("instance_id") or "")
+        if not result.ok:
+            failure_message = result.message or "创建失败"
+            failure_capacity = bool(data.get("capacity")) or is_capacity_message(failure_message)
+            if first_result is None:
+                first_result = result
+            break
+
+        if first_result is None:
+            first_result = result
+        schedule_post_launch_adjustments(
+            session,
+            instance_id=instance_id,
+            compartment_id=str(item_payload.get("compartment_id") or ""),
+            boot_vpu=boot_vpu,
         )
-    except Exception as exc:  # noqa: BLE001
-        if payload.get("managed_nsg_id"):
+        created.append(
+            {
+                "ok": True,
+                "display_name": str(item_payload.get("display_name") or ""),
+                "instance_id": instance_id,
+                "work_request_id": result.work_request_id or "",
+                "message": result.message or "创建成功",
+                "root_password": item_password or "",
+            }
+        )
+        _audit_launch(True, result.message or "创建成功", instance_id)
+        # Stop the batch at the first failure rather than pushing the remaining
+        # calls at a rate limit the capacity-retry loop competes for — a capacity
+        # miss means the AD is out, so #3 and #4 would fail the same way.
+
+    warns = extra_warnings + format_guard_warnings(launch_guard)
+
+    if not created:
+        # Total failure: clean the managed NSG for permanent (non-capacity) errors.
+        if payload.get("managed_nsg_id") and (
+            not failure_capacity or payload.get("auth_mode") == "password"
+        ):
             try:
                 session.delete_managed_nsg(str(payload.get("managed_nsg_id")))
             except Exception:
                 pass
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-    data = result.data if isinstance(result.data, dict) else {}
-    instance_id = str(data.get("instance_id") or "")
-    if result.ok:
-        schedule_post_launch_adjustments(
-            session,
-            instance_id=instance_id,
-            compartment_id=str(payload.get("compartment_id") or ""),
-            boot_vpu=boot_vpu,
+        _audit_launch(False, failure_message or "创建失败", "")
+        data = (
+            first_result.data
+            if first_result is not None and isinstance(first_result.data, dict)
+            else {}
         )
-        msg = result.message or "创建成功"
-        if boot_vpu != 10 and instance_id:
-            msg += f"；引导卷性能 {boot_vpu} VPUs/GB 将在后台自动调整（hydration 完成后）"
-        warns = extra_warnings + format_guard_warnings(launch_guard)
-        if warns:
-            msg += "；提醒：" + "；".join(warns)
-        _audit_launch(True, msg, instance_id)
         return LaunchInstanceResult(
-            ok=True,
-            message=msg,
-            work_request_id=result.work_request_id or "",
-            instance_id=instance_id,
-            root_password=root_password if root_password else "",
+            ok=False,
+            message=failure_message or "创建失败",
+            work_request_id=(first_result.work_request_id or "") if first_result else "",
+            instance_id=str(data.get("instance_id") or ""),
             data=data,
+            instances=[],
+            created_count=0,
+            requested_count=count,
         )
 
-    # fail: cleanup nsg for non-capacity password/key permanent errors
-    capacity_failure = bool((data or {}).get("capacity")) or is_capacity_message(result.message or "")
-    if payload.get("managed_nsg_id") and (not capacity_failure or payload.get("auth_mode") == "password"):
-        try:
-            session.delete_managed_nsg(str(payload.get("managed_nsg_id")))
-        except Exception:
-            pass
-    _audit_launch(False, result.message or "创建失败", instance_id)
+    head = created[0]
+    if count == 1:
+        msg = head["message"]
+    elif len(created) == count:
+        msg = f"已创建 {len(created)} 台：" + "、".join(c["display_name"] for c in created)
+    else:
+        msg = (
+            f"已创建 {len(created)}/{count} 台，第 {len(created) + 1} 台起停止："
+            f"{failure_message or '创建失败'}"
+        )
+    if boot_vpu != 10:
+        msg += f"；引导卷性能 {boot_vpu} VPUs/GB 将在后台自动调整（hydration 完成后）"
+    if warns:
+        msg += "；提醒：" + "；".join(warns)
+
     return LaunchInstanceResult(
-        ok=False,
-        message=result.message or "创建失败",
-        work_request_id=result.work_request_id or "",
-        instance_id=instance_id,
-        data=data,
+        # Partial success is not "ok": the form must keep the failure visible
+        # instead of reporting a clean create for a batch that fell short.
+        ok=len(created) == count,
+        message=msg,
+        work_request_id=head["work_request_id"],
+        instance_id=head["instance_id"],
+        root_password=head["root_password"],
+        data={"instance_id": head["instance_id"], "created_count": len(created)},
+        instances=created,
+        created_count=len(created),
+        requested_count=count,
     )

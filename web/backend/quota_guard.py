@@ -170,6 +170,7 @@ def check_launch_quota(
     boot_volume_vpus_per_gb: Any = 10,
     free_only_mode: Optional[bool] = None,
     usage: Optional[dict[str, Any]] = None,
+    count: int = 1,
 ) -> free_quota.GuardResult:
     """Return a GuardResult without raising (for worker / soft checks).
 
@@ -192,6 +193,7 @@ def check_launch_quota(
         free_only_mode=bool(free_only_mode),
         account_tier=tier,
         usage=usage,
+        count=count,
     )
 
 
@@ -206,8 +208,14 @@ def enforce_launch_quota(
     boot_volume_vpus_per_gb: Any = 10,
     free_only_mode: Optional[bool] = None,
     fallback_configs: Optional[list[dict[str, Any]]] = None,
+    count: int = 1,
 ) -> free_quota.GuardResult:
-    """Validate a launch (or capacity-retry primary config). Raises HTTP 400 if blocked."""
+    """Validate a launch (or capacity-retry primary config). Raises HTTP 400 if blocked.
+
+    ``count`` validates the whole batch at once: the free caps are tenancy-wide
+    totals, so checking one instance and then creating several would let the
+    batch through at N times the allowance.
+    """
     # One snapshot for the primary config and every fallback below.
     effective_free_only = (
         free_only_for_tier(account_tier) if free_only_mode is None else bool(free_only_mode)
@@ -226,6 +234,7 @@ def enforce_launch_quota(
         boot_volume_vpus_per_gb=boot_volume_vpus_per_gb,
         free_only_mode=free_only_mode,
         usage=usage,
+        count=count,
     )
     if not guard.ok:
         raise HTTPException(
@@ -246,6 +255,7 @@ def enforce_launch_quota(
             boot_volume_vpus_per_gb=boot_volume_vpus_per_gb,
             free_only_mode=free_only_mode,
             usage=usage,
+            count=count,
         )
         if not fb_guard.ok:
             raise HTTPException(

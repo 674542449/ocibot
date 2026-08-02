@@ -271,6 +271,11 @@ class LaunchInstanceRequest(BaseModel):
     memory_in_gbs: Optional[float] = None
     boot_volume_size_in_gbs: Optional[int] = None
     boot_volume_vpus_per_gb: int = 10
+    # How many identical instances to create in one submit. The free caps are
+    # tenancy-wide totals, so the guard validates count × this config, not one.
+    # Bounded because each one is a separate LaunchInstance call against a rate
+    # limit that the capacity-retry loop also competes for.
+    count: int = Field(default=1, ge=1, le=8)
     assign_public_ip: bool = True
     assign_ipv6_ip: bool = False
     open_guest_firewall: bool = True
@@ -294,6 +299,12 @@ class LaunchInstanceResult(BaseModel):
     capacity_job_id: str = ""
     root_password: str = ""  # only returned once for password mode
     data: dict[str, Any] = Field(default_factory=dict)
+    # One entry per instance when count > 1. The scalar fields above stay filled
+    # from the FIRST successful instance so existing callers keep working.
+    # Each entry: {ok, display_name, instance_id, message, root_password}.
+    instances: list[dict[str, Any]] = Field(default_factory=list)
+    created_count: int = 0
+    requested_count: int = 1
 
 
 class ShapeConfigRequest(BaseModel):

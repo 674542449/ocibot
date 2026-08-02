@@ -59,9 +59,9 @@
           <span
             v-if="!quotaPreview.secondary_region"
             class="badge"
-            :class="quotaPreview.overall_status === 'ok' ? 'running' : 'warn'"
+            :class="quotaStatusOk(quotaPreview.overall_status) ? 'running' : 'warn'"
           >
-            {{ quotaPreview.overall_status || '—' }}
+            {{ quotaStatusLabel(quotaPreview.overall_status) }}
           </span>
         </div>
         <div class="muted" style="margin-top: 0.25rem">
@@ -153,7 +153,7 @@
               </span>
               <span
                 class="badge"
-                :class="quotaPreview.overall_status === 'ok' ? 'running' : 'warn'"
+                :class="quotaStatusOk(quotaPreview.overall_status) ? 'running' : 'warn'"
               >{{ quotaStatusLabel(quotaPreview.overall_status) }}</span>
             </template>
             <span class="badge" :class="freeOnly ? 'running' : 'warn'">
@@ -172,17 +172,31 @@
         </p>
         <div v-else class="quota-grid">
           <div v-for="q in quotaRows" :key="q.key" class="quota-item">
-            <div class="quota-label">{{ q.label }}</div>
+            <div class="quota-head">
+              <span class="quota-label">{{ q.label }}</span>
+              <span class="quota-total">
+                {{ q.used }}<span class="muted"> / {{ q.limit }}{{ q.unit }}</span>
+              </span>
+            </div>
+            <!-- Two segments: what is already used, plus what THIS submit adds. -->
             <div class="quota-bar">
+              <div class="quota-fill" :class="q.status" :style="{ width: Math.min(100, q.ratio * 100) + '%' }" />
               <div
-                class="quota-fill"
-                :class="q.status"
-                :style="{ width: Math.min(100, q.ratio * 100) + '%' }"
+                v-if="q.need > 0"
+                class="quota-fill quota-need"
+                :class="{ 'is-over': q.over }"
+                :style="{ width: q.needRatio * 100 + '%' }"
               />
             </div>
             <div class="quota-nums">
-              已用 <strong>{{ q.used }}</strong> / {{ q.limit }}{{ q.unit }}
-              <span class="muted">（剩余 {{ q.remaining }}{{ q.unit }}）</span>
+              <span class="q-seg"><i class="q-dot q-dot-used"></i>已用 {{ q.used }}{{ q.unit }}</span>
+              <span v-if="q.need > 0" class="q-seg">
+                <i class="q-dot q-dot-need" :class="{ 'is-over': q.over }"></i>本次 {{ q.needText }}{{ q.unit }}
+              </span>
+              <span class="q-seg" :class="{ 'q-bad': q.over }">
+                <template v-if="q.over">超出 {{ q.overText }}{{ q.unit }}</template>
+                <template v-else>创建后剩余 {{ q.afterText }}{{ q.unit }}</template>
+              </span>
             </div>
           </div>
         </div>
@@ -290,6 +304,25 @@
         <div class="field">
           <label>Boot Volume GB（可选，≥50）</label>
           <input v-model="form.boot_volume_size_in_gbs" type="number" min="50" placeholder="留空≈默认" />
+        </div>
+        <div class="field">
+          <label>创建数量</label>
+          <input
+            v-model.number="form.count"
+            type="number"
+            min="1"
+            max="8"
+            :disabled="form.as_retry"
+            :title="form.as_retry ? '容量重试每次只抢 1 台' : '一次创建多台相同配置的实例，名称自动加 -1 -2 …'"
+          />
+          <p class="muted" style="margin: 0.2rem 0 0; font-size: 12px">
+            <template v-if="form.as_retry">容量重试每次只抢 1 台</template>
+            <template v-else-if="form.count > 1">
+              将创建 {{ form.count }} 台，名称 {{ form.display_name || 'instance' }}-1 …
+              {{ form.display_name || 'instance' }}-{{ form.count }}；额度按总量校验
+            </template>
+            <template v-else>默认 1 台</template>
+          </p>
         </div>
       </div>
       <p v-if="shapeSpecHint" class="muted" style="margin: 0; font-size: 12px">{{ shapeSpecHint }}</p>
@@ -535,27 +568,81 @@ function fmtNum(n: unknown): string {
   return Number.isInteger(v) ? String(v) : v.toFixed(1)
 }
 
+/** 'full' means the free allowance is fully in use — expected on a free
+ *  account, and not a reason to paint the panel as a fault. */
+function quotaStatusOk(status: string): boolean {
+  return !status || status === 'ok' || status === 'full'
+}
+
 function quotaStatusLabel(status: string): string {
   return (
-    { ok: '正常', warn: '接近上限', critical: '即将用尽', over: '已超额' }[status] || status || '—'
+    {
+      ok: '正常',
+      warn: '接近上限',
+      // Using the whole free allowance is the intended end state of a free
+      // account, not a fault — it used to render as an alarm next to a launch
+      // the server was about to allow, which read as "the check is wrong".
+      full: '额度已用满',
+      critical: '即将用尽',
+      over: '已超额',
+    }[status] || status || '—'
   )
 }
 
 /** Per-resource used/limit/remaining rows for the usage panel.
  *  A row whose bucket the server did not return is dropped — rendering it as
  *  「已用 — / —」 just looks broken. */
+const batchCount = computed(() => {
+  const n = Math.floor(Number(form.count) || 1)
+  if (form.as_retry) return 1
+  return Math.min(8, Math.max(1, n))
+})
+
+/** Free-quota units this submit would consume, keyed like the server's buckets.
+ *  Mirrors free_quota.shape_resource_units × count so the bars can show
+ *  「本次占用」 before the server answers. The verdict from the server is still
+ *  what blocks submission — this is presentation only. */
+const quotaNeed = computed<Record<string, number>>(() => {
+  const n = batchCount.value
+  const s = String(form.shape || '')
+  const isA1 = s.includes('A1.Flex')
+  const isE2 = s.toLowerCase().includes('e2.1.micro')
+  const boot =
+    form.boot_volume_size_in_gbs === '' || form.boot_volume_size_in_gbs == null
+      ? 47
+      : Number(form.boot_volume_size_in_gbs) || 0
+  return {
+    a1_ocpu: isA1 ? (Number(form.ocpus) || 0) * n : 0,
+    a1_memory_gb: isA1 ? (Number(form.memory_in_gbs) || 0) * n : 0,
+    e2_micro_count: isE2 ? n : 0,
+    block_storage_gb: boot * n,
+  }
+})
+
 const quotaRows = computed(() => {
   const buckets = quotaPreview.value?.buckets || {}
   return QUOTA_ROWS.filter((r) => buckets[r.key]).map((r) => {
     const b = buckets[r.key] || {}
+    const used = Number(b.used) || 0
+    const limit = Number(b.limit) || 0
+    const need = quotaNeed.value[r.key] || 0
+    const after = limit - used - need
     return {
       key: r.key,
       label: r.label,
       unit: r.unit,
-      used: fmtNum(b.used),
-      limit: fmtNum(b.limit),
+      used: fmtNum(used),
+      limit: fmtNum(limit),
       remaining: fmtNum(b.remaining),
-      ratio: Number(b.ratio) || 0,
+      need,
+      needText: fmtNum(need),
+      afterText: fmtNum(Math.max(0, after)),
+      // Negative headroom is the whole point of the panel — say so instead of
+      // clamping to 0 and looking like it just fits.
+      over: after < -1e-9,
+      overText: fmtNum(Math.abs(after)),
+      ratio: limit ? used / limit : 0,
+      needRatio: limit ? Math.max(0, Math.min(1 - used / limit, need / limit)) : 0,
       status: b.status || 'ok',
     }
   })
@@ -574,6 +661,7 @@ const form = reactive({
   memory_in_gbs: 24 as number | null,
   boot_volume_size_in_gbs: '' as number | string,
   boot_volume_vpus_per_gb: 10,
+  count: 1,
   assign_public_ip: true,
   assign_ipv6_ip: false,
   open_guest_firewall: true,
@@ -913,6 +1001,7 @@ async function checkQuotaForForm(): Promise<boolean> {
       memory_in_gbs: isFlex.value ? form.memory_in_gbs : null,
       boot_volume_size_in_gbs: form.boot_volume_size_in_gbs || null,
       boot_volume_vpus_per_gb: form.boot_volume_vpus_per_gb,
+      count: batchCount.value,
     })
     quotaVerdict.value = data
     // Keep the usage panel in sync with the snapshot the verdict used.
@@ -993,6 +1082,7 @@ async function doLaunch() {
         memory_in_gbs: isFlex.value ? form.memory_in_gbs : null,
         boot_volume_size_in_gbs: boot,
         boot_volume_vpus_per_gb: form.boot_volume_vpus_per_gb,
+        count: batchCount.value,
         assign_public_ip: form.assign_public_ip,
         assign_ipv6_ip: form.assign_ipv6_ip,
         open_guest_firewall: form.open_guest_firewall,
@@ -1122,17 +1212,29 @@ onMounted(async () => {
   gap: 0.6rem 1rem;
   margin-top: 0.5rem;
 }
+.quota-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.5rem;
+}
 .quota-label {
   font-size: 12px;
   color: var(--text-secondary);
 }
+.quota-total {
+  font-size: 13px;
+  font-weight: 700;
+}
 .quota-bar {
-  height: 6px;
+  height: 8px;
   border-radius: 999px;
   background: var(--panel-2);
   border: 1px solid var(--border);
   overflow: hidden;
-  margin: 0.25rem 0;
+  margin: 0.3rem 0;
+  /* Two segments side by side: current usage, then what this submit adds. */
+  display: flex;
 }
 .quota-fill {
   height: 100%;
@@ -1142,12 +1244,63 @@ onMounted(async () => {
 .quota-fill.warn {
   background: var(--warn);
 }
+/* "full" = the whole free allowance is in use. That is the normal end state of
+   a free account, so it is not painted as danger. */
+.quota-fill.full {
+  background: var(--accent);
+  opacity: 0.75;
+}
 .quota-fill.critical,
 .quota-fill.over {
   background: var(--danger, #e5484d);
 }
+/* What THIS launch would add — hatched so it reads as "not yet real". */
+.quota-need {
+  background: repeating-linear-gradient(
+    45deg,
+    var(--warn) 0 4px,
+    transparent 4px 8px
+  );
+  background-color: color-mix(in srgb, var(--warn) 35%, transparent);
+}
+.quota-need.is-over {
+  background: repeating-linear-gradient(
+    45deg,
+    var(--danger, #e5484d) 0 4px,
+    transparent 4px 8px
+  );
+  background-color: color-mix(in srgb, var(--danger, #e5484d) 35%, transparent);
+}
 .quota-nums {
   font-size: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.15rem 0.7rem;
+}
+.q-seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  color: var(--text-secondary);
+}
+.q-seg.q-bad {
+  color: var(--danger, #e5484d);
+  font-weight: 600;
+}
+.q-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  display: inline-block;
+}
+.q-dot-used {
+  background: var(--accent);
+}
+.q-dot-need {
+  background: var(--warn);
+}
+.q-dot-need.is-over {
+  background: var(--danger, #e5484d);
 }
 .password-reveal {
   border: 1px solid var(--warn);

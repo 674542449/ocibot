@@ -360,6 +360,9 @@ function quotaStatusText(s: string) {
   const m: Record<string, string> = {
     over: '已超免费额度',
     critical: '接近上限',
+    // Exactly at the cap. For a free account that is the intended end state —
+    // two of two free micros running is the whole point — so it is not an alarm.
+    full: '额度已用满',
     warn: '偏高',
     ok: '正常',
   }
@@ -477,6 +480,12 @@ onMounted(async () => {
 .st-ok {
   background: var(--ok);
 }
+/* Fully used, not over. Same colour family as ok — a free account that has used
+   its whole allowance is in the expected state, not a fault to act on. */
+.st-full {
+  background: var(--ok);
+  opacity: 0.72;
+}
 .st-warn {
   background: var(--warn);
 }
@@ -487,7 +496,8 @@ onMounted(async () => {
   background: var(--danger);
   color: #fff;
 }
-.badge.st-ok {
+.badge.st-ok,
+.badge.st-full {
   background: var(--ok-soft);
   color: var(--ok);
   border-color: transparent;
@@ -503,7 +513,8 @@ onMounted(async () => {
   color: var(--danger);
   border-color: transparent;
 }
-:global(html[data-theme='dark']) .badge.st-ok {
+:global(html[data-theme='dark']) .badge.st-ok,
+:global(html[data-theme='dark']) .badge.st-full {
   color: #7dffa8;
   background: rgba(28, 78, 52, 0.85);
 }

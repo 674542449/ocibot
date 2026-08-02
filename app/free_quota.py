@@ -239,9 +239,16 @@ def build_quota_snapshot(
     def _bucket(used: float, limit: float, *, soft: bool = False) -> dict[str, Any]:
         remaining = max(0.0, float(limit) - float(used))
         ratio = (float(used) / float(limit)) if limit else 0.0
-        if used > limit:
+        if used > limit + 1e-9:
             # Soft caps (public IP) never contribute a hard "over" to overall.
             status = "critical" if soft else "over"
+        elif limit and used >= limit - 1e-9:
+            # Exactly at the cap. On a *free allowance* that is the intended end
+            # state — two of two free micros running is the whole point — so it is
+            # reported as "full", not as an alarm. Calling it critical made the
+            # launch page show a red verdict for a launch it was about to allow,
+            # which read as "the check is wrong".
+            status = "full"
         elif ratio >= 0.9:
             status = "critical"
         elif ratio >= 0.7:
@@ -279,6 +286,9 @@ def build_quota_snapshot(
         if b["status"] == "over":
             overall = "over"
             break
+        # "full" is deliberately not escalated: a free account that has used its
+        # whole allowance is in the expected state, and flagging it made every
+        # page render an alarm that no action could clear.
         if b["status"] == "critical" and overall != "over":
             overall = "critical"
         elif b["status"] == "warn" and overall == "ok":
@@ -398,8 +408,14 @@ def validate_launch_against_quota(
     account_tier: str = "",
     usage: Optional[dict[str, Any]] = None,
     enforce_storage_cap: Optional[bool] = None,
+    count: int = 1,
 ) -> GuardResult:
     """Validate a launch request against free-tier caps / free-only mode.
+
+    ``count`` is how many identical instances the caller intends to create. The
+    caps apply to the TOTAL, so this must be checked once for the whole batch:
+    validating a single instance and then launching four of them would wave
+    through four times the free allowance.
 
     Blocking policy:
     - free_only_mode ON: only free shapes; stay within free remaining for A1/E2/disk.
@@ -429,7 +445,10 @@ def validate_launch_against_quota(
     issues: list[GuardIssue] = []
     warnings: list[GuardIssue] = []
     shape = (shape or "").strip()
-    units = shape_resource_units(shape, ocpus, memory_in_gbs)
+    n = max(1, _as_int(count, 1))
+    per_unit = shape_resource_units(shape, ocpus, memory_in_gbs)
+    # Everything below reasons about the whole batch.
+    units = {k: v * n for k, v in per_unit.items()}
 
     boot = boot_volume_size_in_gbs
     if boot in (None, ""):
@@ -486,12 +505,14 @@ def validate_launch_against_quota(
             else:
                 warnings.append(GuardIssue("e2_insufficient", msg + " 继续创建可能计费。", "warn"))
 
-    projected_disk = disk_used + boot_gb
+    batch_boot = boot_gb * n
+    projected_disk = disk_used + batch_boot
     if projected_disk > FREE_BLOCK_STORAGE_GB + 1e-9:
         assumed = "（未填 Boot 时按约 47GB 估算）" if boot_assumed else ""
+        each = f"{n} × {boot_gb:g} GB = " if n > 1 else ""
         msg = (
             f"块存储将超过免费 200GB：当前已用 {disk_used:g} GB，"
-            f"本次 Boot {boot_gb:g} GB{assumed}，合计 {projected_disk:g} GB。"
+            f"本次 Boot {each}{batch_boot:g} GB{assumed}，合计 {projected_disk:g} GB。"
         )
         if enforce_storage_cap:
             issues.append(GuardIssue("storage_over_free_cap", msg))
@@ -514,9 +535,12 @@ def validate_launch_against_quota(
         "e2_micro_count_after": e2_used + int(units["e2_micro_count"]),
         "block_storage_gb_after": round(projected_disk, 4),
         "boot_gb": boot_gb,
+        "boot_gb_total": round(batch_boot, 4),
         "boot_assumed": boot_assumed,
         "shape": shape,
+        "count": n,
         "units": units,
+        "units_per_instance": per_unit,
         "remaining_after": {
             "a1_ocpu": round(max(0.0, FREE_A1_OCPU - (a1_used + units["a1_ocpu"])), 4),
             "a1_memory_gb": round(max(0.0, FREE_A1_MEMORY_GB - (a1_mem_used + units["a1_memory_gb"])), 4),
