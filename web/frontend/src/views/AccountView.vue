@@ -225,10 +225,13 @@
     <div class="card stack">
       <div class="row" style="justify-content: space-between; align-items: baseline">
         <h3 style="margin: 0">每月账单</h3>
-        <span v-if="unpaidCount > 0" class="badge warn">{{ unpaidCount }} 张未付清</span>
+        <span v-if="invoiceError" class="badge stopped">读取失败</span>
+        <span v-else-if="unpaidCount > 0" class="badge warn">{{ unpaidCount }} 张未付清</span>
         <span v-else-if="invoices.length" class="badge running">已全部付清</span>
       </div>
-      <p v-if="invoiceMsg" class="muted" style="margin: 0; font-size: 12px">{{ invoiceMsg }}</p>
+      <p v-if="invoiceMsg && !invoiceError" class="muted" style="margin: 0; font-size: 12px">
+        {{ invoiceMsg }}
+      </p>
       <div v-if="invoices.length" class="table-wrap">
         <table>
           <thead>
@@ -255,6 +258,7 @@
           </tbody>
         </table>
       </div>
+      <div v-else-if="invoiceError" class="error-box">读取账单失败：{{ invoiceError }}</div>
       <div v-else class="empty">该账号暂无账单记录。</div>
     </div>
 
@@ -441,6 +445,9 @@ async function loadUsage() {
  *  tenancy has no subscription, so it is never billed. */
 const invoices = ref<any[]>([])
 const invoiceMsg = ref('')
+/** Set only when the read itself failed. Kept apart from invoiceMsg so the page
+ *  never reports "no bills" for an account it could not read. */
+const invoiceError = ref('')
 const unpaidCount = computed(
   () => invoices.value.filter((i) => !i.is_paid).length,
 )
@@ -480,13 +487,20 @@ function invoiceClass(inv: any): string {
 
 async function loadInvoices() {
   if (!tenantId.value) return
+  invoiceError.value = ''
   try {
     const res = await api.get(`/tenants/${tenantId.value}/invoices`)
     invoices.value = res.data.data?.invoices || []
     invoiceMsg.value = res.data.message || ''
+    // ok=false means Oracle refused the read; an empty list then proves nothing.
+    if (!res.data.ok) {
+      invoiceError.value = res.data.message || '未知原因'
+      invoices.value = []
+    }
   } catch (e: any) {
     invoices.value = []
-    invoiceMsg.value = e?.message || '读取账单失败'
+    invoiceMsg.value = ''
+    invoiceError.value = e?.message || '请求失败'
   }
 }
 

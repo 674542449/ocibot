@@ -705,6 +705,12 @@ df -h /
 """
 
 
+# Sort key for the invoice list. The service accepts a closed set and the SDK
+# rejects anything else client-side; keep this in step with
+# oci.osp_gateway.InvoiceServiceClient.list_invoices.
+_INVOICE_SORT_BY = "INVOICE_DATE"
+
+
 class TenantSession:
     """One authenticated OCI session bound to a TenantConfig."""
 
@@ -3558,11 +3564,15 @@ class TenantSession:
             cfg["region"] = home
         try:
             client = InvoiceServiceClient(cfg, retry_strategy=sdk_default_retry_strategy())
+            # "INVOICE_DATE" is the billing period this table is ordered by, and it
+            # is one of the values the service accepts — the enum is small and
+            # closed, so it is asserted rather than assumed. Sending anything else
+            # is rejected client-side by the SDK before a request is even made.
             resp = client.list_invoices(
                 osp_home_region=home,
                 compartment_id=tenancy,
                 limit=limit,
-                sort_by="TIME_INVOICE_DUE",
+                sort_by=_INVOICE_SORT_BY,
                 sort_order="DESC",
             )
         except Exception as exc:  # noqa: BLE001

@@ -40,6 +40,12 @@ from web.backend.models import Tenant, User  # noqa: E402
 
 _PEM = "-----BEGIN PRIVATE KEY-----\nMIIBOgIBAAJBAK\n-----END PRIVATE KEY-----"
 
+# Captured at import, before _session() below swaps the SDK class for a MagicMock
+# and leaves it swapped — otherwise a later test reads the mock's docstring.
+from oci.osp_gateway import InvoiceServiceClient as _RealInvoiceClient  # noqa: E402
+
+_REAL_LIST_INVOICES_DOC = _RealInvoiceClient.list_invoices.__doc__ or ""
+
 
 class _Invoice:
     def __init__(self, **kw):
@@ -215,3 +221,43 @@ def test_endpoint_does_not_5xx_when_oracle_refuses(client, monkeypatch):
     r = c.get(f"/api/tenants/{tid}/invoices")
     assert r.status_code == 502, r.text
     assert "读取账单失败" in r.json()["detail"]
+
+# ---------------------------------------------------------------------------
+# Parameters the service validates
+# ---------------------------------------------------------------------------
+
+
+def test_sort_key_is_one_the_service_accepts():
+    """Shipped broken in 0.4.49: sort_by was guessed as "TIME_INVOICE_DUE" and
+    every query failed with `Invalid value for sort_by`. The accepted set is
+    closed and lives in the SDK docstring, so it can simply be checked."""
+    import re
+
+    from app.oci_client import _INVOICE_SORT_BY
+
+    section = re.search(r":param str sort_by:(.{0,400})", _REAL_LIST_INVOICES_DOC, re.S)
+    assert section, "SDK no longer documents sort_by"
+    allowed = re.findall(r'"([A-Z_]+)"', section.group(1))
+    assert allowed, "SDK no longer lists the allowed sort_by values"
+    assert _INVOICE_SORT_BY in allowed, f"{_INVOICE_SORT_BY} not in {allowed}"
+
+
+def test_the_call_passes_the_pinned_sort_key():
+    from app.oci_client import _INVOICE_SORT_BY
+
+    s = _session([])
+    s.list_invoices()
+    import oci.osp_gateway as osp
+
+    kwargs = osp.InvoiceServiceClient.return_value.list_invoices.call_args.kwargs
+    assert kwargs["sort_by"] == _INVOICE_SORT_BY
+    assert kwargs["sort_order"] == "DESC"
+
+
+def test_a_refused_read_is_not_reported_as_an_empty_account():
+    """The operator saw the sort_by error AND "this account has no invoices" at
+    the same time. An unreadable account is not a settled one."""
+    r = _session(raises=Exception("Invalid value for `sort_by`")).list_invoices()
+    assert r.ok is False
+    assert "没有账单" not in (r.message or "")
+
