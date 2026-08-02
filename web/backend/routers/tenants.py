@@ -122,7 +122,15 @@ def list_tenants(
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> list[TenantOut]:
-    rows = db.scalars(select(Tenant).where(Tenant.owner_id == user.id).order_by(Tenant.name)).all()
+    # Insertion order, not alphabetical: the operator knows their tenants by the
+    # order they added them, and sorting by name made a rename jump a row across
+    # the table. `id` only breaks ties so the order is deterministic when two rows
+    # share a timestamp (a paste-import that creates 主区 + 副区 together).
+    rows = db.scalars(
+        select(Tenant)
+        .where(Tenant.owner_id == user.id)
+        .order_by(Tenant.created_at, Tenant.id)
+    ).all()
     return [_to_out(r) for r in rows]
 
 

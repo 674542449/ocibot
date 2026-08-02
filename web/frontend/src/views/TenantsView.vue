@@ -13,7 +13,6 @@
     </div>
 
     <div v-if="error" class="error-box">{{ error }}</div>
-    <div v-if="msg" class="success-box">{{ msg }}</div>
 
     <div class="card table-wrap">
       <table>
@@ -22,6 +21,7 @@
             <th>名称</th>
             <th>区域</th>
             <th>等级</th>
+            <th>密码到期</th>
             <th>Tenancy</th>
             <th>状态</th>
             <th>操作</th>
@@ -29,15 +29,19 @@
         </thead>
         <tbody>
           <tr v-if="tenants.length === 0">
-            <td colspan="6" class="muted">还没有租户，点击右上角添加，或粘贴原始 API 配置。</td>
+            <td colspan="7" class="muted">还没有租户，点击右上角添加，或粘贴原始 API 配置。</td>
           </tr>
           <tr v-for="t in orderedTenants" :key="t.id" :class="{ 'sub-row': !!t.parent_tenant_id }">
-            <td>
+            <td class="name-cell">
               <span v-if="t.parent_tenant_id" class="muted sub-tree">└</span>
               <span class="dot" :style="{ background: t.color }"></span>
               {{ t.name }}
               <span v-if="t.parent_tenant_id" class="badge sub-badge">副区</span>
-              <span v-if="isTenantLocked(t.id)" class="badge running" title="其他页面默认使用该租户">
+              <span
+                class="badge running lock-flag"
+                :class="{ 'is-off': !isTenantLocked(t.id) }"
+                title="其他页面默认使用该租户"
+              >
                 🔒 默认
               </span>
             </td>
@@ -48,6 +52,30 @@
               </span>
             </td>
             <td>{{ tierLabel(t.account_tier) }}</td>
+            <!-- Own column on purpose: rendered inside 状态 it added a second line
+                 on query, growing the row and pushing every row below it down.
+                 Here the header reserves the width and the cell is simply empty
+                 until queried, so nothing moves. -->
+            <td class="pwd-cell">
+              <!-- Always a badge, even before the query: a plain "—" placeholder is
+                   shorter than a badge, so the first result grew the row. The
+                   placeholder keeps a CJK glyph so its line box matches the real
+                   value's exactly. -->
+              <span
+                class="badge"
+                :class="
+                  pwdStatus[t.id] ? (pwdStatus[t.id].days > 0 ? 'warn' : 'running') : 'pwd-empty'
+                "
+              >
+                {{
+                  pwdStatus[t.id]
+                    ? pwdStatus[t.id].days > 0
+                      ? pwdStatus[t.id].days + ' 天'
+                      : '未设置'
+                    : '未查询'
+                }}
+              </span>
+            </td>
             <td class="muted" style="font-size: 12px; word-break: break-all">
               {{ shortId(t.tenancy_ocid) }}
             </td>
@@ -58,13 +86,6 @@
               <span v-if="!t.free_only_mode" class="badge warn" title="超出 Always Free 不再拦截">
                 允许计费
               </span>
-              <!-- 只显示 defaultPasswordPolicy 的数值：这是控制台登录真正生效的
-                   那条，也是判断强制改密有没有关掉时唯一要看的数字。 -->
-              <div v-if="pwdStatus[t.id]" class="pwd-line">
-                <span class="badge" :class="pwdStatus[t.id].days > 0 ? 'warn' : 'running'">
-                  密码到期 {{ pwdStatus[t.id].days > 0 ? pwdStatus[t.id].days + ' 天' : '未设置' }}
-                </span>
-              </div>
             </td>
             <td>
               <div class="row row-actions">
@@ -376,6 +397,10 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import api, { type Tenant, type TenantRegions } from '@/api/client'
 import { isTenantLocked, lockTenant, unlockTenant } from '@/stores/tenantLock'
 import { pickAndReadTextFile } from '@/utils/file'
+// Row actions report through the fixed-position toast host, never through the
+// in-flow banner above the table: that banner appearing pushed the whole table
+// down, so the row you just clicked moved out from under the cursor.
+import { showToast } from '@/utils/toast'
 
 type ParsePreview = {
   ok: boolean
@@ -393,7 +418,6 @@ type ParsePreview = {
 
 const tenants = ref<Tenant[]>([])
 const error = ref('')
-const msg = ref('')
 const busy = ref('')
 const showForm = ref(false)
 const showManual = ref(false)
@@ -476,8 +500,6 @@ async function readPasswordDays(tenantId: string): Promise<number | null> {
  * 免得一个叫「查询」的动作意外改了 Oracle 配置。
  */
 async function passwordExpiry(t: Tenant) {
-  error.value = ''
-  msg.value = ''
   busy.value = t.id
   try {
     let days = await readPasswordDays(t.id)
@@ -486,19 +508,20 @@ async function passwordExpiry(t: Tenant) {
         `/tenants/${t.id}/oci-password-policy/disable-expiry`,
       )
       if (!data.ok) {
-        error.value = `${t.name}: 当前 ${days} 天后过期，关闭失败：${data.message || '未知原因'}`
+        showToast(`${t.name}: 当前 ${days} 天后过期，关闭失败：${data.message || '未知原因'}`, 'err', 5000)
         pwdStatus[t.id] = { days }
         return
       }
       days = await readPasswordDays(t.id)
     }
     pwdStatus[t.id] = { days: days ?? 0 }
-    msg.value =
+    showToast(
       (days ?? 0) > 0
         ? `${t.name}: defaultPasswordPolicy = ${days} 天`
-        : `${t.name}: defaultPasswordPolicy 未设置有效期（密码不会过期）`
+        : `${t.name}: defaultPasswordPolicy 未设置有效期（密码不会过期）`,
+    )
   } catch (e: any) {
-    error.value = e?.message || '密码到期查询失败'
+    showToast(e?.message || '密码到期查询失败', 'err', 5000)
   } finally {
     busy.value = ''
   }
@@ -616,7 +639,6 @@ async function pasteFromClipboard() {
 
 async function parseOnly() {
   error.value = ''
-  msg.value = ''
   try {
     const { data } = await api.post<ParsePreview>('/tenants/parse', {
       api_text: paste.api_text,
@@ -644,7 +666,6 @@ async function parseOnly() {
 
 async function importPaste() {
   error.value = ''
-  msg.value = ''
   saving.value = true
   try {
     const { data } = await api.post<Tenant>('/tenants/import', {
@@ -654,14 +675,14 @@ async function importPaste() {
       description: paste.description,
       test_connection: paste.test_connection,
     })
-    msg.value = `已添加「${data.name}」`
+    showToast(`已添加「${data.name}」`)
     if (paste.test_connection) {
       try {
         const t = await api.post<{ ok: boolean; message: string }>(`/tenants/${data.id}/test`)
-        if (t.data.ok) msg.value += ` · 连接测试：${t.data.message}`
-        else error.value = `已保存，但连接测试失败：${t.data.message}`
+        if (t.data.ok) showToast(`连接测试：${t.data.message}`, 'ok', 4000)
+        else showToast(`已保存，但连接测试失败：${t.data.message}`, 'err', 6000)
       } catch (e: any) {
-        error.value = `已保存，但连接测试失败：${e?.message || e}`
+        showToast(`已保存，但连接测试失败：${e?.message || e}`, 'err', 6000)
       }
     }
     showForm.value = false
@@ -675,7 +696,6 @@ async function importPaste() {
 
 async function saveManual() {
   error.value = ''
-  msg.value = ''
   saving.value = true
   try {
     if (editingId.value) {
@@ -694,7 +714,7 @@ async function saveManual() {
       }
       const { data } = await api.patch<Tenant>(`/tenants/${editingId.value}`, payload)
       replaceTenant(data)
-      msg.value = '已保存'
+      showToast('已保存')
     } else {
       await api.post('/tenants', {
         name: form.name,
@@ -707,7 +727,7 @@ async function saveManual() {
         description: form.description,
         free_only_mode: form.free_only_mode,
       })
-      msg.value = '已添加'
+      showToast('已添加')
     }
     showForm.value = false
     await load()
@@ -720,15 +740,13 @@ async function saveManual() {
 
 /** 锁定/取消锁定：其他页面进入时默认选中被锁定的租户。 */
 function toggleLock(t: Tenant) {
-  msg.value = ''
-  error.value = ''
   if (isTenantLocked(t.id)) {
     unlockTenant()
-    msg.value = `已取消锁定「${t.name}」，各页面恢复为默认选第一个租户`
+    showToast(`已取消锁定「${t.name}」，各页面恢复为默认选第一个租户`)
     return
   }
   lockTenant(t)
-  msg.value = `已锁定「${t.name}」：实例 / 存储 / 创建实例 / 账号用量 进入时都会自动选它`
+  showToast(`已锁定「${t.name}」：实例 / 存储 / 创建实例 / 账号用量 进入时都会自动选它`)
 }
 
 function closeRegions() {
@@ -775,7 +793,6 @@ async function subscribeRegion(region: string, alreadySubscribed: boolean) {
       `③ 面板会自动添加对应的副区租户（默认允许计费）。`
   if (!confirm(question)) return
   error.value = ''
-  msg.value = ''
   regionBusy.value = region
   try {
     const { data } = await api.post<{ ok: boolean; message: string }>(
@@ -783,31 +800,29 @@ async function subscribeRegion(region: string, alreadySubscribed: boolean) {
       { region, confirm: true, add_tenant: true },
     )
     if (data.ok) {
-      msg.value = data.message || '已开通'
+      showToast(data.message || '已开通', 'ok', 4000)
       await load()
       await openRegions(t)
     } else {
-      error.value = data.message || '开通副区失败'
+      showToast(data.message || '开通副区失败', 'err', 6000)
     }
   } catch (e: any) {
-    error.value = e?.message || '开通副区失败'
+    showToast(e?.message || '开通副区失败', 'err', 6000)
   } finally {
     regionBusy.value = ''
   }
 }
 
 async function detectTier(t: Tenant) {
-  error.value = ''
-  msg.value = ''
   busy.value = t.id
   try {
     const { data } = await api.get(`/tenants/${t.id}/account`)
     const tier = data?.data?.tier || '未知'
     const reason = data?.data?.tier_reason || data?.message || ''
-    msg.value = `${t.name}: ${tier}${reason ? ' — ' + reason : ''}`
+    showToast(`${t.name}: ${tier}${reason ? ' — ' + reason : ''}`, 'ok', 3000)
     await load()
   } catch (e: any) {
-    error.value = e?.message || '识别失败'
+    showToast(e?.message || '识别失败', 'err', 5000)
   } finally {
     busy.value = ''
   }
@@ -821,15 +836,14 @@ async function remove(t: Tenant) {
       `（仅移出面板，不会删除 Oracle 上的区域订阅或实例）`
     : ''
   if (!confirm(`删除租户「${t.name}」？${extra}`)) return
-  error.value = ''
   busy.value = t.id
   try {
     const { data } = await api.delete<{ message: string }>(`/tenants/${t.id}`)
-    msg.value = data?.message || '已删除'
+    showToast(data?.message || '已删除')
     if (regionsFor.value?.id === t.id) closeRegions()
     await load()
   } catch (e: any) {
-    error.value = e?.message || '删除失败'
+    showToast(e?.message || '删除失败', 'err', 5000)
   } finally {
     busy.value = ''
   }
@@ -839,7 +853,7 @@ onMounted(async () => {
   try {
     await load()
   } catch (e: any) {
-    error.value = e?.message || '加载失败'
+    showToast(e?.message || '加载失败', 'err', 5000)
   }
 })
 </script>
@@ -891,13 +905,24 @@ onMounted(async () => {
 .sub-badge {
   margin-left: 0.35rem;
 }
-.pwd-line {
-  margin-top: 0.25rem;
+/* Fixed width so a result never resizes the column: a wider column narrows the
+   actions column until its buttons wrap, which grows EVERY row in the table. */
+.pwd-cell {
   font-size: 12px;
-  display: flex;
-  align-items: center;
-  gap: 0.35rem;
-  flex-wrap: wrap;
+  white-space: nowrap;
+  width: 5.6rem;
+  min-width: 5.6rem;
+}
+.pwd-empty {
+  visibility: hidden;
+}
+
+/* The 🔒 默认 badge keeps its space when hidden. Rendering it conditionally
+   changed the name column's width on click, which narrowed the actions column
+   until its buttons wrapped — every row in the table grew by 21px. Reserving
+   the slot makes locking a pure repaint. */
+.lock-flag.is-off {
+  visibility: hidden;
 }
 /* 操作按钮保持一行：表格外层已有横向滚动，宁可让这一列滚动，
    也不让按钮折成两行把每行撑高一倍。 */
