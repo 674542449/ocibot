@@ -2,43 +2,48 @@
 
 :root {
   color-scheme: light;
-  /* Surfaces */
-  --bg: #eef1f6;
-  --bg-glow-1: rgba(51, 112, 255, 0.14);
-  --bg-glow-2: rgba(107, 78, 255, 0.1);
-  --panel: rgba(255, 255, 255, 0.72);
+  /* Surfaces — opaque on purpose. Translucent panels blurred the one thing this
+     panel exists to show: dense columns of machine values. */
+  --bg: #e9ecf2;
+  --bg-glow-1: rgba(91, 91, 214, 0.10);
+  --bg-glow-2: rgba(91, 91, 214, 0.06);
+  --panel: #ffffff;
   --panel-solid: #ffffff;
-  --panel-2: rgba(247, 248, 250, 0.78);
-  --border: rgba(255, 255, 255, 0.55);
-  --border-strong: rgba(201, 205, 212, 0.95);
-  --glass-border: rgba(255, 255, 255, 0.65);
-  --glass-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.75);
+  --panel-2: #f4f6fa;
+  --border: #dfe3ec;
+  --border-strong: #c6ccda;
+  --glass-border: #dfe3ec;
+  --glass-highlight: 0 0 transparent;
   /* Text */
-  --text: #1d2129;
-  --muted: #86909c;
-  --text-secondary: #4e5969;
-  /* Brand — Feishu-like blue */
-  --accent: #3370ff;
-  --accent-hover: #245bdb;
-  --accent-soft: rgba(232, 243, 255, 0.9);
-  --accent-soft-2: #bedaff;
+  --text: #171a21;
+  --muted: #626a79;
+  --text-secondary: #4b5464;
+  /* Accent — indigo. The four status hues (green / red / amber / grey) are
+     spoken for by machine state, and this panel is almost entirely status
+     reporting; indigo is the one hue that can never be misread as a state. */
+  --accent: #4f46c4;
+  --accent-hover: #3d35a8;
+  --accent-soft: #ecebfa;
+  --accent-soft-2: #c7c3ef;
   /* Status */
-  --danger: #f53f3f;
-  --danger-soft: rgba(255, 236, 232, 0.92);
-  --ok: #00b42a;
-  --ok-soft: rgba(232, 255, 234, 0.92);
-  --warn: #ff7d00;
-  --warn-soft: rgba(255, 247, 232, 0.92);
+  --danger: #c8242b;
+  --danger-soft: #fdeaea;
+  --ok: #0a7f28;
+  --ok-soft: #e6f6ea;
+  --warn: #9a5800;
+  --warn-soft: #fdf1e0;
   /* Effects */
-  --radius: 10px;
-  --radius-lg: 16px;
-  --input-bg: rgba(255, 255, 255, 0.78);
-  --row-hover: rgba(247, 248, 250, 0.85);
-  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.04), 0 4px 14px rgba(15, 23, 42, 0.04);
-  --shadow-md: 0 8px 28px rgba(15, 23, 42, 0.08);
-  --blur: 18px;
+  --radius: 6px;
+  --radius-lg: 10px;
+  --input-bg: #ffffff;
+  --row-hover: #f4f6fa;
+  --shadow-sm: 0 1px 2px rgba(20, 26, 40, 0.05);
+  --shadow-md: 0 6px 20px rgba(20, 26, 40, 0.09);
+  --blur: 0px;
   --sidebar-w: 232px;
   --page-pad: 1rem;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", "JetBrains Mono", Consolas,
+    Menlo, monospace;
   font-family: "PingFang SC", "Microsoft YaHei", "Segoe UI", system-ui, -apple-system,
     "Noto Sans SC", sans-serif;
   line-height: 1.5;
@@ -53,33 +58,33 @@
 /* Optional dark glass — keep text/surfaces high-contrast on charcoal */
 html[data-theme='dark'] {
   color-scheme: dark;
-  --bg: #0f1014;
-  --bg-glow-1: rgba(64, 128, 255, 0.14);
-  --bg-glow-2: rgba(107, 78, 255, 0.1);
-  --panel: rgba(28, 29, 34, 0.88);
-  --panel-solid: #1c1d22;
-  --panel-2: rgba(36, 38, 44, 0.92);
-  --border: rgba(255, 255, 255, 0.1);
-  --border-strong: rgba(255, 255, 255, 0.2);
-  --glass-border: rgba(255, 255, 255, 0.12);
-  --glass-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.06);
-  --text: #f5f6f8;
-  --muted: #9aa3b2;
-  --text-secondary: #c5cad3;
-  --accent: #5b91ff;
-  --accent-hover: #82adff;
-  --accent-soft: rgba(48, 74, 130, 0.55);
-  --accent-soft-2: #3a547d;
+  --bg: #0e0f14;
+  --bg-glow-1: rgba(124, 118, 240, 0.12);
+  --bg-glow-2: rgba(124, 118, 240, 0.07);
+  --panel: #171921;
+  --panel-solid: #171921;
+  --panel-2: #1e212b;
+  --border: #272b36;
+  --border-strong: #3a4050;
+  --glass-border: #272b36;
+  --glass-highlight: 0 0 transparent;
+  --text: #f2f4f8;
+  --muted: #8b93a5;
+  --text-secondary: #bfc6d4;
+  --accent: #8b84f5;
+  --accent-hover: #a49ef8;
+  --accent-soft: #262444;
+  --accent-soft-2: #3d3a6b;
   --danger: #ff7b76;
   --danger-soft: rgba(90, 40, 38, 0.72);
   --ok: #3dd68c;
   --ok-soft: rgba(28, 68, 48, 0.72);
   --warn: #f5b942;
   --warn-soft: rgba(90, 64, 20, 0.72);
-  --input-bg: rgba(36, 38, 44, 0.95);
-  --row-hover: rgba(48, 50, 58, 0.9);
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35), 0 4px 16px rgba(0, 0, 0, 0.22);
-  --shadow-md: 0 12px 32px rgba(0, 0, 0, 0.42);
+  --input-bg: #1e212b;
+  --row-hover: #1e212b;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.45);
 }
 
 * {
@@ -134,8 +139,6 @@ button {
   box-shadow: var(--glass-highlight), var(--shadow-sm);
   font-weight: 550;
   font-size: 13px;
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
 }
 
 html[data-theme='dark'] button:not(.primary):not(.danger):not(.ghost) {
@@ -156,28 +159,29 @@ html[data-theme='dark'] button:hover:not(:disabled):not(.primary):not(.danger):n
 }
 
 button.primary {
-  background: linear-gradient(180deg, #4b83ff 0%, var(--accent) 100%);
+  background: var(--accent);
   border-color: transparent;
   color: #fff;
-  box-shadow: 0 4px 14px rgba(51, 112, 255, 0.28), var(--glass-highlight);
+  box-shadow: none;
 }
 
 button.primary:hover:not(:disabled) {
-  background: linear-gradient(180deg, var(--accent-hover) 0%, #1f4fd6 100%);
+  background: var(--accent-hover);
   border-color: transparent;
   color: #fff;
 }
 
 html[data-theme='dark'] button.primary {
-  color: #fff;
-  background: linear-gradient(180deg, #5b91ff 0%, var(--accent) 100%);
+  color: #14121f;
+  background: var(--accent);
   border-color: transparent;
+  font-weight: 600;
 }
 
 html[data-theme='dark'] button.primary:hover:not(:disabled) {
-  background: linear-gradient(180deg, var(--accent-hover) 0%, #3a6fe0 100%);
+  background: var(--accent-hover);
   border-color: transparent;
-  color: #fff;
+  color: #14121f;
 }
 
 button.danger {
@@ -245,8 +249,6 @@ textarea {
   padding: 0.5rem 0.75rem;
   min-height: 36px;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
   box-shadow: var(--glass-highlight);
 }
 
@@ -291,8 +293,6 @@ html[data-theme='dark'] option {
   padding: 1rem 1.15rem;
   box-shadow: var(--glass-highlight), var(--shadow-sm);
   max-width: 100%;
-  backdrop-filter: blur(var(--blur)) saturate(1.35);
-  -webkit-backdrop-filter: blur(var(--blur)) saturate(1.35);
 }
 
 .muted {
@@ -359,8 +359,6 @@ html[data-theme='dark'] option {
   border-radius: var(--radius-lg);
   max-width: 100%;
   background: var(--panel);
-  backdrop-filter: blur(var(--blur)) saturate(1.3);
-  -webkit-backdrop-filter: blur(var(--blur)) saturate(1.3);
   box-shadow: var(--glass-highlight), var(--shadow-sm);
 }
 
@@ -373,23 +371,34 @@ table {
 th,
 td {
   text-align: left;
-  padding: 0.7rem 0.85rem;
-  border-bottom: 1px solid color-mix(in srgb, var(--border-strong) 55%, transparent);
+  padding: 0.6rem 0.85rem;
+  border-bottom: 1px solid var(--border);
   vertical-align: middle;
   color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Machine-generated values — identifiers, addresses, fingerprints, versions.
+   Set apart from prose so an operator can tell at a glance what is a name they
+   chose and what the platform returned. */
+.mono,
+code {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.92em;
 }
 
 th {
-  background: rgba(247, 248, 250, 0.72);
+  background: var(--panel-2);
   position: sticky;
   top: 0;
   z-index: 1;
-  font-weight: 560;
-  font-size: 13px;
+  font-weight: 600;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
   color: var(--text-secondary);
   white-space: nowrap;
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
 }
 
 html[data-theme='dark'] th {
@@ -418,8 +427,6 @@ tr:hover td {
   word-break: break-word;
   background: rgba(247, 248, 250, 0.85);
   color: var(--text-secondary);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
   box-shadow: var(--glass-highlight);
 }
 
@@ -474,8 +481,6 @@ html[data-theme='dark'] .badge.err {
   border-radius: var(--radius-lg);
   word-break: break-word;
   overflow-wrap: anywhere;
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
   box-shadow: var(--glass-highlight);
 }
 
@@ -487,8 +492,6 @@ html[data-theme='dark'] .badge.err {
   border-radius: var(--radius-lg);
   word-break: break-word;
   overflow-wrap: anywhere;
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
   box-shadow: var(--glass-highlight);
 }
 
@@ -694,8 +697,6 @@ html[data-theme='dark'] .scroll-x > button.primary {
   background: rgba(255, 255, 255, 0.38);
   border: 1px solid var(--glass-border);
   box-shadow: var(--glass-highlight);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
 }
 
 html[data-theme='dark'] .btn-group {
@@ -820,5 +821,32 @@ h3 {
   .page-tools > button,
   .page-tools > a {
     flex: 1 1 100%;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   Quality floor
+   --------------------------------------------------------------------------- */
+
+/* Keyboard focus was visible on exactly one class before this. Anyone driving
+   the panel from the keyboard — which is how you use a terminal-adjacent tool —
+   had no idea what was selected. Indigo reads clearly on both themes and is not
+   used for any machine state, so a focus ring can never be mistaken for status. */
+:where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius);
+}
+
+/* Respect the OS setting. The panel animates toasts, bars and route changes;
+   for anyone who has asked their system to stop that, it should stop. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }

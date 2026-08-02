@@ -653,12 +653,17 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import api, { type Instance } from '@/api/client'
 import { pickAndReadTextFile } from '@/utils/file'
 import { copyText } from '@/utils/toast'
-import WebSshTerminal from '@/components/WebSshTerminal.vue'
+// Loaded only when the WebSSH tab is actually opened. Imported statically it
+// pulled xterm.js (~250 kB) into this page's chunk, so every visit that just
+// checked an IP or hit reboot downloaded a terminal engine it never rendered.
+const WebSshTerminal = defineAsyncComponent(
+  () => import('@/components/WebSshTerminal.vue'),
+)
 import SshCredentialFields, { type SshCredModel } from '@/components/SshCredentialFields.vue'
 
 const route = useRoute()

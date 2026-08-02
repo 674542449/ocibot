@@ -446,12 +446,28 @@ onMounted(async () => {
   height: 160px;
   display: block;
 }
+/* An allowance is a bounded quantity, not a task in progress — the quarter ticks
+   let you read "about three quarters gone" without doing the division, which is
+   the question actually being asked of this bar. */
 .gauge-track {
+  position: relative;
   height: 10px;
-  background: var(--border);
-  border-radius: 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 3px;
   overflow: hidden;
   margin-top: 4px;
+}
+.gauge-track::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    to right,
+    transparent 0 calc(25% - 1px),
+    color-mix(in srgb, var(--text) 22%, transparent) calc(25% - 1px) 25%
+  );
 }
 .gauge-grid {
   display: grid;

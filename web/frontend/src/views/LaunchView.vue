@@ -1223,18 +1223,34 @@ onMounted(async () => {
   color: var(--text-secondary);
 }
 .quota-total {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
   font-size: 13px;
   font-weight: 700;
 }
 .quota-bar {
+  position: relative;
   height: 8px;
-  border-radius: 999px;
+  border-radius: 3px;
   background: var(--panel-2);
   border: 1px solid var(--border);
   overflow: hidden;
   margin: 0.3rem 0;
   /* Two segments side by side: current usage, then what this submit adds. */
   display: flex;
+}
+/* Quarter ticks — matches the allowance gauges on the usage page, so the same
+   quantity is read the same way wherever it appears. */
+.quota-bar::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    to right,
+    transparent 0 calc(25% - 1px),
+    color-mix(in srgb, var(--text) 22%, transparent) calc(25% - 1px) 25%
+  );
 }
 .quota-fill {
   height: 100%;
