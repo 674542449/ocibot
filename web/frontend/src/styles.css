@@ -2,27 +2,31 @@
 
 :root {
   color-scheme: light;
-  /* Surfaces. One continuous field: content is separated by hairlines and
-     space, not by a stack of white boxes on grey. */
-  --bg: #f7f7f9;
+  --bg: #dce2ed;
   --bg-glow-1: transparent;
   --bg-glow-2: transparent;
   --panel: #ffffff;
   --panel-solid: #ffffff;
-  --panel-2: #f0f0f3;
-  --border: #e4e4e9;
-  --border-strong: #cfcfd6;
-  --glass-border: #e4e4e9;
+  --panel-2: #e4eaf5;
+  --border: #c1c7d0;
+  --border-strong: #91959c;
+  --glass-border: #c1c7d0;
   --glass-highlight: 0 0 transparent;
-  /* Text */
-  --text: #14141a;
-  --muted: #6b6b78;
-  --text-secondary: #45454f;
-  /* Accent */
-  --accent: #4f46c4;
-  --accent-hover: #3d35a8;
-  --accent-soft: #ecebfa;
-  --accent-soft-2: #c7c3ef;
+  --text: #353639;
+  --muted: #66696e;
+  --text-secondary: #616368;
+  --accent: #4a41c0;
+  --accent-hover: #3b34a0;
+  --accent-soft: #eceafb;
+  --accent-soft-2: #c3bfee;
+  --danger: #c8242b;
+  --danger-soft: #fdecec;
+  --ok: #0a7f28;
+  --ok-soft: #e7f6ec;
+  --warn: #9a5800;
+  --warn-soft: #fbf1e2;
+  --input-bg: #ffffff;
+  --row-hover: #eef1f7;
   /* Effects */
   --radius: 6px;
   --radius-lg: 10px;
@@ -50,33 +54,31 @@
 /* Optional dark glass — keep text/surfaces high-contrast on charcoal */
 html[data-theme='dark'] {
   color-scheme: dark;
-  --bg: #0a0a0f;
+  --bg: #141415;
   --bg-glow-1: transparent;
   --bg-glow-2: transparent;
-  /* Panels sit barely above the field — enough to read as a surface, not
-     enough to look like a card pasted on top of it. */
-  --panel: #111117;
-  --panel-solid: #111117;
-  --panel-2: #17171f;
-  --border: #23232d;
-  --border-strong: #33333f;
-  --glass-border: #23232d;
+  --panel: #2b2c2e;
+  --panel-solid: #2b2c2e;
+  --panel-2: #38393c;
+  --border: #4d4f53;
+  --border-strong: #71757a;
+  --glass-border: #4d4f53;
   --glass-highlight: 0 0 transparent;
-  --text: #ececf2;
-  --muted: #82828f;
-  --text-secondary: #b4b4c0;
-  --accent: #8f86ff;
-  --accent-hover: #a9a2ff;
-  --accent-soft: #1e1b3a;
-  --accent-soft-2: #35306b;
-  --danger: #ff6b6b;
-  --danger-soft: #2e1618;
+  --text: #d5dbe5;
+  --muted: #9ea2aa;
+  --text-secondary: #b7bcc6;
+  --accent: #8a97ff;
+  --accent-hover: #a3adff;
+  --accent-soft: #2c2f4d;
+  --accent-soft-2: #454a78;
+  --danger: #ff7b76;
+  --danger-soft: #3a2325;
   --ok: #4ade80;
-  --ok-soft: #0f2a1c;
+  --ok-soft: #1d3327;
   --warn: #fbbf24;
-  --warn-soft: #2e2410;
-  --input-bg: #15151d;
-  --row-hover: #16161e;
+  --warn-soft: #39301c;
+  --input-bg: #38393c;
+  --row-hover: #303234;
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
   --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.45);
 }
@@ -407,7 +409,9 @@ code {
 }
 
 th {
-  background: var(--panel);
+  /* The second surface, not the panel itself — with them equal the header row
+     was indistinguishable from the data under it. */
+  background: var(--panel-2);
   position: sticky;
   top: 0;
   z-index: 1;
