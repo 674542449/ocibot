@@ -40,8 +40,8 @@
   --shadow-sm: 0 1px 2px rgba(20, 26, 40, 0.05);
   --shadow-md: 0 6px 20px rgba(20, 26, 40, 0.09);
   --blur: 0px;
-  /* Icon rail — one fixed width, no expanded state. */
-  --sidebar-w: 68px;
+  /* Labelled sidebar: an icon alone does not name a destination. */
+  --sidebar-w: 240px;
   --page-pad: clamp(1.25rem, 3.2vw, 2.75rem);
   --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", "JetBrains Mono", Consolas,
     Menlo, monospace;
@@ -129,11 +129,11 @@ textarea {
 button {
   cursor: pointer;
   border: 1px solid var(--border-strong);
-  background: rgba(255, 255, 255, 0.55);
+  background: var(--panel-solid);
   color: var(--text);
-  border-radius: 999px;
-  padding: 0.4rem 0.85rem;
-  min-height: 34px;
+  border-radius: var(--radius);
+  padding: 0.45rem 0.95rem;
+  min-height: 36px;
   touch-action: manipulation;
   transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease,
     box-shadow 0.15s ease, transform 0.12s ease;
@@ -250,7 +250,7 @@ textarea {
   padding: 0.5rem 0.75rem;
   min-height: 36px;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
-  box-shadow: var(--glass-highlight);
+  box-shadow: none;
 }
 
 @media (max-width: 900px) {
@@ -321,7 +321,8 @@ html[data-theme='dark'] option {
   gap: 0.75rem 1.5rem;
   justify-content: space-between;
   align-items: flex-start;
-  padding-bottom: 0.35rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
 }
 
 .page-head h2 {
@@ -401,6 +402,7 @@ th {
   text-transform: uppercase;
   color: var(--text-secondary);
   white-space: nowrap;
+  border-bottom: 1px solid var(--border-strong);
 }
 
 html[data-theme='dark'] th {
@@ -852,3 +854,66 @@ h3 {
     scroll-behavior: auto !important;
   }
 }
+
+/* ---------------------------------------------------------------------------
+   Shared page furniture
+   --------------------------------------------------------------------------- */
+
+/* Toolbars sit on the header baseline; controls keep one height so a row of
+   select + search + buttons reads as a single instrument, not a pile. */
+.page-tools > * {
+  flex: 0 0 auto;
+}
+
+.page-tools input[type='search'],
+.page-tools select {
+  width: auto;
+  min-width: 11rem;
+}
+
+/* A table row is a target. Hover says so; the accent edge marks where you are
+   without moving anything. */
+tbody tr {
+  transition: background 0.1s ease;
+}
+
+tbody tr:hover {
+  background: var(--row-hover);
+}
+
+/* "Nothing here" is a place to act from, not a shrug. Views that render an
+   empty message inside a card or a full-width cell get room and a centre. */
+.card > .empty,
+td.empty,
+.empty {
+  padding: 2.25rem 1rem;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+/* Card headings: one rhythm everywhere instead of per-view inline margins. */
+.card > h3,
+.card > h4 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 620;
+  letter-spacing: -0.01em;
+}
+
+.card > h3 + p,
+.card > h4 + p {
+  margin-top: 0.3rem;
+}
+
+/* Field labels read as labels, values read as values. */
+.field label {
+  letter-spacing: 0.01em;
+}
+
+/* Long machine strings in a cell wrap at the character, never widen the table. */
+td .mono {
+  word-break: break-all;
+}
+

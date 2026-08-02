@@ -666,112 +666,36 @@ onBeforeUnmount(() => {
 }
 
 /* ---------------------------------------------------------------------------
-   Icon rail
-   Permanent on desktop — one navigation shape, no state to remember or mis-set.
-   The mobile drawer below restores full labels, where there is room for them.
+   Sidebar
+   Icon plus label. The icon is recognition, the word is the answer — an
+   icon-only rail made every destination a guess.
    --------------------------------------------------------------------------- */
 
-/* Labels stay in the DOM at zero size so screen readers still announce them;
-   every link also carries an aria-label, and the tooltip covers sighted use. */
 .rail-label {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
+  min-width: 0;
   overflow: hidden;
-  clip-path: inset(50%);
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.brand,
-.nav a,
-.foot-btn,
-.locked-tenant {
-  justify-content: center;
-  padding-left: 0;
-  padding-right: 0;
-}
-
-.nav-section {
-  /* A group heading with no room for its words becomes a divider instead. */
-  height: 1px;
-  margin: 0.55rem 0.75rem;
-  padding: 0;
-  overflow: hidden;
-  text-indent: -999px;
-  background: var(--border);
-}
-
-/* Label on hover, since the icon alone does not name the destination. */
+/* Tooltips belong to the icon-only shape; the label is on screen now. */
 .rail-tip {
-  position: absolute;
-  left: calc(100% + 10px);
-  top: 50%;
-  transform: translateY(-50%) translateX(-4px);
-  padding: 0.32rem 0.6rem;
-  border-radius: var(--radius);
-  background: var(--panel-solid);
-  border: 1px solid var(--border-strong);
-  box-shadow: var(--shadow-md);
-  color: var(--text);
-  font-size: 12px;
-  font-weight: 500;
-  white-space: nowrap;
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity 0.12s ease, transform 0.12s ease;
-  z-index: 40;
-}
-
-.nav a:hover .rail-tip,
-.nav a:focus-visible .rail-tip,
-.foot-btn:hover .rail-tip,
-.foot-btn:focus-visible .rail-tip {
-  opacity: 1;
-  transform: translateY(-50%) translateX(0);
+  display: none;
 }
 
 .foot-btn {
-  position: relative;
   display: flex;
   align-items: center;
-  justify-content: center;
-  min-height: 40px;
+  gap: 0.6rem;
+  justify-content: flex-start;
+  min-height: 38px;
+  text-align: left;
 }
 
 .foot-ico {
   display: inline-flex;
   justify-content: center;
   flex-shrink: 0;
-}
-
-/* The rail is a desktop shape. The drawer has room for words, so it uses them. */
-@media (max-width: 900px) {
-  .rail-tip {
-    display: none;
-  }
-  .rail-label {
-    position: static;
-    width: auto;
-    height: auto;
-    overflow: visible;
-    clip-path: none;
-  }
-  .brand,
-  .nav a,
-  .foot-btn,
-  .locked-tenant {
-    justify-content: flex-start;
-    padding-left: 0.7rem;
-    padding-right: 0.7rem;
-    gap: 0.7rem;
-  }
-  .nav-section {
-    height: auto;
-    margin: 0.75rem 0.55rem 0.35rem;
-    overflow: visible;
-    text-indent: 0;
-    background: none;
-  }
+  opacity: 0.85;
 }
 </style>

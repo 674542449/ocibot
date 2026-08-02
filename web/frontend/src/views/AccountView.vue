@@ -82,7 +82,7 @@
           </thead>
           <tbody>
             <tr v-if="!(data.limits || []).length">
-              <td colspan="2" class="muted">无配额数据或无权限</td>
+              <td colspan="2" class="muted empty">无配额数据或无权限</td>
             </tr>
             <tr v-for="l in data.limits || []" :key="l.name">
               <td>{{ l.name }}</td>
@@ -149,7 +149,7 @@
           </thead>
           <tbody>
             <tr v-if="!(quota.instances || []).length">
-              <td colspan="4" class="muted">无运行中相关实例</td>
+              <td colspan="4" class="muted empty">无运行中相关实例</td>
             </tr>
             <tr v-for="inst in quota.instances || []" :key="inst.id">
               <td>
@@ -189,7 +189,7 @@
           </thead>
           <tbody>
             <tr v-if="!(quota.volumes || []).length">
-              <td colspan="4" class="muted">无卷数据</td>
+              <td colspan="4" class="muted empty">无卷数据</td>
             </tr>
             <tr v-for="v in quota.volumes || []" :key="v.id || v.display_name">
               <td>{{ v.display_name || shortId(v.id) }}</td>
@@ -264,7 +264,7 @@
           </thead>
           <tbody>
             <tr v-if="!(usage?.by_service || []).length">
-              <td colspan="2" class="muted">无服务拆分</td>
+              <td colspan="2" class="muted empty">无服务拆分</td>
             </tr>
             <tr v-for="s in usage?.by_service || []" :key="s.service">
               <td>{{ s.service }}</td>

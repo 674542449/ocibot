@@ -68,7 +68,7 @@
         </thead>
         <tbody>
           <tr v-if="!loading && filtered.length === 0">
-            <td colspan="9" class="muted">
+            <td colspan="9" class="muted empty">
               {{ instances.length ? '没有匹配搜索的实例' : '暂无实例。请先在「租户」添加 API，再「创建实例」。' }}
             </td>
           </tr>

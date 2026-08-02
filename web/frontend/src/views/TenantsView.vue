@@ -29,7 +29,7 @@
         </thead>
         <tbody>
           <tr v-if="tenants.length === 0">
-            <td colspan="7" class="muted">还没有租户，点击右上角添加，或粘贴原始 API 配置。</td>
+            <td colspan="7" class="muted empty">还没有租户，点击右上角添加，或粘贴原始 API 配置。</td>
           </tr>
           <tr v-for="t in orderedTenants" :key="t.id" :class="{ 'sub-row': !!t.parent_tenant_id }">
             <td class="name-cell">
@@ -42,7 +42,7 @@
                 :class="{ 'is-off': !isTenantLocked(t.id) }"
                 title="其他页面默认使用该租户"
               >
-                🔒 默认
+                <Icon name="lock" :size="12" /> 默认
               </span>
             </td>
             <td>
@@ -395,6 +395,7 @@ key_file=~/.oci/oci_api_key.pem"
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import api, { type Tenant, type TenantRegions } from '@/api/client'
+import Icon from '@/components/Icon.vue'
 import { isTenantLocked, lockTenant, unlockTenant } from '@/stores/tenantLock'
 import { pickAndReadTextFile } from '@/utils/file'
 // Row actions report through the fixed-position toast host, never through the
@@ -923,6 +924,11 @@ onMounted(async () => {
    the slot makes locking a pure repaint. */
 .lock-flag.is-off {
   visibility: hidden;
+}
+.lock-flag {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
 }
 /* 操作按钮保持一行：表格外层已有横向滚动，宁可让这一列滚动，
    也不让按钮折成两行把每行撑高一倍。 */

@@ -107,7 +107,7 @@
           </thead>
           <tbody>
             <tr v-if="channels.length === 0">
-              <td colspan="6" class="muted">尚未配置任何通知渠道。强烈建议配置——抢机成功后可第一时间收到推送。</td>
+              <td colspan="6" class="muted empty">尚未配置任何通知渠道。强烈建议配置——抢机成功后可第一时间收到推送。</td>
             </tr>
             <tr v-for="c in channels" :key="c.id">
               <td>{{ c.name }}</td>

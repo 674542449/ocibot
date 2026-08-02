@@ -333,7 +333,7 @@
             </thead>
             <tbody>
               <tr v-if="!(sl.rules || []).length">
-                <td colspan="4" class="muted">该安全列表没有规则</td>
+                <td colspan="4" class="muted empty">该安全列表没有规则</td>
               </tr>
               <tr v-for="(r, i) in sl.rules || []" :key="`${sl.id}-${i}`">
                 <td>{{ r.direction_label || r.direction }}</td>
@@ -377,7 +377,7 @@
           </thead>
           <tbody>
             <tr v-if="reservedIps.length === 0">
-              <td colspan="5" class="muted">该区域暂无保留 IP。「新建保留 IP」后即可绑定到实例。</td>
+              <td colspan="5" class="muted empty">该区域暂无保留 IP。「新建保留 IP」后即可绑定到实例。</td>
             </tr>
             <tr v-for="ip in reservedIps" :key="ip.id">
               <td
@@ -597,7 +597,7 @@
             </thead>
             <tbody>
               <tr v-if="backups.length === 0">
-                <td colspan="6" class="muted">暂无备份</td>
+                <td colspan="6" class="muted empty">暂无备份</td>
               </tr>
               <tr v-for="b in backups" :key="b.id">
                 <td>{{ b.display_name || b.id.slice(-12) }}</td>

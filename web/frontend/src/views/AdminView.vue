@@ -12,7 +12,9 @@
     <div class="card stack update-card">
       <div class="row" style="justify-content: space-between; align-items: flex-start; gap: 0.75rem">
         <div style="min-width: 0; flex: 1">
-          <h3 style="margin: 0">🔄 系统更新</h3>
+          <h3 style="margin: 0; display: flex; align-items: center; gap: 0.45rem">
+            <Icon name="refresh" :size="17" /> 系统更新
+          </h3>
           <p class="muted" style="margin: 0.25rem 0 0; font-size: 12px">
             定位宿主机仓库目录，执行与 SSH 相同的
             <code>bash scripts/install.sh update</code>
@@ -156,7 +158,10 @@
             <td>
               <span class="badge" :class="u.is_admin ? 'warn' : ''">{{ u.is_admin ? '管理员' : '用户' }}</span>
             </td>
-            <td>{{ u.totp_enabled ? '✅' : '—' }}</td>
+            <td>
+              <Icon v-if="u.totp_enabled" name="check" :size="16" class="ok-mark" />
+              <span v-else class="muted">—</span>
+            </td>
             <td>{{ u.tenant_count }}</td>
             <td>
               <span class="badge" :class="u.is_active ? 'running' : 'err'">
@@ -189,6 +194,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import api from '@/api/client'
+import Icon from '@/components/Icon.vue'
 import { useAuthStore } from '@/stores/auth'
 
 type AdminUser = {
@@ -570,5 +576,8 @@ onBeforeUnmount(() => {
   .update-actions button {
     flex: 1;
   }
+}
+.ok-mark {
+  color: var(--ok);
 }
 </style>

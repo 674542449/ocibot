@@ -47,7 +47,7 @@
           </thead>
           <tbody>
             <tr v-if="capacityJobs.length === 0">
-              <td colspan="7" class="muted">
+              <td colspan="7" class="muted empty">
                 暂无容量重试。可在「创建实例」勾选容量不足自动重试，成功后会显示在这里。
               </td>
             </tr>

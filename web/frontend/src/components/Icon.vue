@@ -116,6 +116,11 @@ withDefaults(
     <g v-else-if="name === 'menu'" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
       <path d="M4 7h16M4 12h16M4 17h16" />
     </g>
+    <!-- refresh / update -->
+    <g v-else-if="name === 'refresh'" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M20 12a8 8 0 1 1-2.4-5.7" />
+      <path d="M20 4v4.5h-4.5" />
+    </g>
     <!-- fallback circle -->
     <g v-else stroke="currentColor" stroke-width="1.7">
       <circle cx="12" cy="12" r="8" />

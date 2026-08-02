@@ -80,7 +80,7 @@
           </thead>
           <tbody>
             <tr v-if="!bootVolumes.length">
-              <td colspan="6" class="muted">暂无引导卷</td>
+              <td colspan="6" class="muted empty">暂无引导卷</td>
             </tr>
             <tr v-for="v in filteredBoot" :key="v.id">
               <td>
@@ -152,7 +152,7 @@
           </thead>
           <tbody>
             <tr v-if="!blockVolumes.length">
-              <td colspan="6" class="muted">暂无块卷</td>
+              <td colspan="6" class="muted empty">暂无块卷</td>
             </tr>
             <tr v-for="v in blockVolumes" :key="v.id">
               <td>
@@ -223,7 +223,7 @@
             </thead>
             <tbody>
               <tr v-if="!buckets.length">
-                <td colspan="4" class="muted">暂无存储桶</td>
+                <td colspan="4" class="muted empty">暂无存储桶</td>
               </tr>
               <tr v-for="b in buckets" :key="b.name">
                 <td>
@@ -264,7 +264,7 @@
             </thead>
             <tbody>
               <tr v-if="!objects.length">
-                <td colspan="4" class="muted">空桶或未加载</td>
+                <td colspan="4" class="muted empty">空桶或未加载</td>
               </tr>
               <tr v-for="o in objects" :key="o.name">
                 <td>{{ o.name }}</td>

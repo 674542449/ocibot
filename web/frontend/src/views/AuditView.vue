@@ -43,7 +43,7 @@
         </thead>
         <tbody>
           <tr v-if="!loading && rows.length === 0">
-            <td colspan="6" class="muted">暂无审计记录</td>
+            <td colspan="6" class="muted empty">暂无审计记录</td>
           </tr>
           <tr v-for="a in rows" :key="a.id">
             <td class="muted" style="font-size: 12px; white-space: nowrap">
