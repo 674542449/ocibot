@@ -215,7 +215,7 @@ const appVersion = ref('')
 let timer: number | undefined
 
 // Default light (ByteDance console style); respect saved preference.
-const theme = ref(localStorage.getItem('ocibot_theme') || 'light')
+const theme = ref(localStorage.getItem('ocibot_theme') || 'dark')
 
 function applyTheme() {
   document.documentElement.setAttribute('data-theme', theme.value)
@@ -339,8 +339,8 @@ onBeforeUnmount(() => {
 .sidebar {
   display: flex;
   flex-direction: column;
-  background: var(--panel);
-  border-right: 1px solid var(--glass-border);
+  background: transparent;
+  border-right: 1px solid var(--border);
   position: sticky;
   top: 0;
   height: 100vh;
@@ -352,9 +352,7 @@ onBeforeUnmount(() => {
   color: var(--text);
 }
 
-:global(html[data-theme='dark']) .sidebar {
-  box-shadow: var(--glass-highlight), 4px 0 24px rgba(0, 0, 0, 0.35);
-}
+
 
 .brand {
   display: flex;
@@ -492,27 +490,38 @@ onBeforeUnmount(() => {
 }
 
 .nav a:hover {
-  background: rgba(255, 255, 255, 0.45);
+  background: var(--row-hover);
   color: var(--text);
 }
 
-:global(html[data-theme='dark']) .nav a:hover {
-  background: rgba(255, 255, 255, 0.08);
-  color: var(--text);
-}
+
 
 .nav a.nav-active {
-  background: var(--accent-soft);
-  color: var(--accent);
+  background: transparent;
+  color: var(--text);
   font-weight: 600;
   border-color: transparent;
   box-shadow: none;
 }
 
-:global(html[data-theme='dark']) .nav a.nav-active {
-  border-color: rgba(91, 145, 255, 0.28);
-  color: #9ec0ff;
+.nav a.nav-active::before {
+  content: '';
+  position: absolute;
+  left: -0.6rem;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+  height: 18px;
+  border-radius: 0 2px 2px 0;
+  background: var(--accent);
 }
+
+.nav a.nav-active .nav-ico {
+  color: var(--accent);
+  opacity: 1;
+}
+
+
 
 .nav-ico {
   width: 1.25rem;

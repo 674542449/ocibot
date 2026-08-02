@@ -2,39 +2,30 @@
 
 :root {
   color-scheme: light;
-  /* Surfaces — opaque on purpose. Translucent panels blurred the one thing this
-     panel exists to show: dense columns of machine values. */
-  --bg: #e9ecf2;
-  --bg-glow-1: rgba(91, 91, 214, 0.10);
-  --bg-glow-2: rgba(91, 91, 214, 0.06);
+  /* Surfaces. One continuous field: content is separated by hairlines and
+     space, not by a stack of white boxes on grey. */
+  --bg: #f7f7f9;
+  --bg-glow-1: transparent;
+  --bg-glow-2: transparent;
   --panel: #ffffff;
   --panel-solid: #ffffff;
-  --panel-2: #f4f6fa;
-  --border: #dfe3ec;
-  --border-strong: #c6ccda;
-  --glass-border: #dfe3ec;
+  --panel-2: #f0f0f3;
+  --border: #e4e4e9;
+  --border-strong: #cfcfd6;
+  --glass-border: #e4e4e9;
   --glass-highlight: 0 0 transparent;
   /* Text */
-  --text: #171a21;
-  --muted: #626a79;
-  --text-secondary: #4b5464;
-  /* Accent — indigo. The four status hues (green / red / amber / grey) are
-     spoken for by machine state, and this panel is almost entirely status
-     reporting; indigo is the one hue that can never be misread as a state. */
+  --text: #14141a;
+  --muted: #6b6b78;
+  --text-secondary: #45454f;
+  /* Accent */
   --accent: #4f46c4;
   --accent-hover: #3d35a8;
   --accent-soft: #ecebfa;
   --accent-soft-2: #c7c3ef;
-  /* Status */
-  --danger: #c8242b;
-  --danger-soft: #fdeaea;
-  --ok: #0a7f28;
-  --ok-soft: #e6f6ea;
-  --warn: #9a5800;
-  --warn-soft: #fdf1e0;
   /* Effects */
-  --radius: 8px;
-  --radius-lg: 14px;
+  --radius: 6px;
+  --radius-lg: 10px;
   --input-bg: #ffffff;
   --row-hover: #f4f6fa;
   --shadow-sm: 0 1px 2px rgba(20, 26, 40, 0.05);
@@ -59,31 +50,33 @@
 /* Optional dark glass — keep text/surfaces high-contrast on charcoal */
 html[data-theme='dark'] {
   color-scheme: dark;
-  --bg: #0e0f14;
-  --bg-glow-1: rgba(124, 118, 240, 0.12);
-  --bg-glow-2: rgba(124, 118, 240, 0.07);
-  --panel: #171921;
-  --panel-solid: #171921;
-  --panel-2: #1e212b;
-  --border: #272b36;
-  --border-strong: #3a4050;
-  --glass-border: #272b36;
+  --bg: #0a0a0f;
+  --bg-glow-1: transparent;
+  --bg-glow-2: transparent;
+  /* Panels sit barely above the field — enough to read as a surface, not
+     enough to look like a card pasted on top of it. */
+  --panel: #111117;
+  --panel-solid: #111117;
+  --panel-2: #17171f;
+  --border: #23232d;
+  --border-strong: #33333f;
+  --glass-border: #23232d;
   --glass-highlight: 0 0 transparent;
-  --text: #f2f4f8;
-  --muted: #8b93a5;
-  --text-secondary: #bfc6d4;
-  --accent: #8b84f5;
-  --accent-hover: #a49ef8;
-  --accent-soft: #262444;
-  --accent-soft-2: #3d3a6b;
-  --danger: #ff7b76;
-  --danger-soft: rgba(90, 40, 38, 0.72);
-  --ok: #3dd68c;
-  --ok-soft: rgba(28, 68, 48, 0.72);
-  --warn: #f5b942;
-  --warn-soft: rgba(90, 64, 20, 0.72);
-  --input-bg: #1e212b;
-  --row-hover: #1e212b;
+  --text: #ececf2;
+  --muted: #82828f;
+  --text-secondary: #b4b4c0;
+  --accent: #8f86ff;
+  --accent-hover: #a9a2ff;
+  --accent-soft: #1e1b3a;
+  --accent-soft-2: #35306b;
+  --danger: #ff6b6b;
+  --danger-soft: #2e1618;
+  --ok: #4ade80;
+  --ok-soft: #0f2a1c;
+  --warn: #fbbf24;
+  --warn-soft: #2e2410;
+  --input-bg: #15151d;
+  --row-hover: #16161e;
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
   --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.45);
 }
@@ -129,7 +122,7 @@ textarea {
 button {
   cursor: pointer;
   border: 1px solid var(--border-strong);
-  background: var(--panel-solid);
+  background: transparent;
   color: var(--text);
   border-radius: var(--radius);
   padding: 0.45rem 0.95rem;
@@ -137,9 +130,14 @@ button {
   touch-action: manipulation;
   transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease,
     box-shadow 0.15s ease, transform 0.12s ease;
-  box-shadow: var(--glass-highlight), var(--shadow-sm);
+  box-shadow: none;
   font-weight: 550;
   font-size: 13px;
+}
+
+button:hover:not(:disabled) {
+  background: var(--row-hover);
+  border-color: var(--accent-soft-2);
 }
 
 html[data-theme='dark'] button:not(.primary):not(.danger):not(.ghost) {
@@ -288,11 +286,13 @@ html[data-theme='dark'] option {
 }
 
 .card {
+  /* A hairline, never a shadow. The old treatment stacked white boxes on grey
+     and every page turned into card soup; containment is enough. */
   background: var(--panel);
-  border: 1px solid var(--glass-border);
+  border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   padding: 1.35rem 1.5rem;
-  box-shadow: var(--glass-highlight), var(--shadow-sm);
+  box-shadow: none;
   max-width: 100%;
 }
 
@@ -327,9 +327,9 @@ html[data-theme='dark'] option {
 
 .page-head h2 {
   margin: 0;
-  font-size: clamp(1.35rem, 3.5vw, 1.75rem);
-  font-weight: 640;
-  letter-spacing: -0.022em;
+  font-size: clamp(1.5rem, 3.5vw, 2rem);
+  font-weight: 660;
+  letter-spacing: -0.03em;
   color: var(--text);
   word-break: break-word;
 }
@@ -358,11 +358,22 @@ html[data-theme='dark'] option {
 .table-wrap {
   overflow: auto;
   -webkit-overflow-scrolling: touch;
-  border: 1px solid var(--glass-border);
+  border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   max-width: 100%;
   background: var(--panel);
-  box-shadow: var(--glass-highlight), var(--shadow-sm);
+  box-shadow: none;
+}
+
+/* A table already inside a .card must not draw a second frame around itself. */
+.card.table-wrap {
+  padding: 0;
+}
+
+.card > .table-wrap {
+  border: none;
+  border-radius: 0;
+  background: transparent;
 }
 
 table {
@@ -374,11 +385,15 @@ table {
 th,
 td {
   text-align: left;
-  padding: 0.8rem 1rem;
+  padding: 0.95rem 1rem;
   border-bottom: 1px solid var(--border);
   vertical-align: middle;
   color: var(--text);
   font-variant-numeric: tabular-nums;
+}
+
+tbody tr:last-child td {
+  border-bottom: none;
 }
 
 /* Machine-generated values — identifiers, addresses, fingerprints, versions.
@@ -392,16 +407,18 @@ code {
 }
 
 th {
-  background: var(--panel-2);
+  background: var(--panel);
   position: sticky;
   top: 0;
   z-index: 1;
   font-weight: 600;
-  font-size: 11px;
-  letter-spacing: 0.06em;
+  font-size: 10px;
+  letter-spacing: 0.11em;
   text-transform: uppercase;
-  color: var(--text-secondary);
+  color: var(--muted);
   white-space: nowrap;
+  padding-top: 0.7rem;
+  padding-bottom: 0.7rem;
   border-bottom: 1px solid var(--border-strong);
 }
 
