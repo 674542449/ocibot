@@ -1,5 +1,5 @@
 <template>
-  <div class="layout" :class="{ 'nav-open': navOpen }">
+  <div class="layout" :class="{ 'nav-open': navOpen, 'rail-open': railOpen }">
     <div v-if="navOpen" class="nav-backdrop" @click="navOpen = false" />
 
     <header class="mobile-topbar">
@@ -20,7 +20,7 @@
 
     <aside class="sidebar">
       <div class="brand">
-        <img class="logo-img" src="/logo.svg" width="36" height="36" alt="OCIBot" />
+        <img class="logo-img" src="/logo.svg" width="30" height="30" alt="OCIBot" />
         <div class="brand-text">
           <div class="title">OCIBot</div>
           <div class="muted small truncate">
@@ -37,12 +37,27 @@
         </button>
       </div>
 
+      <!-- Pin/unpin the rail. Persisted, because which one you want depends on
+           the screen you are at, not on the session. -->
+      <button
+        type="button"
+        class="rail-toggle"
+        :aria-expanded="railOpen"
+        :aria-label="railOpen ? '收起导航' : '展开导航'"
+        @click="toggleRail"
+      >
+        <span class="rail-toggle-ico" aria-hidden="true">{{ railOpen ? '«' : '»' }}</span>
+        <span class="rail-label">收起导航</span>
+      </button>
+
       <!-- Always visible: a default tenant that silently applies on four pages
            would otherwise be an unexplained behaviour with no obvious way out. -->
       <div v-if="hasLockedTenant" class="locked-tenant" :title="`各页面默认使用「${lockedTenantName}」`">
         <span class="lock-ico" aria-hidden="true">🔒</span>
-        <span class="truncate">{{ lockedTenantName }}</span>
-        <button type="button" class="lock-x" title="取消锁定" @click="unlockTenant()">✕</button>
+        <span class="truncate rail-label">{{ lockedTenantName }}</span>
+        <button type="button" class="lock-x rail-label" title="取消锁定" @click="unlockTenant()">
+          ✕
+        </button>
       </div>
 
       <nav class="nav">
@@ -51,13 +66,15 @@
           v-for="item in primaryNav"
           :key="item.to"
           :to="item.to"
+          :aria-label="item.label"
           :class="{ 'nav-active': isNavActive(item) }"
           active-class=""
           exact-active-class=""
           @click="navOpen = false"
         >
-          <span class="nav-ico" aria-hidden="true"><Icon :name="item.icon" :size="18" /></span>
-          <span>{{ item.label }}</span>
+          <span class="nav-ico" aria-hidden="true"><Icon :name="item.icon" :size="19" /></span>
+          <span class="rail-label">{{ item.label }}</span>
+          <span class="rail-tip" aria-hidden="true">{{ item.label }}</span>
         </router-link>
 
         <div class="nav-section">资源</div>
@@ -65,13 +82,15 @@
           v-for="item in resourceNav"
           :key="item.to"
           :to="item.to"
+          :aria-label="item.label"
           :class="{ 'nav-active': isNavActive(item) }"
           active-class=""
           exact-active-class=""
           @click="navOpen = false"
         >
-          <span class="nav-ico" aria-hidden="true"><Icon :name="item.icon" :size="18" /></span>
-          <span>{{ item.label }}</span>
+          <span class="nav-ico" aria-hidden="true"><Icon :name="item.icon" :size="19" /></span>
+          <span class="rail-label">{{ item.label }}</span>
+          <span class="rail-tip" aria-hidden="true">{{ item.label }}</span>
         </router-link>
 
         <div class="nav-section">系统</div>
@@ -79,24 +98,39 @@
           v-for="item in systemNav"
           :key="item.to"
           :to="item.to"
+          :aria-label="item.label"
           :class="{ 'nav-active': isNavActive(item) }"
           active-class=""
           exact-active-class=""
           @click="navOpen = false"
         >
-          <span class="nav-ico" aria-hidden="true"><Icon :name="item.icon" :size="18" /></span>
-          <span>{{ item.label }}</span>
+          <span class="nav-ico" aria-hidden="true"><Icon :name="item.icon" :size="19" /></span>
+          <span class="rail-label">{{ item.label }}</span>
+          <span class="rail-tip" aria-hidden="true">{{ item.label }}</span>
         </router-link>
       </nav>
 
       <div class="sidebar-foot">
-        <div v-if="buildLabel" class="muted small build-label" :title="buildFull">
+        <div v-if="buildLabel" class="muted small build-label rail-label" :title="buildFull">
           v{{ appVersion }} · {{ buildLabel }}
         </div>
-        <button type="button" class="theme-btn-desktop ghost-btn" @click="toggleTheme">
-          {{ theme === 'light' ? '切换暗色' : '切换亮色' }}
+        <button
+          type="button"
+          class="theme-btn-desktop ghost-btn foot-btn"
+          :aria-label="theme === 'light' ? '切换暗色' : '切换亮色'"
+          @click="toggleTheme"
+        >
+          <span class="foot-ico" aria-hidden="true">{{ theme === 'light' ? '🌙' : '☀️' }}</span>
+          <span class="rail-label">{{ theme === 'light' ? '切换暗色' : '切换亮色' }}</span>
+          <span class="rail-tip" aria-hidden="true">
+            {{ theme === 'light' ? '切换暗色' : '切换亮色' }}
+          </span>
         </button>
-        <button type="button" class="ghost-btn" @click="onLogout">退出登录</button>
+        <button type="button" class="ghost-btn foot-btn" aria-label="退出登录" @click="onLogout">
+          <span class="foot-ico" aria-hidden="true">⏻</span>
+          <span class="rail-label">退出登录</span>
+          <span class="rail-tip" aria-hidden="true">退出登录</span>
+        </button>
       </div>
     </aside>
 
@@ -130,6 +164,20 @@ const auth = useAuthStore()
 const router = useRouter()
 const route = useRoute()
 const navOpen = ref(false)
+
+/** Pinned-open rail. Persisted: whether you want labels depends on the screen
+ *  you are sitting at, not on the session. */
+const RAIL_KEY = 'ocibot_rail_open'
+const railOpen = ref(localStorage.getItem(RAIL_KEY) === '1')
+
+function toggleRail() {
+  railOpen.value = !railOpen.value
+  try {
+    localStorage.setItem(RAIL_KEY, railOpen.value ? '1' : '0')
+  } catch {
+    // Private mode / storage disabled: the rail still toggles for this session.
+  }
+}
 
 type NavItem = {
   to: string
@@ -298,6 +346,13 @@ onBeforeUnmount(() => {
   min-height: 100vh;
   min-height: 100dvh;
   background: transparent;
+  /* No transition on grid-template-columns: Chrome fails to interpolate it here
+     and leaves the column stuck at its previous width until the next reload, so
+     the toggle appeared to do nothing. Snapping is correct and instant. */
+}
+
+.layout.rail-open {
+  grid-template-columns: var(--sidebar-w-open) 1fr;
 }
 
 .mobile-topbar,
@@ -315,11 +370,9 @@ onBeforeUnmount(() => {
   height: 100vh;
   height: 100dvh;
   max-height: 100dvh;
-  overflow: hidden;
+  overflow: visible;
   z-index: 20;
-  backdrop-filter: blur(22px) saturate(1.4);
-  -webkit-backdrop-filter: blur(22px) saturate(1.4);
-  box-shadow: var(--glass-highlight), 4px 0 24px rgba(15, 23, 42, 0.04);
+  box-shadow: none;
   color: var(--text);
 }
 
@@ -331,7 +384,7 @@ onBeforeUnmount(() => {
   display: flex;
   gap: 0.75rem;
   align-items: center;
-  padding: 1rem 1rem 0.85rem;
+  padding: 1rem 0.85rem 0.85rem;
   border-bottom: 1px solid var(--border);
 }
 
@@ -430,7 +483,8 @@ onBeforeUnmount(() => {
   -webkit-overflow-scrolling: touch;
   flex: 1;
   min-height: 0;
-  padding: 0.65rem 0.65rem 1rem;
+  padding: 0.65rem 0.6rem 1rem;
+  overflow-x: visible;
 }
 
 .nav-section {
@@ -447,14 +501,15 @@ onBeforeUnmount(() => {
 }
 
 .nav a {
+  position: relative;
   color: var(--text-secondary);
   padding: 0.55rem 0.7rem;
-  border-radius: 12px;
+  border-radius: var(--radius);
   border: 1px solid transparent;
-  min-height: 40px;
+  min-height: 42px;
   display: flex;
   align-items: center;
-  gap: 0.55rem;
+  gap: 0.7rem;
   font-weight: 500;
   transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease,
     box-shadow 0.12s ease;
@@ -474,8 +529,8 @@ onBeforeUnmount(() => {
   background: var(--accent-soft);
   color: var(--accent);
   font-weight: 600;
-  border-color: rgba(51, 112, 255, 0.12);
-  box-shadow: var(--glass-highlight);
+  border-color: transparent;
+  box-shadow: none;
 }
 
 :global(html[data-theme='dark']) .nav a.nav-active {
@@ -528,8 +583,8 @@ onBeforeUnmount(() => {
 .main {
   min-width: 0;
   max-width: 100%;
-  padding: 1.15rem 1.35rem 1.5rem;
-  padding-bottom: max(1.5rem, env(safe-area-inset-bottom));
+  padding: var(--page-pad);
+  padding-bottom: max(var(--page-pad), env(safe-area-inset-bottom));
 }
 
 .sidebar-close {
@@ -631,6 +686,160 @@ onBeforeUnmount(() => {
 
   .main {
     padding: 0.85rem 0.75rem 1.25rem;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   Icon rail
+   Collapsed by default; the pinned state widens the grid column so content is
+   pushed rather than covered — an overlay that hides the table you were reading
+   is worse than a narrower table.
+   --------------------------------------------------------------------------- */
+
+/* Text that only exists when the rail is pinned open. Kept in the DOM at zero
+   width so screen readers still announce it; the links also carry aria-label. */
+.layout:not(.rail-open) .rail-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.layout:not(.rail-open) .brand {
+  justify-content: center;
+  padding-left: 0;
+  padding-right: 0;
+}
+
+.layout:not(.rail-open) .nav a,
+.layout:not(.rail-open) .foot-btn,
+.layout:not(.rail-open) .rail-toggle {
+  justify-content: center;
+  padding-left: 0;
+  padding-right: 0;
+}
+
+.layout:not(.rail-open) .nav-section {
+  /* A group heading with no room for its words becomes a divider instead. */
+  height: 1px;
+  margin: 0.55rem 0.75rem;
+  overflow: hidden;
+  text-indent: -999px;
+  background: var(--border);
+}
+
+.layout:not(.rail-open) .locked-tenant {
+  justify-content: center;
+}
+
+/* Label on hover, since the icon alone does not name the destination. */
+.rail-tip {
+  position: absolute;
+  left: calc(100% + 10px);
+  top: 50%;
+  transform: translateY(-50%) translateX(-4px);
+  padding: 0.32rem 0.6rem;
+  border-radius: var(--radius);
+  background: var(--panel-solid);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-md);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.12s ease, transform 0.12s ease;
+  z-index: 40;
+}
+
+.layout:not(.rail-open) .nav a:hover .rail-tip,
+.layout:not(.rail-open) .nav a:focus-visible .rail-tip,
+.layout:not(.rail-open) .foot-btn:hover .rail-tip,
+.layout:not(.rail-open) .foot-btn:focus-visible .rail-tip {
+  opacity: 1;
+  transform: translateY(-50%) translateX(0);
+}
+
+.layout.rail-open .rail-tip {
+  display: none;
+}
+
+.rail-toggle {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  margin: 0.6rem 0.6rem 0;
+  padding: 0.4rem 0.7rem;
+  min-height: 34px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  box-shadow: none;
+}
+
+.rail-toggle:hover {
+  background: var(--row-hover);
+  color: var(--text);
+}
+
+.rail-toggle-ico {
+  font-size: 14px;
+  line-height: 1;
+}
+
+.foot-btn {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  justify-content: flex-start;
+  min-height: 40px;
+}
+
+.foot-ico {
+  width: 1.2rem;
+  display: inline-flex;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+/* The rail is a desktop affordance; the mobile drawer always shows full labels. */
+@media (max-width: 900px) {
+  .layout.rail-open {
+    grid-template-columns: 1fr;
+  }
+  .rail-toggle,
+  .rail-tip {
+    display: none;
+  }
+  .layout:not(.rail-open) .rail-label {
+    position: static;
+    width: auto;
+    height: auto;
+    overflow: visible;
+    clip-path: none;
+  }
+  .layout:not(.rail-open) .brand,
+  .layout:not(.rail-open) .nav a,
+  .layout:not(.rail-open) .foot-btn,
+  .layout:not(.rail-open) .locked-tenant {
+    justify-content: flex-start;
+    padding-left: 0.7rem;
+    padding-right: 0.7rem;
+  }
+  .layout:not(.rail-open) .nav-section {
+    height: auto;
+    margin: 0.75rem 0.55rem 0.35rem;
+    overflow: visible;
+    text-indent: 0;
+    background: none;
   }
 }
 </style>
