@@ -1,63 +1,112 @@
 <template>
   <div class="login-page">
-    <form class="login-card stack" @submit.prevent="submit">
-      <div class="login-brand">
-        <img class="logo-img" src="/logo.svg" width="44" height="44" alt="OCIBot" />
+    <!-- Identity canvas. Deliberately dark in both themes: this is the threshold
+         into the panel, and a surface that commits to one look reads as designed
+         rather than as a page that happens to inherit whatever is set. -->
+    <section class="canvas" aria-hidden="true">
+      <div class="grid-field"></div>
+      <div class="sweep"></div>
+
+      <div class="canvas-inner">
+        <img class="mark" src="/logo.svg" width="28" height="28" alt="" />
+        <h1 class="wordmark">OCIBOT</h1>
+        <p class="lede">在一处管理跨账号、跨区域的服务器。</p>
+      </div>
+
+      <!-- Real, not decorative: the build you are about to sign in to. -->
+      <dl v-if="health.version" class="readout">
         <div>
-          <h1>OCIBot</h1>
-          <p class="muted">Oracle Cloud 多租户实例管理</p>
+          <dt>版本</dt>
+          <dd>v{{ health.version }}</dd>
         </div>
-      </div>
+        <div>
+          <dt>服务</dt>
+          <dd><i class="dot"></i>正常</dd>
+        </div>
+      </dl>
+    </section>
 
-      <div class="mode-tabs">
-        <button type="button" :class="{ active: mode === 'login' }" @click="mode = 'login'">
-          登录
+    <section class="form-side">
+      <form class="login-form stack" @submit.prevent="submit">
+        <header class="form-head">
+          <h2>{{ mode === 'login' ? '登录' : '创建账号' }}</h2>
+          <p class="muted">
+            {{ mode === 'login' ? '使用你的面板账号继续。' : '第一个注册的账号将成为管理员。' }}
+          </p>
+        </header>
+
+        <div class="mode-tabs" role="tablist">
+          <button
+            type="button"
+            role="tab"
+            :aria-selected="mode === 'login'"
+            :class="{ active: mode === 'login' }"
+            @click="mode = 'login'"
+          >
+            登录
+          </button>
+          <button
+            type="button"
+            role="tab"
+            :aria-selected="mode === 'register'"
+            :class="{ active: mode === 'register' }"
+            @click="mode = 'register'"
+          >
+            注册
+          </button>
+        </div>
+
+        <div class="field">
+          <label for="login-user">用户名</label>
+          <input
+            id="login-user"
+            v-model="username"
+            autocomplete="username"
+            required
+            minlength="3"
+          />
+        </div>
+        <div class="field">
+          <label for="login-pass">密码</label>
+          <input
+            id="login-pass"
+            v-model="password"
+            type="password"
+            autocomplete="current-password"
+            required
+            minlength="8"
+          />
+        </div>
+        <div v-if="needTotp" class="field">
+          <label for="login-totp">两步验证码</label>
+          <input
+            id="login-totp"
+            v-model="totpCode"
+            class="totp"
+            inputmode="numeric"
+            autocomplete="one-time-code"
+            maxlength="6"
+            placeholder="000000"
+          />
+        </div>
+
+        <div v-if="error" class="error-box">{{ error }}</div>
+        <div v-if="hint" class="success-box">{{ hint }}</div>
+
+        <button class="primary submit" type="submit" :disabled="loading">
+          {{ loading ? '请稍候…' : mode === 'login' ? '登录' : '创建账号' }}
         </button>
-        <button type="button" :class="{ active: mode === 'register' }" @click="mode = 'register'">
-          注册
-        </button>
-      </div>
 
-      <div class="field">
-        <label>用户名</label>
-        <input v-model="username" autocomplete="username" required minlength="3" />
-      </div>
-      <div class="field">
-        <label>密码</label>
-        <input
-          v-model="password"
-          type="password"
-          autocomplete="current-password"
-          required
-          minlength="8"
-        />
-      </div>
-      <div v-if="needTotp" class="field">
-        <label>两步验证码（6 位）</label>
-        <input
-          v-model="totpCode"
-          inputmode="numeric"
-          autocomplete="one-time-code"
-          placeholder="123456"
-        />
-      </div>
-
-      <div v-if="error" class="error-box">{{ error }}</div>
-      <div v-if="hint" class="success-box">{{ hint }}</div>
-
-      <button class="primary submit" type="submit" :disabled="loading">
-        {{ loading ? '请稍候…' : mode === 'login' ? '登录' : '创建账号' }}
-      </button>
-      <p class="muted tip">
-        首次注册自动成为管理员。OCI 私钥仅服务端加密存储，不会进入浏览器。
-      </p>
-    </form>
+        <p class="muted tip">API 私钥仅在服务端加密存储，不会进入浏览器。</p>
+      </form>
+    </section>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import api from '@/api/client'
 import { useAuthStore } from '@/stores/auth'
 
 const auth = useAuthStore()
@@ -72,6 +121,19 @@ const needTotp = ref(false)
 const loading = ref(false)
 const error = ref('')
 const hint = ref('')
+
+/** Version of the running build, read before sign-in (/api/health is public). */
+const health = reactive<{ version: string }>({ version: '' })
+
+onMounted(async () => {
+  try {
+    const { data } = await api.get<{ version?: string }>('/health')
+    health.version = String(data?.version || '')
+  } catch {
+    // Silent: an unreachable health endpoint is not the sign-in form's problem,
+    // and an error here would sit above the field the operator came to fill in.
+  }
+})
 
 /** Only follow same-origin in-app paths, never an attacker-supplied absolute URL. */
 function safeRedirect(raw: unknown): string {
@@ -113,59 +175,170 @@ async function submit() {
   min-height: 100vh;
   min-height: 100dvh;
   display: grid;
-  place-items: center;
-  padding: 1.25rem;
-  padding-top: max(1.25rem, env(safe-area-inset-top));
-  padding-bottom: max(1.25rem, env(safe-area-inset-bottom));
-  background:
-    radial-gradient(900px 420px at 10% -10%, var(--bg-glow-1), transparent),
-    radial-gradient(700px 380px at 100% 0%, var(--bg-glow-2), transparent),
-    var(--bg);
+  grid-template-columns: 1.05fr 0.95fr;
   color: var(--text);
+  background: var(--bg);
 }
 
-.login-card {
-  width: min(420px, 100%);
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 16px;
-  padding: 1.5rem 1.4rem 1.35rem;
-  box-shadow: var(--shadow-md);
-}
+/* ---------------------------------------------------------------- canvas */
 
-.login-brand {
+.canvas {
+  position: relative;
+  overflow: hidden;
   display: flex;
-  gap: 0.85rem;
-  align-items: center;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: clamp(2rem, 5vw, 4rem);
+  /* Fixed palette, not tokens: this panel keeps its look in either theme. */
+  background: #0b0d16;
+  color: #eef0fa;
 }
 
-.logo-img {
-  width: 44px;
-  height: 44px;
-  border-radius: 12px;
+/* A machined surface rather than a gradient wash — the panel is an instrument. */
+.grid-field {
+  position: absolute;
+  inset: -1px;
+  pointer-events: none;
+  background-image:
+    linear-gradient(to right, rgba(139, 132, 245, 0.09) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(139, 132, 245, 0.09) 1px, transparent 1px);
+  background-size: 46px 46px;
+  mask-image: radial-gradient(120% 90% at 20% 15%, #000 35%, transparent 78%);
+  -webkit-mask-image: radial-gradient(120% 90% at 20% 15%, #000 35%, transparent 78%);
+}
+
+/* The single moving element on the page. It reads as an instrument refreshing,
+   which is what this product actually does — it waits and watches for capacity.
+   One slow orchestrated motion; nothing else on the page animates. */
+.sweep {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 140px;
+  pointer-events: none;
+  background: linear-gradient(
+    to bottom,
+    transparent,
+    rgba(139, 132, 245, 0.13) 62%,
+    rgba(196, 192, 255, 0.5) 78%,
+    transparent 79%
+  );
+  animation: sweep 9s cubic-bezier(0.45, 0, 0.25, 1) infinite;
+}
+
+@keyframes sweep {
+  0% {
+    transform: translateY(-140px);
+    opacity: 0;
+  }
+  12% {
+    opacity: 1;
+  }
+  88% {
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(100vh);
+    opacity: 0;
+  }
+}
+
+.canvas-inner {
+  position: relative;
+  margin-top: auto;
+  margin-bottom: auto;
+}
+
+.mark {
   display: block;
-  box-shadow: 0 6px 16px rgba(51, 112, 255, 0.35);
-  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  margin-bottom: 1.6rem;
+  opacity: 0.9;
 }
 
-.logo {
-  width: 44px;
-  height: 44px;
-  border-radius: 12px;
+.wordmark {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: clamp(2.4rem, 6.4vw, 4.25rem);
+  font-weight: 600;
+  letter-spacing: -0.045em;
+  line-height: 0.95;
+  color: #fff;
+}
+
+.lede {
+  margin: 1.15rem 0 0;
+  max-width: 22ch;
+  font-size: clamp(0.95rem, 1.6vw, 1.1rem);
+  line-height: 1.6;
+  color: rgba(238, 240, 250, 0.62);
+}
+
+.readout {
+  position: relative;
+  display: flex;
+  gap: 2.5rem;
+  margin: 0;
+}
+
+.readout div {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.readout dt {
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  /* 0.42 measured 3.73:1 against the canvas — too low for 10px type. */
+  color: rgba(238, 240, 250, 0.55);
+}
+
+.readout dd {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  color: rgba(238, 240, 250, 0.92);
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #3dd68c;
+  box-shadow: 0 0 0 3px rgba(61, 214, 140, 0.16);
+}
+
+/* ------------------------------------------------------------- form side */
+
+.form-side {
   display: grid;
   place-items: center;
-  font-weight: 700;
-  color: #fff;
-  background: linear-gradient(135deg, #3370ff, #6b4eff);
-  box-shadow: 0 6px 16px rgba(51, 112, 255, 0.35);
-  flex-shrink: 0;
+  padding: clamp(1.5rem, 4vw, 3rem);
+  padding-top: max(1.5rem, env(safe-area-inset-top));
+  padding-bottom: max(1.5rem, env(safe-area-inset-bottom));
 }
 
-h1 {
+.login-form {
+  width: min(370px, 100%);
+}
+
+.form-head h2 {
   margin: 0;
-  font-size: clamp(1.25rem, 4.5vw, 1.45rem);
+  font-size: 1.5rem;
   font-weight: 650;
   letter-spacing: -0.02em;
+}
+
+.form-head p {
+  margin: 0.35rem 0 0;
+  font-size: 13px;
 }
 
 .mode-tabs {
@@ -174,7 +347,7 @@ h1 {
   gap: 0.25rem;
   padding: 0.25rem;
   background: var(--panel-2);
-  border-radius: 10px;
+  border-radius: var(--radius);
   border: 1px solid var(--border);
 }
 
@@ -183,7 +356,7 @@ h1 {
   box-shadow: none;
   background: transparent;
   color: var(--text-secondary);
-  min-height: 36px;
+  min-height: 34px;
   font-weight: 560;
 }
 
@@ -191,6 +364,14 @@ h1 {
   background: var(--panel);
   color: var(--accent);
   box-shadow: var(--shadow-sm);
+}
+
+/* A six-digit code is read back digit by digit — space it like a keypad. */
+.totp {
+  font-family: var(--font-mono);
+  font-size: 1.1rem;
+  letter-spacing: 0.4em;
+  text-align: center;
 }
 
 .submit {
@@ -203,5 +384,47 @@ h1 {
   margin: 0;
   font-size: 12px;
   line-height: 1.55;
+}
+
+/* ------------------------------------------------------------ responsive */
+
+@media (max-width: 860px) {
+  .login-page {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 1fr;
+  }
+  .canvas {
+    padding: 1.75rem 1.5rem 1.5rem;
+  }
+  .canvas-inner {
+    margin: 0;
+  }
+  .mark {
+    margin-bottom: 1rem;
+  }
+  .wordmark {
+    font-size: 2rem;
+  }
+  .lede {
+    margin-top: 0.6rem;
+    font-size: 0.9rem;
+    max-width: none;
+  }
+  .readout {
+    margin-top: 1.5rem;
+    gap: 1.75rem;
+  }
+  .sweep {
+    animation-duration: 7s;
+  }
+}
+
+/* The sweep is ambience, not information — it is the first thing to go. The
+   global reduced-motion rule also neutralises it; this keeps it off even if
+   that rule is ever scoped differently. */
+@media (prefers-reduced-motion: reduce) {
+  .sweep {
+    display: none;
+  }
 }
 </style>
