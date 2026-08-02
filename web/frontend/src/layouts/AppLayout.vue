@@ -1,9 +1,11 @@
 <template>
-  <div class="layout" :class="{ 'nav-open': navOpen, 'rail-open': railOpen }">
+  <div class="layout" :class="{ 'nav-open': navOpen }">
     <div v-if="navOpen" class="nav-backdrop" @click="navOpen = false" />
 
     <header class="mobile-topbar">
-      <button type="button" class="icon-btn" aria-label="打开菜单" @click="navOpen = true">☰</button>
+      <button type="button" class="icon-btn" aria-label="打开菜单" @click="navOpen = true">
+        <Icon name="menu" :size="20" />
+      </button>
       <div class="mobile-brand">
         <span class="title">OCIBot</span>
         <span class="muted small">{{ pageTitle }}</span>
@@ -12,9 +14,10 @@
         type="button"
         class="icon-btn"
         :title="theme === 'light' ? '暗色' : '亮色'"
+        :aria-label="theme === 'light' ? '切换暗色' : '切换亮色'"
         @click="toggleTheme"
       >
-        {{ theme === 'light' ? '🌙' : '☀️' }}
+        <Icon :name="theme === 'light' ? 'moon' : 'sun'" :size="19" />
       </button>
     </header>
 
@@ -33,30 +36,18 @@
           aria-label="关闭菜单"
           @click="navOpen = false"
         >
-          ✕
+          <Icon name="close" :size="18" />
         </button>
       </div>
 
-      <!-- Pin/unpin the rail. Persisted, because which one you want depends on
-           the screen you are at, not on the session. -->
-      <button
-        type="button"
-        class="rail-toggle"
-        :aria-expanded="railOpen"
-        :aria-label="railOpen ? '收起导航' : '展开导航'"
-        @click="toggleRail"
-      >
-        <span class="rail-toggle-ico" aria-hidden="true">{{ railOpen ? '«' : '»' }}</span>
-        <span class="rail-label">收起导航</span>
-      </button>
 
       <!-- Always visible: a default tenant that silently applies on four pages
            would otherwise be an unexplained behaviour with no obvious way out. -->
       <div v-if="hasLockedTenant" class="locked-tenant" :title="`各页面默认使用「${lockedTenantName}」`">
-        <span class="lock-ico" aria-hidden="true">🔒</span>
+        <span class="lock-ico" aria-hidden="true"><Icon name="lock" :size="16" /></span>
         <span class="truncate rail-label">{{ lockedTenantName }}</span>
         <button type="button" class="lock-x rail-label" title="取消锁定" @click="unlockTenant()">
-          ✕
+          <Icon name="close" :size="14" />
         </button>
       </div>
 
@@ -120,14 +111,16 @@
           :aria-label="theme === 'light' ? '切换暗色' : '切换亮色'"
           @click="toggleTheme"
         >
-          <span class="foot-ico" aria-hidden="true">{{ theme === 'light' ? '🌙' : '☀️' }}</span>
+          <span class="foot-ico" aria-hidden="true">
+            <Icon :name="theme === 'light' ? 'moon' : 'sun'" :size="18" />
+          </span>
           <span class="rail-label">{{ theme === 'light' ? '切换暗色' : '切换亮色' }}</span>
           <span class="rail-tip" aria-hidden="true">
             {{ theme === 'light' ? '切换暗色' : '切换亮色' }}
           </span>
         </button>
         <button type="button" class="ghost-btn foot-btn" aria-label="退出登录" @click="onLogout">
-          <span class="foot-ico" aria-hidden="true">⏻</span>
+          <span class="foot-ico" aria-hidden="true"><Icon name="logout" :size="18" /></span>
           <span class="rail-label">退出登录</span>
           <span class="rail-tip" aria-hidden="true">退出登录</span>
         </button>
@@ -165,19 +158,6 @@ const router = useRouter()
 const route = useRoute()
 const navOpen = ref(false)
 
-/** Pinned-open rail. Persisted: whether you want labels depends on the screen
- *  you are sitting at, not on the session. */
-const RAIL_KEY = 'ocibot_rail_open'
-const railOpen = ref(localStorage.getItem(RAIL_KEY) === '1')
-
-function toggleRail() {
-  railOpen.value = !railOpen.value
-  try {
-    localStorage.setItem(RAIL_KEY, railOpen.value ? '1' : '0')
-  } catch {
-    // Private mode / storage disabled: the rail still toggles for this session.
-  }
-}
 
 type NavItem = {
   to: string
@@ -349,10 +329,6 @@ onBeforeUnmount(() => {
   /* No transition on grid-template-columns: Chrome fails to interpolate it here
      and leaves the column stuck at its previous width until the next reload, so
      the toggle appeared to do nothing. Snapping is correct and instant. */
-}
-
-.layout.rail-open {
-  grid-template-columns: var(--sidebar-w-open) 1fr;
 }
 
 .mobile-topbar,
@@ -691,14 +667,13 @@ onBeforeUnmount(() => {
 
 /* ---------------------------------------------------------------------------
    Icon rail
-   Collapsed by default; the pinned state widens the grid column so content is
-   pushed rather than covered — an overlay that hides the table you were reading
-   is worse than a narrower table.
+   Permanent on desktop — one navigation shape, no state to remember or mis-set.
+   The mobile drawer below restores full labels, where there is room for them.
    --------------------------------------------------------------------------- */
 
-/* Text that only exists when the rail is pinned open. Kept in the DOM at zero
-   width so screen readers still announce it; the links also carry aria-label. */
-.layout:not(.rail-open) .rail-label {
+/* Labels stay in the DOM at zero size so screen readers still announce them;
+   every link also carries an aria-label, and the tooltip covers sighted use. */
+.rail-label {
   position: absolute;
   width: 1px;
   height: 1px;
@@ -708,31 +683,23 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
-.layout:not(.rail-open) .brand {
+.brand,
+.nav a,
+.foot-btn,
+.locked-tenant {
   justify-content: center;
   padding-left: 0;
   padding-right: 0;
 }
 
-.layout:not(.rail-open) .nav a,
-.layout:not(.rail-open) .foot-btn,
-.layout:not(.rail-open) .rail-toggle {
-  justify-content: center;
-  padding-left: 0;
-  padding-right: 0;
-}
-
-.layout:not(.rail-open) .nav-section {
+.nav-section {
   /* A group heading with no room for its words becomes a divider instead. */
   height: 1px;
   margin: 0.55rem 0.75rem;
+  padding: 0;
   overflow: hidden;
   text-indent: -999px;
   background: var(--border);
-}
-
-.layout:not(.rail-open) .locked-tenant {
-  justify-content: center;
 }
 
 /* Label on hover, since the icon alone does not name the destination. */
@@ -756,85 +723,50 @@ onBeforeUnmount(() => {
   z-index: 40;
 }
 
-.layout:not(.rail-open) .nav a:hover .rail-tip,
-.layout:not(.rail-open) .nav a:focus-visible .rail-tip,
-.layout:not(.rail-open) .foot-btn:hover .rail-tip,
-.layout:not(.rail-open) .foot-btn:focus-visible .rail-tip {
+.nav a:hover .rail-tip,
+.nav a:focus-visible .rail-tip,
+.foot-btn:hover .rail-tip,
+.foot-btn:focus-visible .rail-tip {
   opacity: 1;
   transform: translateY(-50%) translateX(0);
-}
-
-.layout.rail-open .rail-tip {
-  display: none;
-}
-
-.rail-toggle {
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 0.7rem;
-  margin: 0.6rem 0.6rem 0;
-  padding: 0.4rem 0.7rem;
-  min-height: 34px;
-  border: 1px solid transparent;
-  border-radius: var(--radius);
-  background: transparent;
-  color: var(--muted);
-  font-size: 12px;
-  box-shadow: none;
-}
-
-.rail-toggle:hover {
-  background: var(--row-hover);
-  color: var(--text);
-}
-
-.rail-toggle-ico {
-  font-size: 14px;
-  line-height: 1;
 }
 
 .foot-btn {
   position: relative;
   display: flex;
   align-items: center;
-  gap: 0.7rem;
-  justify-content: flex-start;
+  justify-content: center;
   min-height: 40px;
 }
 
 .foot-ico {
-  width: 1.2rem;
   display: inline-flex;
   justify-content: center;
   flex-shrink: 0;
 }
 
-/* The rail is a desktop affordance; the mobile drawer always shows full labels. */
+/* The rail is a desktop shape. The drawer has room for words, so it uses them. */
 @media (max-width: 900px) {
-  .layout.rail-open {
-    grid-template-columns: 1fr;
-  }
-  .rail-toggle,
   .rail-tip {
     display: none;
   }
-  .layout:not(.rail-open) .rail-label {
+  .rail-label {
     position: static;
     width: auto;
     height: auto;
     overflow: visible;
     clip-path: none;
   }
-  .layout:not(.rail-open) .brand,
-  .layout:not(.rail-open) .nav a,
-  .layout:not(.rail-open) .foot-btn,
-  .layout:not(.rail-open) .locked-tenant {
+  .brand,
+  .nav a,
+  .foot-btn,
+  .locked-tenant {
     justify-content: flex-start;
     padding-left: 0.7rem;
     padding-right: 0.7rem;
+    gap: 0.7rem;
   }
-  .layout:not(.rail-open) .nav-section {
+  .nav-section {
     height: auto;
     margin: 0.75rem 0.55rem 0.35rem;
     overflow: visible;

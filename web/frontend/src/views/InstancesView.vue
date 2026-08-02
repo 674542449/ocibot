@@ -226,14 +226,38 @@
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   white-space: nowrap;
 }
+/* Anchored to the viewport, not to the document. As a sticky card in the flow it
+   appeared above the table and pushed every row down the moment you ticked a
+   checkbox — the row you had just clicked slid out from under the cursor. Here it
+   floats over the content, so selecting changes nothing about the table's
+   position. */
 .batch-bar {
-  position: sticky;
-  top: 0.5rem;
-  z-index: 5;
-  gap: 0.75rem;
+  position: fixed;
+  left: 50%;
+  bottom: max(1.25rem, env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  z-index: 30;
+  gap: 0.9rem;
+  width: max-content;
+  max-width: min(calc(100vw - 2rem), 760px);
+  padding: 0.7rem 1.1rem;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-md);
+  background: var(--panel-solid);
 }
+
 .batch-bar strong {
   font-size: 13px;
+  white-space: nowrap;
+}
+
+/* The rail is fixed-width, so centring on the viewport would sit slightly left
+   of the content it acts on. Nudge it back over the table. */
+@media (min-width: 901px) {
+  .batch-bar {
+    left: calc(50% + var(--sidebar-w) / 2);
+  }
 }
 </style>
 

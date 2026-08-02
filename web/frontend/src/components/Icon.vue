@@ -1,4 +1,4 @@
-"""Shared icons for sidebar / headers (inline SVG, currentColor)."""
+<!-- Shared icons (inline SVG, currentColor) for the shell and page headers. -->
 
 <script setup lang="ts">
 withDefaults(
@@ -86,6 +86,35 @@ withDefaults(
     <!-- check -->
     <g v-else-if="name === 'check'" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
       <path d="M5 12.5 10 17.5 19 7" />
+    </g>
+    <!-- theme: moon -->
+    <g v-else-if="name === 'moon'" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M20 13.4A8.2 8.2 0 0 1 10.6 4a8.5 8.5 0 1 0 9.4 9.4Z" />
+    </g>
+    <!-- theme: sun -->
+    <g v-else-if="name === 'sun'" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="4" />
+      <path
+        d="M12 2.8v2.4M12 18.8v2.4M4.8 4.8l1.7 1.7M17.5 17.5l1.7 1.7M2.8 12h2.4M18.8 12h2.4M4.8 19.2l1.7-1.7M17.5 6.5l1.7-1.7"
+      />
+    </g>
+    <!-- logout: power -->
+    <g v-else-if="name === 'logout'" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 3.5v8" />
+      <path d="M7.3 6.6a7.5 7.5 0 1 0 9.4 0" />
+    </g>
+    <!-- locked tenant -->
+    <g v-else-if="name === 'lock'" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="5" y="10.5" width="14" height="9.5" rx="2" />
+      <path d="M8.2 10.5V8a3.8 3.8 0 0 1 7.6 0v2.5" />
+    </g>
+    <!-- close -->
+    <g v-else-if="name === 'close'" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <path d="M6.5 6.5l11 11M17.5 6.5l-11 11" />
+    </g>
+    <!-- menu -->
+    <g v-else-if="name === 'menu'" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <path d="M4 7h16M4 12h16M4 17h16" />
     </g>
     <!-- fallback circle -->
     <g v-else stroke="currentColor" stroke-width="1.7">
