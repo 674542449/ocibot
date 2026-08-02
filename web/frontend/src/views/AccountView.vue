@@ -4,7 +4,7 @@
       <div>
         <h2>账号用量</h2>
         <p class="muted" style="margin: 0.2rem 0 0">
-          订阅等级 / 配额 / 费用 · 点击「刷新」才请求 Oracle
+          订阅等级 / 配额 / 每月账单与支付状态 · 点击「刷新」才请求 Oracle
         </p>
       </div>
       <div class="page-tools">
@@ -223,6 +223,42 @@
     </div>
 
     <div class="card stack">
+      <div class="row" style="justify-content: space-between; align-items: baseline">
+        <h3 style="margin: 0">每月账单</h3>
+        <span v-if="unpaidCount > 0" class="badge warn">{{ unpaidCount }} 张未付清</span>
+        <span v-else-if="invoices.length" class="badge running">已全部付清</span>
+      </div>
+      <p v-if="invoiceMsg" class="muted" style="margin: 0; font-size: 12px">{{ invoiceMsg }}</p>
+      <div v-if="invoices.length" class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>账期</th>
+              <th>账单号</th>
+              <th>金额</th>
+              <th>未付金额</th>
+              <th>到期日</th>
+              <th>状态</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="inv in invoices" :key="inv.invoice_id || inv.invoice_number">
+              <td>{{ billingMonth(inv.time_invoice) }}</td>
+              <td class="mono">{{ inv.invoice_number || '—' }}</td>
+              <td class="mono">{{ money(inv.amount, inv.currency) }}</td>
+              <td class="mono">{{ money(inv.amount_due, inv.currency) }}</td>
+              <td>{{ dateOnly(inv.time_due) }}</td>
+              <td>
+                <span class="badge" :class="invoiceClass(inv)">{{ invoiceLabel(inv) }}</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div v-else class="empty">该账号暂无账单记录。</div>
+    </div>
+
+    <div class="card stack">
       <div class="row" style="justify-content: space-between">
         <h3 style="margin: 0">费用（最近 {{ days }} 天）</h3>
         <div class="muted" style="font-size: 13px">
@@ -401,6 +437,59 @@ async function loadUsage() {
   }
 }
 
+/** Invoices for this tenancy, newest first. Empty on a free account — such a
+ *  tenancy has no subscription, so it is never billed. */
+const invoices = ref<any[]>([])
+const invoiceMsg = ref('')
+const unpaidCount = computed(
+  () => invoices.value.filter((i) => !i.is_paid).length,
+)
+
+function billingMonth(iso: string): string {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? '—' : `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+}
+
+function dateOnly(iso: string): string {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? '—' : d.toISOString().slice(0, 10)
+}
+
+function money(v: number | null, currency: string): string {
+  if (v === null || v === undefined) return '—'
+  return `${Number(v).toFixed(2)}${currency ? ' ' + currency : ''}`
+}
+
+/** Paid is the answer being asked for, so it is stated plainly; a failed
+ *  payment is called out separately because it needs action. */
+function invoiceLabel(inv: any): string {
+  if (inv.is_paid) return '已支付'
+  if (inv.is_payment_failed) return '支付失败'
+  return { OPEN: '未支付', PAST_DUE: '已逾期', PAYMENT_SUBMITTED: '支付处理中' }[
+    String(inv.status || '').toUpperCase() as string
+  ] || '未支付'
+}
+
+function invoiceClass(inv: any): string {
+  if (inv.is_paid) return 'running'
+  if (inv.is_payment_failed || String(inv.status).toUpperCase() === 'PAST_DUE') return 'stopped'
+  return 'warn'
+}
+
+async function loadInvoices() {
+  if (!tenantId.value) return
+  try {
+    const res = await api.get(`/tenants/${tenantId.value}/invoices`)
+    invoices.value = res.data.data?.invoices || []
+    invoiceMsg.value = res.data.message || ''
+  } catch (e: any) {
+    invoices.value = []
+    invoiceMsg.value = e?.message || '读取账单失败'
+  }
+}
+
 async function loadQuota() {
   if (!tenantId.value) return
   try {
@@ -416,7 +505,7 @@ async function loadAll() {
   error.value = ''
   loading.value = true
   try {
-    await Promise.all([loadAccount(), loadUsage(), loadQuota()])
+    await Promise.all([loadAccount(), loadUsage(), loadQuota(), loadInvoices()])
   } catch (e: any) {
     error.value = e?.message || '加载失败'
   } finally {

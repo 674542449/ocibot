@@ -379,6 +379,34 @@ def account_status(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+@router.get("/tenants/{tenant_id}/invoices")
+def account_invoices(
+    tenant_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+    limit: int = Query(24, ge=1, le=100),
+) -> dict[str, Any]:
+    """Billing invoices and whether each was paid (OSP Gateway).
+
+    Separate from /usage on purpose: usage says what a month cost, an invoice
+    says what Oracle billed and whether it was settled. Only this API knows the
+    payment state. Read on demand, like every other Oracle call in the panel.
+    """
+    row = _tenant_or_404(db, user.id, tenant_id)
+    try:
+        session = get_session_for_row(row)
+        result = session.list_invoices(limit=limit)
+        return {
+            "ok": bool(result.ok),
+            "message": result.message or "",
+            "data": result.data if isinstance(result.data, dict) else {},
+        }
+    except OCIClientError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"读取账单失败: {exc}") from exc
+
+
 @router.get("/tenants/{tenant_id}/usage")
 def account_usage(
     tenant_id: str,

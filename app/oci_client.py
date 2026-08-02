@@ -3523,6 +3523,114 @@ class TenantSession:
                 data={"daily": [], "by_service": [], "total": 0, "currency": "", "days": days},
             )
 
+    def list_invoices(self, limit: int = 24) -> OperationResult:
+        """List billing invoices with their payment status (OSP Gateway).
+
+        This is not the Usage API: usage tells you what a month *cost*, invoices
+        tell you what Oracle billed and whether it was settled. Only the invoice
+        service knows the latter.
+
+        An Always Free / trial tenancy has no subscription and therefore no
+        invoices — that returns ok with an empty list and a note, because "no
+        bills" is the correct answer for such an account, not a failure.
+        """
+        from datetime import timezone
+
+        tenancy = (self.tenant.tenancy_ocid or "").strip()
+        if not tenancy:
+            return OperationResult(ok=False, message="缺少 Tenancy OCID", data={"invoices": []})
+        try:
+            from oci.osp_gateway import InvoiceServiceClient
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(
+                ok=False,
+                message=f"当前 OCI SDK 不含 osp_gateway 模块（{exc}）",
+                data={"invoices": []},
+            )
+
+        limit = max(1, min(int(limit or 24), 100))
+        try:
+            home = self._home_region() or self.tenant.region
+        except Exception:
+            home = self.tenant.region
+        cfg = dict(self._config)
+        if home:
+            cfg["region"] = home
+        try:
+            client = InvoiceServiceClient(cfg, retry_strategy=sdk_default_retry_strategy())
+            resp = client.list_invoices(
+                osp_home_region=home,
+                compartment_id=tenancy,
+                limit=limit,
+                sort_by="TIME_INVOICE_DUE",
+                sort_order="DESC",
+            )
+        except Exception as exc:  # noqa: BLE001
+            text = str(exc)
+            # A tenancy with no subscription answers 404/NotAuthorizedOrNotFound.
+            # For a free account that is the expected state, not an error to shout.
+            if "NotAuthorizedOrNotFound" in text or "404" in text:
+                return OperationResult(
+                    ok=True,
+                    message=(
+                        "未查询到账单。Always Free / 试用账号没有订阅，因此不会产生账单；"
+                        "若这是付费账号，请确认当前用户有账单读取权限"
+                        "（Allow group <你的组> to read invoices in tenancy）。"
+                    ),
+                    data={"invoices": [], "unavailable": True},
+                )
+            return OperationResult(ok=False, message=text, data={"invoices": []})
+
+        data = getattr(resp, "data", None)
+        rows = list(getattr(data, "items", None) or (data if isinstance(data, list) else []) or [])
+
+        def _iso(value: Any) -> str:
+            if not value:
+                return ""
+            try:
+                return value.astimezone(timezone.utc).isoformat()
+            except Exception:
+                return str(value)
+
+        def _num(value: Any) -> Optional[float]:
+            try:
+                return None if value is None else float(value)
+            except (TypeError, ValueError):
+                return None
+
+        out: list[dict[str, Any]] = []
+        for inv in rows:
+            status = str(getattr(inv, "invoice_status", "") or "")
+            paid = getattr(inv, "is_paid", None)
+            # is_paid is authoritative; fall back to the status when absent.
+            if paid is None:
+                paid = status.upper() == "CLOSED"
+            out.append(
+                {
+                    "invoice_id": str(getattr(inv, "invoice_id", "") or ""),
+                    "invoice_number": str(getattr(inv, "invoice_number", "") or ""),
+                    "status": status,
+                    "is_paid": bool(paid),
+                    "is_payment_failed": bool(getattr(inv, "is_payment_failed", False)),
+                    "type": str(getattr(inv, "invoice_type", "") or ""),
+                    "currency": str(
+                        getattr(getattr(inv, "currency", None), "currency_code", "")
+                        or getattr(inv, "currency", "")
+                        or ""
+                    ),
+                    "amount": _num(getattr(inv, "invoice_amount", None)),
+                    "amount_due": _num(getattr(inv, "invoice_amount_due", None)),
+                    "time_invoice": _iso(getattr(inv, "time_invoice", None)),
+                    "time_due": _iso(getattr(inv, "time_invoice_due", None)),
+                }
+            )
+        note = "" if out else "该账号下没有账单记录（Always Free / 试用账号不会产生账单）。"
+        return OperationResult(
+            ok=True,
+            message=note or f"已读取 {len(out)} 张账单",
+            data={"invoices": out, "unavailable": False},
+        )
+
     def get_network_egress_usage(self) -> OperationResult:
         """Outbound bytes for the current calendar month, from VCN metrics.
 

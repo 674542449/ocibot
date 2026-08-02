@@ -175,6 +175,7 @@ def make_session():
         },
     )
     s.disable_console_password_expiry.return_value = R(True, "已关闭", {})
+    s.list_invoices.return_value = R(True, "已读取 0 张账单", {"invoices": [], "unavailable": False})
     s.resolve_compartment.return_value = "ocid1.compartment.oc1..c1"
     s.launch_from_payload.return_value = R(True, "创建成功", {"instance_id": "ocid1.instance.oc1..new"})
     s.launch_instance.return_value = s.launch_from_payload.return_value
@@ -286,6 +287,7 @@ def test_every_endpoint_is_wired() -> None:
             f"/api/tenants/{tid}", f"/api/tenants/{tid}/instances",
             f"/api/tenants/{tid}/instances/{iid}", f"/api/tenants/{tid}/account",
             f"/api/tenants/{tid}/usage", f"/api/tenants/{tid}/free-quota",
+            f"/api/tenants/{tid}/invoices",
             f"/api/tenants/{tid}/launch-meta", f"/api/tenants/{tid}/boot-volumes",
             f"/api/tenants/{tid}/block-volumes", f"/api/tenants/{tid}/reserved-ips",
             f"/api/tenants/{tid}/boot-volume-backups", f"/api/tenants/{tid}/custom-images",
