@@ -614,11 +614,12 @@ onBeforeUnmount(() => {
     position: sticky;
     top: 0;
     z-index: 40;
-    background: color-mix(in srgb, var(--panel) 78%, transparent);
-    border-bottom: 1px solid var(--glass-border);
+    /* Opaque: the blur that made translucency work here was removed with the
+       rest of the glass, and 78% white over scrolling table rows is muddy. */
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
     padding: 0.4rem 0.55rem;
     padding-top: max(0.4rem, env(safe-area-inset-top));
-    backdrop-filter: blur(18px) saturate(1.35);
   }
 
   .mobile-brand {
@@ -654,6 +655,13 @@ onBeforeUnmount(() => {
     transform: translateX(-105%);
     transition: transform 0.2s ease;
     border-right: 1px solid var(--border);
+    /* Opaque. On desktop the sidebar is a column of the page field and stays
+       transparent, but here it is a drawer floating over the content — with no
+       background of its own the labels rendered straight onto the page and the
+       scrim behind it, which in light theme left dark text on a dark backdrop
+       at 1.05:1. Effectively invisible. */
+    background: var(--panel);
+    box-shadow: var(--shadow-md);
     box-shadow: var(--shadow-md);
   }
 

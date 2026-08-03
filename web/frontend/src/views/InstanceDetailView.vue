@@ -1519,14 +1519,12 @@ watch([tenantId, instanceId], async () => {
   }
 }
 .metric-card {
-  border: 1px solid var(--glass-border);
-  border-radius: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
   padding: 0.7rem 0.8rem 0.55rem;
-  background: color-mix(in srgb, var(--panel) 70%, transparent);
+  background: var(--panel-2);
   min-width: 0;
-  box-shadow: var(--glass-highlight);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  box-shadow: none;
   position: relative;
   color: var(--text);
 }
@@ -1560,12 +1558,10 @@ watch([tenantId, instanceId], async () => {
   z-index: 2;
   padding: 0.3rem 0.5rem;
   border-radius: 10px;
-  background: rgba(20, 22, 28, 0.92);
+  background: rgb(20, 22, 28);
   color: #fff;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.28);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  box-shadow: var(--shadow-md);
   white-space: nowrap;
   text-align: center;
   min-width: 4.5rem;
