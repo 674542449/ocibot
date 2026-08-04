@@ -149,7 +149,7 @@ onMounted(() => {
     const cx = w * 0.5
     const cy = h * 0.5
     const R = Math.min(w, h) * 0.36
-    const ry = t * 0.00011
+    const ry = t * 0.00035
     const rx = -0.38
     // Perspective: points nearer the camera spread out and brighten.
     const proj = (p: P3) => {
@@ -214,7 +214,7 @@ onMounted(() => {
       ctx.lineWidth = 1
       ctx.stroke()
 
-      const phase = ((t * 0.00016 + i * 0.137) % 1 + 1) % 1
+      const phase = ((t * 0.0004 + i * 0.137) % 1 + 1) % 1
       const q = proj(arcPoint(a, b, phase, 0.22))
       if (q.z >= -0.15) {
         ctx.globalAlpha = 0.9
@@ -230,7 +230,7 @@ onMounted(() => {
     for (let i = 0; i < NODES.length; i++) {
       const q = proj(NODES[i])
       const front = q.z > 0
-      const glow = 0.5 + 0.5 * Math.sin(t * 0.0012 + i * 0.9)
+      const glow = 0.5 + 0.5 * Math.sin(t * 0.0022 + i * 0.9)
       const r = (front ? 2.1 : 1.2) * q.k
       ctx.globalAlpha = front ? 0.55 + 0.45 * glow : 0.16
       ctx.fillStyle = front ? '#a99fff' : '#6f68b8'
@@ -248,18 +248,21 @@ onMounted(() => {
     ctx.globalAlpha = 1
   }
 
-  // One frame is drawn synchronously so the globe is present even where
-  // requestAnimationFrame never runs (reduced motion, hidden tab, prerender).
+  // Drawn once synchronously so the globe is present even before the first
+  // animation frame — and in any environment where one never arrives.
   draw(0)
 
-  if (!reduced) {
-    const loop = (t: number) => {
-      if (stop) return
-      if (!document.hidden) draw(t)
-      raf = requestAnimationFrame(loop)
-    }
+  // Reduced motion runs the whole scene at a fraction of the speed rather than
+  // freezing it: the setting asks for calm, not for a still image, and a globe
+  // that never turns reads as broken. Freezing it outright is what made the
+  // first version look like it had failed to start.
+  const speed = reduced ? 0.4 : 1
+  const loop = (t: number) => {
+    if (stop) return
+    if (!document.hidden) draw(t * speed)
     raf = requestAnimationFrame(loop)
   }
+  raf = requestAnimationFrame(loop)
 
   const onResize = () => {
     resize()
