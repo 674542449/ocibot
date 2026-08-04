@@ -1494,10 +1494,20 @@ onMounted(async () => {
 })
 
 // If the router reuses this component for a different instance, reload its data.
+// Mirrors onMounted exactly: the summary, then only the tab actually on screen.
+// It used to pull metrics unconditionally, so switching between instances while
+// sitting on the firewall tab spent a Monitoring query nobody asked for.
 watch([tenantId, instanceId], async () => {
   try {
     await loadInstance()
-    await loadMetrics()
+    if (tab.value === 'metrics') await loadMetrics()
+    else if (tab.value === 'console') await loadConsole()
+    else if (tab.value === 'firewall') await loadFirewall()
+    else if (tab.value === 'network') await loadReservedIps()
+    else if (tab.value === 'volume') {
+      await loadBoot()
+      await loadBackups()
+    }
   } catch (e: any) {
     error.value = e?.message || '加载失败'
   }
