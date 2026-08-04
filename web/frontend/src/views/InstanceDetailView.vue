@@ -236,7 +236,7 @@
         <h3 style="margin: 0">防火墙 (NSG)</h3>
         <div class="row">
           <button @click="loadFirewall">刷新</button>
-          <button class="danger" :disabled="fwBusy" @click="openAllFirewall">一键全开放</button>
+          <button class="danger" :disabled="fwBusy" @click="openAllFirewall">放行全部端口</button>
         </div>
       </div>
       <p class="muted" style="margin: 0; font-size: 12px">{{ fwMsg }}</p>
@@ -245,7 +245,7 @@
       <div v-if="!fwGroups.length && !fwSecurityLists.length" class="card" style="padding: 0.75rem">
         <div class="muted" style="font-size: 13px">
           该实例没有关联的网络安全组（NSG），其子网也没有可读的安全列表。<br />
-          放行端口可点「一键全开放」（会为实例创建并绑定一个 NSG），或在 Oracle 控制台为子网添加安全列表规则。
+          放行端口可点「放行全部端口」（为该实例创建并绑定一个 NSG），或在 Oracle 控制台为子网添加安全列表规则。
         </div>
       </div>
 
@@ -345,7 +345,7 @@
           </table>
         </div>
         <p class="muted" style="margin: 0.4rem 0 0; font-size: 12px">
-          安全列表规则请在 Oracle 控制台修改；面板的「添加规则 / 一键全开放」只作用于 NSG。
+          安全列表规则请在 Oracle 控制台修改；面板的「添加规则 / 放行全部端口」只作用于 NSG。
         </p>
       </div>
     </div>

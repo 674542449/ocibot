@@ -15,19 +15,18 @@
     <main class="stack-area">
       <section class="hero">
         <h1 class="wordmark">
-          <span class="line">CONTROL</span>
-          <span class="line accent">EVERY REGION</span>
+          <span class="line">OCIBOT</span>
+          <span class="line accent">控制台</span>
         </h1>
-        <p class="lede">在一处管理跨账号、跨区域的服务器。</p>
+        <p class="lede">多账号 · 多区域云资源管理</p>
+        <p class="modules">实例 · 存储 · 网络 · 容量重试 · WebSSH · 备份</p>
       </section>
 
       <section class="panel">
         <form class="login-form stack" @submit.prevent="submit">
           <header class="form-head">
             <h2>{{ mode === 'login' ? '登录' : '创建账号' }}</h2>
-            <p class="muted">
-              {{ mode === 'login' ? '使用你的面板账号继续。' : '第一个注册的账号将成为管理员。' }}
-            </p>
+            <p v-if="mode === 'register'" class="muted">首个注册账号将获得管理员权限。</p>
           </header>
 
           <div class="mode-tabs" role="tablist">
@@ -83,7 +82,7 @@
           <div v-if="hint" class="success-box">{{ hint }}</div>
 
           <button class="primary submit" type="submit" :disabled="loading">
-            {{ loading ? '请稍候…' : mode === 'login' ? '登录' : '创建账号' }}
+            {{ loading ? (mode === 'login' ? '验证中…' : '创建中…') : mode === 'login' ? '登录' : '创建账号' }}
           </button>
 
           <p class="muted tip">API 私钥仅在服务端加密存储，不会进入浏览器。</p>
@@ -94,14 +93,16 @@
     <!-- Real, not decorative: the build you are about to sign in to. -->
     <footer v-if="health.version" class="readout">
       <span class="ro"><i class="ro-k">版本</i><b>v{{ health.version }}</b></span>
-      <span class="ro"><i class="ro-k">服务</i><b><i class="dot"></i>正常</b></span>
-      <span class="ro ro-wide"><i class="ro-k">区域</i><b>35 个节点</b></span>
+      <span class="ro">
+        <i class="ro-k">API</i>
+        <b><i class="dot" :class="{ down: health.status !== 'ok' }"></i>{{ apiStatusLabel }}</b>
+      </span>
     </footer>
   </div>
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import api from '@/api/client'
 import GlobeField from '@/components/GlobeField.vue'
@@ -121,17 +122,24 @@ const error = ref('')
 const hint = ref('')
 
 /** Version of the running build, read before sign-in (/api/health is public). */
-const health = reactive<{ version: string }>({ version: '' })
+const health = reactive<{ version: string; status: string }>({ version: '', status: '' })
 
 onMounted(async () => {
   try {
-    const { data } = await api.get<{ version?: string }>('/health')
+    const { data } = await api.get<{ version?: string; status?: string }>('/health')
     health.version = String(data?.version || '')
+    health.status = String(data?.status || '')
   } catch {
     // Silent: an unreachable health endpoint is not the sign-in form's problem,
     // and an error here would sit above the field the operator came to fill in.
   }
 })
+
+/** 'ok' is the only state with a settled meaning; anything else is shown
+ *  verbatim rather than flattened into a word that hides which fault it is. */
+const apiStatusLabel = computed(() =>
+  health.status === 'ok' ? '正常' : health.status || '未知',
+)
 
 /** Only follow same-origin in-app paths, never an attacker-supplied absolute URL. */
 function safeRedirect(raw: unknown): string {
@@ -266,6 +274,19 @@ async function submit() {
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
+}
+
+.modules {
+  margin: 0.5rem 0 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  color: rgba(236, 238, 251, 0.5);
+}
+
+.dot.down {
+  background: #ff6b6b;
+  box-shadow: 0 0 0 3px rgba(255, 107, 107, 0.16);
 }
 
 .lede {

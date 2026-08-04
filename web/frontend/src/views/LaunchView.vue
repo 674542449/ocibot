@@ -73,7 +73,7 @@
       </div>
       <div class="row">
         <button class="primary" :disabled="submitting" @click="doLaunch">
-          {{ submitting ? '提交中，请稍候…' : '确认并创建' }}
+          {{ submitting ? '创建中…' : '确认并创建' }}
         </button>
         <button type="button" :disabled="submitting" @click="confirmOpen = false">返回修改</button>
       </div>

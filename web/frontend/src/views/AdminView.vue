@@ -317,7 +317,7 @@ async function applyUpdate() {
   try {
     const { data } = await api.post('/admin/update/apply')
     updateInfo.value = data
-    msg.value = '更新已开始，请稍候…页面可能短暂无法访问。'
+    msg.value = '更新已开始：拉取代码、重建镜像、滚动重启，期间面板可能短暂不可访问。'
     startUpdatePoll()
   } catch (e: any) {
     updateBusy.value = false
