@@ -21,6 +21,7 @@ import { onBeforeUnmount, onMounted, ref } from 'vue'
 const el = ref<HTMLCanvasElement | null>(null)
 let raf = 0
 let stop = false
+let detachResize: (() => void) | null = null
 
 /** name, latitude, longitude — the regions this panel actually talks to. */
 const REGIONS: Array<[string, number, number]> = [
@@ -269,12 +270,14 @@ onMounted(() => {
     draw(performance.now())
   }
   window.addEventListener('resize', onResize)
-  onBeforeUnmount(() => window.removeEventListener('resize', onResize))
+  detachResize = () => window.removeEventListener('resize', onResize)
 })
 
 onBeforeUnmount(() => {
   stop = true
   if (raf) cancelAnimationFrame(raf)
+  detachResize?.()
+  detachResize = null
 })
 </script>
 

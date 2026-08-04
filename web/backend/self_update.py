@@ -73,11 +73,50 @@ def _utcnow() -> str:
 
 
 def _repo() -> str:
-    return (os.environ.get("OCIBOT_UPDATE_REPO") or DEFAULT_REPO).strip()
+    return _checked_repo((os.environ.get("OCIBOT_UPDATE_REPO") or DEFAULT_REPO).strip())
 
 
 def _branch() -> str:
-    return (os.environ.get("OCIBOT_UPDATE_BRANCH") or os.environ.get("OCIBOT_BRANCH") or DEFAULT_BRANCH).strip()
+    raw = (
+        os.environ.get("OCIBOT_UPDATE_BRANCH")
+        or os.environ.get("OCIBOT_BRANCH")
+        or DEFAULT_BRANCH
+    ).strip()
+    return _checked_branch(raw)
+
+
+def _checked_repo(repo: str) -> str:
+    """owner/name only. Rejected values never reach an argv.
+
+    The leading dash is refused for the same reason as the branch: it only
+    lands in a URL and an `-e KEY=value` today, neither of which parses it as an
+    option, but that is a property of the current call sites rather than of the
+    value.
+    """
+    if repo.startswith("-") or not re.fullmatch(
+        r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo or ""
+    ):
+        raise RuntimeError(f"非法仓库名：{repo!r}")
+    return repo
+
+
+def _checked_branch(branch: str) -> str:
+    """Branch name for `git fetch origin <branch>`.
+
+    The leading-dash rejection is the part that matters: git parses an argument
+    beginning with "-" as an option, so a branch of "--upload-pack=<cmd>" turns a
+    fetch into arbitrary command execution. argv is a list here, so there is no
+    shell to inject into — but there is still an option parser, and this runs on
+    the update path, which is the highest privilege the panel has.
+    """
+    if (
+        not branch
+        or branch.startswith("-")
+        or ".." in branch
+        or not re.fullmatch(r"[A-Za-z0-9._/-]+", branch)
+    ):
+        raise RuntimeError(f"非法分支名：{branch!r}")
+    return branch
 
 
 def _host_dir() -> Path:
@@ -284,13 +323,9 @@ def _github_headers() -> dict[str, str]:
 
 
 def fetch_remote_head(timeout: float = 15.0) -> dict[str, Any]:
+    # _repo()/_branch() validate; both paths that build an argv share the rules.
     repo = _repo()
     branch = _branch()
-    # Strict allowlist: owner/name only.
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo or ""):
-        raise RuntimeError(f"非法仓库名：{repo}")
-    if not re.fullmatch(r"[A-Za-z0-9._/-]+", branch or "") or ".." in branch:
-        raise RuntimeError(f"非法分支名：{branch}")
     url = f"https://api.github.com/repos/{repo}/commits/{branch}"
     with httpx.Client(timeout=timeout, follow_redirects=True, trust_env=False) as client:
         r = client.get(url, headers=_github_headers())

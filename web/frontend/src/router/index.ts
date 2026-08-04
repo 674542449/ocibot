@@ -103,4 +103,44 @@ router.beforeEach(async (to) => {
   }
 })
 
+/**
+ * After an update the server serves new content-hashed chunk filenames, so any
+ * tab still running the previous build fails its next lazy import with "Failed
+ * to fetch dynamically imported module" and the navigation dies silently — the
+ * operator sees a page that simply refuses to change. This is why every release
+ * note has had to say "press Ctrl+F5".
+ *
+ * Reload once to pick the new index.html up. The sessionStorage guard makes it
+ * exactly once: if the reload does not fix it, the cause is not a stale chunk
+ * and looping would hide the real error.
+ */
+const RELOAD_FLAG = 'ocibot_chunk_reload'
+
+router.onError((err, to) => {
+  const msg = String((err as Error)?.message || err)
+  const stale =
+    /Failed to fetch dynamically imported module|Importing a module script failed|error loading dynamically imported module/i.test(
+      msg,
+    )
+  if (!stale) return
+  try {
+    if (sessionStorage.getItem(RELOAD_FLAG)) return
+    sessionStorage.setItem(RELOAD_FLAG, '1')
+  } catch {
+    // Private mode: reloading unguarded is still better than a dead navigation,
+    // and the failure is not the kind that repeats indefinitely.
+  }
+  window.location.assign(to.fullPath)
+})
+
+// A completed navigation means the running build is serving fine; clear the
+// guard so a genuinely stale chunk months from now still gets its one reload.
+router.afterEach(() => {
+  try {
+    sessionStorage.removeItem(RELOAD_FLAG)
+  } catch {
+    /* ignore */
+  }
+})
+
 export default router
