@@ -634,6 +634,11 @@ def delete_tenant(
             )
         ).all()
     )
+    # A default pointing at a deleted tenant would keep every page falling through
+    # to "first tenant" with nothing in the UI explaining why.
+    doomed = {target.id for target in [*children, row]}
+    if user.locked_tenant_id in doomed:
+        user.locked_tenant_id = ""
     for target in [*children, row]:
         db.delete(target)
     db.commit()

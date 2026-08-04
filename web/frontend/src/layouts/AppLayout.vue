@@ -45,7 +45,7 @@
            would otherwise be an unexplained behaviour with no obvious way out. -->
       <div v-if="hasLockedTenant" class="locked-tenant" :title="`各页面默认使用「${lockedTenantName}」`">
         <span class="lock-ico" aria-hidden="true"><Icon name="lock" :size="16" /></span>
-        <span class="truncate rail-label">{{ lockedTenantName }}</span>
+        <span class="truncate rail-label">{{ lockedTenantName || '默认租户' }}</span>
         <button type="button" class="lock-x rail-label" title="取消锁定" @click="unlockTenant()">
           <Icon name="close" :size="14" />
         </button>

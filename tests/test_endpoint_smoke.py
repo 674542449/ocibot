@@ -305,6 +305,15 @@ def test_every_endpoint_is_wired() -> None:
         ]:
             check("GET", p, c.get(p))
 
+        # The one PUT in the API. Covered here for the same reason as the rest:
+        # a coding error in an OCI-facing route surfaces as a generic 5xx that
+        # unit tests calling the function directly never see.
+        check(
+            "PUT",
+            "/api/auth/locked-tenant",
+            c.put("/api/auth/locked-tenant", json={"tenant_id": tid}),
+        )
+
         posts = [
             (f"/api/tenants/{tid}/test", {}),
             (f"/api/tenants/{tid}/regions/subscribe",

@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import api, { type TokenResponse } from '@/api/client'
+import { resetTenantLock, setLockedTenantFromSession } from '@/stores/tenantLock'
 
 export const useAuthStore = defineStore('auth', () => {
   // Auth is the server's HttpOnly cookie. We keep only the username (for display
@@ -25,6 +26,9 @@ export const useAuthStore = defineStore('auth', () => {
     username.value = null
     isAdmin.value = false
     totpEnabled.value = false
+    // Otherwise the next account signing in on this browser would open every
+    // page on the previous operator's default tenant.
+    resetTenantLock()
     localStorage.removeItem('ocibot_username')
   }
 
@@ -63,10 +67,14 @@ export const useAuthStore = defineStore('auth', () => {
         username: string
         is_admin?: boolean
         totp_enabled?: boolean
+        locked_tenant_id?: string
       }>('/auth/me')
       username.value = data.username
       isAdmin.value = !!data.is_admin
       totpEnabled.value = !!data.totp_enabled
+      // The default tenant lives with the account, so it arrives with the session
+      // rather than being read out of this browser's storage.
+      setLockedTenantFromSession(String(data.locked_tenant_id || ''))
       localStorage.setItem('ocibot_username', data.username)
       return true
     } catch {

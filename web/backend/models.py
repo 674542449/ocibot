@@ -43,6 +43,12 @@ class User(Base):
     totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     # Fernet-encrypted TOTP secret (pending until totp_enabled=True).
     totp_secret_encrypted: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    # Default tenant the pages open with. Stored per user rather than per browser
+    # so the choice follows the account to another device; "" means no default.
+    # Not a ForeignKey on purpose: a stale id is harmless (the UI falls back to
+    # the first tenant), while a cascade would couple deleting a tenant to the
+    # users table for a preference.
+    locked_tenant_id: Mapped[str] = mapped_column(String(36), default="", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     tenants: Mapped[list["Tenant"]] = relationship(back_populates="owner", cascade="all, delete-orphan")

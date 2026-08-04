@@ -396,7 +396,12 @@ key_file=~/.oci/oci_api_key.pem"
 import { computed, onMounted, reactive, ref } from 'vue'
 import api, { type Tenant, type TenantRegions } from '@/api/client'
 import Icon from '@/components/Icon.vue'
-import { isTenantLocked, lockTenant, unlockTenant } from '@/stores/tenantLock'
+import {
+  isTenantLocked,
+  lockTenant,
+  syncLockedTenantName,
+  unlockTenant,
+} from '@/stores/tenantLock'
 import { pickAndReadTextFile } from '@/utils/file'
 // Row actions report through the fixed-position toast host, never through the
 // in-flow banner above the table: that banner appearing pushed the whole table
@@ -621,6 +626,10 @@ function openEdit(t: Tenant) {
 async function load() {
   const { data } = await api.get<Tenant[]>('/tenants')
   tenants.value = data
+  // This page lists every tenant instead of picking one, so pickTenantId never
+  // runs here and the sidebar chip would show a lock with no name after a fresh
+  // sign-in — the session carries the id, not the name.
+  syncLockedTenantName(data)
 }
 
 async function pasteFromClipboard() {

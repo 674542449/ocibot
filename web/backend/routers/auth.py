@@ -22,10 +22,11 @@ from web.backend.config import get_settings
 from web.backend.crypto_util import decrypt_text, encrypt_text
 from web.backend.db import get_db
 from web.backend.meta import KEY_OPEN_REGISTRATION, get_meta
-from web.backend.models import User
+from web.backend.models import Tenant, User
 from web.backend.rate_limit import login_ip_limiter, login_user_limiter, register_ip_limiter
 from web.backend.schemas import (
     ChangePasswordRequest,
+    LockedTenantRequest,
     LoginRequest,
     RegisterRequest,
     TokenResponse,
@@ -219,6 +220,32 @@ def login(
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="两步验证码错误")
     _audit("auth.login", "ok", owner_id=user.id)
     return _issue(response, user)
+
+
+@router.put("/locked-tenant", response_model=UserOut)
+def set_locked_tenant(
+    body: LockedTenantRequest,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> UserOut:
+    """Set (or clear) the tenant every page opens with, for this account.
+
+    Server-side so the choice follows the operator to another browser or device.
+    An empty tenant_id clears it.
+    """
+    tenant_id = (body.tenant_id or "").strip()
+    if tenant_id:
+        owned = db.scalar(
+            select(Tenant).where(Tenant.id == tenant_id, Tenant.owner_id == user.id)
+        )
+        # 404, not 403: an id belonging to someone else must not be distinguishable
+        # from one that does not exist.
+        if owned is None:
+            raise HTTPException(status_code=404, detail="租户不存在")
+    user.locked_tenant_id = tenant_id
+    db.commit()
+    db.refresh(user)
+    return UserOut.model_validate(user)
 
 
 @router.post("/logout")

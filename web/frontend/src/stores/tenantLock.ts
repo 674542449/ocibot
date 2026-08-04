@@ -1,10 +1,15 @@
 /**
  * 锁定租户：把某个租户设为「默认」，其他页面进入时自动选它，不用每页重选一次。
  *
- * Stored in localStorage rather than on the server: it is a per-browser UI
- * preference, and keeping it client-side means no new API surface and no
- * migration. The trade-off is that it does not follow you to another browser or
- * device — deliberate, and cheap to redo there.
+ * Stored on the server against the account, not in localStorage: the choice is a
+ * property of the operator, so it has to follow them to another browser, another
+ * device, or a private window. It arrives with /auth/me alongside the session and
+ * is written back with PUT /auth/locked-tenant.
+ *
+ * The in-memory ref is what every page reads, so `pickTenantId` stays synchronous
+ * — pages pick a tenant during their first render and cannot await a round trip.
+ * Writes are optimistic: the UI updates immediately and the request follows, so a
+ * click never waits on the network to feel like it worked.
  *
  * Selection priority every view follows (see `pickTenantId`):
  *   1. `?tenant=` in the URL — a deep link must always win, otherwise clicking
@@ -17,51 +22,58 @@
  */
 import { computed, ref } from 'vue'
 
-import type { Tenant } from '@/api/client'
+import api, { type Tenant } from '@/api/client'
 
-const KEY_ID = 'ocibot_locked_tenant_id'
-const KEY_NAME = 'ocibot_locked_tenant_name'
-
-function readStorage(key: string): string {
-  // localStorage throws in some privacy modes; a missing preference is not worth
-  // breaking the page over.
-  try {
-    return localStorage.getItem(key) || ''
-  } catch {
-    return ''
-  }
-}
-
-function writeStorage(key: string, value: string): void {
-  try {
-    if (value) localStorage.setItem(key, value)
-    else localStorage.removeItem(key)
-  } catch {
-    /* ignore */
-  }
-}
-
-const lockedId = ref(readStorage(KEY_ID))
-/** Kept only so the sidebar badge can render a name without loading the tenant
- *  list; the id is the authoritative part. */
-const lockedName = ref(readStorage(KEY_NAME))
+const lockedId = ref('')
+/** Display name for the sidebar badge; resolved from the tenant list, so it is a
+ *  convenience only — the id is the authoritative part and the server's copy. */
+const lockedName = ref('')
 
 export const lockedTenantId = computed(() => lockedId.value)
 export const lockedTenantName = computed(() => lockedName.value)
 export const hasLockedTenant = computed(() => !!lockedId.value)
 
+/** Seed from the session payload. Called by the auth store on every /auth/me. */
+export function setLockedTenantFromSession(id: string): void {
+  lockedId.value = id || ''
+  if (!id) lockedName.value = ''
+}
+
+/** Drop local state on sign-out so the next account does not inherit it. */
+export function resetTenantLock(): void {
+  lockedId.value = ''
+  lockedName.value = ''
+}
+
+async function persist(tenantId: string): Promise<void> {
+  try {
+    await api.put('/auth/locked-tenant', { tenant_id: tenantId })
+  } catch {
+    // The optimistic value stays for this session rather than snapping back
+    // under the cursor; the next /auth/me reconciles it with the server.
+  }
+}
+
 export function lockTenant(tenant: Tenant): void {
   lockedId.value = tenant.id
   lockedName.value = tenant.name
-  writeStorage(KEY_ID, tenant.id)
-  writeStorage(KEY_NAME, tenant.name)
+  void persist(tenant.id)
 }
 
 export function unlockTenant(): void {
   lockedId.value = ''
   lockedName.value = ''
-  writeStorage(KEY_ID, '')
-  writeStorage(KEY_NAME, '')
+  void persist('')
+}
+
+/** Resolve the badge's display name from a tenant list, without the fallback
+ *  and self-healing that `pickTenantId` performs. Pages that show every tenant
+ *  (rather than picking one) call this so the sidebar chip has a name: the
+ *  session only carries the id, and the name is not the server's to cache. */
+export function syncLockedTenantName(tenants: Tenant[]): void {
+  if (!lockedId.value) return
+  const found = tenants.find((t) => t.id === lockedId.value)
+  if (found) lockedName.value = found.name
 }
 
 export function isTenantLocked(id: string): boolean {
@@ -70,9 +82,8 @@ export function isTenantLocked(id: string): boolean {
 
 /**
  * Which tenant a page should open with. Also self-heals: a lock pointing at a
- * tenant that no longer exists (deleted, disabled, or belonging to a different
- * account after a re-login on the same browser) is cleared rather than left to
- * silently fall through on every page forever.
+ * tenant that no longer exists (deleted or disabled) is cleared rather than left
+ * to silently fall through on every page forever.
  */
 export function pickTenantId(tenants: Tenant[], queryTenant?: unknown): string {
   const query = String(queryTenant ?? '')
@@ -81,12 +92,8 @@ export function pickTenantId(tenants: Tenant[], queryTenant?: unknown): string {
   if (lockedId.value) {
     const found = tenants.find((t) => t.id === lockedId.value)
     if (found) {
-      // Keep the cached display name honest after a rename; the sidebar badge
-      // renders from it without loading the tenant list itself.
-      if (found.name !== lockedName.value) {
-        lockedName.value = found.name
-        writeStorage(KEY_NAME, found.name)
-      }
+      // Keep the badge honest after a rename.
+      if (found.name !== lockedName.value) lockedName.value = found.name
       return lockedId.value
     }
     // Only drop the lock once we have actually seen a list — an empty array here

@@ -66,11 +66,18 @@ class TokenResponse(BaseModel):
     username: str
 
 
+class LockedTenantRequest(BaseModel):
+    """Empty string clears the default."""
+
+    tenant_id: str = Field(default="", max_length=36)
+
+
 class UserOut(BaseModel):
     id: str
     username: str
     is_admin: bool = False
     totp_enabled: bool = False
+    locked_tenant_id: str = ""
     created_at: UtcDatetime
 
     model_config = {"from_attributes": True}
