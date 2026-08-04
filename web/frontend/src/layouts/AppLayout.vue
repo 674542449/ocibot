@@ -693,6 +693,11 @@ onBeforeUnmount(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  /* Same treatment as the module line on the sign-in page — these are the same
+     names, so they should read as the same kind of thing. CJK falls back to the
+     system face; the tracking is what carries the effect. */
+  font-family: var(--font-mono);
+  letter-spacing: 0.04em;
 }
 
 /* Tooltips belong to the icon-only shape; the label is on screen now. */

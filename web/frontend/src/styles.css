@@ -327,6 +327,14 @@ html[data-theme='dark'] option {
   border-bottom: 1px solid var(--border);
 }
 
+/* The descriptive line under a page title: same typographic voice as the
+   sign-in page's module list. */
+.page-head p {
+  font-family: var(--font-mono);
+  letter-spacing: 0.03em;
+  font-size: 12px;
+}
+
 .page-head h2 {
   margin: 0;
   font-size: clamp(1.5rem, 3.5vw, 2rem);
