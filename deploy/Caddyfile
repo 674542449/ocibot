@@ -1,0 +1,37 @@
+# OCIBot 内置 HTTPS 终结（Caddy）
+#
+# 只有 web/.env 里 COMPOSE_PROFILES=tls 时这个容器才会启动，也就是执行过
+#   bash scripts/install.sh domain <你的域名>
+# 之后。IP 直连模式下它不存在，80/443 端口不会被占用。
+#
+# 这个文件是仓库文件：`install.sh update` 会 git reset --hard，任何手改都会被覆盖。
+# 所以域名从环境变量来（compose 从 web/.env 注入），文件本身保持静态。
+
+{
+	# 证书和 ACME 账号私钥存在 ocibot_caddy_data 卷里。不要删这个卷 ——
+	# 每次重建都重新签发很容易撞上 Let's Encrypt 的速率限制（同一组域名 5 次/周），
+	# 撞上之后要等一周才能再签。
+	#
+	# 这里刻意不写 email：{$VAR} 展开成空值会让 Caddyfile 解析失败（参数个数不对），
+	# 而 Caddy 不填邮箱也能正常签发和自动续期，只是收不到到期提醒 —— 用一个
+	# 会让容器起不来的可选项去换一封提醒邮件不划算。
+	admin off
+}
+
+# 未设置时回落到 localhost（签一张自签证书）而不是留空 —— 留空会让 Caddyfile
+# 解析失败、容器反复重启，比一个能打开但证书不受信的页面难排查得多。
+{$OCIBOT_DOMAIN:localhost} {
+	encode zstd gzip
+
+	# 网页终端走 WebSocket。Caddy 的 reverse_proxy 默认透传 Upgrade，
+	# 不像 nginx / NPM 需要另外打开一个「Websockets Support」开关 ——
+	# 那个开关没打开正是 NPM 方案里最常见的「终端连不上但其余正常」。
+	#
+	# 同样默认行为：保留原始 Host 头，并补上 X-Forwarded-For / -Proto / -Host。
+	# 后端的跨站校验（origin_guard.py）比对 Host，限流按 X-Forwarded-For 计数，
+	# 两者都依赖这三个头，所以不要在这里改 header_up。
+	reverse_proxy api:8000
+}
+
+# 请求体上限：Caddy 默认不限制，备份导入（20MB）不需要额外配置。
+# 这是相对 NPM 的一个实际差别 —— 那边默认上限会把备份导入截断成看不懂的报错。

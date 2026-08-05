@@ -64,15 +64,39 @@ $env:OCIBOT_BRANCH = "main"
 irm https://raw.githubusercontent.com/674542449/ocibot/main/scripts/install.ps1 | iex
 ```
 
+安装时会问一句怎么访问，二选一（`curl | bash` 无终端时默认 IP 直连）：
+
+1. **IP + 端口** —— `http://服务器IP:8000`，不用域名，明文
+2. **域名 + HTTPS** —— `https://panel.example.com`，证书自动签发续期
+
 安装完成后：
 
-1. 打开 `http://127.0.0.1:8000`
+1. 打开脚本最后打印的那个地址
 2. **注册第一个账号**（自动成为管理员）
 3. 进入 **租户**，粘贴云账号的 API 配置与私钥
 4. 在 **实例 / 创建实例** 开始使用
 
-> 换机器重装 / 想挂域名走 HTTPS：[docs/REDEPLOY.md](docs/REDEPLOY.md) 是从零到可用的
-> 完整步骤（含旧机器备份导出、云端安全组放行 80/443、域名反代与完工检查）。
+### 访问方式（随时可换，不影响数据）
+
+面板自带 HTTPS 终结，**不需要另外装 Nginx Proxy Manager 或任何反代**：
+
+```bash
+# 域名 + 自动 HTTPS（内置 Caddy 签证书）
+./scripts/install.sh domain panel.example.com
+
+# 改回 IP + 端口直连
+./scripts/install.sh ip
+```
+
+切换会成组改写 Cookie、限流、端口绑定这几项配置 —— 它们必须和访问方式一致，
+配错不会报错，只会表现成「登录后立刻被登出」这类看不出原因的现象。
+细节与排查见 [docs/ACCESS-MODES.md](docs/ACCESS-MODES.md)。
+
+> 域名模式需要 DNS 已指向本机，且 **80 和 443 都放行**（80 是证书校验用的）。
+> 云厂商安全组脚本改不到，需要自己在控制台放行。
+>
+> 换机器重装：[docs/REDEPLOY.md](docs/REDEPLOY.md) 是从零到可用的完整步骤。
+> 仍想用 Nginx Proxy Manager：[docs/NPM-REVERSE-PROXY.md](docs/NPM-REVERSE-PROXY.md)。
 
 ### 更新
 
@@ -91,7 +115,9 @@ Docker 部署且已挂载仓库与 `docker.sock` 时，也可在管理员页使�
 
 | 命令 | 说明 |
 |------|------|
-| `./scripts/install.sh status` | 容器状态与健康检查 |
+| `./scripts/install.sh status` | 容器状态、健康检查与当前访问地址 |
+| `./scripts/install.sh domain <域名>` | 切换到域名 + 自动 HTTPS |
+| `./scripts/install.sh ip` | 切换回 IP + 端口直连 |
 | `./scripts/install.sh uninstall` | 停止服务（默认保留数据卷） |
 | `OCIBOT_PURGE_DATA=1 ./scripts/install.sh uninstall` | 停止并删除数据卷 |
 

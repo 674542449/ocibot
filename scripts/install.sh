@@ -16,6 +16,10 @@ REPO_URL="${OCIBOT_REPO_URL:-}"
 REPO_DIR="${OCIBOT_DIR:-$HOME/ocibot}"
 BRANCH="${OCIBOT_BRANCH:-main}"
 COMPOSE="docker compose"
+# 访问方式：ip = 直接 http://服务器IP:端口；domain = 域名 + 自动 HTTPS（内置 Caddy）。
+# 空值表示「沿用 web/.env 里已有的设置」，update/status 不会因此改动配置。
+ACCESS_MODE="${OCIBOT_ACCESS_MODE:-}"
+PANEL_DOMAIN="${OCIBOT_DOMAIN:-}"
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m %s\n' "$*"; }
@@ -167,10 +171,276 @@ OCIBOT_API_WORKERS=2
 OCIBOT_DB_POOL_SIZE=10
 OCIBOT_DB_MAX_OVERFLOW=20
 OCIBOT_PORT=8000
+OCIBOT_BIND=0.0.0.0
+OCIBOT_TRUST_PROXY=0
+COMPOSE_PROFILES=
 EOF
   chmod 600 "$envf" || true
   link_root_env
   warn "已写入随机密钥到 web/.env —— 请备份该文件；丢失 OCIBOT_MASTER_KEY 将无法解密租户私钥"
+}
+
+# ---------------------------------------------------------------- 访问方式
+#
+# 两种模式，任选其一，装完后随时可以互换：
+#
+#   ip     —— http://服务器IP:8000 直接打开。零依赖，但是明文。
+#   domain —— https://你的域名 自动签证书（内置 Caddy），8000 端口只监听回环。
+#
+# 两者的差别不止「有没有证书」：Cookie 是否仅限 HTTPS、限流按谁的 IP 计数、
+# 端口对不对公网开放，三项必须和访问方式一致，配错任何一项都不会报错，只会在
+# 「登录后立刻被登出」或「一个人试错连累所有人」这类现象里暴露出来。所以这里
+# 成组写入，不让操作者逐项去对。
+
+# set_env_kv KEY VALUE —— 有则改（含被注释掉的同名行、重复行），无则追加。
+#
+# 用 awk 而不是 sed：值里含 '/'（如 https://…）和 '#'，任何单字符分隔符都可能和
+# 模式或值撞上。scripts/setup-proxy.sh 第一版用 '#' 作分隔符，正好和模式里的 '#?'
+# 冲突，sed 报错但脚本继续跑完并打印成功 —— 面板会停在 COOKIE_SECURE=0 的状态。
+set_env_kv() {
+  local key="$1" val="$2" envf="$REPO_DIR/web/.env" tmp
+  [ -f "$envf" ] || die "找不到 $envf"
+  tmp="$(mktemp)"
+  awk -v k="$key" -v v="$val" '
+    BEGIN { done = 0 }
+    {
+      probe = $0
+      sub(/^[[:space:]]*#?[[:space:]]*/, "", probe)
+      if (index(probe, k "=") == 1) {
+        if (!done) { print k "=" v; done = 1 }
+        next
+      }
+      print
+    }
+    END { if (!done) print k "=" v }
+  ' "$envf" > "$tmp" || { rm -f "$tmp"; die "写入 web/.env 失败（$key）"; }
+  # 回写进原文件而不是 mv，保住原有的属主与权限（里面有主密钥）。
+  cat "$tmp" > "$envf" || { rm -f "$tmp"; die "写入 web/.env 失败（$key）"; }
+  rm -f "$tmp"
+  grep -qx "${key}=${val}" "$envf" || die "校验失败：$key 未写入 web/.env"
+}
+
+get_env_kv() {
+  local key="$1" envf="$REPO_DIR/web/.env"
+  [ -f "$envf" ] || return 0
+  sed -n "s/^${key}=//p" "$envf" | tail -n1 | tr -d '\r'
+}
+
+# 从终端读一行。不能直接 `read`：一键安装是 `curl … | bash`，此时 stdin 是脚本
+# 本身，read 会把脚本后面的内容当成用户输入吃掉。
+ask() {
+  local prompt="$1" def="${2:-}" ans=""
+  if [ -r /dev/tty ]; then
+    printf '%s' "$prompt" >/dev/tty
+    read -r ans </dev/tty || ans=""
+  fi
+  printf '%s' "${ans:-$def}"
+}
+
+# 规范化域名。转小写不只是美观：OCIBOT_CORS_ORIGINS 是精确字符串比对，而浏览器
+# 发出的 Origin 头里主机名永远是小写，输入 Panel.Example.com 会比对不上。
+normalize_domain() {
+  local d
+  d="$(printf '%s' "${1:-}" | tr -d ' \r' | tr 'A-Z' 'a-z' | sed -e 's#^https\?://##' -e 's#/.*$##')"
+  # 这一行不只是「输入校验」：这个值会被原样写进 web/.env 的 OCIBOT_DOMAIN= 后面。
+  # 字符白名单里没有换行，所以带换行的参数会在这里被拒 —— 否则一个精心构造的
+  # 「域名」可以往 .env 里再插一行，覆盖掉 OCIBOT_MASTER_KEY 之类的键。
+  case "$d" in
+    ""|*[!a-z0-9.-]*|.*|*.|-*|*-) die "域名看起来不对：'${1:-}'" ;;
+    *-.*|*.-*)                    die "域名看起来不对：'${1:-}'（标签不能以 - 开头或结尾）" ;;
+    *..*)                         die "域名看起来不对：'${1:-}'（有连续的点）" ;;
+  esac
+  # 纯 IP 走不了 Let's Encrypt（公共 CA 不给裸 IP 签证书），Caddy 会退回自签，
+  # 浏览器每次都会拦一道警告。这种情况直接用 IP 模式，不要伪装成域名模式。
+  case "$d" in
+    *[!0-9.]*) : ;;
+    *)  die "'$d' 是 IP 不是域名。IP 访问请执行：$0 ip" ;;
+  esac
+  case "$d" in
+    *.*) : ;;
+    *)   die "域名看起来不对：'${1:-}'（需要形如 panel.example.com）" ;;
+  esac
+  printf '%s' "$d"
+}
+
+# 80/443 被别的东西占着时，compose 只会抛一句 "port is already allocated"，
+# 不会说是谁占的。这里先查出来并给出可执行的下一步。
+check_web_ports_free() {
+  local holder=""
+  holder="$(docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null \
+            | grep -E ':(80|443)->' | awk '{print $1}' | grep -v '^ocibot-caddy' || true)"
+  if [ -n "$holder" ]; then
+    warn "80/443 端口已被这些容器占用："
+    printf '%s\n' "$holder" | sed 's/^/    /'
+    die "先停掉它们（docker stop <名字>），或继续用原有反代而不启用本模式"
+  fi
+  if command -v ss >/dev/null 2>&1; then
+    if ss -Hltn 2>/dev/null | awk '{print $4}' | grep -qE '[:.](80|443)$'; then
+      warn "宿主机上已有进程监听 80/443（可能是 nginx/apache），Caddy 可能起不来"
+      warn "查看：ss -ltnp | grep -E ':(80|443) '"
+    fi
+  fi
+}
+
+open_web_ports() {
+  # 尽力而为：只在明确启用的防火墙上加放行规则，不去改 iptables 原始规则。
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+    ufw allow 80/tcp >/dev/null 2>&1 && ufw allow 443/tcp >/dev/null 2>&1 \
+      && log "已在 ufw 放行 80/443" || warn "ufw 放行失败，请手动执行：ufw allow 80,443/tcp"
+  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-service=http >/dev/null 2>&1
+    firewall-cmd --permanent --add-service=https >/dev/null 2>&1
+    firewall-cmd --reload >/dev/null 2>&1 && log "已在 firewalld 放行 80/443" || true
+  fi
+  warn "云厂商的安全组/入站规则是另一层，脚本改不到 —— 请确认 80 和 443 已放行"
+  warn "（80 端口是 Let's Encrypt 校验域名归属用的，只开 443 签不出证书）"
+}
+
+# 域名解析是否指向本机。不匹配只警告不中断：套了 CDN（如 Cloudflare 橙云）时
+# 解析到的本来就是 CDN 的 IP，这时签发仍然可行。
+check_dns() {
+  local domain="$1" pubip resolved
+  pubip="$(curl -fsS -m 5 https://api.ipify.org 2>/dev/null || true)"
+  resolved="$(getent hosts "$domain" 2>/dev/null | awk '{print $1}' | head -n1 || true)"
+  if [ -z "$resolved" ]; then
+    warn "解析不到 $domain —— 如果 DNS 还没配好，证书会签发失败"
+    return 0
+  fi
+  if [ -n "$pubip" ] && [ "$resolved" != "$pubip" ]; then
+    warn "$domain 解析到 $resolved，本机公网 IP 是 $pubip（套了 CDN 则属正常）"
+  else
+    log "DNS 检查通过：$domain → $resolved"
+  fi
+}
+
+apply_mode_domain() {
+  local domain="$1"
+  log "访问方式 → 域名 + HTTPS（https://$domain）"
+  set_env_kv OCIBOT_DOMAIN "$domain"
+  set_env_kv OCIBOT_CORS_ORIGINS "https://$domain"
+  # Cookie 仅经 HTTPS 下发；应用也以这一项作为「前面有 TLS」的信号来下发 HSTS。
+  set_env_kv OCIBOT_COOKIE_SECURE 1
+  set_env_kv OCIBOT_COOKIE_SAMESITE lax
+  # 限流按真实客户端 IP 计数，否则所有人被算作 Caddy 一个 IP：一个人试错就会
+  # 把其他人一起挡在门外，攻击者反过来也更容易耗光公共额度。
+  set_env_kv OCIBOT_TRUST_PROXY 1
+  # 只信任 Docker 内网来的代理头。配合下面 BIND=127.0.0.1（8000 不对公网开放），
+  # 能到达 api 的只有同网络的容器，所以信任这个私有网段是安全的；填 '*' 则等于
+  # 让任何人伪造自己的 IP，限流形同虚设。
+  set_env_kv OCIBOT_FORWARDED_ALLOW_IPS 172.16.0.0/12
+  # 明文端口收回回环，公网只能经 Caddy 的 HTTPS 进来。
+  set_env_kv OCIBOT_BIND 127.0.0.1
+  set_env_kv COMPOSE_PROFILES tls
+}
+
+apply_mode_ip() {
+  local port="${OCIBOT_PORT:-$(get_env_kv OCIBOT_PORT)}"
+  port="${port:-8000}"
+  log "访问方式 → IP 直连（http://服务器IP:$port）"
+  set_env_kv OCIBOT_CORS_ORIGINS "http://127.0.0.1:${port},http://localhost:${port}"
+  # 明文访问下 COOKIE_SECURE=1 会让浏览器根本不回传登录 Cookie，表现为
+  # 「登录成功后立刻又跳回登录页」，是这两种模式之间最容易踩的一脚。
+  set_env_kv OCIBOT_COOKIE_SECURE 0
+  set_env_kv OCIBOT_COOKIE_SAMESITE lax
+  # 没有反代时开 TRUST_PROXY 等于把限流身份交给客户端自己声明。
+  set_env_kv OCIBOT_TRUST_PROXY 0
+  set_env_kv OCIBOT_FORWARDED_ALLOW_IPS "127.0.0.1,::1"
+  set_env_kv OCIBOT_BIND 0.0.0.0
+  set_env_kv COMPOSE_PROFILES ""
+  set_env_kv OCIBOT_DOMAIN ""
+  # 切回来时 Caddy 还占着 80/443，必须显式删掉：`compose up` 不会去动一个
+  # 当前 profile 之外的运行中容器。
+  compose --profile tls rm -sf caddy >/dev/null 2>&1 || true
+}
+
+# 装的时候问一次；非交互（curl | bash 且没有 tty）时保持原有的 IP 直连行为。
+choose_access_mode() {
+  [ -z "$ACCESS_MODE" ] || return 0
+  if [ -n "$PANEL_DOMAIN" ]; then
+    ACCESS_MODE="domain"
+    return 0
+  fi
+  if [ ! -r /dev/tty ]; then
+    log "非交互安装，默认 IP 直连；之后可执行：bash scripts/install.sh domain <域名>"
+    ACCESS_MODE="ip"
+    return 0
+  fi
+  cat >/dev/tty <<'EOF'
+
+怎么访问这个面板？
+  1) IP + 端口     http://服务器IP:8000        —— 不用域名，明文
+  2) 域名 + HTTPS  https://panel.example.com  —— 自动签证书，无需另装反代
+EOF
+  local pick
+  pick="$(ask '选择 [1/2]（默认 1）： ' 1)"
+  case "$pick" in
+    2) ACCESS_MODE="domain"; PANEL_DOMAIN="$(ask '你的域名（如 panel.example.com）： ')" ;;
+    *) ACCESS_MODE="ip" ;;
+  esac
+}
+
+apply_access_mode() {
+  case "$ACCESS_MODE" in
+    domain)
+      PANEL_DOMAIN="$(normalize_domain "$PANEL_DOMAIN")"
+      check_web_ports_free
+      check_dns "$PANEL_DOMAIN"
+      open_web_ports
+      apply_mode_domain "$PANEL_DOMAIN"
+      ;;
+    ip)
+      apply_mode_ip
+      ;;
+    "")
+      : ;;  # update/status：沿用现有配置
+    *)
+      die "OCIBOT_ACCESS_MODE 只能是 ip 或 domain（当前：$ACCESS_MODE）"
+      ;;
+  esac
+}
+
+# FORWARDED_ALLOW_IPS 默认写 172.16.0.0/12，覆盖 Docker 默认的地址池
+# （172.17.0.0/16 … 172.31.0.0/16）。但宿主机配过 default-address-pools、
+# 或那段被占满时，compose 会从 192.168.x 之类的网段分配 —— 那样 Caddy 的来源 IP
+# 不在信任列表里，代理头被忽略，所有人重新被算作同一个 IP。
+#
+# 这个失效是静默的：面板照常能用，只有在「一个人试错把所有人挡在门外」时才暴露。
+# 所以起来之后按实际网段核对一次，不对就改掉并重建 api。
+reconcile_proxy_subnet() {
+  [ "$(get_env_kv COMPOSE_PROFILES)" = "tls" ] || return 0
+  local subnet current
+  subnet="$(docker network inspect ocibot_default \
+              -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null \
+            | awk '{print $1}' | tr -d '\r')"
+  [ -n "$subnet" ] || return 0
+  case "$subnet" in
+    172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;  # 已在 172.16.0.0/12 内
+  esac
+  current="$(get_env_kv OCIBOT_FORWARDED_ALLOW_IPS)"
+  [ "$current" = "$subnet" ] && return 0
+  warn "Docker 网络是 $subnet，不在默认信任的 172.16.0.0/12 内 —— 已按实际网段修正"
+  set_env_kv OCIBOT_FORWARDED_ALLOW_IPS "$subnet"
+  compose up -d --force-recreate api >/dev/null 2>&1 || true
+}
+
+# 装完/切换完打印真正能打开的地址，而不是让操作者去猜。
+print_access_summary() {
+  local mode domain port
+  mode="$(get_env_kv COMPOSE_PROFILES)"
+  domain="$(get_env_kv OCIBOT_DOMAIN)"
+  port="$(get_env_kv OCIBOT_PORT)"; port="${port:-8000}"
+  echo
+  if [ "$mode" = "tls" ] && [ -n "$domain" ]; then
+    log "面板地址：https://$domain"
+    log "首次访问会等十几秒签发证书；卡住就看：cd $REPO_DIR && $COMPOSE logs caddy"
+    log "切回 IP 直连：bash scripts/install.sh ip"
+  else
+    local pubip
+    pubip="$(curl -fsS -m 5 https://api.ipify.org 2>/dev/null || true)"
+    log "面板地址：http://${pubip:-<服务器IP>}:$port"
+    warn "当前是明文 HTTP，登录密码在链路上不加密。有域名的话建议改用："
+    warn "    bash scripts/install.sh domain <你的域名>"
+  fi
 }
 
 compose() {
@@ -180,7 +450,16 @@ compose() {
   if [ -z "$dir" ] || [ ! -d "$dir" ]; then
     die "REPO_DIR 无效：$REPO_DIR"
   fi
-  (cd "$dir" && $COMPOSE "$@")
+  # web/.env 里的 COMPOSE_PROFILES=tls 本身就该被 compose 读到（它通过符号链接
+  # 也是项目根的 .env），但那依赖具体 compose 版本对 .env 里 COMPOSE_* 变量的处理。
+  # 这里显式再传一次 --profile：多传是幂等的，而漏传的后果是 HTTPS 前端被静默跳过，
+  # 表现成「装完了但域名打不开」，且哪条日志都不会提到 profile。
+  local profile_args=()
+  if [ -f "$dir/web/.env" ] && grep -qx 'COMPOSE_PROFILES=tls' "$dir/web/.env"; then
+    profile_args=(--profile tls)
+  fi
+  # ${a[@]+"${a[@]}"}：set -u 下展开空数组在 bash 4.3 及更早会报 unbound variable。
+  (cd "$dir" && $COMPOSE ${profile_args[@]+"${profile_args[@]}"} "$@")
 }
 
 export_build_env() {
@@ -226,6 +505,8 @@ do_install() {
   ensure_docker
   ensure_repo
   ensure_env
+  choose_access_mode
+  apply_access_mode
   export_build_env
   log "构建并启动（PostgreSQL + API + Worker）…"
   compose up -d --build db
@@ -234,15 +515,50 @@ do_install() {
   log "等待健康检查…"
   local i
   for i in $(seq 1 40); do
+    # 走回环而不是公网地址：域名模式下证书可能还没签好，但那不影响面板本身是否就绪。
     if curl -fsS "http://127.0.0.1:${OCIBOT_PORT:-8000}/api/health" >/dev/null 2>&1; then
-      log "就绪：http://127.0.0.1:${OCIBOT_PORT:-8000}"
+      reconcile_proxy_subnet
       log "首次打开页面 → 注册管理员账号"
       log "管理员「用户管理」页可检查/执行在线更新"
+      print_access_summary
       return 0
     fi
     sleep 3
   done
   warn "健康检查超时，请运行：$0 status  或  docker compose -f $REPO_DIR/docker-compose.yml logs"
+}
+
+# 装完之后换访问方式，不重装、不动数据库。
+do_switch_mode() {
+  ensure_docker
+  ensure_repo
+  [ -f "$REPO_DIR/web/.env" ] || die "还没安装过，请先执行：$0 install"
+  ensure_env
+  apply_access_mode
+  export_build_env
+  log "应用新配置…"
+  # --force-recreate：改的全是进程启动时读一次的环境变量，不重建容器不会生效。
+  compose up -d --force-recreate
+  log "等待面板就绪…"
+  local i
+  for i in $(seq 1 20); do
+    curl -fsS "http://127.0.0.1:${OCIBOT_PORT:-8000}/api/health" >/dev/null 2>&1 && break
+    sleep 3
+  done
+  reconcile_proxy_subnet
+  if [ "$ACCESS_MODE" = "domain" ]; then
+    log "等待证书签发…"
+    for i in $(seq 1 20); do
+      if curl -fsS -m 10 "https://${PANEL_DOMAIN}/api/health" >/dev/null 2>&1; then
+        log "HTTPS 已就绪 ✓"
+        break
+      fi
+      sleep 5
+    done
+    curl -fsS -m 10 "https://${PANEL_DOMAIN}/api/health" >/dev/null 2>&1 \
+      || warn "HTTPS 暂时打不开。排查顺序：DNS 是否指向本机 → 80/443 是否放行 → $COMPOSE logs caddy"
+  fi
+  print_access_summary
 }
 
 sync_repo_to_origin() {
@@ -323,16 +639,19 @@ do_status() {
   compose ps
   echo
   curl -fsS "http://127.0.0.1:${OCIBOT_PORT:-8000}/api/health" && echo || warn "API 未响应"
+  print_access_summary
 }
 
 do_uninstall() {
   ensure_docker
   ensure_repo
   warn "将停止容器。默认保留 PostgreSQL 数据卷 ocibot_pg。"
-  compose down
+  # 显式带上 tls profile：如果 web/.env 里没有 COMPOSE_PROFILES=tls（例如手工改过），
+  # 不带这个参数会把 caddy 留在后台继续占着 80/443。
+  compose --profile tls down
   if [ "${OCIBOT_PURGE_DATA:-0}" = "1" ]; then
     warn "OCIBOT_PURGE_DATA=1 → 删除数据卷"
-    compose down -v
+    compose --profile tls down -v
   fi
   log "已停止。仓库目录仍在：$REPO_DIR"
 }
@@ -343,16 +662,32 @@ case "$cmd" in
   update|upgrade) do_update ;;
   status|ps) do_status ;;
   uninstall|down) do_uninstall ;;
+  domain|https)
+    ACCESS_MODE="domain"
+    PANEL_DOMAIN="${2:-$PANEL_DOMAIN}"
+    [ -n "$PANEL_DOMAIN" ] || PANEL_DOMAIN="$(ask '你的域名（如 panel.example.com）： ')"
+    do_switch_mode
+    ;;
+  ip|http)
+    ACCESS_MODE="ip"
+    do_switch_mode
+    ;;
   *)
     cat <<EOF
-用法: $0 {install|update|status|uninstall}
+用法: $0 {install|update|status|uninstall|domain <域名>|ip}
+
+访问方式（装完后可随时互换，不影响数据）:
+  $0 domain panel.example.com   域名 + 自动 HTTPS（内置 Caddy 签证书，不需要另装反代）
+  $0 ip                         直接 http://服务器IP:8000（明文，无需域名）
 
 环境变量:
-  OCIBOT_REPO_URL   git clone 地址（远程一键安装时必填）
-  OCIBOT_DIR        安装目录（默认 \$HOME/ocibot）
-  OCIBOT_BRANCH     分支（默认 main）
-  OCIBOT_PORT       映射端口（默认 8000，需与 web/.env 一致）
-  OCIBOT_PURGE_DATA 卸载时删库（=1）
+  OCIBOT_REPO_URL     git clone 地址（远程一键安装时必填）
+  OCIBOT_DIR          安装目录（默认 \$HOME/ocibot）
+  OCIBOT_BRANCH       分支（默认 main）
+  OCIBOT_PORT         映射端口（默认 8000，需与 web/.env 一致）
+  OCIBOT_ACCESS_MODE  ip | domain（非交互安装时指定，省去询问）
+  OCIBOT_DOMAIN       域名（配合 OCIBOT_ACCESS_MODE=domain）
+  OCIBOT_PURGE_DATA   卸载时删库（=1）
 EOF
     exit 1
     ;;

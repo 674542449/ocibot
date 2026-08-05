@@ -94,6 +94,37 @@ services:
       start_period: 30s
     restart: unless-stopped
 
+  # HTTPS 终结。只在 tls profile 下启动，也就是 web/.env 里有 COMPOSE_PROFILES=tls
+  # 时 —— 那一行由 `scripts/install.sh domain <域名>` 写入。IP 直连模式下这个服务
+  # 完全不存在，不会去抢 80/443。
+  #
+  # 存在的理由：没有它就得在外面再架一套 Nginx Proxy Manager，每次重装都要手点一遍
+  # 域名、证书、Websockets 开关、请求体上限，而漏掉其中任何一项都会以「终端连不上」
+  # 或「备份导入失败」这类完全不指向反代的症状出现。
+  caddy:
+    profiles: ["tls"]
+    image: caddy:2-alpine
+    environment:
+      OCIBOT_DOMAIN: ${OCIBOT_DOMAIN:-localhost}
+    volumes:
+      # 相对路径，和上面 api 的绝对路径挂载不同：compose 以 compose 文件所在目录
+      # 解析它，所以手动部署到任意目录也对。api 那个必须写绝对路径是另一个原因
+      # （面板内一键更新时要在辅助容器里解析成同一个宿主机路径），这里没这个约束，
+      # 反而套用 ${OCIBOT_HOST_REPO:-/root/ocibot} 会在非默认目录的手动部署里挂错。
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ocibot_caddy_data:/data
+      - ocibot_caddy_config:/config
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    depends_on:
+      api:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
   worker:
     build:
       context: .
@@ -117,3 +148,6 @@ services:
 
 volumes:
   ocibot_pg:
+  # 证书 + ACME 账号。删掉等于丢掉已签发的证书，重建时会重新走一次签发流程。
+  ocibot_caddy_data:
+  ocibot_caddy_config:

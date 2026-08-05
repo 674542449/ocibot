@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.4.60 — 2026-08-06
+
+面板自带 HTTPS，不再需要外部反向代理。
+
+### 功能
+- **内置 HTTPS 终结**。新增一个 `caddy:2-alpine` 服务，挂在 compose 的 `tls`
+  profile 下，配置见 `deploy/Caddyfile`。证书签发与续期全自动，
+  **不需要再装 Nginx Proxy Manager**。
+
+  ```bash
+  bash scripts/install.sh domain panel.example.com   # 域名 + 自动 HTTPS
+  bash scripts/install.sh ip                         # 改回 IP + 端口直连
+  ```
+
+  两种访问方式装完后随时可以互换，不影响数据库和已导入的租户。
+  首次安装会交互询问；`curl … | bash` 这种没有终端的场景默认 IP 直连，
+  与此前行为一致。
+
+- **访问方式相关的配置成组写入**。`COMPOSE_PROFILES` / `OCIBOT_DOMAIN` /
+  `CORS_ORIGINS` / `COOKIE_SECURE` / `TRUST_PROXY` / `FORWARDED_ALLOW_IPS` /
+  `BIND` 七项由脚本一起改，不再逐项手工对照。
+
+  这不是为了省事：它们配错**不会报错**。`COOKIE_SECURE=1` 配明文访问时，
+  浏览器根本不回传登录 Cookie，表现是「登录成功后立刻跳回登录页」；
+  `TRUST_PROXY=1` 而前面没有反代时，任何客户端都能自己声明限流身份。
+  两种都不指向配置，很难联想。新增 `tests/test_deploy_modes.py` 18 例锁住这些配对。
+
+- 切换到域名模式前会先检查 **80/443 是否被占用**（列出占用的容器名而不是让
+  compose 抛一句 `port is already allocated`）、**DNS 是否指向本机**，
+  并尽力在 ufw / firewalld 放行 80/443。云厂商安全组脚本改不到，会明确提示。
+
+- `install.sh status` 与安装结束时打印**真正能打开的地址**，不再让人去猜。
+
+### 修复
+- `install.sh uninstall` 现在会带上 `--profile tls`。不带的话，
+  `docker compose down` 会把 Caddy 留在后台继续占着 80/443。
+- 面板内一键更新时向辅助容器透传 `COMPOSE_PROFILES` 等访问方式相关变量，
+  否则更新流程眼里的「这套栈」不包含 HTTPS 前端。
+
+### 维护
+- 新增 `docs/ACCESS-MODES.md`（两种模式的差别、前提、自检与排查）。
+  `docs/NPM-REVERSE-PROXY.md` 保留，作为仍想用 NPM 时的路径。
+- 域名入参校验收紧：拒绝裸 IP、连续点、以 `-` 开头或结尾的标签。
+  字符白名单不含换行——这个值会被原样写进 `web/.env` 的 `OCIBOT_DOMAIN=` 后面，
+  带换行的输入本可以再插一行覆盖 `OCIBOT_MASTER_KEY`。
+
+### 升级
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.60
+```
+
+升级本身不改变现有访问方式。要启用 HTTPS 再执行
+`bash scripts/install.sh domain <你的域名>`。
+
 ## 0.4.59 — 2026-08-03
 
 全量 bug + 安全排查。三处修复，两处属于纵深防御，一处是真实的日常故障。

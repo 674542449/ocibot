@@ -439,6 +439,17 @@ def _compose_env_flags(host_repo: str) -> list[str]:
         "OCIBOT_DB_POOL_SIZE",
         "OCIBOT_DB_MAX_OVERFLOW",
         "OCIBOT_WORKER_ID",
+        # Access-mode keys (scripts/install.sh domain|ip). COMPOSE_PROFILES is the
+        # one that is not plain interpolation: it decides whether the compose run
+        # includes the `tls` profile at all, i.e. whether the HTTPS front end is
+        # part of the stack being brought up. The API container receives all of
+        # these from web/.env via env_file, so passing them BY NAME hands the
+        # helper container the same view the operator's shell would have.
+        "COMPOSE_PROFILES",
+        "OCIBOT_DOMAIN",
+        "OCIBOT_BIND",
+        "OCIBOT_TRUST_PROXY",
+        "OCIBOT_FORWARDED_ALLOW_IPS",
     ):
         val = os.environ.get(key)
         if val is not None and str(val).strip() != "":
