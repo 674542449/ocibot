@@ -662,7 +662,6 @@ onBeforeUnmount(() => {
        at 1.05:1. Effectively invisible. */
     background: var(--panel);
     box-shadow: var(--shadow-md);
-    box-shadow: var(--shadow-md);
   }
 
   .layout.nav-open .sidebar {

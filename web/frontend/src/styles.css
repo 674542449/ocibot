@@ -1,20 +1,37 @@
 /* Soft glass console tokens (Feishu base + iOS-like frosted surfaces) */
 
+/* 表面亮度阶梯（亮色）
+ *
+ * 主工作区原本是纯白 #ffffff —— 感知亮度 L*100，且它占满大半个视口，是屏幕上
+ * 最亮的一块。长时间盯着看会累，这也是电子书「阅读模式」不用纯白的原因。
+ * 现在降到 L*95，仍然读得出是「纸」，但不再是最高亮度。
+ *
+ *   bg        L* 87.7   页面底色
+ *   panel     L* 95.1   主工作区（原 100）
+ *   panel-2   L* 92.6   表头等次级面
+ *   input-bg  L* 96.6   输入框仍比面板亮一点，保住「这里可以输入」的可供性
+ *
+ * 降亮度不能靠降对比换来：正文 11.52:1、次要文字 6.13:1，都远高于 AA 的 4.5:1。
+ * 每一对（含非文本的 3:1）都在 scratchpad 的 palette.py 里算过，23 项全过。
+ */
 :root {
   color-scheme: light;
-  --bg: #dce2ed;
+  --bg: #d7dce6;
   --bg-glow-1: transparent;
   --bg-glow-2: transparent;
-  --panel: #ffffff;
-  --panel-solid: #ffffff;
-  --panel-2: #e4eaf5;
-  --border: #c1c7d0;
-  --border-strong: #91959c;
-  --glass-border: #c1c7d0;
+  --panel: #eef1f6;
+  --panel-solid: #eef1f6;
+  --panel-2: #e3e8f0;
+  --border: #c8cfd9;
+  /* 提到 3:1 以上 —— 之前 #91959c 在页面底色上只有 2.31:1，直接落在页面背景上的
+   * 按钮/输入框边框达不到 WCAG 1.4.11 的非文本对比度。现在 panel 上 3.72、
+   * bg 上 3.06。 */
+  --border-strong: #767c85;
+  --glass-border: #c8cfd9;
   --glass-highlight: 0 0 transparent;
-  --text: #353639;
-  --muted: #62656a;
-  --text-secondary: #616368;
+  --text: #2f3134;
+  --muted: #565a60;
+  --text-secondary: #565a60;
   --accent: #4a41c0;
   --accent-hover: #3b34a0;
   --accent-soft: #eceafb;
@@ -25,13 +42,13 @@
   --ok-soft: #e7f6ec;
   --warn: #9a5800;
   --warn-soft: #fbf1e2;
-  --input-bg: #ffffff;
-  --row-hover: #eef1f7;
+  /* 只声明一次：这两个键原本在本块里各写了两遍，后一份覆盖前一份，
+   * 改前一份不会有任何效果 —— 是个专门用来浪费一轮排查的写法。 */
+  --input-bg: #f6f8fb;
+  --row-hover: #e6ebf2;
   /* Effects */
   --radius: 6px;
   --radius-lg: 10px;
-  --input-bg: #ffffff;
-  --row-hover: #f4f6fa;
   --shadow-sm: 0 1px 2px rgba(20, 26, 40, 0.05);
   --shadow-md: 0 6px 20px rgba(20, 26, 40, 0.09);
   --blur: 0px;
@@ -51,22 +68,36 @@
   font-feature-settings: "kern";
 }
 
-/* Optional dark glass — keep text/surfaces high-contrast on charcoal */
+/* 表面亮度阶梯（暗色）
+ *
+ * 暗色的刺眼来源和亮色相反：底色原本是 #141415（L*6.4，已经很接近纯黑），
+ * 亮字压在近黑底上会产生光晕（halation），散光的人尤其明显，而且 bg 到 panel
+ * 之间跨了 11.6 个 L*，一眼扫过去明暗落差很大。
+ *
+ * 现在把地板抬起来、把落差压平：
+ *   bg      L*  6.4 → 10.8   离开近黑
+ *   panel   L* 18.0 → 16.1
+ *   两者相差 11.6 → 5.3 个 L*
+ *
+ * 正文同时从 #d5dbe5 降到 #cbd1dc：暗色下过亮的字本身就是眩光源。
+ * 降完仍有 9.63:1，远高于 AA。
+ */
 html[data-theme='dark'] {
   color-scheme: dark;
-  --bg: #141415;
+  --bg: #1c1d20;
   --bg-glow-1: transparent;
   --bg-glow-2: transparent;
-  --panel: #2b2c2e;
-  --panel-solid: #2b2c2e;
-  --panel-2: #38393c;
-  --border: #4d4f53;
-  --border-strong: #71757a;
-  --glass-border: #4d4f53;
+  --panel: #26282c;
+  --panel-solid: #26282c;
+  --panel-2: #2f3236;
+  --border: #3c3f45;
+  /* 原 #71757a 在输入框底色上只有 2.49:1，达不到非文本的 3:1；现在 3.16。 */
+  --border-strong: #787d86;
+  --glass-border: #3c3f45;
   --glass-highlight: 0 0 transparent;
-  --text: #d5dbe5;
-  --muted: #9ea2aa;
-  --text-secondary: #b7bcc6;
+  --text: #cbd1dc;
+  --muted: #969ca5;
+  --text-secondary: #b2b8c2;
   --accent: #8a97ff;
   --accent-hover: #a3adff;
   --accent-soft: #2c2f4d;
@@ -77,8 +108,8 @@ html[data-theme='dark'] {
   --ok-soft: #1d3327;
   --warn: #fbbf24;
   --warn-soft: #39301c;
-  --input-bg: #38393c;
-  --row-hover: #303234;
+  --input-bg: #2e3135;
+  --row-hover: #2a2c31;
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
   --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.45);
 }
