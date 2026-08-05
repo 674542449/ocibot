@@ -296,21 +296,91 @@ open_web_ports() {
   warn "（80 端口是 Let's Encrypt 校验域名归属用的，只开 443 签不出证书）"
 }
 
-# 域名解析是否指向本机。不匹配只警告不中断：套了 CDN（如 Cloudflare 橙云）时
-# 解析到的本来就是 CDN 的 IP，这时签发仍然可行。
+# 域名是否套了 CDN。按响应头认，不按 IP 段认：各家的 IP 段会变，Server 头不会，
+# 而且这个判断只用来决定「要不要提醒」，不做任何拦截。
+detect_cdn() {
+  curl -sI -m 8 "http://$1/" 2>/dev/null \
+    | tr -d '\r' | sed -n 's/^[Ss]erver: //p' | tail -n1
+}
+
+# CDN 回源用明文时会和 Caddy 的 HTTP→HTTPS 跳转打成死循环，浏览器报
+# ERR_TOO_MANY_REDIRECTS。这是套 CDN 的部署里最容易撞上的一件事，而症状完全
+# 不指向「回源协议」，所以在切换前后都明确说一次。
+warn_cdn_tls_mode() {
+  local server="$1"
+  case "$(printf '%s' "$server" | tr 'A-Z' 'a-z')" in
+    *cloudflare*)
+      warn "检测到 Cloudflare 代理（橙云）。必须把 SSL/TLS 加密模式设为「完全（严格）」："
+      warn "    后台 → SSL/TLS → 概述 → 加密模式 → 完全（严格）/ Full (strict)"
+      warn "  留在「灵活 / Flexible」会明文回源，和本机的 HTTP→HTTPS 跳转形成死循环，"
+      warn "  浏览器报 ERR_TOO_MANY_REDIRECTS。"
+      warn "  另外先关掉 SSL/TLS → Edge Certificates → Always Use HTTPS：它在边缘就拦下"
+      warn "  HTTP，而证书签发的域名校验正是走 HTTP 到达本机的。签发成功后可再开回来。"
+      ;;
+    ?*)
+      warn "域名前面有 CDN/代理（Server: $server）。请确认它是以 HTTPS 回源的 ——"
+      warn "  明文回源会和本机的 HTTP→HTTPS 跳转形成死循环。"
+      ;;
+  esac
+}
+
+# 域名解析是否指向本机。不匹配只警告不中断：套了 CDN 时解析到的本来就是 CDN 的
+# IP，这时签发仍然可行。
 check_dns() {
-  local domain="$1" pubip resolved
+  local domain="$1" pubip resolved server
   pubip="$(curl -fsS -m 5 https://api.ipify.org 2>/dev/null || true)"
   resolved="$(getent hosts "$domain" 2>/dev/null | awk '{print $1}' | head -n1 || true)"
   if [ -z "$resolved" ]; then
     warn "解析不到 $domain —— 如果 DNS 还没配好，证书会签发失败"
     return 0
   fi
+  server="$(detect_cdn "$domain")"
   if [ -n "$pubip" ] && [ "$resolved" != "$pubip" ]; then
-    warn "$domain 解析到 $resolved，本机公网 IP 是 $pubip（套了 CDN 则属正常）"
+    warn "$domain 解析到 $resolved，本机公网 IP 是 $pubip"
+    [ -n "$server" ] || warn "  如果没套 CDN，说明 DNS 指错了机器，证书签不出来"
   else
     log "DNS 检查通过：$domain → $resolved"
   fi
+  [ -z "$server" ] || warn_cdn_tls_mode "$server"
+}
+
+# 面板是否真的能从公网打开。
+#
+# 不能用 `curl -fsS`：-f 只在 400 及以上失败，308 会被当成成功返回空 body ——
+# 于是明文回源导致的重定向死循环会被报成「HTTPS 已就绪 ✓」，恰好是操作者最需要
+# 被告知的那一种坏法。这里认状态码，并在 30x 指回同一个 https 地址时点破成因。
+verify_public_https() {
+  local domain="$1" url="https://$1/api/health" code loc
+  code="$(curl -s -o /dev/null -m 15 -w '%{http_code}' "$url" 2>/dev/null || echo 000)"
+  case "$code" in
+    200)
+      log "HTTPS 已就绪 ✓（https://$domain）"
+      return 0
+      ;;
+    30*)
+      loc="$(curl -sI -m 15 "$url" 2>/dev/null | tr -d '\r' | sed -n 's/^[Ll]ocation: //p' | tail -n1)"
+      case "$loc" in
+        https://"$domain"/*)
+          warn "HTTPS 返回 $code 且跳回自己（Location: $loc）—— 这是重定向死循环"
+          warn_cdn_tls_mode "$(detect_cdn "$domain")"
+          # 308/301 是「永久」重定向，浏览器会把它缓存下来。服务端改好之后，
+          # 之前打开过页面的浏览器仍会凭自己的缓存继续跳，看起来像没修好。
+          warn "修好之后浏览器可能仍在循环：308 是永久重定向，会被浏览器缓存。"
+          warn "  用无痕窗口验证，或清掉该站点的缓存与 Cookie 再试。"
+          ;;
+        *) warn "HTTPS 返回 $code，跳到了 $loc" ;;
+      esac
+      return 1
+      ;;
+    000)
+      warn "连不上 https://$domain。排查顺序：DNS → 80/443 是否放行 → $COMPOSE logs caddy"
+      return 1
+      ;;
+    *)
+      warn "https://$domain 返回 $code（期望 200）。查看：$COMPOSE logs caddy"
+      return 1
+      ;;
+  esac
 }
 
 apply_mode_domain() {
@@ -548,15 +618,18 @@ do_switch_mode() {
   reconcile_proxy_subnet
   if [ "$ACCESS_MODE" = "domain" ]; then
     log "等待证书签发…"
+    local ready=0
     for i in $(seq 1 20); do
-      if curl -fsS -m 10 "https://${PANEL_DOMAIN}/api/health" >/dev/null 2>&1; then
-        log "HTTPS 已就绪 ✓"
+      # 静默探一次，只在最后一次把结论和成因打出来 —— 中途的失败是正常的等待过程。
+      if [ "$(curl -s -o /dev/null -m 10 -w '%{http_code}' \
+                "https://${PANEL_DOMAIN}/api/health" 2>/dev/null || echo 000)" = "200" ]; then
+        ready=1
         break
       fi
       sleep 5
     done
-    curl -fsS -m 10 "https://${PANEL_DOMAIN}/api/health" >/dev/null 2>&1 \
-      || warn "HTTPS 暂时打不开。排查顺序：DNS 是否指向本机 → 80/443 是否放行 → $COMPOSE logs caddy"
+    [ "$ready" = "1" ] && log "HTTPS 已就绪 ✓（https://${PANEL_DOMAIN}）" \
+                       || verify_public_https "$PANEL_DOMAIN" || true
   fi
   print_access_summary
 }

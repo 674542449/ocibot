@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.4.61 — 2026-08-06
+
+切换到域名模式后的校验能报出真实结论，并认出 CDN 明文回源这一类故障。
+
+### 修复
+- **切换脚本会把坏掉的部署报成成功**。原来用 `curl -fsS https://域名/api/health`
+  判断，而 `-f` 只在 **400 及以上**失败 —— 308 重定向被当成成功且返回空 body。
+  于是「CDN 用明文回源 → 和本机的 HTTP→HTTPS 跳转打成死循环 → 浏览器
+  ERR_TOO_MANY_REDIRECTS」这种坏法，脚本会打印「HTTPS 已就绪 ✓」。
+  恰好是操作者最需要被告知的那一种。
+
+  改为直接看状态码：只有 200 算就绪；30x 时取 `Location`，指回同一个 https 地址
+  就点破成因。
+
+### 功能
+- 检测到域名前面有 CDN 时（按 `Server` 响应头认，不按 IP 段 —— IP 段会变），
+  在切换前后都提示回源协议的要求。Cloudflare 单独给出确切操作：
+  加密模式必须是 **完全（严格）/ Full (strict)**，且证书签发期间要先关掉
+  **Always Use HTTPS**（它在边缘拦下 HTTP，而 ACME 的域名校验正是走 HTTP 到达本机）。
+- 判定为死循环时额外说明：**308 是永久重定向，浏览器会缓存**。服务端修好之后
+  旧标签页仍会自己跳，看起来像没修好 —— 需要用无痕窗口或清站点缓存验证。
+
+### 维护
+- `docs/ACCESS-MODES.md` 新增 ERR_TOO_MANY_REDIRECTS 专节，第一步先用
+  `curl -L -w '%{http_code} redirects=%{num_redirects}'` 分清是服务端还在循环
+  还是只有浏览器还在循环 —— 两者的处理完全不同。
+- `tests/test_deploy_modes.py` 增至 22 例，其中三例专门锁住「不得用 `curl -f`
+  判断 HTTPS 是否就绪」。
+
+### 升级
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.61
+```
+
 ## 0.4.60 — 2026-08-06
 
 面板自带 HTTPS，不再需要外部反向代理。

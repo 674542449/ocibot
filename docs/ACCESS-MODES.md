@@ -98,6 +98,7 @@ curl -sI https://panel.example.com | grep -i strict-transport
 
 | 现象 | 原因 |
 |---|---|
+| `ERR_TOO_MANY_REDIRECTS` | 见下方专节 |
 | 打不开，`docker compose logs caddy` 里是 ACME 报错 | DNS 没指向本机，或 80 端口没放行 |
 | 容器反复重启 | `OCIBOT_DOMAIN` 是空的；执行 `bash scripts/install.sh domain <域名>` 重设 |
 | 端口被占用起不来 | 还有别的反代在跑，先 `docker stop` 掉 |
@@ -107,6 +108,34 @@ curl -sI https://panel.example.com | grep -i strict-transport
 ```bash
 cd ~/ocibot && docker compose logs --tail 50 caddy
 ```
+
+### ERR_TOO_MANY_REDIRECTS
+
+先分清是**服务端还在循环**，还是**只有浏览器还在循环**：
+
+```bash
+curl -sS -o /dev/null -L -w '%{http_code} redirects=%{num_redirects}\n' https://你的域名/
+```
+
+- `200 redirects=0` → **服务端是好的**。308 是「永久」重定向，浏览器会缓存它，
+  所以修好之后旧标签页仍会自己跳。用无痕窗口验证，或清掉该站点的缓存与 Cookie。
+- 仍在循环 → 看 `Location` 是不是指回同一个 https 地址。是的话，问题在**回源协议**：
+
+  **Cloudflare（橙云）**：SSL/TLS → 概述 → 加密模式必须是**完全（严格）/ Full (strict)**。
+  留在「灵活 / Flexible」时 CF 用明文 80 回源，Caddy 在 80 上按规矩回 308 让你转
+  HTTPS，CF 把这个 308 原样交给浏览器 —— 于是转不完。
+
+  同时先关掉 SSL/TLS → Edge Certificates → **Always Use HTTPS**：它在边缘就拦下
+  HTTP，而 Let's Encrypt 的域名校验正是走 HTTP 到达本机的，开着会签不出证书。
+  确认签发成功后可以再开回来：
+
+  ```bash
+  docker compose logs caddy | grep -i "certificate obtained"
+  ```
+
+不要反过来让面板迁就 Flexible。Flexible 的含义是 CF 到服务器这一段在公网上是明文的，
+而这条链路上跑的是管理员会话和 OCI 私钥相关的操作 —— 浏览器地址栏那把锁在这种模式下
+并不代表端到端加密。
 
 ---
 

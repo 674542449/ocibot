@@ -88,6 +88,30 @@ def test_compose_wrapper_passes_the_profile_explicitly(install_sh: str) -> None:
     assert "profile_args=(--profile tls)" in body
 
 
+def test_https_verification_does_not_use_curl_dash_f(install_sh: str) -> None:
+    """`curl -f` only fails on >=400, so a 308 redirect loop (CDN terminating TLS
+    but fetching the origin over plain HTTP) came back as success and the switch
+    reported "HTTPS 已就绪 ✓" for a panel that would not open at all."""
+    body = _body(install_sh, "verify_public_https")
+    assert "%{http_code}" in body, "status code must be inspected, not curl's exit code"
+    assert "curl -fsS" not in body
+    assert "30*)" in body, "a 3xx must be reported as a failure, not skipped over"
+
+
+def test_switch_waits_on_a_200_not_on_curl_success(install_sh: str) -> None:
+    body = _body(install_sh, "do_switch_mode")
+    assert "curl -fsS -m 10 \"https://" not in body
+    assert '= "200"' in body
+
+
+def test_redirect_loop_names_the_cdn_cause(install_sh: str) -> None:
+    body = _body(install_sh, "warn_cdn_tls_mode")
+    assert "cloudflare" in body
+    assert "Full (strict)" in body
+    # Always Use HTTPS at the edge starves the ACME HTTP-01 challenge.
+    assert "Always Use HTTPS" in body
+
+
 def test_forwarded_allow_ips_is_never_wildcard(install_sh: str) -> None:
     # "*" would let a client that can reach uvicorn forge X-Forwarded-For and get
     # a fresh login rate-limit bucket per request.
