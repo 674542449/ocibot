@@ -25,6 +25,7 @@ Two things guard the two ways this can rot:
 
 from __future__ import annotations
 
+import ast
 import importlib
 import importlib.util  # `import importlib` alone does not bind the util submodule
 import pathlib
@@ -83,6 +84,63 @@ VERIFY = [
 ]
 
 
+def _prune_init(init_path: pathlib.Path, deleted: set[str]) -> int:
+    """Remove deleted packages from oci/__init__.py's `__all__` and eager import.
+
+    Necessary because __init__.py has TWO code paths:
+
+        if ... os.getenv("OCI_PYTHON_SDK_LAZY_IMPORTS_DISABLED") != "true":
+            def __getattr__(x): ...          # lazy — fine with a trimmed tree
+        else:
+            from . import <all 175 packages>  # eager — ImportError on a trimmed tree
+
+    Deleting directories alone only satisfies the lazy path. An operator who sets
+    that SDK variable (it is a documented knob, and web/.env is passed straight
+    into the container) would get a panel that will not start, with a traceback
+    pointing at the SDK and nothing connecting it to this trim.
+
+    Pruning both lists makes the two paths agree with what is actually on disk,
+    so the variable stops mattering. It also keeps `dir(oci)` honest.
+    """
+    text = init_path.read_text(encoding="utf-8")
+    tree = ast.parse(text)
+    lines = text.splitlines(keepends=True)
+    edits: list[tuple[int, int, str]] = []  # (start_line, end_line, replacement)
+
+    for node in ast.walk(tree):
+        # __all__ = [...]
+        if (
+            isinstance(node, ast.Assign)
+            and any(getattr(t, "id", "") == "__all__" for t in node.targets)
+            and isinstance(node.value, ast.List)
+        ):
+            kept = [
+                ast.literal_eval(e)
+                for e in node.value.elts
+                if ast.literal_eval(e) not in deleted
+            ]
+            indent = " " * (node.col_offset)
+            body = ", ".join(f'"{n}"' for n in kept)
+            edits.append((node.lineno, node.end_lineno or node.lineno, f"{indent}__all__ = [{body}]\n"))
+        # from . import a, b, c, ...   (the eager fallback)
+        elif isinstance(node, ast.ImportFrom) and node.level == 1 and node.module is None:
+            kept_names = [a.name for a in node.names if a.name not in deleted]
+            if len(kept_names) == len(node.names):
+                continue
+            indent = " " * (node.col_offset)
+            edits.append(
+                (node.lineno, node.end_lineno or node.lineno,
+                 f"{indent}from . import {', '.join(kept_names)}\n")
+            )
+
+    if not edits:
+        return 0
+    for start, end, replacement in sorted(edits, reverse=True):
+        lines[start - 1 : end] = [replacement]
+    init_path.write_text("".join(lines), encoding="utf-8")
+    return len(edits)
+
+
 def main() -> int:
     spec = importlib.util.find_spec("oci")
     if spec is None or not spec.origin:
@@ -94,16 +152,19 @@ def main() -> int:
         return sum(f.stat().st_size for f in path.rglob("*") if f.is_file()) / 1e6
 
     before = size_mb(root)
-    removed = 0
+    deleted: set[str] = set()
     for child in sorted(root.iterdir()):
         if not child.is_dir() or child.name.startswith("__"):
             continue
         if child.name in KEEP:
             continue
         shutil.rmtree(child, ignore_errors=True)
-        removed += 1
+        deleted.add(child.name)
     after = size_mb(root)
-    print(f"oci SDK: {before:.0f} MB -> {after:.0f} MB ({removed} service packages removed)")
+    print(f"oci SDK: {before:.0f} MB -> {after:.0f} MB ({len(deleted)} service packages removed)")
+
+    edits = _prune_init(root / "__init__.py", deleted)
+    print(f"pruned {edits} reference list(s) in oci/__init__.py")
 
     # The point of the whole script: prove the remaining tree still satisfies
     # every import the panel makes.

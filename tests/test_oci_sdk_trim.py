@@ -89,3 +89,32 @@ def test_trim_script_verifies_rather_than_trusting_itself():
     src = TRIM.read_text(encoding="utf-8")
     assert "VERIFY" in src
     assert "return 1" in src, "a failed verification must fail the build"
+
+
+def test_trim_also_prunes_the_sdk_init_lists():
+    """Deleting the directories is only half the job.
+
+    oci/__init__.py carries both a `__all__` naming every service package and an
+    EAGER `from . import <all of them>` used when
+    OCI_PYTHON_SDK_LAZY_IMPORTS_DISABLED=true. Delete the directories without
+    pruning those lists and that variable turns `import oci` into an ImportError
+    — the panel does not start, and the traceback points at the SDK with nothing
+    tying it to the trim. Verified by simulation: the eager branch on an
+    unpruned-but-trimmed tree raises ImportError on the first name.
+    """
+    src = TRIM.read_text(encoding="utf-8")
+    assert "_prune_init" in src
+    assert "__all__" in src
+    # Both statement kinds must be handled, not just the easy one.
+    assert "ast.ImportFrom" in src and "ast.Assign" in src
+
+
+def test_sdk_still_has_both_import_branches():
+    """If Oracle drops the eager fallback, _prune_init's second edit becomes dead
+    code and this test says so rather than leaving it to be puzzled over."""
+    oci = pytest.importorskip("oci")
+    init = Path(oci.__file__).read_text(encoding="utf-8")
+    assert "OCI_PYTHON_SDK_LAZY_IMPORTS_DISABLED" in init, (
+        "the SDK no longer branches on this variable — re-check whether "
+        "scripts/trim_oci_sdk.py still needs to prune the eager import list"
+    )
