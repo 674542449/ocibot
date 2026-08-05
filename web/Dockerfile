@@ -35,6 +35,19 @@ COPY requirements.txt /app/requirements.txt
 COPY web/backend/requirements.txt /app/web/backend/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
+# The OCI SDK is ~403 MB, of which this panel reaches ~57 MB. Dropping the 158
+# service packages it can never call (Autonomous Database, Data Safe, GoldenGate,
+# …) takes the image down by ~346 MB, which matters because the operator rebuilds
+# it on their own server on every update — often an Always-Free instance whose
+# boot volume is the scarce resource.
+#
+# In the same layer as the install so the saving is real rather than a deleted
+# file hiding in a lower layer. The script imports every client afterwards and
+# exits non-zero if a delete was wrong, so a mistake fails the BUILD instead of
+# surfacing as a 502 on some feature weeks later.
+COPY scripts/trim_oci_sdk.py /tmp/trim_oci_sdk.py
+RUN python /tmp/trim_oci_sdk.py && rm -f /tmp/trim_oci_sdk.py
+
 COPY app /app/app
 COPY web/backend /app/web/backend
 COPY --from=frontend /src/dist /app/web/frontend/dist

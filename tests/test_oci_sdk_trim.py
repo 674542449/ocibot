@@ -1,0 +1,91 @@
+"""The image drops OCI SDK service packages the panel never imports.
+
+scripts/trim_oci_sdk.py verifies its own half at build time: after deleting, it
+imports every client and fails the Docker build if one is gone.
+
+It cannot verify the other half. If someone adds `from oci.vault import ...` to
+app/oci_client.py and does not add "vault" to KEEP, the build still succeeds —
+the trim script does not know about the new import, so it happily deletes the
+package, and the failure appears at runtime as a 502 on whichever feature needed
+it. That is the half this test covers: every oci.<service> named anywhere in the
+source must survive the trim.
+"""
+
+from __future__ import annotations
+
+import ast
+import re
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+TRIM = ROOT / "scripts" / "trim_oci_sdk.py"
+SOURCES = list((ROOT / "app").rglob("*.py")) + list((ROOT / "web" / "backend").rglob("*.py"))
+
+
+def _keep_set() -> set[str]:
+    """Read KEEP out of the script without importing it (it has side effects)."""
+    tree = ast.parse(TRIM.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "KEEP" for t in node.targets
+        ):
+            return {ast.literal_eval(e) for e in node.value.elts}  # type: ignore[attr-defined]
+    raise AssertionError("KEEP not found in scripts/trim_oci_sdk.py")
+
+
+def _referenced_services() -> dict[str, str]:
+    """Every oci.<service> mentioned in the backend, mapped to where."""
+    found: dict[str, str] = {}
+    pattern = re.compile(r"\boci\.([a-z_][a-z0-9_]*)")
+    for path in SOURCES:
+        if "__pycache__" in path.parts:
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        for m in re.finditer(r"^\s*from\s+oci\.([a-z_][a-z0-9_]*)", text, re.M):
+            found.setdefault(m.group(1), f"{path.relative_to(ROOT)}")
+        for m in pattern.finditer(text):
+            found.setdefault(m.group(1), f"{path.relative_to(ROOT)}")
+    return found
+
+
+def _would_be_deleted(service: str, keep: set[str]) -> bool:
+    """Mirror the script's rule: it removes DIRECTORIES not in KEEP.
+
+    Single-module members (oci/util.py, oci/exceptions.py, ...) are never
+    touched, so requiring them in KEEP would be noise. If a future SDK version
+    turns one of them into a package, this starts requiring it — which is the
+    correct behaviour, since it would then become deletable.
+    """
+    oci = pytest.importorskip("oci")
+    root = Path(oci.__file__).parent
+    return (root / service).is_dir() and service not in keep
+
+
+def test_every_referenced_service_survives_the_trim():
+    keep = _keep_set()
+    missing = {
+        service: where
+        for service, where in _referenced_services().items()
+        if _would_be_deleted(service, keep)
+    }
+    assert not missing, (
+        "these oci service packages are used but would be deleted from the image; "
+        "add them to KEEP in scripts/trim_oci_sdk.py:\n"
+        + "\n".join(f"  oci.{s}  ({w})" for s, w in sorted(missing.items()))
+    )
+
+
+def test_trim_keeps_the_non_obvious_transitive_dependency():
+    """oci.pagination does `from .. import dns, object_storage` at module scope
+    and oci/__init__.py imports pagination, so dropping dns breaks `import oci`
+    itself — with a traceback that points at the SDK, not at this trim."""
+    assert "dns" in _keep_set()
+
+
+@pytest.mark.skipif(not TRIM.exists(), reason="trim script absent")
+def test_trim_script_verifies_rather_than_trusting_itself():
+    src = TRIM.read_text(encoding="utf-8")
+    assert "VERIFY" in src
+    assert "return 1" in src, "a failed verification must fail the build"
