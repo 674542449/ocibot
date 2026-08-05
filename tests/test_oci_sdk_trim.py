@@ -109,6 +109,33 @@ def test_trim_also_prunes_the_sdk_init_lists():
     assert "ast.ImportFrom" in src and "ast.Assign" in src
 
 
+def test_trim_runs_in_the_same_layer_as_pip_install():
+    """Otherwise the trim frees nothing.
+
+    Docker layers are additive. With
+
+        RUN pip install ...
+        RUN python trim_oci_sdk.py
+
+    the install layer still contains all 404 MB and the trim layer merely records
+    deletions, so image size is unchanged — while every local check still passes,
+    because the trimmed tree really is what the container sees at runtime. The
+    only symptom is `docker images` reporting a size that never went down, which
+    is exactly how it was missed: shipped in 0.4.64, and the operator's image came
+    back at 1.15 GB.
+    """
+    dockerfile = (ROOT / "web" / "Dockerfile").read_text(encoding="utf-8")
+    # Join line continuations so a single logical RUN reads as one line.
+    logical = re.sub(r"\\\s*\n\s*", " ", dockerfile)
+    run_lines = [ln for ln in logical.splitlines() if ln.strip().startswith("RUN")]
+    installs = [ln for ln in run_lines if "pip install" in ln]
+    assert installs, "no `RUN pip install` found in web/Dockerfile"
+    assert any("trim_oci_sdk.py" in ln for ln in installs), (
+        "trim_oci_sdk.py must run in the SAME `RUN` as pip install; a separate "
+        "instruction leaves the untrimmed SDK in the lower layer and saves nothing"
+    )
+
+
 def test_sdk_still_has_both_import_branches():
     """If Oracle drops the eager fallback, _prune_init's second edit becomes dead
     code and this test says so rather than leaving it to be puzzled over."""

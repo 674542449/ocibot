@@ -33,20 +33,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY requirements.txt /app/requirements.txt
 COPY web/backend/requirements.txt /app/web/backend/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
-
-# The OCI SDK is ~403 MB, of which this panel reaches ~57 MB. Dropping the 158
-# service packages it can never call (Autonomous Database, Data Safe, GoldenGate,
-# …) takes the image down by ~346 MB, which matters because the operator rebuilds
-# it on their own server on every update — often an Always-Free instance whose
-# boot volume is the scarce resource.
-#
-# In the same layer as the install so the saving is real rather than a deleted
-# file hiding in a lower layer. The script imports every client afterwards and
-# exits non-zero if a delete was wrong, so a mistake fails the BUILD instead of
-# surfacing as a 502 on some feature weeks later.
 COPY scripts/trim_oci_sdk.py /tmp/trim_oci_sdk.py
-RUN python /tmp/trim_oci_sdk.py && rm -f /tmp/trim_oci_sdk.py
+
+# The OCI SDK installs ~404 MB (208 MB of .py plus the 195 MB of .pyc pip
+# byte-compiles alongside it), of which this panel reaches ~58 MB. The other
+# ~346 MB is Autonomous Database, Data Safe, GoldenGate and the like — code that
+# cannot execute here. It matters because the image is rebuilt on the operator's
+# own server on every update, often an Always-Free instance where the boot
+# volume is the scarce resource.
+#
+# ONE RUN, deliberately. Layers are additive: with `pip install` and the trim as
+# two instructions, the install layer keeps all 404 MB and the trim layer only
+# records the deletions, so the image does not shrink by a single byte. That is
+# not hypothetical — it shipped that way in 0.4.64/0.4.65 and the operator's
+# image came back at 1.15 GB. tests/test_oci_sdk_trim.py now pins them together.
+#
+# The script imports every client afterwards and exits non-zero if a delete was
+# wrong, so a mistake fails the BUILD rather than surfacing as a 502 weeks later.
+RUN pip install --no-cache-dir -r /app/requirements.txt \
+    && python /tmp/trim_oci_sdk.py \
+    && rm -f /tmp/trim_oci_sdk.py
 
 COPY app /app/app
 COPY web/backend /app/web/backend
