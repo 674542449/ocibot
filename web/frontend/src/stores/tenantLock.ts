@@ -82,25 +82,39 @@ export function isTenantLocked(id: string): boolean {
 
 /**
  * Which tenant a page should open with. Also self-heals: a lock pointing at a
- * tenant that no longer exists (deleted or disabled) is cleared rather than left
- * to silently fall through on every page forever.
+ * tenant that no longer exists is cleared rather than left to silently fall
+ * through on every page forever.
+ *
+ * `selectable` is what this page can actually offer. `known` is every tenant the
+ * account has, and it is what the self-heal judges against — pass it whenever
+ * `selectable` is a filtered subset.
+ *
+ * Why the two are separate: 创建实例 and 存储 list only ENABLED tenants. When
+ * both arguments were the same list, locking a tenant and then disabling it made
+ * merely opening one of those two pages clear the lock, while opening 账户 or
+ * 实例 (which pass every tenant) kept it. Since 0.4.58 the lock lives on the
+ * account, so that was a persisted setting being destroyed by navigating — and
+ * which happened depended on which page you clicked first. Disabled is a
+ * reversible state; only a tenant that is really gone should drop the lock.
  */
-export function pickTenantId(tenants: Tenant[], queryTenant?: unknown): string {
+export function pickTenantId(
+  selectable: Tenant[],
+  queryTenant?: unknown,
+  known: Tenant[] = selectable,
+): string {
   const query = String(queryTenant ?? '')
-  if (query && tenants.some((t) => t.id === query)) return query
+  if (query && selectable.some((t) => t.id === query)) return query
 
   if (lockedId.value) {
-    const found = tenants.find((t) => t.id === lockedId.value)
+    const found = selectable.find((t) => t.id === lockedId.value)
     if (found) {
       // Keep the badge honest after a rename.
       if (found.name !== lockedName.value) lockedName.value = found.name
       return lockedId.value
     }
     // Only drop the lock once we have actually seen a list — an empty array here
-    // usually means "still loading", not "that tenant is gone". A disabled tenant
-    // also lands here (some pages list only enabled ones), which is intended:
-    // a tenant you cannot use is not a useful default.
-    if (tenants.length) unlockTenant()
+    // usually means "still loading", not "that tenant is gone".
+    if (known.length && !known.some((t) => t.id === lockedId.value)) unlockTenant()
   }
-  return tenants[0]?.id || ''
+  return selectable[0]?.id || ''
 }

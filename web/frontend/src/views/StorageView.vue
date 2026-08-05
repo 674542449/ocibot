@@ -366,7 +366,9 @@ function formatBytes(n: number) {
 async function loadTenants() {
   const { data } = await api.get<Tenant[]>('/tenants')
   tenants.value = data.filter((t) => t.enabled)
-  tenantId.value = pickTenantId(tenants.value, route.query.tenant)
+  // Third argument is the UNFILTERED list: a locked tenant that is merely
+  // disabled must not be treated as gone and have the lock cleared.
+  tenantId.value = pickTenantId(tenants.value, route.query.tenant, data)
   const t = String(route.query.tab || '')
   if (t === 'boot' || t === 'block' || t === 'object') tab.value = t
 }

@@ -6,6 +6,7 @@ from collections.abc import Generator
 from pathlib import Path
 
 from sqlalchemy import create_engine, event
+from sqlalchemy.engine.url import make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from web.backend.config import get_settings
@@ -13,6 +14,29 @@ from web.backend.config import get_settings
 
 class Base(DeclarativeBase):
     pass
+
+
+def _is_memory_sqlite(url: str) -> bool:
+    """True for a SQLite URL that lives in RAM rather than on disk.
+
+    Parsed rather than pattern-matched, because there are three spellings and
+    the easy-to-forget one is the bare ``sqlite://`` — no ``:memory:`` text in
+    it anywhere, yet still an in-memory database. The others are the explicit
+    ``:memory:`` and the URI form ``file:x?mode=memory`` used for a shared one.
+    """
+    try:
+        parsed = make_url(url)
+    except Exception:
+        # Unparseable: let create_engine raise the real error rather than
+        # guessing a pool configuration from a URL we do not understand.
+        return False
+    if not parsed.database:
+        return True  # sqlite:// — no path means memory
+    if parsed.database == ":memory:":
+        return True
+    # In the URI form the mode lands in the query string, not in `database`
+    # (which is just "file:shared"), so checking the path alone misses it.
+    return str(parsed.query.get("mode", "")).lower() == "memory"
 
 
 def _make_engine():
@@ -28,12 +52,18 @@ def _make_engine():
         # Ensure parent dir exists for default sqlite path
         if ":///" in url:
             raw_path = url.split(":///", 1)[1]
-            if raw_path and raw_path != ":memory:":
+            if raw_path and not _is_memory_sqlite(url):
                 Path(raw_path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
         connect_args["check_same_thread"] = False
         # SQLite: small pool (often NullPool-ish behavior is fine; keep simple).
-        engine_kwargs["pool_size"] = 5
-        engine_kwargs["max_overflow"] = 0
+        #
+        # Not for in-memory, though: SQLAlchemy's pysqlite dialect gives a memory
+        # URL a SingletonThreadPool, which accepts neither of these and raises
+        # TypeError from create_engine — at import time, so the whole API dies
+        # before it can say why. A file URL gets a QueuePool and is fine.
+        if not _is_memory_sqlite(url):
+            engine_kwargs["pool_size"] = 5
+            engine_kwargs["max_overflow"] = 0
     else:
         # PostgreSQL production pool — faster concurrent API + worker traffic.
         engine_kwargs["pool_size"] = int(getattr(settings, "db_pool_size", 10) or 10)

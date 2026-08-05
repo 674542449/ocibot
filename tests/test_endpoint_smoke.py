@@ -364,4 +364,42 @@ def test_every_endpoint_is_wired() -> None:
         ]:
             check("DELETE", p, c.delete(p))
 
+        # create-image answers 403 by design (CLAUDE.md), but "refuses" and
+        # "raises on the way to refusing" are different things and only one of
+        # them is acceptable.
+        p = f"/api/tenants/{tid}/instances/{iid}/create-image"
+        check("POST", p, c.post(p, json={"display_name": "img"}))
+
+        p = f"/api/tenants/{tid}/oci-password-policy/disable-expiry"
+        check("POST", p, c.post(p, json={"policy_id": "p1"}))
+
+        # Admin reset targets a SECOND user on purpose: the route refuses to reset
+        # the caller's own password, so pointing it at ourselves would exercise the
+        # 400 guard instead of the code path that actually does the work.
+        with SessionLocal() as db:
+            victim = db.scalar(select(User).where(User.username == "smoke-victim"))
+            if victim is None:
+                victim = User(username="smoke-victim", password_hash=hash_password("throwaway123"))
+                db.add(victim)
+                db.commit()
+            victim_id = victim.id
+        p = f"/api/admin/users/{victim_id}/reset-password"
+        check("POST", p, c.post(p))
+
+        # --- session-ending routes last: each one invalidates the cookie the
+        # --- preceding requests were relying on.
+        p = "/api/auth/change-password"
+        r = c.post(p, json={"old_password": "supersecret123", "new_password": "supersecret456"})
+        check("POST", p, r)
+        # Not just "no 5xx": a change-password that returns 200 without actually
+        # changing anything looks identical from the status code alone.
+        assert r.status_code == 200, f"change-password: {r.status_code} {r.text}"
+
+        check("POST", "/api/auth/logout", c.post("/api/auth/logout"))
+
+        r = c.post("/api/auth/login", json={"username": "smoke", "password": "supersecret456"})
+        assert r.status_code == 200, f"new password does not work: {r.status_code} {r.text}"
+
+        check("POST", "/api/auth/logout-all", c.post("/api/auth/logout-all"))
+
     assert not failures, "endpoints returned 5xx:\n" + "\n".join(failures)

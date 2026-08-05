@@ -418,17 +418,36 @@ async function loadTenants() {
   tenantId.value = pickTenantId(rows, route.query.tenant)
 }
 
+// Request-sequence guard, same as StorageView/InstancesView. Without it a slow
+// response for tenant A lands after the user switched to tenant B and fills the
+// page with A's spend, invoices and remaining free quota under B's name — every
+// number on the page is wrong and nothing says so.
+//
+// The counter is PER LOADER: loadAll() starts four at once, so one shared
+// counter would have each of them bump it and discard all but the last-started.
+const loadSeq: Record<string, number> = {}
+
+function beginLoad(key: string): { stale: () => boolean } {
+  const seq = (loadSeq[key] = (loadSeq[key] || 0) + 1)
+  const wanted = tenantId.value
+  return { stale: () => seq !== loadSeq[key] || tenantId.value !== wanted }
+}
+
 async function loadAccount() {
   if (!tenantId.value) return
+  const guard = beginLoad('account')
   const res = await api.get(`/tenants/${tenantId.value}/account`)
+  if (guard.stale()) return
   data.value = res.data.data || {}
   msg.value = res.data.message || ''
 }
 
 async function loadUsage() {
   if (!tenantId.value) return
+  const guard = beginLoad('usage')
   try {
     const res = await api.get(`/tenants/${tenantId.value}/usage`, { params: { days: days.value } })
+    if (guard.stale()) return
     usage.value = res.data.data || {}
     usageMsg.value = res.data.message || ''
     if (!res.data.ok && res.data.message) {
@@ -436,6 +455,7 @@ async function loadUsage() {
       usageMsg.value = res.data.message
     }
   } catch (e: any) {
+    if (guard.stale()) return
     usage.value = { daily: [], by_service: [], total: 0 }
     usageMsg.value = e?.message || '读取账单失败'
   }
@@ -487,9 +507,11 @@ function invoiceClass(inv: any): string {
 
 async function loadInvoices() {
   if (!tenantId.value) return
+  const guard = beginLoad('invoices')
   invoiceError.value = ''
   try {
     const res = await api.get(`/tenants/${tenantId.value}/invoices`)
+    if (guard.stale()) return
     invoices.value = res.data.data?.invoices || []
     invoiceMsg.value = res.data.message || ''
     // ok=false means Oracle refused the read; an empty list then proves nothing.
@@ -498,6 +520,7 @@ async function loadInvoices() {
       invoices.value = []
     }
   } catch (e: any) {
+    if (guard.stale()) return
     invoices.value = []
     invoiceMsg.value = ''
     invoiceError.value = e?.message || '请求失败'
@@ -506,24 +529,31 @@ async function loadInvoices() {
 
 async function loadQuota() {
   if (!tenantId.value) return
+  const guard = beginLoad('quota')
   try {
     const res = await api.get(`/tenants/${tenantId.value}/free-quota`)
+    if (guard.stale()) return
     quota.value = res.data.data || null
   } catch {
+    if (guard.stale()) return
     quota.value = null
   }
 }
 
 async function loadAll() {
   if (!tenantId.value) return
+  const guard = beginLoad('all')
   error.value = ''
   loading.value = true
   try {
     await Promise.all([loadAccount(), loadUsage(), loadQuota(), loadInvoices()])
   } catch (e: any) {
+    if (guard.stale()) return
     error.value = e?.message || '加载失败'
   } finally {
-    loading.value = false
+    // Only the newest run may clear the spinner. Otherwise an earlier, slower
+    // run finishing second turns it off while the current one is still loading.
+    if (!guard.stale()) loading.value = false
   }
 }
 

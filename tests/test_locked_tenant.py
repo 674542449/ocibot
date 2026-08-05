@@ -169,3 +169,58 @@ def test_deleting_the_tenant_clears_the_default(ca, ids):
 def test_it_requires_a_session():
     with TestClient(app) as anon:
         assert anon.put("/api/auth/locked-tenant", json={"tenant_id": "x"}).status_code == 401
+
+
+# --------------------------------------------------------------------------
+# Frontend guard. The self-heal that clears a vanished lock lives in
+# web/frontend/src/stores/tenantLock.ts, and there is no JS test runner in this
+# repo, so the invariant is asserted against the source instead.
+# --------------------------------------------------------------------------
+
+_FRONTEND = Path(__file__).resolve().parents[1] / "web" / "frontend" / "src"
+
+
+def _call_args(text: str, start: int) -> str:
+    """Return the argument text of the pickTenantId( call starting at `start`."""
+    depth, i = 0, start
+    while i < len(text):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[start:i]
+        i += 1
+    return ""
+
+
+def test_filtered_tenant_lists_pass_the_full_list_to_pick():
+    """A page that offers only ENABLED tenants must still judge "is the locked
+    tenant gone?" against every tenant.
+
+    Otherwise locking a tenant and then disabling it means that merely opening
+    创建实例 or 存储 clears the lock — server-side, permanently, since 0.4.58 —
+    while opening 账户 or 实例 (which pass the unfiltered list) keeps it. Whether
+    a saved default survived came down to which page was clicked first.
+    """
+    offenders = []
+    for path in sorted(_FRONTEND.glob("views/*.vue")):
+        src = path.read_text(encoding="utf-8")
+        idx = src.find("pickTenantId(")
+        if idx < 0:
+            continue
+        args = _call_args(src, src.index("(", idx))
+        # Only pages that narrow the list need the third argument.
+        if ".filter(" not in src.split("pickTenantId(")[0][-600:]:
+            continue
+        if args.count(",") < 2:
+            offenders.append(f"{path.name}: pickTenantId({args.strip()}) — 缺少完整租户列表参数")
+    assert not offenders, "\n".join(offenders)
+
+
+def test_selfheal_requires_absence_from_the_known_list():
+    """The clear must be conditional on the tenant being absent from `known`,
+    not merely on `known` being non-empty."""
+    store = (_FRONTEND / "stores" / "tenantLock.ts").read_text(encoding="utf-8")
+    assert "known.some((t) => t.id === lockedId.value)" in store
+    assert "if (known.length && !known.some" in store

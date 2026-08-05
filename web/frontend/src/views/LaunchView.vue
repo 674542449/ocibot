@@ -747,7 +747,9 @@ async function loadTenants() {
   tenants.value = data.filter((t) => t.enabled)
   // ?tenant= (or the locked tenant) may name a 副区 row; select its primary so
   // both dropdowns agree.
-  const picked = pickTenantId(tenants.value, route.query.tenant)
+  // Third argument is the UNFILTERED list: a locked tenant that is merely
+  // disabled must not be treated as gone and have the lock cleared.
+  const picked = pickTenantId(tenants.value, route.query.tenant, data)
   const wanted = tenants.value.find((t) => t.id === picked) || primaryTenants.value[0]
   if (!wanted) return
   const parentListed = tenants.value.some((p) => p.id === wanted.parent_tenant_id)
