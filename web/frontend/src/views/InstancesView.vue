@@ -138,17 +138,33 @@
             <td>
               <!-- 密码模式创建时写在实例标签里；密钥模式没有这个值。
                    默认打码，点一下才显示 —— 列表常开着，也常被截图。 -->
-              <template v-if="ins.root_password">
-                <span
-                  class="copyable pwd-cell"
-                  :title="revealed.has(ins.id) ? '单击复制 root 密码' : '单击显示 root 密码'"
-                  role="button"
-                  tabindex="0"
-                  @click="onPasswordClick(ins, $event)"
-                  @keydown.enter.prevent="onPasswordClick(ins)"
-                >{{ revealed.has(ins.id) ? ins.root_password : '••••••••' }}</span>
-              </template>
-              <span v-else class="muted">—</span>
+              <div class="pwd-wrap">
+                <template v-if="ins.root_password">
+                  <span
+                    class="copyable pwd-cell"
+                    :title="revealed.has(ins.id) ? '单击复制 root 密码' : '单击显示 root 密码'"
+                    role="button"
+                    tabindex="0"
+                    @click="onPasswordClick(ins, $event)"
+                    @keydown.enter.prevent="onPasswordClick(ins)"
+                  >{{ revealed.has(ins.id) ? ins.root_password : '••••••••' }}</span>
+                </template>
+                <span v-else class="muted">—</span>
+                <!-- Editable because the note is written once at launch and goes
+                     stale the moment the password is changed over SSH. Shown for
+                     key-mode instances too: those start with no note, and there is
+                     no reason the operator cannot record one later. -->
+                <button
+                  type="button"
+                  class="ghost pwd-edit"
+                  :title="ins.root_password ? '修改密码备注' : '记录 root 密码'"
+                  :aria-label="`${ins.display_name} 密码备注`"
+                  :disabled="pwdBusy === ins.id"
+                  @click="editPassword(ins)"
+                >
+                  {{ pwdBusy === ins.id ? '…' : '改' }}
+                </button>
+              </div>
             </td>
             <td>
               <div class="btn-group" role="group" :aria-label="`${ins.display_name} 操作`">
@@ -225,6 +241,23 @@
 .pwd-cell {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   white-space: nowrap;
+}
+
+/* The edit control keeps a fixed slot whether or not a password is recorded, so
+   the column width does not change between rows — a width that depends on the
+   cell's contents makes the whole table reflow when one note is cleared. */
+.pwd-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.pwd-edit {
+  flex: 0 0 auto;
+  min-width: 1.9rem;
+  padding: 0.05rem 0.35rem;
+  font-size: 12px;
+  line-height: 1.6;
 }
 /* Anchored to the viewport, not to the document. As a sticky card in the flow it
    appeared above the table and pushed every row down the moment you ticked a
@@ -448,6 +481,50 @@ async function onPasswordClick(ins: Instance, ev?: MouseEvent) {
   }
   await copyText(ins.root_password, 'root 密码已复制')
   void ev
+}
+
+/** Which row's note is being written, so its button can show progress. */
+const pwdBusy = ref('')
+
+/**
+ * Edit the remembered root password.
+ *
+ * It is a memo stored in an OCI freeform tag — nothing authenticates with it —
+ * so this only fixes what the panel displays; it does NOT change the password on
+ * the machine. The prompt says so, because "改密码" and "改密码备注" are one
+ * character apart and the consequences of confusing them are not.
+ */
+async function editPassword(ins: Instance) {
+  const current = ins.root_password || ''
+  const next = window.prompt(
+    `记录 ${ins.display_name} 的 root 密码。\n` +
+      `仅更新面板显示，不会修改服务器上的密码。\n` +
+      `留空则清除备注。`,
+    current,
+  )
+  if (next === null) return // cancelled
+  const value = next.trim()
+  if (value === current) return
+  pwdBusy.value = ins.id
+  try {
+    const { data } = await api.post<{ ok: boolean; message: string }>(
+      `/tenants/${ins.tenant_id || tenantId.value}/instances/${ins.id}/root-password`,
+      { root_password: value },
+    )
+    if (!data.ok) {
+      showToast(data.message || '更新失败', 'err', 5000)
+      return
+    }
+    // Update in place rather than reloading the whole list: a full refresh here
+    // would spend an Oracle round trip per row to redisplay one changed cell.
+    ins.root_password = value
+    if (!value) revealed.delete(ins.id)
+    showToast(data.message || '已更新密码备注', 'ok', 2500)
+  } catch (e: any) {
+    showToast(e?.message || '更新失败', 'err', 5000)
+  } finally {
+    pwdBusy.value = ''
+  }
 }
 
 let loadSeq = 0

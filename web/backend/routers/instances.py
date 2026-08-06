@@ -46,6 +46,7 @@ from web.backend.schemas import (
     PowerActionRequest,
     PowerActionResult,
     RenameRequest,
+    RootPasswordNoteRequest,
     ShapeConfigRequest,
     TerminateRequest,
 )
@@ -220,6 +221,43 @@ def rename_instance(
     try:
         session = get_session_for_row(row)
         result = session.rename_instance(instance_id, body.display_name.strip())
+        return PowerActionResult(**op_result_dict(result))
+    except OCIClientError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post(
+    "/tenants/{tenant_id}/instances/{instance_id}/root-password",
+    response_model=PowerActionResult,
+)
+def set_root_password_note(
+    tenant_id: str,
+    instance_id: str,
+    body: RootPasswordNoteRequest,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> PowerActionResult:
+    """Update the root password remembered against an instance.
+
+    The value is only ever a memo — nothing in the panel authenticates with it —
+    but it is written once at launch and then goes stale the moment the operator
+    changes the password over SSH, which is precisely when it needs to be right.
+    """
+    row = _tenant_or_404(db, user.id, tenant_id)
+    try:
+        session = get_session_for_row(row)
+        result = session.set_root_password_note(instance_id, body.root_password)
+        # Not audited with the value, obviously; the fact of the change is enough
+        # and the audit log is readable by every admin.
+        write_audit(
+            db,
+            owner_id=user.id,
+            action="instance.root_password_note",
+            target=instance_id,
+            detail="set" if (body.root_password or "").strip() else "cleared",
+        )
         return PowerActionResult(**op_result_dict(result))
     except OCIClientError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc

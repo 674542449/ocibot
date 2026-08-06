@@ -264,6 +264,18 @@ class RenameRequest(BaseModel):
     display_name: str = Field(min_length=1, max_length=255)
 
 
+class RootPasswordNoteRequest(BaseModel):
+    """New value for the remembered root password (empty clears it).
+
+    No minimum length and no complexity rule on purpose: this records a password
+    that already exists on the machine, it does not set one. Rejecting a short
+    value here would leave the panel displaying the OLD password, which is worse
+    than displaying a weak one — the whole point is that the note stops lying.
+    """
+
+    root_password: str = Field(default="", max_length=255)
+
+
 class LaunchInstanceRequest(BaseModel):
     display_name: str = "instance"
     availability_domain: str = ""

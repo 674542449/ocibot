@@ -1062,6 +1062,49 @@ class TenantSession:
         except Exception as exc:  # noqa: BLE001
             return OperationResult(ok=False, message=str(exc))
 
+    def set_root_password_note(self, instance_id: str, password: str) -> OperationResult:
+        """Update (or clear) the remembered root password on an existing instance.
+
+        The value lives in the instance's freeform tag ``ocibot_root_password``,
+        written once at launch. It is a memo — nothing authenticates with it — so
+        it silently goes stale the moment the operator changes the password on the
+        box over SSH, which is exactly when they need the panel to still be right.
+
+        Two OCI calls, and the first one is not optional: ``UpdateInstanceDetails``
+        REPLACES the whole freeform-tag map rather than merging into it, so sending
+        only this key would delete every other tag on the instance — including the
+        ``ocibot_managed`` marker other features key off. Read, merge, write.
+
+        An empty password removes the tag instead of storing an empty string, so
+        the list shows "—" (no password recorded) rather than a blank that looks
+        like a rendering fault.
+        """
+        password = (password or "").strip()
+        # Tag values cannot span lines, and a stray newline would corrupt the map
+        # rather than fail loudly.
+        if "\n" in password or "\r" in password:
+            return OperationResult(ok=False, message="密码备注不能包含换行")
+        if len(password) > 255:
+            return OperationResult(ok=False, message="密码备注过长（上限 255 字符）")
+        try:
+            current = self.compute.get_instance(instance_id).data
+            tags = dict(getattr(current, "freeform_tags", None) or {})
+            if password:
+                tags[ROOT_PASSWORD_TAG] = password
+            else:
+                tags.pop(ROOT_PASSWORD_TAG, None)
+            details = oci.core.models.UpdateInstanceDetails(freeform_tags=tags)
+            self.compute.update_instance(instance_id, details)
+            return OperationResult(
+                ok=True,
+                message="已更新密码备注" if password else "已清除密码备注",
+                data={"root_password": password},
+            )
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=str(exc))
+
     def rename_instance(self, instance_id: str, display_name: str) -> OperationResult:
         display_name = (display_name or "").strip()
         if not display_name:

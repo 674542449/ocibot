@@ -97,6 +97,7 @@ def make_session():
     s.instance_action.return_value = R(True, "已提交")
     s.terminate_instance.return_value = R(True, "已终止")
     s.rename_instance.return_value = R(True, "已重命名")
+    s.set_root_password_note.return_value = R(True, "已更新密码备注")
     s.update_instance_shape.return_value = R(True, "已提交")
     s.replace_ephemeral_public_ip.return_value = R(True, "已更换", {"new_ip": "1.2.3.4"})
     s.assign_public_ipv6.return_value = R(True, "ok", {})
@@ -320,6 +321,8 @@ def test_every_endpoint_is_wired() -> None:
              {"region": "ap-osaka-1", "confirm": True, "add_tenant": True}),
             (f"/api/tenants/{tid}/instances/{iid}/power", {"action": "SOFTSTOP"}),
             (f"/api/tenants/{tid}/instances/{iid}/rename", {"display_name": "renamed"}),
+            (f"/api/tenants/{tid}/instances/{iid}/root-password", {"root_password": "NewPass123!"}),
+            (f"/api/tenants/{tid}/instances/{iid}/root-password", {"root_password": ""}),
             (f"/api/tenants/{tid}/instances/{iid}/shape", {"ocpus": 2, "memory_in_gbs": 12}),
             (f"/api/tenants/{tid}/instances/{iid}/public-ip/replace", None),
             (f"/api/tenants/{tid}/instances/{iid}/ipv6", None),
