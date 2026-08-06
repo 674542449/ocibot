@@ -271,6 +271,30 @@
           {{ usage?.currency || '' }}
         </div>
       </div>
+
+      <!-- 本月费用. Deliberately its own block rather than another number in the
+           header row: it answers a different question from "最近 N 天" (calendar
+           month vs rolling window) and the two are easy to mistake for each other
+           when they sit side by side. The period is spelled out for the same
+           reason. -->
+      <div class="mtd">
+        <div class="mtd-label">
+          本月费用
+          <span class="mtd-period" v-if="usage?.month_start">
+            {{ usage.month_start }} 起 · UTC
+          </span>
+        </div>
+        <div class="mtd-value">
+          <template v-if="monthToDate !== null">
+            <strong>{{ monthToDate }}</strong>
+            <span class="mtd-cur">{{ usage?.currency || '' }}</span>
+          </template>
+          <!-- Never 0.00 for a read that failed: for a cost figure those two
+               readings mean opposite things. -->
+          <span v-else class="mtd-none">未能读取</span>
+        </div>
+      </div>
+
       <p class="muted" style="margin: 0; font-size: 12px">{{ usageMsg }}</p>
       <div v-if="(usage?.daily || []).length" class="chart-wrap">
         <svg :viewBox="`0 0 ${svgW} ${svgH}`" class="bar-chart">
@@ -332,6 +356,19 @@ const msg = ref('')
 const data = ref<any>(null)
 const usage = ref<any>(null)
 const usageMsg = ref('')
+
+/** Month-to-date spend, or null when the read did not succeed.
+ *
+ *  The server sends null (not 0) in that case on purpose, so the distinction has
+ *  to survive here too: `?? 0` or a bare falsy check would turn "Oracle refused
+ *  the usage read" into a confident "本月 0.00", which is the one wrong answer
+ *  nobody would question. Formatted to 2 decimals because this is money. */
+const monthToDate = computed<string | null>(() => {
+  const raw = usage.value?.month_to_date
+  if (raw === null || raw === undefined) return null
+  const n = Number(raw)
+  return Number.isFinite(n) ? n.toFixed(2) : null
+})
 const days = ref(30)
 
 const svgW = 640
@@ -568,6 +605,58 @@ onMounted(async () => {
 </script>
 
 <style scoped>
+/* 本月费用. Given its own surface so it reads as a distinct figure rather than a
+   second interpretation of the chart below it — the chart is a rolling window,
+   this is the calendar month. */
+.mtd {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.4rem 1rem;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+}
+
+.mtd-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* The period is part of the number's meaning, not decoration: without it "本月"
+   is ambiguous about the timezone, and Oracle bills on UTC. */
+.mtd-period {
+  margin-left: 0.5rem;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0.02em;
+  color: var(--muted);
+}
+
+.mtd-value {
+  font-family: var(--font-mono);
+  font-size: 20px;
+  line-height: 1.2;
+  color: var(--text);
+}
+
+.mtd-cur {
+  margin-left: 0.3rem;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.mtd-none {
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--warn);
+}
+
 .chart-wrap {
   border: 1px solid var(--border);
   border-radius: 8px;

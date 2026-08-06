@@ -3450,15 +3450,38 @@ class TenantSession:
             return OperationResult(
                 ok=False,
                 message="Usage API 客户端不可用（SDK 未安装 usage_api 或初始化失败）",
-                data={"daily": [], "by_service": [], "total": 0, "currency": "", "days": days},
+                # month_to_date is None, not 0: for a cost figure those two mean
+                # very different things, and a page that prints 0.00 for a read it
+                # never managed to perform is worse than one that prints nothing.
+                data={
+                    "daily": [],
+                    "by_service": [],
+                    "total": 0,
+                    "currency": "",
+                    "days": days,
+                    "month_to_date": None,
+                },
             )
-        end = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        now = datetime.now(timezone.utc)
+        end = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
         start = end - timedelta(days=days)
+        # Calendar month-to-date is a different question from "the last N days",
+        # and the two only coincide by accident. Asking Oracle for one window that
+        # covers BOTH keeps this to a single call — spending a second call on it
+        # would compete with the capacity retry loop for the same rate limit.
+        #
+        # The window aggregates below still use `start`, so `total`, `daily` and
+        # `by_service` keep meaning exactly what they meant before; only the new
+        # month figure reads from the wider range.
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        query_start = min(start, month_start)
+        window_day = start.date().isoformat()
+        month_day = month_start.date().isoformat()
         tenancy = self.tenant.tenancy_ocid.strip()
         try:
             details = oci.usage_api.models.RequestSummarizedUsagesDetails(
                 tenant_id=tenancy,
-                time_usage_started=start,
+                time_usage_started=query_start,
                 time_usage_ended=end,
                 granularity="DAILY",
                 query_type="COST",
@@ -3475,6 +3498,7 @@ class TenantSession:
             service_map: dict[str, float] = {}
             currency = ""
             total = 0.0
+            month_total = 0.0
             for it in items:
                 # cost fields vary by query_type
                 cost = getattr(it, "computed_amount", None)
@@ -3486,17 +3510,27 @@ class TenantSession:
                     amount = float(cost or 0)
                 except (TypeError, ValueError):
                     amount = 0.0
-                total += amount
                 cur = str(getattr(it, "currency", "") or getattr(it, "currency_code", "") or "")
                 if cur and not currency:
                     currency = cur
                 svc = str(getattr(it, "service", "") or getattr(it, "service_name", "") or "Other")
-                service_map[svc] = service_map.get(svc, 0.0) + amount
                 ts = getattr(it, "time_usage_started", None) or getattr(it, "time_usage_ended", None)
                 if ts is not None:
                     day = ts.date().isoformat() if hasattr(ts, "date") else str(ts)[:10]
                 else:
                     day = "unknown"
+                # ISO dates compare correctly as strings. "unknown" sorts above any
+                # real date, so it is excluded explicitly rather than being counted
+                # into whichever bucket the comparison happened to put it in.
+                dated = day != "unknown"
+                if dated and day >= month_day:
+                    month_total += amount
+                # Window aggregates: unchanged semantics, so a widened query does
+                # not quietly inflate the "最近 N 天" total the page has always shown.
+                if dated and day < window_day:
+                    continue
+                total += amount
+                service_map[svc] = service_map.get(svc, 0.0) + amount
                 daily_map[day] = daily_map.get(day, 0.0) + amount
             daily = [{"date": d, "amount": round(v, 4)} for d, v in sorted(daily_map.items())]
             by_service = [
@@ -3514,19 +3548,43 @@ class TenantSession:
                     "days": days,
                     "time_start": start.isoformat(),
                     "time_end": end.isoformat(),
+                    # Calendar month to date, in UTC — Oracle bills on UTC, so a
+                    # local-midnight boundary would disagree with the invoice.
+                    "month_to_date": round(month_total, 4),
+                    "month_start": month_start.date().isoformat(),
                 },
             )
         except ServiceError as exc:
             return OperationResult(
                 ok=False,
                 message=_format_service_error(exc),
-                data={"daily": [], "by_service": [], "total": 0, "currency": "", "days": days},
+                # month_to_date is None, not 0: for a cost figure those two mean
+                # very different things, and a page that prints 0.00 for a read it
+                # never managed to perform is worse than one that prints nothing.
+                data={
+                    "daily": [],
+                    "by_service": [],
+                    "total": 0,
+                    "currency": "",
+                    "days": days,
+                    "month_to_date": None,
+                },
             )
         except Exception as exc:  # noqa: BLE001
             return OperationResult(
                 ok=False,
                 message=str(exc),
-                data={"daily": [], "by_service": [], "total": 0, "currency": "", "days": days},
+                # month_to_date is None, not 0: for a cost figure those two mean
+                # very different things, and a page that prints 0.00 for a read it
+                # never managed to perform is worse than one that prints nothing.
+                data={
+                    "daily": [],
+                    "by_service": [],
+                    "total": 0,
+                    "currency": "",
+                    "days": days,
+                    "month_to_date": None,
+                },
             )
 
     def list_invoices(self, limit: int = 24) -> OperationResult:
