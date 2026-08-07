@@ -799,6 +799,13 @@ def launch_instance(
     failure_message = ""
     failure_capacity = False
 
+    # Supplied by the browser and held constant across retries of the same
+    # submission, so a launch whose response was lost (proxy timeout, dropped
+    # connection) is not created twice when the operator presses the button
+    # again. Empty when the client is older than this feature; that simply means
+    # no protection, not an error.
+    idempotency_key = str(getattr(body, "idempotency_key", "") or "").strip()
+
     for index in range(count):
         item_payload = dict(payload)
         if count > 1:
@@ -808,9 +815,19 @@ def launch_instance(
         else:
             item_password = generate_root_password(16)
 
+        # Per-item token, never the bare key. A retry token tells Oracle "this is
+        # the same request as before", so sending one identical key for all N
+        # items of a batch would make it create the FIRST instance and then hand
+        # back that same instance N-1 more times — the page would report five
+        # machines created and one would exist.
+        item_key = f"{idempotency_key}-{index}" if idempotency_key else ""
+
         try:
             result = session.launch_from_payload(
-                item_payload, root_password=item_password, custom_user_data=custom_user_data
+                item_payload,
+                root_password=item_password,
+                custom_user_data=custom_user_data,
+                idempotency_key=item_key,
             )
         except Exception as exc:  # noqa: BLE001
             if not created and item_payload.get("managed_nsg_id"):

@@ -56,7 +56,7 @@ class _Session:
             raise RuntimeError("429 TooManyRequests")
         return _Result(True, "", dict(_HEALTHY_SNAPSHOT))
 
-    def launch_from_payload(self, payload, custom_user_data=""):
+    def launch_from_payload(self, payload, custom_user_data="", idempotency_key=""):
         self.launches += 1
         return _Result(False, "Out of host capacity")
 

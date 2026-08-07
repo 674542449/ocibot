@@ -1060,10 +1060,37 @@ async function openConfirm() {
   confirmOpen.value = true
 }
 
+/**
+ * Idempotency key for the current submission.
+ *
+ * Minted on the first attempt and kept for every retry of that same attempt, so
+ * a launch whose response was lost — a proxy timeout, a dropped connection, the
+ * Cloudflare 520 that started this — is recognised by Oracle as the same request
+ * and returns the original instance rather than creating a second one.
+ *
+ * Cleared only after a SUCCESSFUL launch, so the next deliberate launch is a new
+ * request. Clearing it on failure would remove the protection precisely when it
+ * is needed; never clearing it would make an intentional second identical
+ * instance silently return the first.
+ */
+const idempotencyKey = ref('')
+
+function newIdempotencyKey(): string {
+  // crypto.randomUUID needs a secure context; the panel is served over HTTPS or
+  // localhost, both of which qualify. The fallback keeps a plain-HTTP IP-mode
+  // deployment working rather than throwing at submit time.
+  try {
+    return crypto.randomUUID().replace(/-/g, '')
+  } catch {
+    return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`
+  }
+}
+
 async function doLaunch() {
   error.value = ''
   msg.value = ''
   submitting.value = true
+  if (!idempotencyKey.value) idempotencyKey.value = newIdempotencyKey()
   try {
     const boot =
       form.boot_volume_size_in_gbs === '' || form.boot_volume_size_in_gbs == null
@@ -1073,6 +1100,7 @@ async function doLaunch() {
     const { data } = await api.post(
       `/tenants/${tenantId.value}/launch`,
       {
+        idempotency_key: idempotencyKey.value,
         display_name: form.display_name,
         availability_domain: form.availability_domain,
         shape: form.shape,
@@ -1104,6 +1132,11 @@ async function doLaunch() {
     submitting.value = false
     confirmOpen.value = false
     if (data.ok) {
+      // Retired only on success: the next launch is a genuinely new request and
+      // must not be swallowed as a duplicate of this one. On failure it is kept,
+      // which is the entire point — pressing 创建 again then reaches Oracle as
+      // the same request instead of as a second machine.
+      idempotencyKey.value = ''
       msg.value = data.message || '创建已提交'
       if (data.instance_id) {
         msg.value += ` · 实例 ${String(data.instance_id).slice(-12)}`

@@ -320,6 +320,19 @@ def free_tier_tag(shape: str) -> str:
     return FREE_TIER_SHAPES.get(shape or "", "")
 
 
+def _clean_retry_token(value: str) -> str:
+    """Normalise an idempotency key into something OCI will accept.
+
+    Oracle caps ``opc-retry-token`` at 64 characters and rejects anything outside
+    a conservative character set. Sanitising rather than raising is deliberate:
+    the token is a safety net, and refusing the whole launch because the client
+    sent an odd key would turn a protection into a new failure mode. An
+    unusable key degrades to "no token", i.e. exactly the old behaviour.
+    """
+    cleaned = "".join(ch for ch in (value or "").strip() if ch.isalnum() or ch in "-_")
+    return cleaned[:64]
+
+
 def generate_root_password(length: int = 16) -> str:
     """Generate a strong random root password suitable for cloud-init and freeform tags.
 
@@ -1890,11 +1903,22 @@ class TenantSession:
         open_guest_firewall: bool = True,
         launch_token: str = "",
         custom_user_data: str = "",
+        idempotency_key: str = "",
     ) -> OperationResult:
         """Launch a VM with controlled root authentication metadata.
 
         custom_user_data: optional first-boot shell script; passed in memory only
         and merged into the generated cloud-init (never persisted in payloads).
+
+        idempotency_key: sent as ``opc-retry-token``. Oracle remembers it for 24
+        hours and replays the original outcome instead of creating a second
+        machine, which is the difference between "the response was lost" and "I
+        now own two instances". Without it a lost response — a proxy timeout, a
+        dropped connection — leaves the operator no safe way to find out whether
+        the launch happened except to look, and looking races the retry.
+
+        Empty means no token, preserving the previous behaviour for callers that
+        have not been taught to supply one.
         """
         try:
             payload = sanitize_launch_payload(
@@ -1969,10 +1993,17 @@ class TenantSession:
             )
             # No SDK retry on launch: OutOfHostCapacity and 429 must surface once
             # so the capacity-retry job can apply its own interval / cooldown.
-            resp = self.compute.launch_instance(
-                details,
-                retry_strategy=sdk_no_retry_strategy(),
-            )
+            #
+            # The retry token is a different mechanism and does not conflict with
+            # that: it does not retry anything, it only makes a repeat of THIS
+            # request return the original result. Oracle scopes it to successful
+            # creates, so a genuine OutOfHostCapacity failure still leaves the
+            # token free for the next attempt.
+            launch_kwargs: dict[str, Any] = {"retry_strategy": sdk_no_retry_strategy()}
+            token = _clean_retry_token(idempotency_key)
+            if token:
+                launch_kwargs["opc_retry_token"] = token
+            resp = self.compute.launch_instance(details, **launch_kwargs)
             inst = resp.data
             wr = resp.headers.get("opc-work-request-id", "") if hasattr(resp, "headers") else ""
             return OperationResult(
@@ -2003,6 +2034,7 @@ class TenantSession:
         *,
         root_password: str = "",
         custom_user_data: str = "",
+        idempotency_key: str = "",
     ) -> OperationResult:
         """Launch from a secret-free payload; password / user-data only in memory."""
         clean = sanitize_launch_payload(payload, for_retry=not bool(root_password))
@@ -2026,6 +2058,7 @@ class TenantSession:
             open_guest_firewall=clean["open_guest_firewall"],
             launch_token=clean.get("launch_token", ""),
             custom_user_data=custom_user_data,
+            idempotency_key=idempotency_key,
         )
 
     # ------------------------------------------------------------------

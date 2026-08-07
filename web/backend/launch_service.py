@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import time
 import uuid
@@ -28,19 +29,140 @@ from app.scheduler import (
 # tenant_id -> (monotonic_ts, meta)
 _META_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _META_TTL = 15 * 60
+
+# Shared second level, so the API's worker processes stop each paying for their
+# own cold fetch. Holds ids and display names (compartments, images, shapes,
+# VCN/subnet) — no credentials — in the existing app_meta key/value table.
+_SHARED_META_PREFIX = "launch_meta:"
+# A tenancy with many custom images produces a large document; past this it is
+# not worth a database round trip and the in-process cache carries it alone.
+_SHARED_META_MAX_BYTES = 512 * 1024
+
+
+# Every shared-cache helper runs in its OWN session, never the request's.
+#
+# The first version borrowed the caller's `db` and called commit()/rollback() on
+# it. That commits whatever else the route had pending, and the rollback in the
+# error path discards it — action at a distance with no visible connection to the
+# cache. It showed up as an unrelated test losing a User row it had just created.
+# Cache bookkeeping is not part of the request's transaction and must not share
+# its fate in either direction.
+def _cache_session():
+    from web.backend.db import SessionLocal
+
+    return SessionLocal()
+
+
+def _load_shared_meta(cache_key: str) -> Optional[tuple[float, dict[str, Any]]]:
+    """Return (age_seconds, meta) from the shared cache, or None.
+
+    Never raises: a cache is an optimisation, and a database hiccup here must not
+    turn into a failed launch.
+    """
+    try:
+        from sqlalchemy import select
+
+        from web.backend.models import AppMeta
+
+        with _cache_session() as db:
+            row = db.scalar(select(AppMeta).where(AppMeta.key == _SHARED_META_PREFIX + cache_key))
+            if row is None or not row.value:
+                return None
+            raw = row.value
+        blob = json.loads(raw)
+        # Wall clock, not time.monotonic(): monotonic is only comparable inside
+        # one process, so storing it would make entries written by another worker
+        # look arbitrarily old or new.
+        age = time.time() - float(blob.get("stored_at") or 0)
+        if age < 0 or age >= _META_TTL:
+            return None
+        meta = blob.get("meta")
+        if not isinstance(meta, dict) or not meta.get("ads"):
+            return None
+        return age, meta
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _store_shared_meta(cache_key: str, meta: dict[str, Any]) -> None:
+    """Best-effort write of the shared cache entry."""
+    try:
+        from sqlalchemy import select
+
+        from web.backend.models import AppMeta
+
+        payload = json.dumps({"stored_at": time.time(), "meta": meta}, ensure_ascii=False)
+        if len(payload.encode("utf-8")) > _SHARED_META_MAX_BYTES:
+            return
+        key = _SHARED_META_PREFIX + cache_key
+        with _cache_session() as db:
+            try:
+                row = db.scalar(select(AppMeta).where(AppMeta.key == key))
+                if row is None:
+                    db.add(AppMeta(key=key, value=payload))
+                else:
+                    row.value = payload
+                db.commit()
+            except Exception:  # noqa: BLE001
+                db.rollback()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 _META_MAX_ENTRIES = 64
 
 
 def clear_launch_meta_cache(tenant_id: Optional[str] = None) -> None:
+    """Drop cached launch metadata for a tenant (or all of them).
+
+    Clears the shared copy too. Clearing only the in-process dict would be undone
+    immediately: the next request reads the stale document back out of the
+    database and promotes it again, so a tenant whose region or compartment just
+    changed would keep serving the old network and image lists until the TTL
+    expired.
+    """
     if tenant_id:
         keys = [k for k in _META_CACHE if k.startswith(f"{tenant_id}|")]
         for k in keys:
             _META_CACHE.pop(k, None)
     else:
         _META_CACHE.clear()
+    try:
+        from sqlalchemy import delete
+
+        from web.backend.models import AppMeta
+
+        prefix = _SHARED_META_PREFIX + (f"{tenant_id}|" if tenant_id else "")
+        with _cache_session() as db:
+            try:
+                db.execute(delete(AppMeta).where(AppMeta.key.like(f"{prefix}%")))
+                db.commit()
+            except Exception:  # noqa: BLE001
+                db.rollback()
+    except Exception:  # noqa: BLE001
+        pass
 
 
-def fetch_launch_meta(session: TenantSession, *, tenant_id: str, force: bool = False) -> dict[str, Any]:
+def fetch_launch_meta(
+    session: TenantSession,
+    *,
+    tenant_id: str,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Compartments / ADs / images / shapes / network for the launch form.
+
+    A cold call is expensive — it lists images for every OS family and, on a
+    tenancy with no network, CREATES a VCN, subnet, gateway and route table,
+    waiting for each to become available. A minute or more is normal.
+
+    Results are cached in-process AND in the database. The shared level exists
+    because the in-process dict is per PROCESS and the API runs
+    OCIBOT_API_WORKERS=2: 加载配置 warmed one worker, and the 创建 request that
+    followed had an even chance of landing on the other — where it did the whole
+    cold fetch INSIDE the launch request and ran past the proxy's timeout. The
+    symptom was an occasional 520 that went away on retry, because by then some
+    worker had a warm cache.
+    """
     tenant = session.tenant
     cache_key = f"{tenant_id}|{tenant.region}|{tenant.compartment_ocid or tenant.tenancy_ocid}"
     if not force:
@@ -49,6 +171,15 @@ def fetch_launch_meta(session: TenantSession, *, tenant_id: str, force: bool = F
             meta = dict(cached[1])
             meta["cached"] = True
             meta["cache_age_sec"] = int(time.monotonic() - cached[0])
+            return meta
+        shared = _load_shared_meta(cache_key)
+        if shared is not None:
+            age, payload = shared
+            # Promote into this process so the next hit skips the database too.
+            _META_CACHE[cache_key] = (time.monotonic() - age, payload)
+            meta = dict(payload)
+            meta["cached"] = True
+            meta["cache_age_sec"] = int(age)
             return meta
 
     comps = session.list_compartments()
@@ -129,6 +260,9 @@ def fetch_launch_meta(session: TenantSession, *, tenant_id: str, force: bool = F
         oldest = min(_META_CACHE, key=lambda k: _META_CACHE[k][0])
         _META_CACHE.pop(oldest, None)
     _META_CACHE[cache_key] = (now, dict(meta))
+    # Also publish to the shared cache so the OTHER worker process does not have
+    # to repeat this — which is the whole reason a launch could take a minute.
+    _store_shared_meta(cache_key, meta)
     return meta
 
 

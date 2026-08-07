@@ -277,6 +277,11 @@ class RootPasswordNoteRequest(BaseModel):
 
 
 class LaunchInstanceRequest(BaseModel):
+    # Stable across retries of the SAME submission, new for a new one. Sent to
+    # Oracle as opc-retry-token so a launch whose response was lost is not
+    # created a second time. Optional: an older client just gets the old
+    # behaviour rather than an error.
+    idempotency_key: str = Field(default="", max_length=64)
     display_name: str = "instance"
     availability_domain: str = ""
     shape: str

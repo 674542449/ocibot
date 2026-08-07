@@ -209,7 +209,12 @@ for mod in (
 
 import web.backend.launch_service as ls  # noqa: E402
 
-ls.fetch_launch_meta = lambda session, *, tenant_id, force=False: {
+# Bound to a local, NOT assigned onto launch_service. Overwriting the shared
+# module attribute here leaked into every other test module in the session —
+# tests/test_launch_meta_shared_cache.py was silently exercising this stub
+# instead of the real cache. The route reads its own imported name, patched
+# below, so only that binding needs replacing.
+_stub_launch_meta = lambda session, *, tenant_id, force=False: {
     "compartments": [{"id": "ocid1.compartment.oc1..c1", "name": "root"}],
     "ads": ["AD-1", "AD-2"],
     "images": [{"id": "ocid1.image.oc1..img", "display_name": "Ubuntu 24.04"}],
@@ -231,7 +236,7 @@ ls.fetch_launch_meta = lambda session, *, tenant_id, force=False: {
 }
 import web.backend.routers.instances as inst_router  # noqa: E402
 
-inst_router.fetch_launch_meta = ls.fetch_launch_meta
+inst_router.fetch_launch_meta = _stub_launch_meta
 inst_router.prepare_launch_network = lambda session, payload, *, meta=None, for_retry=False: payload
 inst_router.schedule_post_launch_adjustments = lambda *a, **k: None
 

@@ -159,8 +159,14 @@ def _stub_launch(monkeypatch, *, results=None, auth_mode="key"):
     calls: list[dict] = []
     session = MagicMock()
 
-    def _launch(payload, root_password="", custom_user_data=""):
-        calls.append({"payload": dict(payload), "root_password": root_password})
+    def _launch(payload, root_password="", custom_user_data="", idempotency_key=""):
+        calls.append(
+            {
+                "payload": dict(payload),
+                "root_password": root_password,
+                "idempotency_key": idempotency_key,
+            }
+        )
         if results:
             return results[min(len(calls) - 1, len(results) - 1)]
         return _R(data={"instance_id": f"ocid1.instance.oc1..n{len(calls)}"})
