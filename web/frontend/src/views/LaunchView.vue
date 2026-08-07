@@ -1074,6 +1074,8 @@ async function openConfirm() {
  * instance silently return the first.
  */
 const idempotencyKey = ref('')
+/** The exact request the current key was minted for; see the check in doLaunch. */
+const idempotencyOf = ref('')
 
 function newIdempotencyKey(): string {
   // crypto.randomUUID needs a secure context; the panel is served over HTTPS or
@@ -1090,42 +1092,54 @@ async function doLaunch() {
   error.value = ''
   msg.value = ''
   submitting.value = true
-  if (!idempotencyKey.value) idempotencyKey.value = newIdempotencyKey()
   try {
     const boot =
       form.boot_volume_size_in_gbs === '' || form.boot_volume_size_in_gbs == null
         ? null
         : Number(form.boot_volume_size_in_gbs)
+    const body = {
+      display_name: form.display_name,
+      availability_domain: form.availability_domain,
+      shape: form.shape,
+      image_id: form.image_id,
+      auth_mode: form.auth_mode,
+      ssh_public_key: form.ssh_public_key,
+      root_password: form.root_password,
+      ocpus: isFlex.value ? form.ocpus : null,
+      memory_in_gbs: isFlex.value ? form.memory_in_gbs : null,
+      boot_volume_size_in_gbs: boot,
+      boot_volume_vpus_per_gb: form.boot_volume_vpus_per_gb,
+      count: batchCount.value,
+      assign_public_ip: form.assign_public_ip,
+      assign_ipv6_ip: form.assign_ipv6_ip,
+      open_guest_firewall: form.open_guest_firewall,
+      user_data: form.user_data.trim(),
+      as_retry: form.as_retry,
+      retry_all_ads: form.retry_all_ads,
+      retry_interval_sec: form.retry_interval_sec,
+      retry_max_attempts: form.retry_max_attempts,
+      fallback_configs:
+        form.as_retry && isFlex.value
+          ? fallbacks.value.filter((f) => f.ocpus > 0 && f.memory_in_gbs > 0)
+          : [],
+    }
+
+    // Reuse the key only while the request is genuinely THE SAME. If the operator
+    // reacted to a failure by changing the shape or the size and pressed 创建
+    // again, that is a different request, and sending the previous token with it
+    // asks Oracle to treat two different launches as one — either replaying the
+    // earlier instance or rejecting the mismatch. Same payload keeps the key (the
+    // protection); changed payload mints a new one.
+    const signature = JSON.stringify(body)
+    if (signature !== idempotencyOf.value) {
+      idempotencyKey.value = newIdempotencyKey()
+      idempotencyOf.value = signature
+    }
+
     // Launch can take a while (network/NSG prep). Keep button disabled until response.
     const { data } = await api.post(
       `/tenants/${tenantId.value}/launch`,
-      {
-        idempotency_key: idempotencyKey.value,
-        display_name: form.display_name,
-        availability_domain: form.availability_domain,
-        shape: form.shape,
-        image_id: form.image_id,
-        auth_mode: form.auth_mode,
-        ssh_public_key: form.ssh_public_key,
-        root_password: form.root_password,
-        ocpus: isFlex.value ? form.ocpus : null,
-        memory_in_gbs: isFlex.value ? form.memory_in_gbs : null,
-        boot_volume_size_in_gbs: boot,
-        boot_volume_vpus_per_gb: form.boot_volume_vpus_per_gb,
-        count: batchCount.value,
-        assign_public_ip: form.assign_public_ip,
-        assign_ipv6_ip: form.assign_ipv6_ip,
-        open_guest_firewall: form.open_guest_firewall,
-        user_data: form.user_data.trim(),
-        as_retry: form.as_retry,
-        retry_all_ads: form.retry_all_ads,
-        retry_interval_sec: form.retry_interval_sec,
-        retry_max_attempts: form.retry_max_attempts,
-        fallback_configs:
-          form.as_retry && isFlex.value
-            ? fallbacks.value.filter((f) => f.ocpus > 0 && f.memory_in_gbs > 0)
-            : [],
-      },
+      { idempotency_key: idempotencyKey.value, ...body },
       { timeout: 180_000 },
     )
     // Always release UI first so success/error is visible even if navigation fails.
@@ -1137,6 +1151,7 @@ async function doLaunch() {
       // which is the entire point — pressing 创建 again then reaches Oracle as
       // the same request instead of as a second machine.
       idempotencyKey.value = ''
+      idempotencyOf.value = ''
       msg.value = data.message || '创建已提交'
       if (data.instance_id) {
         msg.value += ` · 实例 ${String(data.instance_id).slice(-12)}`

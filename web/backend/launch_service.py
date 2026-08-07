@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import time
 import uuid
@@ -105,8 +106,18 @@ def _store_shared_meta(cache_key: str, meta: dict[str, Any]) -> None:
                 db.commit()
             except Exception:  # noqa: BLE001
                 db.rollback()
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        # Logged, not swallowed. A failure here does not break the request — but
+        # it does silently switch the cross-worker cache off, which is the thing
+        # that keeps a cold fetch out of the launch request. Without this line the
+        # only symptom would be the intermittent timeout quietly coming back, and
+        # nothing anywhere would connect it to a serialisation problem.
+        logging.getLogger("ocibot.launch").warning(
+            "launch meta shared cache write failed (%s: %s) — cross-worker caching "
+            "is inactive for this tenant, cold fetches may run inside a launch",
+            exc.__class__.__name__,
+            exc,
+        )
 
 
 _META_MAX_ENTRIES = 64

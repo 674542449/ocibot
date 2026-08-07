@@ -207,8 +207,6 @@ for mod in (
     if hasattr(m, "get_session_for_row"):
         m.get_session_for_row = lambda row: SESSION
 
-import web.backend.launch_service as ls  # noqa: E402
-
 # Bound to a local, NOT assigned onto launch_service. Overwriting the shared
 # module attribute here leaked into every other test module in the session —
 # tests/test_launch_meta_shared_cache.py was silently exercising this stub

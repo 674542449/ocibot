@@ -15,8 +15,6 @@ import sys
 import types
 from pathlib import Path
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.oci_client import _clean_retry_token  # noqa: E402
@@ -144,14 +142,31 @@ def test_route_derives_per_item_tokens():
     assert "idempotency_key=item_key," in src
 
 
+def _launch_view() -> str:
+    return (
+        Path(__file__).resolve().parents[1]
+        / "web" / "frontend" / "src" / "views" / "LaunchView.vue"
+    ).read_text(encoding="utf-8")
+
+
 def test_frontend_reuses_the_key_across_retries_and_resets_after_success():
     """The whole scheme depends on the browser keeping the key STABLE while a
     submission is being retried and minting a NEW one once it succeeded —
     otherwise a retry looks like a fresh request (no protection) or a deliberate
     second launch is silently swallowed as a duplicate."""
-    src = (
-        Path(__file__).resolve().parents[1]
-        / "web" / "frontend" / "src" / "views" / "LaunchView.vue"
-    ).read_text(encoding="utf-8")
+    src = _launch_view()
     assert "idempotencyKey" in src
     assert "idempotency_key" in src, "must actually be sent to the API"
+    # Retired on success only; keeping it on failure IS the protection.
+    assert "idempotencyKey.value = ''" in src
+
+
+def test_key_is_reminted_when_the_request_changes():
+    """Reacting to a failure by changing the shape and pressing 创建 again is a
+    DIFFERENT request. Sending the previous token with it asks Oracle to treat two
+    different launches as one — replaying the earlier instance, or rejecting the
+    mismatch. The key is therefore bound to the payload it was minted for."""
+    src = _launch_view()
+    assert "const signature = JSON.stringify(body)" in src
+    assert "if (signature !== idempotencyOf.value)" in src
+    assert "idempotencyOf.value = signature" in src
