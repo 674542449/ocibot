@@ -14,7 +14,7 @@ from web.backend.audit import write_audit
 from web.backend.auth import get_current_user
 from web.backend.crypto_util import encrypt_text
 from web.backend.db import get_db
-from app.oci_client import generate_root_password
+from app.oci_client import derive_retry_token, generate_root_password
 from web.backend.launch_service import (
     build_launch_request,
     fetch_launch_meta,
@@ -249,14 +249,21 @@ def set_root_password_note(
     try:
         session = get_session_for_row(row)
         result = session.set_root_password_note(instance_id, body.root_password)
-        # Not audited with the value, obviously; the fact of the change is enough
-        # and the audit log is readable by every admin.
+        # Never the value itself — the audit log is readable by every admin. The
+        # OUTCOME is recorded, not just the intent: writing "set" for a call
+        # Oracle rejected would leave the log asserting a change that never
+        # happened, which is worse than having no entry.
         write_audit(
             db,
             owner_id=user.id,
             action="instance.root_password_note",
             target=instance_id,
-            detail="set" if (body.root_password or "").strip() else "cleared",
+            detail={
+                "tenant_id": tenant_id,
+                "action": "set" if (body.root_password or "").strip() else "cleared",
+                "ok": bool(result.ok),
+                "message": result.message,
+            },
         )
         return PowerActionResult(**op_result_dict(result))
     except OCIClientError as exc:
@@ -820,7 +827,11 @@ def launch_instance(
         # items of a batch would make it create the FIRST instance and then hand
         # back that same instance N-1 more times — the page would report five
         # machines created and one would exist.
-        item_key = f"{idempotency_key}-{index}" if idempotency_key else ""
+        #
+        # Derived by a helper rather than an f-string: the token is capped at 64
+        # characters, so a client-supplied key at that limit lost the suffix to
+        # truncation and produced exactly the collision described above.
+        item_key = derive_retry_token(idempotency_key, index) if idempotency_key else ""
 
         try:
             result = session.launch_from_payload(

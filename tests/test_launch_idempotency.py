@@ -15,9 +15,11 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.oci_client import _clean_retry_token  # noqa: E402
+from app.oci_client import _clean_retry_token, derive_retry_token  # noqa: E402
 
 
 class _Compute:
@@ -122,24 +124,42 @@ def test_batch_items_get_distinct_tokens():
     """THE trap. A retry token means "this is the same request as before", so one
     shared key across a batch of 5 would create the first machine and then return
     that same machine four more times — the page reports five created and one
-    exists. Derived per index in the route.
+    exists.
     """
-    key = "submission-xyz"
-    tokens = [f"{key}-{i}" for i in range(5)]
+    tokens = [derive_retry_token("submission-xyz", i) for i in range(5)]
     assert len(set(tokens)) == 5
-    for t in tokens:
-        assert _clean_retry_token(t) == t, "index suffix must survive sanitising"
 
 
-def test_route_derives_per_item_tokens():
-    """Pin the route's derivation, since the batch trap above is invisible in
-    any single-instance test."""
+@pytest.mark.parametrize("base_len", [1, 32, 62, 63, 64, 200])
+def test_distinct_tokens_at_every_key_length(base_len):
+    """The first version of this built the token with an f-string, and Oracle's
+    64-character cap then truncated the "-{index}" suffix away — so a key at the
+    limit (which the schema permits) gave every item in the batch the SAME token,
+    i.e. exactly the collision above. The earlier test missed it by only ever
+    using a short key.
+    """
+    base = "k" * base_len
+    tokens = [derive_retry_token(base, i) for i in range(8)]  # count is capped at 8
+    assert len(set(tokens)) == 8, f"collision at base length {base_len}"
+    assert all(len(t) <= 64 for t in tokens), "token exceeds the service limit"
+
+
+def test_derivation_output_is_already_clean():
+    """Whatever comes out must need no further sanitising, or the caller could
+    re-truncate and reintroduce the collision."""
+    for i in range(8):
+        token = derive_retry_token("a/b c:d" + "z" * 80, i)
+        assert _clean_retry_token(token) == token
+
+
+def test_route_uses_the_helper_not_an_fstring():
     src = (
         Path(__file__).resolve().parents[1]
         / "web" / "backend" / "routers" / "instances.py"
     ).read_text(encoding="utf-8")
-    assert 'item_key = f"{idempotency_key}-{index}" if idempotency_key else ""' in src
+    assert "derive_retry_token(idempotency_key, index)" in src
     assert "idempotency_key=item_key," in src
+    assert 'f"{idempotency_key}-{index}"' not in src, "the unsafe derivation is back"
 
 
 def _launch_view() -> str:

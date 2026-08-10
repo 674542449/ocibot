@@ -333,6 +333,24 @@ def _clean_retry_token(value: str) -> str:
     return cleaned[:64]
 
 
+def derive_retry_token(base: str, index: int) -> str:
+    """Per-item retry token for a batch launch, collision-free by construction.
+
+    Naively appending "-{index}" is wrong: Oracle caps the token at 64 characters,
+    so a base that is already at the limit loses the suffix to truncation and
+    every item in the batch ends up with the SAME token. Oracle then creates the
+    first instance and replays it for the rest — the page reports N created and
+    one exists. The key comes from the client, and the schema permits the full 64,
+    so this is reachable without anything looking wrong.
+
+    Room for the suffix is reserved before truncating, so the part that makes the
+    tokens distinct is the part that always survives.
+    """
+    suffix = f"-{int(index)}"
+    head = _clean_retry_token(base)[: 64 - len(suffix)]
+    return _clean_retry_token(head + suffix)
+
+
 def generate_root_password(length: int = 16) -> str:
     """Generate a strong random root password suitable for cloud-init and freeform tags.
 
