@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.4.72 — 2026-08-06
+
+给创建实例加上分阶段耗时日志。**这一版不修 bug，是为了先拿到数据。**
+
+### 说明
+创建实例仍偶发失败、重试即成功，且报错来自 Cloudflare —— 说明 0.4.69 修的
+「启动配置缓存按进程」是真实机制，但**不是全部原因**：请求仍会跑过 Cloudflare
+免费版 100 秒的硬上限。
+
+我已经两次靠推断定位、两次没修干净。这次不再猜：每次创建都会打印一行分阶段耗时，
+成功失败都打。
+
+```
+launch timing outcome=created total=48.3s session=0.1s meta=0.2s build=0.0s
+  pre=0.1s quota=31.7s network=14.9s launch=1.3s
+```
+
+| 阶段 | 做什么 |
+|---|---|
+| `session` | 建立 OCI 客户端 |
+| `meta` | 启动配置（0.4.69 起跨进程缓存） |
+| `quota` | **免费额度校验** —— 要列出所有分区的实例、引导卷、块卷，未缓存 |
+| `network` | **准备网络 / 创建 NSG** —— 对 Oracle 的写操作 |
+| `launch` | LaunchInstance 本身 |
+
+总耗时超过 60 秒记为 WARNING —— 那已经贴近代理上限，下一次稍慢一点就会失败。
+
+复现一次后执行：
+
+```bash
+cd ~/ocibot && docker compose logs api | grep "launch timing" | tail -5
+```
+
+有了这一行就能直接看出该优化哪一段。在拿到之前我不会再改创建流程 ——
+`quota` 那段涉及免费额度守卫，为了赶时间给它加缓存会牺牲「不超额」这个保证，
+不看数据就动它是不负责任的。
+
+### 升级
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.72
+```
+
 ## 0.4.71 — 2026-08-06
 
 代码核对。一个真 bug：批量创建的幂等 token 会撞车。

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from datetime import datetime, timezone
 from typing import Annotated, Any
 
@@ -52,6 +54,49 @@ from web.backend.schemas import (
 )
 
 router = APIRouter(tags=["instances"])
+
+log = logging.getLogger("ocibot.instances")
+
+
+class _PhaseTimer:
+    """Record how long each phase of a launch takes, and log it once at the end.
+
+    Creating an instance is the panel's longest request: a free-quota read that
+    lists instances and volumes across every compartment, then network/NSG
+    preparation that WRITES to Oracle, then LaunchInstance itself. Behind
+    Cloudflare's free plan there is a hard 100-second ceiling on the whole thing,
+    and overruns come back as a 520 with nothing on our side saying which part was
+    slow.
+
+    Two fixes have already been aimed at this from inference rather than
+    measurement, and neither finished the job. This logs one line per launch —
+    always, success or failure — so the next report is data instead of another
+    guess about which phase to optimise.
+    """
+
+    def __init__(self) -> None:
+        self._t0 = time.monotonic()
+        self._last = self._t0
+        self._phases: list[tuple[str, float]] = []
+
+    def mark(self, name: str) -> None:
+        now = time.monotonic()
+        self._phases.append((name, now - self._last))
+        self._last = now
+
+    def emit(self, outcome: str) -> None:
+        total = time.monotonic() - self._t0
+        detail = " ".join(f"{n}={d:.1f}s" for n, d in self._phases)
+        # WARNING past 60s: that is the point where the request is close enough to
+        # the proxy ceiling that the next slightly slower tenancy will fail.
+        level = logging.WARNING if total >= 60 else logging.INFO
+        log.log(
+            level,
+            "launch timing outcome=%s total=%.1fs %s",
+            outcome,
+            total,
+            detail,
+        )
 
 
 def _tenant_or_404(db: Session, user_id: str, tenant_id: str) -> Tenant:
@@ -642,10 +687,14 @@ def launch_instance(
     row = _tenant_or_404(db, user.id, tenant_id)
     if not row.enabled:
         raise HTTPException(status_code=400, detail="租户已禁用")
+    timer = _PhaseTimer()
     try:
         session = get_session_for_row(row)
+        timer.mark("session")
         meta = fetch_launch_meta(session, tenant_id=row.id, force=False)
+        timer.mark("meta")
         built = build_launch_request(body.model_dump(), meta=meta)
+        timer.mark("build")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except OCIClientError as exc:
@@ -669,6 +718,7 @@ def launch_instance(
         )
 
     # Always Free guard BEFORE network/NSG prep so we don't leave orphan resources.
+    timer.mark("pre")
     free_only = free_only_for_tenant(row)
     launch_guard = None
     extra_warnings: list[str] = []
@@ -699,6 +749,7 @@ def launch_instance(
                 count=count,
             )
     except HTTPException:
+        timer.emit("quota-refused")
         raise
     except Exception as exc:  # noqa: BLE001
         # A quota-read failure must not surface as an unhandled 500 (this branch
@@ -707,10 +758,12 @@ def launch_instance(
 
     # Pre-launch: IPv6 + managed NSG (desktop parity)
     try:
+        timer.mark("quota")
         payload = prepare_launch_network(
             session, payload, meta=meta, for_retry=bool(built["as_retry"])
         )
         built["payload"] = payload
+        timer.mark("network")
     except (ValueError, OCIClientError) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
@@ -777,6 +830,8 @@ def launch_instance(
         db.add(job)
         db.commit()
         db.refresh(job)
+        timer.mark("enqueue")
+        timer.emit("queued-retry")
         _audit_launch(False, "已加入容量重试队列", "", job.id)
         retry_msg = (
             f"已加入容量重试：后台将每 {job.interval_sec}s 尝试一次"
@@ -894,6 +949,8 @@ def launch_instance(
                 session.delete_managed_nsg(str(payload.get("managed_nsg_id")))
             except Exception:
                 pass
+        timer.mark("launch")
+        timer.emit("failed")
         _audit_launch(False, failure_message or "创建失败", "")
         data = (
             first_result.data
@@ -910,6 +967,9 @@ def launch_instance(
             created_count=0,
             requested_count=count,
         )
+
+    timer.mark("launch")
+    timer.emit("created" if len(created) == count else "partial")
 
     head = created[0]
     if count == 1:
