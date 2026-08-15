@@ -299,3 +299,43 @@ def test_count_is_bounded(client, monkeypatch):
     _stub_launch(monkeypatch)
     assert c.post(f"/api/tenants/{tid}/launch", json=_body(count=0)).status_code == 422
     assert c.post(f"/api/tenants/{tid}/launch", json=_body(count=99)).status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# The UI must surface every generated password, and must explain a lost response.
+# No JS test runner here, so these assert against the Vue source.
+# ---------------------------------------------------------------------------
+
+_LAUNCH_VIEW = (
+    Path(__file__).resolve().parents[1] / "web" / "frontend" / "src" / "views" / "LaunchView.vue"
+)
+
+
+def test_batch_passwords_all_reach_the_screen():
+    """A batch generates a separate password per machine after the first and the
+    server returns them all in `instances`. The reveal panel was fed from the
+    scalar `root_password`, which only ever held the FIRST one — creating three
+    password-mode machines showed one password and dropped the other two.
+
+    They are still recoverable from the instance list (each lives in that
+    instance's OCI tag), so this was not permanent loss — but the screen that
+    exists specifically to hand them over was showing a third of them.
+    """
+    src = _LAUNCH_VIEW.read_text(encoding="utf-8")
+    assert "pendingPasswords" in src
+    assert "data.instances" in src, "must read the per-instance list, not just the head"
+    assert "v-for=\"p in pendingPasswords\"" in src
+
+
+def test_lost_response_is_explained_for_gateway_statuses():
+    """Cloudflare answers an overrun with 520/524 and an HTML body, so the API
+    interceptor finds no `detail` and the user got a bare "Request failed with
+    status code 520" — no hint that the launch may have succeeded, and every
+    reason to retry blindly. Only the status-less client timeout used to be
+    handled."""
+    src = _LAUNCH_VIEW.read_text(encoding="utf-8")
+    assert "_GATEWAY_STATUSES" in src
+    for status in (502, 504, 520, 524):
+        assert str(status) in src, f"{status} not treated as a lost response"
+    # The multi-line guidance is useless if the box collapses newlines.
+    assert 'class="error-box" style="white-space: pre-line"' in src

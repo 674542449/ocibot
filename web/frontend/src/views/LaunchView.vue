@@ -12,19 +12,32 @@
       </div>
     </div>
 
-    <div v-if="error" class="error-box">{{ error }}</div>
+    <!-- pre-line: the lost-response guidance below is several lines, and without
+         this .error-box collapses them into one run-on sentence. -->
+    <div v-if="error" class="error-box" style="white-space: pre-line">{{ error }}</div>
     <div v-if="msg" class="success-box">{{ msg }}</div>
 
     <!-- One-time root password: shown until the user confirms they saved it.
          The server never returns it again, so this must not auto-dismiss. -->
-    <div v-if="pendingPassword" class="card stack password-reveal">
-      <h3 style="margin: 0">请立即保存 root 密码</h3>
+    <div v-if="pendingPasswords.length" class="card stack password-reveal">
+      <h3 style="margin: 0">
+        请立即保存 root 密码<span v-if="pendingPasswords.length > 1">（{{ pendingPasswords.length }} 台）</span>
+      </h3>
       <p class="muted" style="margin: 0; font-size: 13px">
-        该密码仅显示一次，服务端不保存明文。离开本页后无法再次查看。
+        该密码本页仅显示一次。之后可在「实例」列表的 root 密码列查看。
       </p>
-      <div class="row" style="gap: 0.5rem; align-items: center; flex-wrap: wrap">
-        <code class="password-value">{{ pendingPassword }}</code>
-        <button type="button" @click="copyPassword">复制</button>
+      <!-- One row per instance. A batch gives every machine its OWN generated
+           password, and this panel used to render only the first — the rest were
+           returned by the server and then dropped on the floor here. -->
+      <div
+        v-for="p in pendingPasswords"
+        :key="p.name"
+        class="row"
+        style="gap: 0.5rem; align-items: center; flex-wrap: wrap"
+      >
+        <span v-if="pendingPasswords.length > 1" class="muted pwd-name">{{ p.name }}</span>
+        <code class="password-value">{{ p.password }}</code>
+        <button type="button" @click="copyPassword(p.password)">复制</button>
       </div>
       <div class="row">
         <button class="primary" type="button" @click="dismissPassword">
@@ -509,16 +522,21 @@ const submitting = ref(false)
 const confirmOpen = ref(false)
 const error = ref('')
 const msg = ref('')
-// Held until the user acknowledges it; the API returns the generated root
-// password exactly once and never exposes it again.
-const pendingPassword = ref('')
+/** Held until the user acknowledges them. One entry per created instance.
+ *
+ *  A batch generates a SEPARATE password for every machine after the first, and
+ *  the server returns them all in `instances`. This used to be a single string
+ *  fed from `data.root_password` (the first instance's), so creating three
+ *  password-mode machines showed one password and silently discarded the other
+ *  two from this screen. */
+const pendingPasswords = ref<Array<{ name: string; password: string }>>([])
 
-async function copyPassword() {
-  await copyText(pendingPassword.value, 'root 密码已复制')
+async function copyPassword(value: string) {
+  await copyText(value, 'root 密码已复制')
 }
 
 function dismissPassword() {
-  pendingPassword.value = ''
+  pendingPasswords.value = []
   router.push({ path: '/', query: { tenant: tenantId.value } }).catch(() => {})
 }
 const presetHint = ref('')
@@ -1077,6 +1095,11 @@ const idempotencyKey = ref('')
 /** The exact request the current key was minted for; see the check in doLaunch. */
 const idempotencyOf = ref('')
 
+/** Statuses that mean "the response was lost", not "the request was refused".
+ *  Cloudflare's own codes plus the generic proxy ones — for all of these the
+ *  launch may well have completed on Oracle's side. */
+const _GATEWAY_STATUSES = new Set([408, 502, 503, 504, 520, 521, 522, 523, 524])
+
 function newIdempotencyKey(): string {
   // crypto.randomUUID needs a secure context; the panel is served over HTTPS or
   // localhost, both of which qualify. The fallback keeps a plain-HTTP IP-mode
@@ -1159,12 +1182,23 @@ async function doLaunch() {
       if (data.capacity_job_id) msg.value += ` · 任务 ${data.capacity_job_id.slice(0, 8)}…`
       // A queued capacity-retry job (no instance yet) → task centre; else the list.
       const queuedRetry = !!data.capacity_job_id && !data.instance_id
-      if (data.root_password) {
-        // The server returns this exactly once (it is only hashed into cloud-init,
-        // never stored in plaintext). Auto-navigating unmounted this view 800ms
-        // later and destroyed the only copy, so hold it here and let the user
-        // leave once they have saved it.
-        pendingPassword.value = data.root_password
+      // Every created instance's password, not just the first. `instances` is
+      // the authoritative list; the scalar `root_password` only ever carried the
+      // head entry, which is why a batch used to lose the rest here.
+      const created: Array<{ display_name?: string; root_password?: string }> =
+        Array.isArray(data.instances) && data.instances.length
+          ? data.instances
+          : [{ display_name: form.display_name, root_password: data.root_password }]
+      pendingPasswords.value = created
+        .filter((c) => !!c.root_password)
+        .map((c, i) => ({
+          name: String(c.display_name || form.display_name || `实例 ${i + 1}`),
+          password: String(c.root_password),
+        }))
+      if (pendingPasswords.value.length) {
+        // Auto-navigating unmounted this view 800ms later and destroyed the only
+        // on-screen copy, so hold here and let the user leave once they have
+        // saved them. (They remain readable afterwards in the instance list.)
         return
       }
       window.setTimeout(() => {
@@ -1184,11 +1218,22 @@ async function doLaunch() {
       error.value = data.message || '创建失败'
     }
   } catch (e: any) {
-    // Axios timeout / network: request may still have succeeded server-side.
-    const status = e?.response?.status
-    if (!status && /timeout/i.test(String(e?.message || ''))) {
+    const status = Number(e?.response?.status || 0)
+    const clientTimeout = !status && /timeout/i.test(String(e?.message || ''))
+    // The response was lost rather than refused. Cloudflare's 520/524 land here,
+    // and so do a plain 502/504 from any proxy — none of them say whether Oracle
+    // acted. Previously only the no-status client timeout got this treatment, so
+    // the case actually being hit (a gateway status) fell through to a bare
+    // "Request failed with status code 520": no guidance, and an invitation to
+    // retry blindly. The body of those responses is HTML, so the interceptor
+    // finds no `detail` and cannot improve the message either.
+    const lostResponse = clientTimeout || _GATEWAY_STATUSES.has(status)
+    if (lostResponse) {
       error.value =
-        '等待响应超时。创建请求可能已在服务端提交成功，请到「实例」或「任务中心」查看，勿重复连点提交。'
+        '未收到服务端响应（网关超时或连接中断），创建可能已经成功。\n' +
+        '可以直接再点一次「确认并创建」：只要配置没改动，面板会用同一个幂等标识提交，' +
+        'Oracle 不会重复创建同一台机器。\n' +
+        '若你改动了配置再提交，那会是一次全新的创建 —— 请先到「实例」页确认上一次的结果。'
     } else {
       error.value = e?.message || '创建失败'
     }
@@ -1371,6 +1416,14 @@ onMounted(async () => {
 .password-reveal {
   border: 1px solid var(--warn);
 }
+/* Fixed width so a batch's rows line up and the passwords stay comparable at a
+   glance instead of shifting with each instance name's length. */
+.pwd-name {
+  min-width: 10rem;
+  font-size: 12px;
+  word-break: break-all;
+}
+
 .password-value {
   font-size: 15px;
   font-weight: 600;
