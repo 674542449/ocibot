@@ -80,6 +80,15 @@
         <button :disabled="acting" @click="doRename">重命名</button>
         <button :disabled="acting" @click="doReplaceIp">换公网IP</button>
         <button :disabled="acting" @click="doIpv6">分配 IPv6</button>
+        <!-- Only offered when there is something to remove: a button that always
+             answers "该实例没有 IPv6" is noise on every instance that never had one. -->
+        <button
+          v-if="instance?.ipv6_addresses?.length"
+          :disabled="acting"
+          @click="doRemoveIpv6"
+        >
+          取消 IPv6
+        </button>
         <button class="danger" :disabled="acting" @click="doTerminate">终止</button>
       </div>
     </div>
@@ -1416,6 +1425,35 @@ async function doIpv6() {
     acting.value = false
   }
 }
+async function doRemoveIpv6() {
+  const list = (instance.value?.ipv6_addresses || []).join('、')
+  // Confirmed because the address is not recoverable: assigning again produces a
+  // NEW one, so anything pointing at the old address (DNS, firewall rules on
+  // other hosts) stops matching.
+  if (
+    !confirm(
+      `确认取消该实例的 IPv6？\n${list}\n\n` +
+        '重新分配会得到一个不同的地址，指向旧地址的 DNS / 防火墙规则将失效。\n' +
+        '子网与 VCN 的 IPv6 前缀和路由保持不变，同子网的其他实例不受影响。',
+    )
+  ) {
+    return
+  }
+  acting.value = true
+  try {
+    const { data } = await api.delete(
+      `/tenants/${tenantId.value}/instances/${instanceId.value}/ipv6`,
+    )
+    if (data.ok) msg.value = data.message
+    else error.value = data.message
+    await loadInstance()
+  } catch (e: any) {
+    error.value = e?.message || '失败'
+  } finally {
+    acting.value = false
+  }
+}
+
 async function doTerminate() {
   if (!confirm('确认终止该实例？')) return
   acting.value = true

@@ -101,6 +101,7 @@ def make_session():
     s.update_instance_shape.return_value = R(True, "已提交")
     s.replace_ephemeral_public_ip.return_value = R(True, "已更换", {"new_ip": "1.2.3.4"})
     s.assign_public_ipv6.return_value = R(True, "ok", {})
+    s.remove_public_ipv6.return_value = R(True, "已取消 IPv6", {"removed": ["2603::1"]})
     s.get_instance_metrics.return_value = R(True, "", {"cpu": [], "network": []})
     s.get_account_status.return_value = R(True, "", {"tier_code": "free", "tier": "Always Free"})
     s.get_usage_summary.return_value = R(True, "", {"total": 0.0, "currency": "USD", "days": []})
@@ -363,6 +364,7 @@ def test_every_endpoint_is_wired() -> None:
 
         for p in [
             f"/api/tenants/{tid}/instances/{iid}/host-key",
+            f"/api/tenants/{tid}/instances/{iid}/ipv6",
             f"/api/tenants/{tid}/object-storage/buckets/b1/objects/a%2Fb.txt",
             f"/api/tenants/{tid}/object-storage/buckets/b1",
             f"/api/tenants/{tid}/block-volumes/v1",

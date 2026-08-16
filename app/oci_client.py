@@ -3206,6 +3206,64 @@ class TenantSession:
         except Exception as exc:  # noqa: BLE001
             return OperationResult(ok=False, message=str(exc))
 
+    def remove_public_ipv6(self, instance_id: str, compartment_id: str) -> OperationResult:
+        """Delete the IPv6 address(es) on the instance's primary VNIC.
+
+        Scope is deliberately just the VNIC's own addresses. The subnet's /64,
+        the VCN's GUA prefix and the ``::/0`` route are SHARED network resources
+        that assign_public_ipv6 may have created — other instances in the same
+        subnet can be relying on them, so tearing them down here would take those
+        machines off IPv6 as a side effect of one instance's change. Undoing the
+        network-level enablement is a VCN-level decision, not this button.
+
+        Idempotent: an instance with no IPv6 reports success rather than an
+        error, so a double click does not produce a scary message.
+        """
+        try:
+            network = self.resolve_primary_network(instance_id, compartment_id)
+            if not network.vnic_id:
+                return OperationResult(ok=False, message="找不到实例的主 VNIC")
+            existing = oci.pagination.list_call_get_all_results(
+                self.network.list_ipv6s, vnic_id=network.vnic_id
+            ).data or []
+            if not existing:
+                return OperationResult(
+                    ok=True, message="该实例当前没有 IPv6，无需取消", data={"removed": []}
+                )
+            removed: list[str] = []
+            failures: list[str] = []
+            for entry in existing:
+                address = str(getattr(entry, "ip_address", "") or "")
+                try:
+                    self.network.delete_ipv6(entry.id)
+                    removed.append(address)
+                except ServiceError as exc:
+                    failures.append(f"{address}: {_format_service_error(exc)}")
+                except Exception as exc:  # noqa: BLE001
+                    failures.append(f"{address}: {exc}")
+            if failures and not removed:
+                return OperationResult(
+                    ok=False,
+                    message="取消 IPv6 失败：" + "；".join(failures),
+                    data={"removed": [], "failed": failures},
+                )
+            message = "已取消 IPv6：" + "、".join(removed)
+            if failures:
+                # Partial result stated plainly — reporting a clean success while
+                # an address is still attached would send the operator away
+                # believing the instance is off IPv6 when it is not.
+                message += f"；仍有 {len(failures)} 个未能删除：" + "；".join(failures)
+            return OperationResult(
+                ok=not failures,
+                message=message
+                + "（子网/VCN 的 IPv6 前缀与路由保持不变，其他实例不受影响）",
+                data={"removed": removed, "failed": failures},
+            )
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=str(exc))
+
     def assign_public_ipv6(self, instance_id: str, compartment_id: str) -> OperationResult:
         """Assign a public IPv6 to the primary VNIC and open internet routing.
 

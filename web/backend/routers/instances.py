@@ -424,6 +424,46 @@ def assign_ipv6(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+@router.delete(
+    "/tenants/{tenant_id}/instances/{instance_id}/ipv6",
+    response_model=PowerActionResult,
+)
+def remove_ipv6(
+    tenant_id: str,
+    instance_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> PowerActionResult:
+    """Remove the instance's IPv6 address(es).
+
+    Only the VNIC's own addresses. The subnet /64, the VCN prefix and the ::/0
+    route stay — they are shared, and other instances in the subnet may be using
+    them.
+    """
+    row = _tenant_or_404(db, user.id, tenant_id)
+    try:
+        session = get_session_for_row(row)
+        info = session.get_instance(instance_id, resolve_ips=False)
+        result = session.remove_public_ipv6(instance_id, info.compartment_id)
+        write_audit(
+            db,
+            owner_id=user.id,
+            action="instance.ipv6.remove",
+            target=instance_id,
+            detail={
+                "tenant_id": tenant_id,
+                "ok": result.ok,
+                "message": result.message,
+                "removed": (result.data or {}).get("removed") if isinstance(result.data, dict) else None,
+            },
+        )
+        return PowerActionResult(**op_result_dict(result))
+    except OCIClientError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 @router.get("/tenants/{tenant_id}/instances/{instance_id}/metrics")
 def instance_metrics(
     tenant_id: str,
