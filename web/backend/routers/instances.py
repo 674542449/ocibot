@@ -20,8 +20,10 @@ from app.oci_client import derive_retry_token, generate_root_password
 from web.backend.launch_service import (
     build_launch_request,
     fetch_launch_meta,
+    launch_meta_state,
     prepare_launch_network,
     schedule_post_launch_adjustments,
+    start_meta_refresh,
 )
 from web.backend.models import CapacityJob, Tenant, User
 from web.backend.oci_bridge import (
@@ -675,6 +677,59 @@ def launch_meta(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"加载创建元数据失败: {exc}") from exc
+
+
+@router.post("/tenants/{tenant_id}/launch-meta/refresh")
+def launch_meta_refresh(
+    tenant_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+    force: bool = Query(True),
+) -> dict[str, Any]:
+    """Start building the launch metadata and return at once.
+
+    The synchronous GET above cannot be made reliably fast: it makes six
+    paginated Oracle reads and, on a tenancy with no network, creates a VCN and
+    waits for it. How long that takes belongs to the operator's Oracle account,
+    not to this code — and Cloudflare cuts any single request at 100 seconds, so
+    「加载配置」 returned a gateway error and then worked on the next click,
+    because the first attempt finished server-side and filled the cache.
+
+    Returning immediately and letting the browser poll removes the dependency on
+    any proxy's ceiling instead of trying to stay under it. A second click while
+    one is in flight joins that run rather than starting more Oracle calls.
+    """
+    row = _tenant_or_404(db, user.id, tenant_id)
+    if not row.enabled:
+        raise HTTPException(status_code=400, detail="租户已禁用")
+    try:
+        session = get_session_for_row(row)
+        return start_meta_refresh(session, row.id, force=force)
+    except OCIClientError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"启动加载失败: {exc}") from exc
+
+
+@router.get("/tenants/{tenant_id}/launch-meta/status")
+def launch_meta_status(
+    tenant_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    """Poll target: ready (with the metadata) / running / error / idle.
+
+    Touches Oracle only through the cache — polling must never itself make API
+    calls, or a page left open would quietly spend the tenancy's rate limit.
+    """
+    row = _tenant_or_404(db, user.id, tenant_id)
+    if not row.enabled:
+        raise HTTPException(status_code=400, detail="租户已禁用")
+    try:
+        session = get_session_for_row(row)
+        return launch_meta_state(session, row.id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"读取加载状态失败: {exc}") from exc
 
 
 @router.post("/tenants/{tenant_id}/launch", response_model=LaunchInstanceResult)

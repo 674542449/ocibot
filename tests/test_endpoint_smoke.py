@@ -292,7 +292,8 @@ def test_every_endpoint_is_wired() -> None:
             f"/api/tenants/{tid}/instances/{iid}", f"/api/tenants/{tid}/account",
             f"/api/tenants/{tid}/usage", f"/api/tenants/{tid}/free-quota",
             f"/api/tenants/{tid}/invoices",
-            f"/api/tenants/{tid}/launch-meta", f"/api/tenants/{tid}/boot-volumes",
+            f"/api/tenants/{tid}/launch-meta", f"/api/tenants/{tid}/launch-meta/status",
+            f"/api/tenants/{tid}/boot-volumes",
             f"/api/tenants/{tid}/block-volumes", f"/api/tenants/{tid}/reserved-ips",
             f"/api/tenants/{tid}/boot-volume-backups", f"/api/tenants/{tid}/custom-images",
             f"/api/tenants/{tid}/object-storage/namespace",
@@ -320,6 +321,7 @@ def test_every_endpoint_is_wired() -> None:
 
         posts = [
             (f"/api/tenants/{tid}/test", {}),
+            (f"/api/tenants/{tid}/launch-meta/refresh", None),
             (f"/api/tenants/{tid}/regions/subscribe",
              {"region": "ap-osaka-1", "confirm": True, "add_tenant": True}),
             (f"/api/tenants/{tid}/instances/{iid}/power", {"action": "SOFTSTOP"}),

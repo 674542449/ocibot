@@ -776,6 +776,39 @@ async function loadTenants() {
 }
 
 let metaSeq = 0
+/** How long the poll keeps waiting before giving up, and how often it asks.
+ *  Generous because a first-time tenancy really does need Oracle to create a VCN
+ *  and wait for it; the point is that no SINGLE request is long, so nothing in
+ *  the path can time it out. */
+const _META_POLL_MS = 2000
+const _META_POLL_LIMIT_MS = 10 * 60 * 1000
+
+/** Kick off the refresh, then poll until it is ready. Returns null if the user
+ *  moved on (tenant switch / newer request), so the caller drops the result. */
+async function pollMeta(tenant: string, force: boolean, seq: number): Promise<any | null> {
+  const started = await api.post(`/tenants/${tenant}/launch-meta/refresh`, null, {
+    params: { force: force === true },
+  })
+  if (started.data?.state === 'ready' && started.data.meta) return started.data.meta
+  if (started.data?.state === 'error') throw new Error(started.data.error || '加载失败')
+
+  const deadline = Date.now() + _META_POLL_LIMIT_MS
+  while (Date.now() < deadline) {
+    if (seq !== metaSeq || tenantId.value !== tenant) return null
+    await new Promise((r) => window.setTimeout(r, _META_POLL_MS))
+    if (seq !== metaSeq || tenantId.value !== tenant) return null
+    const { data } = await api.get(`/tenants/${tenant}/launch-meta/status`)
+    if (data?.state === 'ready' && data.meta) return data.meta
+    if (data?.state === 'error') throw new Error(data.error || '加载失败')
+    if (data?.state === 'idle') {
+      // The run ended without leaving a result — treat as failed rather than
+      // polling forever against a state that will never change.
+      throw new Error('加载未完成，请重试')
+    }
+  }
+  throw new Error('加载超时（10 分钟）。请检查该租户的 Oracle API 是否可用后重试。')
+}
+
 async function loadMeta(force = false) {
   if (!tenantId.value) return
   error.value = ''
@@ -783,11 +816,18 @@ async function loadMeta(force = false) {
   const seq = ++metaSeq
   const requestedTenant = tenantId.value
   try {
-    const { data } = await api.get(`/tenants/${requestedTenant}/launch-meta`, {
-      params: { force: force === true },
-    })
+    // Started in the background and polled, NOT fetched in one request.
+    //
+    // Building this metadata makes six paginated Oracle reads and, on a tenancy
+    // with no network, creates a VCN and waits for it — the duration belongs to
+    // the operator's Oracle account, not to us. Cloudflare cuts any single
+    // request at 100 seconds, which is why 加载配置 showed a gateway error and
+    // then worked on the second click: the first attempt kept running on the
+    // server and filled the cache. Polling removes the dependency on that
+    // ceiling instead of trying to stay under it.
+    const data = await pollMeta(requestedTenant, force, seq)
     // Drop stale responses if the user switched tenants mid-flight.
-    if (seq !== metaSeq || tenantId.value !== requestedTenant) return
+    if (data === null || seq !== metaSeq || tenantId.value !== requestedTenant) return
     meta.value = data
     if (!form.display_name) form.display_name = data?.defaults?.display_name || padName()
     if (data?.defaults?.retry_interval_sec) form.retry_interval_sec = data.defaults.retry_interval_sec

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -158,6 +159,158 @@ def clear_launch_meta_cache(tenant_id: Optional[str] = None) -> None:
                 db.rollback()
     except Exception:  # noqa: BLE001
         pass
+
+
+# --------------------------------------------------------------------------
+# Asynchronous refresh
+#
+# 「加载配置」 cannot be a single long request. It does six paginated Oracle reads
+# and, on a tenancy with no network, creates a VCN and waits for it — how long
+# that takes is a property of someone else's account, not something this code can
+# bound. Cloudflare's free plan cuts any single request at 100 seconds, so the
+# page failed with a gateway error and then worked on the next click, because the
+# first attempt kept running server-side and filled the cache.
+#
+# Parallelising the reads (0.4.74) helped and was still not enough. Chasing the
+# ceiling is the wrong game: the fix is to stop having a request that long. The
+# browser now asks for a refresh, gets an answer immediately, and polls — the
+# same shape the capacity-retry jobs already use.
+#
+# State lives in the database, not in a module variable, because the POST and the
+# poll are served by different worker processes about half the time.
+# --------------------------------------------------------------------------
+
+_STATUS_PREFIX = "launch_meta_status:"
+# A refresh that has not reported in this long is treated as dead rather than
+# leaving the page waiting on a process that has since restarted.
+_STATUS_STALE_SEC = 15 * 60
+
+# Threads started in THIS process, so a second click does not launch a second
+# fetch. The database row covers the cross-process case.
+_REFRESH_LOCK = threading.Lock()
+_REFRESHING: set[str] = set()
+
+
+def meta_cache_key(session: TenantSession, tenant_id: str) -> str:
+    tenant = session.tenant
+    return f"{tenant_id}|{tenant.region}|{tenant.compartment_ocid or tenant.tenancy_ocid}"
+
+
+def _read_status(cache_key: str) -> dict[str, Any]:
+    try:
+        from sqlalchemy import select
+
+        from web.backend.models import AppMeta
+
+        with _cache_session() as db:
+            row = db.scalar(select(AppMeta).where(AppMeta.key == _STATUS_PREFIX + cache_key))
+            raw = row.value if row is not None else ""
+        if not raw:
+            return {}
+        blob = json.loads(raw)
+        if time.time() - float(blob.get("at") or 0) > _STATUS_STALE_SEC:
+            return {}
+        return blob if isinstance(blob, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _write_status(cache_key: str, state: str, error: str = "") -> None:
+    try:
+        from sqlalchemy import delete, select
+
+        from web.backend.models import AppMeta
+
+        key = _STATUS_PREFIX + cache_key
+        with _cache_session() as db:
+            try:
+                if not state:
+                    db.execute(delete(AppMeta).where(AppMeta.key == key))
+                else:
+                    payload = json.dumps(
+                        {"state": state, "error": error[:500], "at": time.time()},
+                        ensure_ascii=False,
+                    )
+                    row = db.scalar(select(AppMeta).where(AppMeta.key == key))
+                    if row is None:
+                        db.add(AppMeta(key=key, value=payload))
+                    else:
+                        row.value = payload
+                db.commit()
+            except Exception:  # noqa: BLE001
+                db.rollback()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def peek_launch_meta(session: TenantSession, tenant_id: str) -> Optional[dict[str, Any]]:
+    """Cached metadata if it is ready, without ever calling Oracle."""
+    cache_key = meta_cache_key(session, tenant_id)
+    cached = _META_CACHE.get(cache_key)
+    if cached and time.monotonic() - cached[0] < _META_TTL and cached[1].get("ads"):
+        meta = dict(cached[1])
+        meta["cached"] = True
+        meta["cache_age_sec"] = int(time.monotonic() - cached[0])
+        return meta
+    shared = _load_shared_meta(cache_key)
+    if shared is None:
+        return None
+    age, payload = shared
+    _META_CACHE[cache_key] = (time.monotonic() - age, payload)
+    meta = dict(payload)
+    meta["cached"] = True
+    meta["cache_age_sec"] = int(age)
+    return meta
+
+
+def launch_meta_state(session: TenantSession, tenant_id: str) -> dict[str, Any]:
+    """What the polling endpoint reports: ready / running / error / idle."""
+    cache_key = meta_cache_key(session, tenant_id)
+    status = _read_status(cache_key)
+    if status.get("state") == "error":
+        return {"state": "error", "error": str(status.get("error") or "加载失败")}
+    meta = peek_launch_meta(session, tenant_id)
+    if meta is not None:
+        return {"state": "ready", "meta": meta}
+    if status.get("state") == "running":
+        return {"state": "running"}
+    return {"state": "idle"}
+
+
+def start_meta_refresh(session: TenantSession, tenant_id: str, *, force: bool = True) -> dict[str, Any]:
+    """Kick off a background refresh and return immediately.
+
+    Idempotent: a second click while one is in flight joins the existing run
+    rather than starting a competing set of Oracle calls.
+    """
+    cache_key = meta_cache_key(session, tenant_id)
+    if not force:
+        meta = peek_launch_meta(session, tenant_id)
+        if meta is not None:
+            return {"state": "ready", "meta": meta}
+    if _read_status(cache_key).get("state") == "running":
+        return {"state": "running"}
+    with _REFRESH_LOCK:
+        if cache_key in _REFRESHING:
+            return {"state": "running"}
+        _REFRESHING.add(cache_key)
+    _write_status(cache_key, "running")
+
+    def _run() -> None:
+        try:
+            fetch_launch_meta(session, tenant_id=tenant_id, force=True)
+            _write_status(cache_key, "")  # cleared: the cache now holds the answer
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("ocibot.launch").warning(
+                "launch meta refresh failed for %s: %s", tenant_id, exc
+            )
+            _write_status(cache_key, "error", str(exc))
+        finally:
+            with _REFRESH_LOCK:
+                _REFRESHING.discard(cache_key)
+
+    threading.Thread(target=_run, name=f"launch-meta-{tenant_id[:8]}", daemon=True).start()
+    return {"state": "running"}
 
 
 def fetch_launch_meta(
