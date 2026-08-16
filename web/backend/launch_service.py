@@ -7,6 +7,7 @@ import logging
 import math
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 from app.oci_client import (
@@ -38,6 +39,11 @@ _SHARED_META_PREFIX = "launch_meta:"
 # A tenancy with many custom images produces a large document; past this it is
 # not worth a database round trip and the in-process cache carries it alone.
 _SHARED_META_MAX_BYTES = 512 * 1024
+
+# Concurrent OCI reads while building the launch metadata. Small on purpose:
+# enough to turn a sum of latencies into roughly the slowest one, not so many
+# that a single 「加载配置」 becomes a burst against the tenancy's rate limit.
+_META_FETCH_WORKERS = 6
 
 
 # Every shared-cache helper runs in its OWN session, never the request's.
@@ -193,31 +199,65 @@ def fetch_launch_meta(
             meta["cache_age_sec"] = int(age)
             return meta
 
-    comps = session.list_compartments()
-    ads = session.list_availability_domains()
-    # Platform images per OS family + tenancy custom images.
-    images_by_os: dict[str, list[dict[str, Any]]] = {}
-    for fam in LAUNCH_OS_FAMILIES:
+    default_comp = tenant.compartment_ocid or tenant.tenancy_ocid
+
+    # These six reads do not depend on each other, and running them one after
+    # another made the wall time their SUM. Each is a paginated round trip to
+    # Oracle, and ensure_default_network additionally walks VCNs and subnets per
+    # compartment — on a tenancy of any size the total ran past the 100-second
+    # ceiling a proxy like Cloudflare puts on one request, which is what made
+    # 「加载配置」 fail and then work on the second click (the first attempt kept
+    # running server-side and populated the cache).
+    #
+    # Concurrency, not extra calls: the same requests are made, so this does not
+    # spend any more of the tenancy's rate limit. Bounded pool and a shared
+    # requests.Session across threads, matching what list_instances_tree and the
+    # IP resolver in oci_client already do.
+    def _images_for(fam: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
         try:
-            imgs = session.list_images(
+            return fam["id"], session.list_images(
                 compartment_id=tenant.tenancy_ocid,
                 operating_system=fam["operating_system"],
                 ubuntu_only=(fam["id"] == "ubuntu"),
             )
         except Exception:  # noqa: BLE001
-            imgs = []
-        images_by_os[fam["id"]] = imgs
-    try:
-        images_by_os["custom"] = session.list_custom_images(
-            compartment_id=tenant.compartment_ocid or tenant.tenancy_ocid
+            return fam["id"], []
+
+    def _custom_images() -> list[dict[str, Any]]:
+        try:
+            return session.list_custom_images(compartment_id=default_comp)
+        except Exception:  # noqa: BLE001
+            return []
+
+    with ThreadPoolExecutor(max_workers=_META_FETCH_WORKERS) as pool:
+        f_comps = pool.submit(session.list_compartments)
+        f_ads = pool.submit(session.list_availability_domains)
+        f_shapes = pool.submit(session.list_shapes, compartment_id=tenant.tenancy_ocid)
+        f_custom = pool.submit(_custom_images)
+        f_network = pool.submit(
+            session.ensure_default_network, compartment_id=default_comp, create_if_missing=True
         )
-    except Exception:  # noqa: BLE001
-        images_by_os["custom"] = []
+        f_families = [pool.submit(_images_for, fam) for fam in LAUNCH_OS_FAMILIES]
+
+        # .result() re-raises, so the calls that used to propagate still do and
+        # the ones that were individually caught above still return their empty
+        # fallback. Error behaviour is unchanged, only the ordering is.
+        images_by_os: dict[str, list[dict[str, Any]]] = {}
+        for fut in f_families:
+            fam_id, imgs = fut.result()
+            images_by_os[fam_id] = imgs
+        images_by_os["custom"] = f_custom.result()
+        comps = f_comps.result()
+        ads = f_ads.result()
+        shapes = f_shapes.result()
+        network = f_network.result()
+
+    # Dependent fallbacks stay sequential: each only runs when the parallel call
+    # above came back empty, so they cost nothing in the normal case.
     images = images_by_os.get("ubuntu") or []
     if not images:
         images = session.list_images(ubuntu_only=True)
         images_by_os["ubuntu"] = images
-    shapes = session.list_shapes(compartment_id=tenant.tenancy_ocid)
     if not shapes:
         shapes = session.list_shapes()
 
@@ -228,8 +268,6 @@ def fetch_launch_meta(
     else:
         shapes_out = shapes
 
-    default_comp = tenant.compartment_ocid or tenant.tenancy_ocid
-    network = session.ensure_default_network(compartment_id=default_comp, create_if_missing=True)
     if not network.ok:
         raise OCIClientError(network.message or "无法准备默认网络（VCN/Subnet）")
     net_data = network.data or {}
