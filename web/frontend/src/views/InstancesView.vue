@@ -62,13 +62,14 @@
             <th>Shape</th>
             <th>公网 IP</th>
             <th>私网 IP</th>
+            <th>创建时间</th>
             <th>root 密码</th>
             <th>操作</th>
           </tr>
         </thead>
         <tbody>
           <tr v-if="!loading && filtered.length === 0">
-            <td colspan="9" class="muted empty">
+            <td colspan="10" class="muted empty">
               {{ instances.length ? '没有匹配搜索的实例' : '暂无实例。请先在「租户」添加 API，再「创建实例」。' }}
             </td>
           </tr>
@@ -134,6 +135,13 @@
                 @click="copyIp(ins.private_ip, $event)"
                 @keydown.enter.prevent="copyIp(ins.private_ip)"
               >{{ ins.private_ip || '—' }}</span>
+            </td>
+            <td>
+              <!-- 精确到秒的本地时间；原始 UTC 时间戳放在 title 里，方便和
+                   Oracle 控制台核对。 -->
+              <span class="created-cell" :title="ins.time_created || ''">
+                {{ formatCreated(ins.time_created) }}
+              </span>
             </td>
             <td>
               <!-- 密码模式创建时写在实例标签里；密钥模式没有这个值。
@@ -238,6 +246,15 @@
 </template>
 
 <style scoped>
+/* 定宽等宽字体 + 不换行：秒级时间戳在窄屏上会被折成两行，同一列的数字就
+   对不齐了，扫一眼比较先后的用途也就没了。表格外层是 .table-wrap，横向
+   滚动本来就有。 */
+.created-cell {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 .pwd-cell {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   white-space: nowrap;
@@ -397,6 +414,22 @@ const filtered = computed(() => {
   })
 })
 
+/** 实例创建时间 → 本地时区的 `YYYY-MM-DD HH:mm:ss`（精确到秒）。
+ *  刻意不用 toLocaleString()：它的输出随浏览器语言变，而这一列要能直接和
+ *  Oracle 控制台、以及导出的 CSV 逐字对比。 */
+function formatCreated(v?: string | null) {
+  const raw = String(v || '').trim()
+  if (!raw) return '—'
+  // 后端返回 ISO 8601；老版本 API 缓存里可能还是空格分隔的形式，一并兜住。
+  const d = new Date(raw.includes('T') ? raw : raw.replace(' ', 'T'))
+  if (Number.isNaN(d.getTime())) return raw
+  const p = (n: number) => String(n).padStart(2, '0')
+  return (
+    `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
+    `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+  )
+}
+
 function stateClass(state: string) {
   const s = (state || '').toUpperCase()
   if (s === 'RUNNING') return 'running'
@@ -418,6 +451,7 @@ function exportCsv() {
     'public_ip',
     'private_ip',
     'region',
+    'time_created',
     'id',
   ]
   const lines = [header.join(',')]
@@ -432,6 +466,8 @@ function exportCsv() {
       ins.public_ip,
       ins.private_ip,
       ins.region,
+      // 与列表里显示的一致（本地时区、精确到秒），而不是原始 UTC 串。
+      formatCreated(ins.time_created),
       ins.id,
     ].map((v) => `"${String(v ?? '').replace(/"/g, '""')}"`)
     lines.push(vals.join(','))

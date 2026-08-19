@@ -2094,11 +2094,11 @@ class TenantSession:
                 shape_cfg = oci.util.to_dict(sc)
             except Exception:
                 shape_cfg = {}
-        time_created = getattr(inst, "time_created", None)
-        if time_created is not None:
-            time_created = str(time_created)
-        else:
-            time_created = ""
+        # ISO 8601 with the "T" separator, like every other time_created this API
+        # returns. Plain str(datetime) yields "2026-01-01 00:00:00+00:00", and a
+        # space-separated stamp with an offset is not something Date() is required
+        # to parse — Chrome accepts it, Safari does not.
+        time_created = self._ts_iso(getattr(inst, "time_created", None))
         return InstanceInfo(
             id=inst.id,
             display_name=inst.display_name or inst.id,
