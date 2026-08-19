@@ -782,6 +782,13 @@ let metaSeq = 0
  *  the path can time it out. */
 const _META_POLL_MS = 2000
 const _META_POLL_LIMIT_MS = 10 * 60 * 1000
+/** How many consecutive 'idle' replies are tolerated before giving up.
+ *  'idle' means the server has neither a running refresh nor a result — normally a
+ *  dead run, but it is also what a single lost status row looks like, and one such
+ *  reply used to fail the page two seconds after the click while the refresh was
+ *  running fine (0.4.77). Retrying a few times costs nothing and no longer turns a
+ *  momentary gap into an error the user has to work around. */
+const _META_IDLE_TOLERANCE = 3
 
 /** Kick off the refresh, then poll until it is ready. Returns null if the user
  *  moved on (tenant switch / newer request), so the caller drops the result. */
@@ -793,6 +800,7 @@ async function pollMeta(tenant: string, force: boolean, seq: number): Promise<an
   if (started.data?.state === 'error') throw new Error(started.data.error || '加载失败')
 
   const deadline = Date.now() + _META_POLL_LIMIT_MS
+  let idleReplies = 0
   while (Date.now() < deadline) {
     if (seq !== metaSeq || tenantId.value !== tenant) return null
     await new Promise((r) => window.setTimeout(r, _META_POLL_MS))
@@ -801,9 +809,13 @@ async function pollMeta(tenant: string, force: boolean, seq: number): Promise<an
     if (data?.state === 'ready' && data.meta) return data.meta
     if (data?.state === 'error') throw new Error(data.error || '加载失败')
     if (data?.state === 'idle') {
-      // The run ended without leaving a result — treat as failed rather than
-      // polling forever against a state that will never change.
-      throw new Error('加载未完成，请重试')
+      // The run appears to have ended without leaving a result — treat as failed
+      // rather than polling forever against a state that will never change. Only
+      // after it repeats, so a single missing status reply is not an error.
+      idleReplies += 1
+      if (idleReplies >= _META_IDLE_TOLERANCE) throw new Error('加载未完成，请重试')
+    } else {
+      idleReplies = 0
     }
   }
   throw new Error('加载超时（10 分钟）。请检查该租户的 Oracle API 是否可用后重试。')

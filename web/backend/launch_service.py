@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -36,10 +37,13 @@ _META_TTL = 15 * 60
 # Shared second level, so the API's worker processes stop each paying for their
 # own cold fetch. Holds ids and display names (compartments, images, shapes,
 # VCN/subnet) — no credentials — in the existing app_meta key/value table.
-_SHARED_META_PREFIX = "launch_meta:"
-# A tenancy with many custom images produces a large document; past this it is
-# not worth a database round trip and the in-process cache carries it alone.
-_SHARED_META_MAX_BYTES = 512 * 1024
+_SHARED_META_PREFIX = "lmeta:"
+# A tenancy with many custom images produces a large document. The cap only exists
+# so one absurd row cannot dominate the table; it is generously above any realistic
+# document (400 images + every shape is a few hundred KB) because falling back to
+# "in-process only" silently disables the cross-worker cache, and that is what
+# 「加载配置」's polling and the launch request both depend on. A skip is logged.
+_SHARED_META_MAX_BYTES = 4 * 1024 * 1024
 
 # Concurrent OCI reads while building the launch metadata. Small on purpose:
 # enough to turn a sum of latencies into roughly the slowest one, not so many
@@ -61,6 +65,49 @@ def _cache_session():
     return SessionLocal()
 
 
+# Every app_meta row this module writes is keyed through _row_key().
+#
+# `app_meta.key` is VARCHAR(64). SQLite ignores that width; PostgreSQL — what
+# production runs — REJECTS a longer value (StringDataRightTruncation) instead of
+# truncating it. The raw cache key is a tenant uuid + region + a tenancy OCID,
+# about 127 characters, so with the old plain-text keys EVERY write to both of
+# these rows failed on the real database and was swallowed by the handlers below
+# (a cache must not break a request). Every test passed because they all run on
+# SQLite with a stub tenancy OCID of a dozen characters.
+#
+# Two shipped features were silently inert because of it:
+#   - 0.4.73's cross-worker meta cache — no row was ever stored, so the cold fetch
+#     could still happen inside a 创建 request (the intermittent 520).
+#   - 0.4.75's polling state — 「加载配置」 wrote "running", the row did not persist,
+#     and the poll two seconds later found no status and no result. It read that as
+#     "never started" and the page reported 加载未完成，请重试, while the fetch it had
+#     just launched was in fact running normally and finished a minute later. That
+#     is the first-click error: retrying appeared to work only because by then the
+#     earlier run had filled the in-process cache.
+#
+# The tenant id stays in clear text at the front because clear_launch_meta_cache()
+# deletes one tenant's rows with LIKE '<prefix><tenant_id>|%'. Only the part with no
+# length bound (region + compartment/tenancy OCID) is hashed.
+#
+# Keep _KEY_WIDTH equal to models.AppMeta.key's width; a test asserts the composed
+# keys fit it, using realistic values instead of the short stubs the other launch
+# tests use.
+_KEY_WIDTH = 64
+_KEY_DIGEST_LEN = 16
+
+
+def _row_key(prefix: str, cache_key: str) -> str:
+    """app_meta key for a cache entry, guaranteed to fit the column."""
+    tenant_id, _, tail = cache_key.partition("|")
+    digest = hashlib.sha256(tail.encode("utf-8")).hexdigest()[:_KEY_DIGEST_LEN]
+    # Derived from the column width rather than assumed: whatever room the prefix,
+    # the separator and the digest leave is what the tenant id may use. Tenant ids
+    # are a String(36) column and the prefixes here are 6-7 characters, so nothing
+    # is actually cut — but a longer prefix cannot quietly overflow the column.
+    head = max(0, _KEY_WIDTH - len(prefix) - 1 - _KEY_DIGEST_LEN)
+    return f"{prefix}{tenant_id[:head]}|{digest}"
+
+
 def _load_shared_meta(cache_key: str) -> Optional[tuple[float, dict[str, Any]]]:
     """Return (age_seconds, meta) from the shared cache, or None.
 
@@ -73,7 +120,9 @@ def _load_shared_meta(cache_key: str) -> Optional[tuple[float, dict[str, Any]]]:
         from web.backend.models import AppMeta
 
         with _cache_session() as db:
-            row = db.scalar(select(AppMeta).where(AppMeta.key == _SHARED_META_PREFIX + cache_key))
+            row = db.scalar(
+                select(AppMeta).where(AppMeta.key == _row_key(_SHARED_META_PREFIX, cache_key))
+            )
             if row is None or not row.value:
                 return None
             raw = row.value
@@ -94,15 +143,22 @@ def _load_shared_meta(cache_key: str) -> Optional[tuple[float, dict[str, Any]]]:
 
 def _store_shared_meta(cache_key: str, meta: dict[str, Any]) -> None:
     """Best-effort write of the shared cache entry."""
+    log = logging.getLogger("ocibot.launch")
     try:
         from sqlalchemy import select
 
         from web.backend.models import AppMeta
 
         payload = json.dumps({"stored_at": time.time(), "meta": meta}, ensure_ascii=False)
-        if len(payload.encode("utf-8")) > _SHARED_META_MAX_BYTES:
+        size = len(payload.encode("utf-8"))
+        if size > _SHARED_META_MAX_BYTES:
+            log.warning(
+                "launch meta is %d bytes, past the shared-cache cap — cross-worker "
+                "caching is inactive for this tenant",
+                size,
+            )
             return
-        key = _SHARED_META_PREFIX + cache_key
+        key = _row_key(_SHARED_META_PREFIX, cache_key)
         with _cache_session() as db:
             try:
                 row = db.scalar(select(AppMeta).where(AppMeta.key == key))
@@ -111,15 +167,27 @@ def _store_shared_meta(cache_key: str, meta: dict[str, Any]) -> None:
                 else:
                     row.value = payload
                 db.commit()
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 db.rollback()
+                # Logged HERE, not only in the outer handler. A commit that failed
+                # inside this block was rolled back and forgotten, so the warning
+                # below never fired for the one failure that actually happened in
+                # production: the key overflowing app_meta.key's VARCHAR(64) on
+                # PostgreSQL (see _row_key). Two releases looked healthy while this
+                # cache stored nothing at all.
+                log.warning(
+                    "launch meta shared cache commit failed (%s: %s) — cross-worker "
+                    "caching is inactive for this tenant",
+                    exc.__class__.__name__,
+                    exc,
+                )
     except Exception as exc:  # noqa: BLE001
         # Logged, not swallowed. A failure here does not break the request — but
         # it does silently switch the cross-worker cache off, which is the thing
         # that keeps a cold fetch out of the launch request. Without this line the
         # only symptom would be the intermittent timeout quietly coming back, and
         # nothing anywhere would connect it to a serialisation problem.
-        logging.getLogger("ocibot.launch").warning(
+        log.warning(
             "launch meta shared cache write failed (%s: %s) — cross-worker caching "
             "is inactive for this tenant, cold fetches may run inside a launch",
             exc.__class__.__name__,
@@ -146,14 +214,28 @@ def clear_launch_meta_cache(tenant_id: Optional[str] = None) -> None:
     else:
         _META_CACHE.clear()
     try:
-        from sqlalchemy import delete
+        from sqlalchemy import delete, or_
 
         from web.backend.models import AppMeta
 
-        prefix = _SHARED_META_PREFIX + (f"{tenant_id}|" if tenant_id else "")
+        # Both rows for this tenant: the cached document AND the refresh status.
+        # A stale status row would otherwise be the first thing launch_meta_state
+        # reports after the tenant's credentials or region changed.
+        #
+        # `launch_meta:` / `launch_meta_status:` are the pre-0.4.77 key formats.
+        # They only exist on SQLite installs — PostgreSQL rejected them for being
+        # longer than app_meta.key (see _row_key) — and nothing reads them now, so
+        # they are swept up here rather than left to sit forever.
+        suffix = f"{tenant_id}|%" if tenant_id else "%"
+        patterns = [
+            _SHARED_META_PREFIX + suffix,
+            _STATUS_PREFIX + suffix,
+            "launch_meta:" + suffix,
+            "launch_meta_status:" + suffix,
+        ]
         with _cache_session() as db:
             try:
-                db.execute(delete(AppMeta).where(AppMeta.key.like(f"{prefix}%")))
+                db.execute(delete(AppMeta).where(or_(*[AppMeta.key.like(p) for p in patterns])))
                 db.commit()
             except Exception:  # noqa: BLE001
                 db.rollback()
@@ -180,7 +262,7 @@ def clear_launch_meta_cache(tenant_id: Optional[str] = None) -> None:
 # poll are served by different worker processes about half the time.
 # --------------------------------------------------------------------------
 
-_STATUS_PREFIX = "launch_meta_status:"
+_STATUS_PREFIX = "lmstat:"
 # A refresh that has not reported in this long is treated as dead rather than
 # leaving the page waiting on a process that has since restarted.
 _STATUS_STALE_SEC = 15 * 60
@@ -203,7 +285,9 @@ def _read_status(cache_key: str) -> dict[str, Any]:
         from web.backend.models import AppMeta
 
         with _cache_session() as db:
-            row = db.scalar(select(AppMeta).where(AppMeta.key == _STATUS_PREFIX + cache_key))
+            row = db.scalar(
+                select(AppMeta).where(AppMeta.key == _row_key(_STATUS_PREFIX, cache_key))
+            )
             raw = row.value if row is not None else ""
         if not raw:
             return {}
@@ -216,12 +300,13 @@ def _read_status(cache_key: str) -> dict[str, Any]:
 
 
 def _write_status(cache_key: str, state: str, error: str = "") -> None:
+    log = logging.getLogger("ocibot.launch")
     try:
         from sqlalchemy import delete, select
 
         from web.backend.models import AppMeta
 
-        key = _STATUS_PREFIX + cache_key
+        key = _row_key(_STATUS_PREFIX, cache_key)
         with _cache_session() as db:
             try:
                 if not state:
@@ -237,10 +322,24 @@ def _write_status(cache_key: str, state: str, error: str = "") -> None:
                     else:
                         row.value = payload
                 db.commit()
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 db.rollback()
-    except Exception:  # noqa: BLE001
-        pass
+                # This used to be `pass`, and that is why the bug below survived two
+                # releases unseen: with the row never persisting, the poll two
+                # seconds after 「加载配置」 found no status and reported 加载未完成
+                # while the fetch ran on happily. A status write that fails IS the
+                # page failing, so it has to be audible even though it must not
+                # raise into the request.
+                log.warning(
+                    "launch meta status write failed (%s: %s) — the launch page will "
+                    "report an unfinished load even though the refresh is running",
+                    exc.__class__.__name__,
+                    exc,
+                )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "launch meta status write failed (%s: %s)", exc.__class__.__name__, exc
+        )
 
 
 def peek_launch_meta(session: TenantSession, tenant_id: str) -> Optional[dict[str, Any]]:
@@ -334,7 +433,9 @@ def fetch_launch_meta(
     worker had a warm cache.
     """
     tenant = session.tenant
-    cache_key = f"{tenant_id}|{tenant.region}|{tenant.compartment_ocid or tenant.tenancy_ocid}"
+    # One definition of the key, shared with peek/status (they must agree or a
+    # refresh would publish to a row the poll never looks at).
+    cache_key = meta_cache_key(session, tenant_id)
     if not force:
         cached = _META_CACHE.get(cache_key)
         if cached and time.monotonic() - cached[0] < _META_TTL and cached[1].get("ads"):
