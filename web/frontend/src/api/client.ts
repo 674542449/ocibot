@@ -112,6 +112,13 @@ export type Instance = {
   free_tier_tag: string
   /** 创建时若选了 root 密码模式，密码会写进实例标签，这里带回来。密钥模式为空。 */
   root_password: string
+  /** 终止保护。存在 OCI 的 freeform tag `ocibot_protected` 上，所以面板重装后
+   *  依然有效，在 Oracle 控制台里也看得见。开启时后端的 terminate 直接返回 409。 */
+  protected: boolean
+  /** Oracle Cloud Agent 的监控插件是否被禁用 —— 也就是「监控页为什么一片空白」
+   *  的答案。null = 该实例没有返回 agent_config（老实例/老镜像），此时 UI 不做
+   *  任何断言，而不是把「不知道」显示成「已启用」。 */
+  monitoring_disabled: boolean | null
   tenant_id: string
   tenant_name: string
 }

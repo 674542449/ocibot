@@ -18,6 +18,12 @@ from typing import Any, Callable, Optional
 # (password mode only). Visible to anyone who can read the instance.
 ROOT_PASSWORD_TAG = "ocibot_root_password"
 
+# Instance freeform-tag key marking an instance as protected from termination.
+# A tag rather than a panel-local column so the flag survives a panel reinstall
+# or a database restore, and so it is visible in the Oracle console instead of
+# being a fact only this panel knows.
+TERMINATE_PROTECT_TAG = "ocibot_protected"
+
 # Bounded parallelism for OCI network calls. The SDK clients wrap a
 # requests.Session, which tolerates concurrent GETs; keep pools small so a
 # large tenancy does not spawn hundreds of threads.
@@ -550,6 +556,25 @@ STATE_ACTIONS: dict[str, set[str]] = {
 }
 
 
+def _agent_monitoring_disabled(inst: Any) -> Optional[bool]:
+    """Is the Oracle Cloud Agent monitoring plugin off for this instance?
+
+    Returns None when the instance carries no agent_config at all, so the UI can
+    stay silent rather than assert something it does not know.
+
+    Two independent switches turn metrics off, and reporting only one of them
+    would leave the other case looking like a panel fault: the top-level
+    ``is_monitoring_disabled``, and ``are_all_plugins_disabled`` which overrides
+    everything below it.
+    """
+    cfg = getattr(inst, "agent_config", None)
+    if cfg is None:
+        return None
+    if bool(getattr(cfg, "are_all_plugins_disabled", False)):
+        return True
+    return bool(getattr(cfg, "is_monitoring_disabled", False))
+
+
 @dataclass
 class InstanceInfo:
     """Normalized instance view for the UI."""
@@ -576,6 +601,11 @@ class InstanceInfo:
     boot_volume_gb: Optional[int] = None
     boot_vpus_per_gb: Optional[int] = None
     shape_config_raw: dict = field(default_factory=dict)
+    # Oracle Cloud Agent 的监控插件是否被禁用。禁用时「监控」页会是空的，而面板
+    # 以前一个字都不解释 —— 用户只会当成功能坏了。这个值就在已经拿到的
+    # GetInstance 响应里（Instance.agent_config），不需要多调一次 API。
+    # None = 该实例没有返回 agent_config（老实例/老镜像），此时不做任何断言。
+    monitoring_disabled: Optional[bool] = None
     raw: Any = None
 
     @property
@@ -1149,6 +1179,139 @@ class TenantSession:
                 ok=True,
                 message="已更新密码备注" if password else "已清除密码备注",
                 data={"root_password": password},
+            )
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=str(exc))
+
+    def set_instance_protected(self, instance_id: str, protected: bool) -> OperationResult:
+        """Mark/unmark an instance as protected from termination.
+
+        Stored as an OCI freeform tag rather than a panel-local column on purpose:
+        the flag then survives a panel reinstall or a database restore, and it is
+        visible in the Oracle console next to the instance, so it does not become
+        a fact only this panel knows.
+
+        Read-merge-write, same as the root-password note above — an
+        UpdateInstanceDetails carrying only this key would delete every other tag
+        on the instance, including the ``ocibot_managed`` marker other features
+        key off.
+        """
+        try:
+            current = self.compute.get_instance(instance_id).data
+            tags = dict(getattr(current, "freeform_tags", None) or {})
+            if protected:
+                tags[TERMINATE_PROTECT_TAG] = "true"
+            else:
+                tags.pop(TERMINATE_PROTECT_TAG, None)
+            self.compute.update_instance(
+                instance_id, oci.core.models.UpdateInstanceDetails(freeform_tags=tags)
+            )
+            return OperationResult(
+                ok=True,
+                message="已开启终止保护" if protected else "已解除终止保护",
+                data={"protected": bool(protected)},
+            )
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=str(exc))
+
+    def capture_console_output(
+        self,
+        instance_id: str,
+        *,
+        length_bytes: int = 256 * 1024,
+        timeout: int = 120,
+    ) -> OperationResult:
+        """Capture and return the instance's serial console output (boot log).
+
+        This is NOT the interactive console connection the panel already has.
+        That one needs an SSH key and a working network path, and it is useless
+        for the case that matters most: the machine does not come back after a
+        reboot. Editing /etc/fstab or resizing a boot volume can leave a VM
+        sitting at an initramfs prompt — OCI still reports RUNNING, SSH times
+        out, and until now the panel had no way to see why.
+
+        OCI models this as a resource, not a call: CaptureConsoleHistory creates
+        a ConsoleHistory that moves REQUESTED -> SUCCEEDED, and only then can its
+        content be read. So this polls, and the wait is bounded.
+
+        Old captures are deleted first. They persist and count against a
+        per-instance limit, so a panel that only ever created them would
+        eventually start failing with a quota error that names nothing the
+        operator recognises.
+        """
+        instance_id = (instance_id or "").strip()
+        if not instance_id:
+            return OperationResult(ok=False, message="缺少 instance_id")
+        # OCI caps a single read at 2 MiB; keep the default well under it so the
+        # response stays something a browser can render.
+        length_bytes = max(4096, min(int(length_bytes or 0) or 262144, 2 * 1024 * 1024))
+        try:
+            inst = self.compute.get_instance(instance_id).data
+            compartment_id = getattr(inst, "compartment_id", "") or self.resolve_compartment()
+
+            # Clean up this instance's previous captures before making another.
+            try:
+                old = oci.pagination.list_call_get_all_results(
+                    self.compute.list_console_histories,
+                    compartment_id,
+                    instance_id=instance_id,
+                ).data or []
+                for h in old:
+                    state = str(getattr(h, "lifecycle_state", "") or "")
+                    if state in {"SUCCEEDED", "FAILED"}:
+                        try:
+                            self.compute.delete_console_history(getattr(h, "id", ""))
+                        except Exception:  # noqa: BLE001
+                            # Best effort: a stale record we cannot remove must not
+                            # stop the operator getting today's log.
+                            pass
+            except Exception:  # noqa: BLE001
+                pass
+
+            created = self.compute.capture_console_history(
+                oci.core.models.CaptureConsoleHistoryDetails(instance_id=instance_id)
+            ).data
+            history_id = getattr(created, "id", "") or ""
+            if not history_id:
+                return OperationResult(ok=False, message="Oracle 未返回控制台历史 ID")
+
+            deadline = time.monotonic() + max(15, int(timeout))
+            state = str(getattr(created, "lifecycle_state", "") or "")
+            while state not in {"SUCCEEDED", "FAILED"} and time.monotonic() < deadline:
+                time.sleep(2.0)
+                try:
+                    state = str(
+                        getattr(
+                            self.compute.get_console_history(history_id).data,
+                            "lifecycle_state",
+                            "",
+                        )
+                        or ""
+                    )
+                except ServiceError:
+                    break
+            if state == "FAILED":
+                return OperationResult(ok=False, message="Oracle 抓取控制台输出失败")
+            if state != "SUCCEEDED":
+                return OperationResult(
+                    ok=False,
+                    message=f"抓取控制台输出超时（{timeout}s，状态 {state or '未知'}）。实例刚启动时可能还没有输出，稍后重试。",
+                )
+
+            content = self.compute.get_console_history_content(
+                history_id, length=length_bytes
+            ).data
+            text = getattr(content, "value", None)
+            if text is None:
+                text = content if isinstance(content, str) else str(content or "")
+            return OperationResult(
+                ok=True,
+                message=f"已抓取控制台输出（{len(text)} 字符）",
+                data={"content": text, "history_id": history_id},
             )
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
@@ -2200,6 +2363,7 @@ class TenantSession:
             tenant_id=self.tenant.id,
             tenant_name=self.tenant.name,
             shape_config_raw=shape_cfg,
+            monitoring_disabled=_agent_monitoring_disabled(inst),
             raw=inst,
         )
 

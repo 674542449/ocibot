@@ -131,6 +131,10 @@ def make_session():
     s.list_console_connections.return_value = []
     s.create_console_connection.return_value = R(True, "已创建", {"serial": "ssh -o x", "vnc": "vnc"})
     s.delete_console_connection.return_value = R(True, "已删除")
+    s.capture_console_output.return_value = R(True, "已抓取", {"content": "[    0.00] Linux", "history_id": "h1"})
+    s.set_instance_protected.return_value = R(True, "已开启终止保护", {"protected": True})
+    s.delete_boot_volume.return_value = R(True, "已删除引导卷", {"size_in_gbs": 47})
+    s.rename_boot_volume.return_value = R(True, "已重命名")
     s.get_instance_firewall.return_value = R(True, "", {"groups": []})
     s.add_instance_firewall_rule.return_value = R(True, "已添加", {})
     s.delete_nsg_rules.return_value = R(True, "已删除", {})
@@ -346,6 +350,10 @@ def test_every_endpoint_is_wired() -> None:
             (f"/api/tenants/{tid}/instances/{iid}/firewall/open-all", None),
             # Regression: this returned 502 "name 'quota_guard' is not defined".
             (f"/api/tenants/{tid}/instances/{iid}/boot-volume", {"size_in_gbs": 60}),
+            (f"/api/tenants/{tid}/instances/{iid}/console-output", None),
+            (f"/api/tenants/{tid}/instances/{iid}/protect", {"protected": True}),
+            (f"/api/tenants/{tid}/instances/{iid}/protect", {"protected": False}),
+            (f"/api/tenants/{tid}/boot-volumes/bv1/rename", {"display_name": "renamed-bv"}),
             (f"/api/tenants/{tid}/reserved-ips", {"display_name": "pip"}),
             (f"/api/tenants/{tid}/instances/{iid}/reserved-ip/attach", {"public_ip_id": "pip1"}),
             (f"/api/tenants/{tid}/reserved-ips/pip1/detach", None),
@@ -372,6 +380,7 @@ def test_every_endpoint_is_wired() -> None:
             f"/api/tenants/{tid}/object-storage/buckets/b1/objects/a%2Fb.txt",
             f"/api/tenants/{tid}/object-storage/buckets/b1",
             f"/api/tenants/{tid}/block-volumes/v1",
+            f"/api/tenants/{tid}/boot-volumes/bv1",
             f"/api/tenants/{tid}/boot-volume-backups/b1",
             f"/api/tenants/{tid}/custom-images/img1",
             f"/api/tenants/{tid}/reserved-ips/pip1",

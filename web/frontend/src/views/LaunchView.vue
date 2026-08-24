@@ -788,6 +788,15 @@ async function loadTenants() {
   tenantId.value = wanted.id
 }
 
+/** 「以此实例为模板创建」带过来的参数（详情页跳转时放在 query 里）。
+ *
+ *  只在 loadMeta 之后应用一次，然后清空：AD / shape 的可选集合来自 meta，
+ *  在那之前写进 form 会被重新绑定的逻辑覆盖掉；而如果不清空，用户手动改完
+ *  再切一次租户，又会被这份模板悄悄改回去。
+ *
+ *  不发任何请求 —— 这些值详情页早就有了，跳转只是把它们带过来。 */
+let pendingTemplate: Record<string, string> | null = null
+
 let metaSeq = 0
 /** How long the poll keeps waiting before giving up, and how often it asks.
  *  Generous because a first-time tenancy really does need Oracle to create a VCN
@@ -885,6 +894,7 @@ async function loadMeta(force = false) {
       form.shape = ''
     }
     onImageChange()
+    applyTemplate(adsList)
   } catch (e: any) {
     if (seq !== metaSeq || tenantId.value !== requestedTenant) return
     meta.value = null
@@ -917,6 +927,40 @@ function onOsFamilyChange() {
   const preferArm = list.find((i) => /arm|aarch64/i.test(`${i.label} ${i.architecture}`))
   form.image_id = (preferArm || list[0]).id
   onImageChange()
+}
+
+/** 把模板参数填进表单。只填**在当前目录里仍然有效**的值。
+ *
+ *  为什么要逐项校验：模板来自另一台机器，它的可用域可能不在这个租户的列表里，
+ *  它的 shape 可能和当前选中的镜像架构不兼容（ARM 镜像配 x86 固定 shape 这种
+ *  组合会一路走到创建请求才被 Oracle 拒绝）。宁可少填一项，也不要预填出一个
+ *  提交不了的组合 —— 那比让用户自己选更糟，因为他会以为已经填好了。 */
+function applyTemplate(adsList: string[]) {
+  const t = pendingTemplate
+  if (!t) return
+  pendingTemplate = null
+
+  if (t.ad && adsList.includes(t.ad)) form.availability_domain = t.ad
+
+  if (t.shape && compatibleShapes.value.some((s) => s.shape === t.shape)) {
+    form.shape = t.shape
+    // 会按 shape 是否弹性重置 OCPU/内存，所以下面的赋值必须在它之后。
+    onShapeChange()
+  }
+
+  // 只有弹性 shape 才谈得上自定义规格；固定 shape 的值由目录决定，
+  // onShapeChange 刚刚已经写好了，覆盖它只会造出一个 Oracle 不接受的组合。
+  if (isFlex.value) {
+    const c = Number(t.ocpus)
+    const m = Number(t.memory)
+    if (Number.isFinite(c) && c > 0) form.ocpus = c
+    if (Number.isFinite(m) && m > 0) form.memory_in_gbs = m
+  }
+
+  const boot = Number(t.boot)
+  if (Number.isFinite(boot) && boot > 0) form.boot_volume_size_in_gbs = boot
+
+  msg.value = '已按所选实例的配置预填，请确认后再创建。'
 }
 
 function onImageChange() {
@@ -1393,7 +1437,22 @@ onMounted(async () => {
   try {
     await loadTenants()
     form.display_name = padName()
-    // No automatic launch-meta fetch on enter.
+    // 「以此实例为模板创建」跳过来时带的参数。只记下来，等 loadMeta 之后再应用
+    // （见 applyTemplate）—— 现在写进 form 会被 meta 的重新绑定覆盖掉。
+    //
+    // 注意这里**没有**顺手去 loadMeta：本页刻意不在进入时请求 Oracle
+    // （CLAUDE.md 记着这条，0.4.20 试过自动加载、0.4.21 又回退了）。模板参数
+    // 会一直等到用户点「加载配置」，那时才一并生效。
+    if (route.query.from) {
+      pendingTemplate = {
+        shape: String(route.query.shape || ''),
+        ocpus: String(route.query.ocpus || ''),
+        memory: String(route.query.memory || ''),
+        ad: String(route.query.ad || ''),
+        boot: String(route.query.boot || ''),
+      }
+      msg.value = '已带入所选实例的配置，点「加载配置」后生效。'
+    }
   } catch (e: any) {
     error.value = e?.message || '初始化失败'
   }

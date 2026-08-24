@@ -89,8 +89,27 @@
         >
           取消 IPv6
         </button>
-        <button class="danger" :disabled="acting" @click="doTerminate">终止</button>
+        <!-- 以现有实例的配置预填创建表单。不产生任何新的 Oracle 调用 ——
+             这些参数本页早就拿在手里了。抢 Always Free 的人重建很频繁。 -->
+        <button :disabled="acting || !instance" @click="useAsTemplate">以此为模板创建</button>
+        <button :disabled="acting" @click="toggleProtect">
+          {{ instance?.protected ? '解除终止保护' : '开启终止保护' }}
+        </button>
+        <!-- 已保护时禁用终止按钮。服务端也会拒（409），这里只是别让人白点一下 ——
+             真正的闸门在服务端，因为 UI 显示的对象和请求打的对象曾经可以不一致。 -->
+        <button
+          class="danger"
+          :disabled="acting || !!instance?.protected"
+          :title="instance?.protected ? '已开启终止保护，请先解除' : '终止实例'"
+          @click="doTerminate"
+        >
+          终止
+        </button>
       </div>
+      <p v-if="instance?.protected" class="muted" style="margin: 0.4rem 0 0; font-size: 12px">
+        🔒 已开启终止保护。标记存在 Oracle 的实例标签上（<code>ocibot_protected</code>），
+        面板重装后依然有效，在 Oracle 控制台里也看得见。
+      </p>
     </div>
     <!-- 换实例时 instance 会被先清空（见 resetInstanceState），上面的卡片
          整块消失。没有这句占位，页面看起来像是加载失败了。 -->
@@ -128,6 +147,18 @@
             <option :value="24">24 小时</option>
           </select>
           <button @click="loadMetrics" :disabled="loadingMetrics">刷新</button>
+        </div>
+      </div>
+      <!-- 监控插件被禁用时，下面的图表就是空的，而面板以前一个字都不解释 ——
+           操作员只会当成「这功能坏了」。这个字段就在已经拿到的 GetInstance
+           响应里（Instance.agent_config），不需要额外调用。
+           monitoring_disabled === null 表示实例没返回 agent_config（老实例/
+           老镜像），这时什么都不说，不做无根据的断言。 -->
+      <div v-if="instance?.monitoring_disabled === true" class="card warn-box" style="margin: 0">
+        <strong>⚠ 该实例的 Oracle Cloud Agent 监控插件已禁用</strong>
+        <div class="muted" style="font-size: 12px; margin-top: 0.25rem">
+          这就是下面没有数据的原因,不是面板故障。到 Oracle 控制台 → 实例 → Oracle Cloud Agent,
+          启用「Compute Instance Monitoring」后,大约几分钟开始有数据。
         </div>
       </div>
       <p class="muted" style="margin: 0; font-size: 12px">{{ metricsMsg }}</p>
@@ -243,6 +274,27 @@
     </div>
 
     <!-- Firewall -->
+    <div v-if="tab === 'bootlog'" class="card stack">
+      <div class="row" style="justify-content: space-between; align-items: flex-start">
+        <div>
+          <h3 style="margin: 0">串口控制台输出（引导日志）</h3>
+          <p class="muted" style="margin: 0.25rem 0 0; font-size: 12px">
+            机器起不来、SSH 连不上时用这个。改坏 <code>/etc/fstab</code>、引导卷扩容失败，
+            都会让系统停在 initramfs 提示符上 —— Oracle 那边仍然显示 RUNNING，
+            只有串口输出能看到真正的原因。抓取需要十几秒。
+          </p>
+        </div>
+        <button class="primary" :disabled="bootlogBusy" @click="loadBootLog">
+          {{ bootlogBusy ? '抓取中…' : '抓取输出' }}
+        </button>
+      </div>
+      <div v-if="bootlogMsg" class="muted" style="font-size: 12px">{{ bootlogMsg }}</div>
+      <pre v-if="bootlog" class="bootlog">{{ bootlog }}</pre>
+      <p v-else-if="!bootlogBusy" class="muted empty" style="margin: 0">
+        点「抓取输出」拉取。和本页其他部分一样，进入页面不会自动请求 Oracle。
+      </p>
+    </div>
+
     <div v-if="tab === 'firewall'" class="card stack">
       <div class="row" style="justify-content: space-between">
         <h3 style="margin: 0">防火墙 (NSG)</h3>
@@ -716,10 +768,15 @@ const loading = ref(false)
 const acting = ref(false)
 const error = ref('')
 const msg = ref('')
-const tab = ref<'metrics' | 'console' | 'webssh' | 'firewall' | 'network' | 'volume'>('metrics')
+const tab = ref<
+  'metrics' | 'console' | 'bootlog' | 'webssh' | 'firewall' | 'network' | 'volume'
+>('metrics')
 const tabs = [
   { id: 'metrics' as const, label: '监控' },
   { id: 'console' as const, label: '控制台' },
+  // 和「控制台」是两回事：那个是交互式串口（要配公钥、要网络通），这个是把
+  // 开机到现在的串口输出整段拉下来。机器起不来的时候，能用的只有后者。
+  { id: 'bootlog' as const, label: '引导日志' },
   { id: 'webssh' as const, label: 'WebSSH' },
   { id: 'firewall' as const, label: '防火墙' },
   { id: 'network' as const, label: '保留 IP' },
@@ -1646,6 +1703,88 @@ async function doRemoveIpv6() {
   }
 }
 
+// ---- 引导日志 ----
+const bootlog = ref('')
+const bootlogMsg = ref('')
+const bootlogBusy = ref(false)
+
+async function loadBootLog() {
+  const act = beginAction()
+  bootlogBusy.value = true
+  bootlogMsg.value = ''
+  try {
+    const { data } = await api.post(
+      `/tenants/${act.tenant}/instances/${act.target}/console-output`,
+    )
+    // 抓取要十几秒，期间用户完全可能已经切到另一台机器上了。没有这一句，
+    // A 的引导日志就会渲染在 B 的页面里 —— 而引导日志正是用来做判断的东西。
+    if (act.moved()) return
+    if (data.ok) {
+      bootlog.value = data.content || ''
+      bootlogMsg.value = data.content ? data.message || '' : '抓取成功，但输出为空。'
+    } else {
+      bootlogMsg.value = data.message || '抓取失败'
+    }
+  } catch (e: any) {
+    if (act.moved()) return
+    bootlogMsg.value = e?.message || '抓取失败'
+  } finally {
+    bootlogBusy.value = false
+  }
+}
+
+async function toggleProtect() {
+  const act = beginAction()
+  const next = !instance.value?.protected
+  if (
+    next === false &&
+    !confirm(
+      `解除「${targetLabel(act.target)}」的终止保护？\n\n解除后即可执行终止操作。`,
+    )
+  ) {
+    return
+  }
+  acting.value = true
+  error.value = ''
+  try {
+    const { data } = await api.post(
+      `/tenants/${act.tenant}/instances/${act.target}/protect`,
+      { protected: next },
+    )
+    if (act.moved()) return
+    if (data.ok) {
+      msg.value = data.message || '已更新'
+      // 就地改，不重载整页：这只影响一个布尔值，重载要再花一轮 Oracle 调用。
+      if (instance.value) instance.value.protected = next
+    } else {
+      error.value = data.message || '操作失败'
+    }
+  } catch (e: any) {
+    if (act.moved()) return
+    error.value = e?.message || '操作失败'
+  } finally {
+    acting.value = false
+  }
+}
+
+/** 带着这台机器的配置跳到创建页。不发任何请求 —— 参数本页已经有了。 */
+function useAsTemplate() {
+  const i = instance.value
+  if (!i) return
+  router.push({
+    path: '/launch',
+    query: {
+      tenant: tenantId.value,
+      from: i.id,
+      shape: i.shape || '',
+      ocpus: i.ocpus != null ? String(i.ocpus) : '',
+      memory: i.memory_in_gbs != null ? String(i.memory_in_gbs) : '',
+      ad: i.availability_domain || '',
+      boot: i.boot_volume_size_in_gbs != null ? String(i.boot_volume_size_in_gbs) : '',
+    },
+  })
+}
+
 async function doTerminate() {
   const act = beginAction()
   if (
@@ -1748,6 +1887,10 @@ function resetInstanceState() {
   metricsSeries.value = {}
   metricHover.value = {}
   metricsMsg.value = ''
+  // 引导日志尤其不能留:它是用来判断「这台机器为什么起不来」的,
+  // 挂在另一台实例的页面上会直接导致误判。
+  bootlog.value = ''
+  bootlogMsg.value = ''
   consoleList.value = []
   fwGroups.value = []
   fwSecurityLists.value = []
@@ -1790,6 +1933,21 @@ watch([tenantId, instanceId], async () => {
 </script>
 
 <style scoped>
+/* 引导日志是等宽、可能很长的机器输出。给固定高度 + 自己滚动，否则一份几千行的
+   内核日志会把整页撑到没法用；不换行，因为内核那些对齐的表格一折行就废了。 */
+.bootlog {
+  max-height: 60vh;
+  overflow: auto;
+  white-space: pre;
+  font-size: 12px;
+  line-height: 1.45;
+  margin: 0;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+}
+
 .tab-row {
   gap: 0.4rem;
 }

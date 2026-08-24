@@ -14,7 +14,11 @@
         <div>
           <h3 style="margin: 0">通知推送</h3>
           <p class="muted" style="margin: 0.2rem 0 0; font-size: 12px">
-            抢机成功/失败、定时任务失败、预算超额时推送。支持 Telegram / Bark / Server酱 / Webhook / 邮件。
+            <!-- 只写抢机。0.4.36 删掉了定时开关机和预算告警，但这句话还在承诺
+                 「定时任务失败、预算超额时推送」—— 后端 notify.EVENT_KEYS 只有
+                 ("capacity",)，那两类通知永远不会来。承诺一个不存在的告警比没有
+                 告警更糟：操作员会以为没收到就是没出事。 -->
+            抢机成功 / 失败时推送。支持 Telegram / Bark / Server酱 / Webhook / 邮件。
           </p>
         </div>
         <button class="primary" @click="showAdd = !showAdd">{{ showAdd ? '收起' : '添加渠道' }}</button>

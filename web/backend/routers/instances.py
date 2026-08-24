@@ -11,7 +11,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.oci_client import OCIClientError, POWER_ACTIONS, is_capacity_message
+from app.oci_client import (
+    OCIClientError,
+    POWER_ACTIONS,
+    TERMINATE_PROTECT_TAG,
+    is_capacity_message,
+)
 from web.backend.audit import write_audit
 from web.backend.auth import get_current_user
 from web.backend.crypto_util import encrypt_text
@@ -234,6 +239,20 @@ def terminate_instance(
     row = _tenant_or_404(db, user.id, tenant_id)
     try:
         session = get_session_for_row(row)
+        # 终止保护：这是全站唯一不可逆的操作，值得一道独立于 UI 的闸门。
+        #
+        # 上一轮审计查出过「详情页显示 A 实例、按钮却打 B 实例」的 bug —— 那类
+        # 缺陷的共同点是确认框问的和实际执行的不是同一个对象，所以再谨慎的确认
+        # 文案也救不了。这里在服务端按实例自己的标签判断，UI 传什么都绕不过去。
+        info = session.get_instance(instance_id)
+        if str((getattr(info, "freeform_tags", None) or {}).get(TERMINATE_PROTECT_TAG, "")).strip().lower() == "true":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"实例「{getattr(info, 'display_name', '') or instance_id[-12:]}」"
+                    "已开启终止保护。请先在详情页解除保护，再执行终止。"
+                ),
+            )
         result = session.terminate_instance(
             instance_id,
             preserve_boot_volume=body.preserve_boot_volume,
@@ -251,6 +270,9 @@ def terminate_instance(
             },
         )
         return PowerActionResult(**op_result_dict(result))
+    except HTTPException:
+        # 终止保护返回的是 409，不能被下面的兜底改写成 502。
+        raise
     except OCIClientError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001

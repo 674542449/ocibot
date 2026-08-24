@@ -774,6 +774,83 @@ def delete_boot_volume_backup(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+class ProtectRequest(BaseModel):
+    protected: bool
+
+
+@router.post("/tenants/{tenant_id}/instances/{instance_id}/console-output")
+def capture_console_output(
+    tenant_id: str,
+    instance_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    """抓取实例的串口控制台输出（引导日志）。
+
+    和已有的「控制台连接」不是一回事：那个是交互式串口，要配 SSH 公钥、要网络
+    通，而最需要诊断的恰恰是「重启后机器再也没回来」——改坏 /etc/fstab、扩引导卷
+    失败，都会让机器停在 initramfs 提示符上，OCI 那边仍然显示 RUNNING，SSH 超时，
+    在此之前面板没有任何办法看到原因。
+
+    POST 而不是 GET：这在 Oracle 侧会创建一个 ConsoleHistory 资源并等它就绪，
+    是有副作用、且要花十几秒的操作，不该被当成可缓存的读。
+    """
+    row = _row(db, user.id, tenant_id)
+    try:
+        session = get_session_for_row(row)
+        result = session.capture_console_output(instance_id)
+        write_audit(
+            db,
+            owner_id=user.id,
+            action="instance.console_output",
+            target=instance_id,
+            # 只记长度，不记内容：引导日志里可能有主机名、内网地址，
+            # 偶尔还有服务启动时打出来的敏感参数。
+            detail={
+                "tenant_id": tenant_id,
+                "ok": result.ok,
+                "chars": len((result.data or {}).get("content", "") or ""),
+            },
+        )
+        data = result.data or {}
+        return {
+            "ok": bool(result.ok),
+            "message": result.message or "",
+            "content": data.get("content", ""),
+        }
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/tenants/{tenant_id}/instances/{instance_id}/protect")
+def set_instance_protected(
+    tenant_id: str,
+    instance_id: str,
+    body: ProtectRequest,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> PowerActionResult:
+    """开启 / 解除终止保护。开启后 terminate 路由会直接 409 拒绝。
+
+    标记存在 OCI 的 freeform tag 上（`ocibot_protected`），不是面板本地的列：
+    面板重装或数据库恢复之后它还在，而且在 Oracle 控制台里也看得见。
+    """
+    row = _row(db, user.id, tenant_id)
+    try:
+        session = get_session_for_row(row)
+        result = session.set_instance_protected(instance_id, bool(body.protected))
+        write_audit(
+            db,
+            owner_id=user.id,
+            action="instance.protect" if body.protected else "instance.unprotect",
+            target=instance_id,
+            detail={"tenant_id": tenant_id, "ok": result.ok, "message": result.message},
+        )
+        return PowerActionResult(**op_result_dict(result))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 class BootVolumeRename(BaseModel):
     # 与 tenants.name 一致的下限，上限取 OCI 自己的 255（oci_client 再截一次，
     # 这里只是把明显错误挡在业务层之外）。

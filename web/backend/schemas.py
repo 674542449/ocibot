@@ -257,6 +257,11 @@ class InstanceOut(BaseModel):
     # root password recorded on the instance's freeform tags at launch, when the
     # instance was created in password mode. Empty for key-mode instances.
     root_password: str = ""
+    # 终止保护（OCI freeform tag ocibot_protected）。开启后 terminate 路由直接拒绝。
+    protected: bool = False
+    # Oracle Cloud Agent 的监控插件是否被禁用。None = 实例没返回 agent_config，
+    # 此时 UI 不做任何断言；True 就是「监控页为什么一片空白」的答案。
+    monitoring_disabled: Optional[bool] = None
     tenant_id: str = ""
     tenant_name: str = ""
 

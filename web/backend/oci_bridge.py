@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.config_store import TenantConfig
 from app.oci_client import (
+    TERMINATE_PROTECT_TAG,
     ROOT_PASSWORD_TAG,
     InstanceInfo,
     OperationResult,
@@ -80,6 +81,16 @@ def instance_to_dict(info: InstanceInfo, *, tenant_id: str = "", tenant_name: st
         "root_password": str(
             (getattr(info, "freeform_tags", None) or {}).get(ROOT_PASSWORD_TAG, "") or ""
         ),
+        # 终止保护。用 OCI freeform tag 存，不用面板本地的列：面板重装或数据库
+        # 恢复之后这个标记还在，而且在 Oracle 控制台里也看得见，不会变成只有本
+        # 面板知道的事实。标签已经在 info 里，读它不产生额外调用。
+        "protected": str(
+            (getattr(info, "freeform_tags", None) or {}).get(TERMINATE_PROTECT_TAG, "")
+        ).strip().lower()
+        == "true",
+        # None = 实例没返回 agent_config，UI 什么都不说；True = 监控插件被禁用，
+        # 这正是「监控页一片空白」的原因。
+        "monitoring_disabled": getattr(info, "monitoring_disabled", None),
         "tenant_id": tenant_id or (info.tenant_id or ""),
         "tenant_name": tenant_name or (info.tenant_name or ""),
     }
