@@ -65,7 +65,24 @@
           <span>含子 Compartment</span>
         </label>
         <input v-model="bootSearch" type="search" placeholder="搜索引导卷" />
+        <label class="choice muted" style="flex: 0 0 auto">
+          <input v-model="orphanOnly" type="checkbox" />
+          <span>只看未挂载</span>
+        </label>
       </div>
+
+      <!-- 孤儿卷的账单提示。免费额度面板早就在数这个数字，但一直没有下手的地方；
+           这里把「有 N 个孤儿」变成「这几个，共 X GB，可以删」。 -->
+      <div v-if="orphanBoot.length" class="card" style="padding: 0.75rem 1rem">
+        <span class="badge warn">未挂载 {{ orphanBoot.length }} 个</span>
+        <span style="margin-left: 0.5rem">
+          合计 <strong>{{ orphanBootGb }} GB</strong>，正在占用免费额度（Always Free 块存储共 200 GB）。
+        </span>
+        <span class="muted" style="font-size: 12px; display: block; margin-top: 0.3rem">
+          终止实例时若勾选了「保留引导卷」，就会留下这种卷。删除后数据不可恢复。
+        </span>
+      </div>
+
       <div class="card table-wrap">
         <table>
           <thead>
@@ -76,11 +93,17 @@
               <th>状态</th>
               <th>挂载实例</th>
               <th>可用域</th>
+              <th>操作</th>
             </tr>
           </thead>
           <tbody>
             <tr v-if="!bootVolumes.length">
-              <td colspan="6" class="muted empty">暂无引导卷</td>
+              <td colspan="7" class="muted empty">暂无引导卷</td>
+            </tr>
+            <tr v-else-if="!filteredBoot.length">
+              <td colspan="7" class="muted empty">
+                {{ orphanOnly ? '没有未挂载的引导卷' : '没有匹配搜索的引导卷' }}
+              </td>
             </tr>
             <tr v-for="v in filteredBoot" :key="v.id">
               <td>
@@ -101,6 +124,41 @@
                 <span v-else class="badge warn">未挂载</span>
               </td>
               <td style="font-size: 12px">{{ v.availability_domain || '—' }}</td>
+              <td>
+                <div class="btn-group" role="group" :aria-label="`${v.display_name} 操作`">
+                  <button
+                    type="button"
+                    class="ghost"
+                    :disabled="bootBusy === v.id"
+                    title="重命名"
+                    @click="renameBoot(v)"
+                  >
+                    重命名
+                  </button>
+                  <!-- 只有未挂载的才给删除入口。挂载中的卷 Oracle 也会拒绝，但那条
+                       报错既不带卷名也不带实例名，操作者面对几个同名孤儿卷根本
+                       分不清自己点中了哪个 —— 不如一开始就不给按钮。 -->
+                  <button
+                    v-if="!v.instance_id"
+                    type="button"
+                    class="danger"
+                    :disabled="bootBusy === v.id"
+                    title="删除引导卷（不可恢复）"
+                    @click="deleteBoot(v)"
+                  >
+                    {{ bootBusy === v.id ? '处理中…' : '删除' }}
+                  </button>
+                  <button
+                    v-else
+                    type="button"
+                    class="ghost"
+                    disabled
+                    title="引导卷仍挂载在实例上，需先终止该实例"
+                  >
+                    删除
+                  </button>
+                </div>
+              </td>
             </tr>
           </tbody>
         </table>
@@ -309,6 +367,9 @@ const includeSub = ref(true)
 
 const bootVolumes = ref<any[]>([])
 const bootSearch = ref('')
+const orphanOnly = ref(false)
+/** 正在处理的引导卷 id，用来只禁用那一行的按钮而不是整张表。 */
+const bootBusy = ref('')
 const blockVolumes = ref<any[]>([])
 const buckets = ref<any[]>([])
 const objectNs = ref('')
@@ -325,15 +386,26 @@ const createForm = reactive({
 })
 
 const filteredBoot = computed(() => {
+  let list = bootVolumes.value
+  if (orphanOnly.value) list = list.filter((v) => !v.instance_id)
   const q = bootSearch.value.trim().toLowerCase()
-  if (!q) return bootVolumes.value
-  return bootVolumes.value.filter((v) =>
+  if (!q) return list
+  return list.filter((v) =>
     [v.display_name, v.id, v.instance_id, v.instance_name, v.availability_domain]
       .join(' ')
       .toLowerCase()
       .includes(q),
   )
 })
+
+/** 未挂载的引导卷。判定和后端 free_quota.summarize_storage 一致：没有 instance_id
+ *  就是孤儿——那里数出来的 orphan_boot_count 正是免费额度面板显示的那个数字。 */
+const orphanBoot = computed(() => bootVolumes.value.filter((v) => !v.instance_id))
+
+/** 删掉全部孤儿卷能腾出多少 GB。 */
+const orphanBootGb = computed(() =>
+  orphanBoot.value.reduce((sum, v) => sum + (Number(v.size_in_gbs) || 0), 0),
+)
 
 function shortId(id: string) {
   if (!id) return '—'
@@ -420,6 +492,67 @@ async function loadBoot() {
     // 勾选框已经翻过去了，表格还是旧范围的数据，页面上一句提示都没有。
     if (guard.stale()) return
     error.value = e?.message || '读取引导卷失败'
+  }
+}
+
+async function renameBoot(v: any) {
+  const next = window.prompt(`重命名引导卷\n\n当前：${v.display_name}`, v.display_name || '')
+  if (next === null) return
+  const name = next.trim()
+  if (!name || name === v.display_name) return
+  error.value = ''
+  msg.value = ''
+  bootBusy.value = v.id
+  try {
+    const { data } = await api.post(
+      `/tenants/${tenantId.value}/boot-volumes/${v.id}/rename`,
+      { display_name: name },
+    )
+    if (data.ok) {
+      // 就地改，不整表重载：重载要为一个字段的变化再花一轮 Oracle 调用，
+      // 而这个页面本来就是「点刷新才请求」的。
+      v.display_name = name
+      msg.value = data.message || '已重命名'
+    } else {
+      error.value = data.message || '重命名失败'
+    }
+  } catch (e: any) {
+    error.value = e?.message || '重命名失败'
+  } finally {
+    bootBusy.value = ''
+  }
+}
+
+async function deleteBoot(v: any) {
+  // 确认框必须带上卷名和容量：孤儿卷全叫「<已终止实例名> (Boot Volume)」，
+  // 一句「确认删除该引导卷？」在几行几乎同名的记录之间等于没问。
+  if (
+    !confirm(
+      `确认删除引导卷「${v.display_name}」？\n\n` +
+        `容量 ${v.size_in_gbs} GB · ${shortId(v.id)}\n\n` +
+        `卷上的数据会一并删除，且无法恢复。`,
+    )
+  ) {
+    return
+  }
+  error.value = ''
+  msg.value = ''
+  bootBusy.value = v.id
+  try {
+    const { data } = await api.delete(`/tenants/${tenantId.value}/boot-volumes/${v.id}`)
+    if (data.ok) {
+      msg.value = data.message || '已删除'
+      // 从本地列表移除即可，同样不重载整表。删除会改变免费额度，所以顺带把
+      // 额度快照也失效掉——否则上面那条「合计 X GB」还停在删除前的数字。
+      bootVolumes.value = bootVolumes.value.filter((x) => x.id !== v.id)
+      quota.value = null
+    } else {
+      error.value = data.message || '删除失败'
+    }
+  } catch (e: any) {
+    error.value = e?.message || '删除失败'
+  } finally {
+    bootBusy.value = ''
   }
 }
 

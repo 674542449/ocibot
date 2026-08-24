@@ -774,6 +774,77 @@ def delete_boot_volume_backup(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+class BootVolumeRename(BaseModel):
+    # 与 tenants.name 一致的下限，上限取 OCI 自己的 255（oci_client 再截一次，
+    # 这里只是把明显错误挡在业务层之外）。
+    display_name: str = Field(min_length=1, max_length=255)
+
+
+@router.delete("/tenants/{tenant_id}/boot-volumes/{volume_id}")
+def delete_boot_volume(
+    tenant_id: str,
+    volume_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> PowerActionResult:
+    """删除一个**未挂载**的引导卷。不可逆，卷上的数据一并消失。
+
+    存在的理由是孤儿卷：在 Oracle 控制台终止实例时「保留引导卷」是默认勾选的，
+    留下的卷会一直占着租户 200GB 的 Always Free 块存储额度。面板早就在统计它们
+    （免费额度面板里的孤儿卷数量），但一直没有清理的入口。
+
+    是否仍被挂载由 oci_client 侧判断并**读不到就拒绝**——删错的代价是抹掉一台
+    在跑的机器的系统盘。
+    """
+    row = _row(db, user.id, tenant_id)
+    try:
+        session = get_session_for_row(row)
+        result = session.delete_boot_volume(volume_id)
+        write_audit(
+            db,
+            owner_id=user.id,
+            action="boot_volume.delete",
+            target=volume_id,
+            detail={
+                "tenant_id": tenant_id,
+                "ok": result.ok,
+                "message": result.message,
+                # 释放了多少容量要进审计：这是配额账本上的一笔支出，
+                # 事后回溯「200GB 是怎么用光/腾出来的」全靠它。
+                "size_in_gbs": (result.data or {}).get("size_in_gbs"),
+            },
+        )
+        return PowerActionResult(**op_result_dict(result))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/tenants/{tenant_id}/boot-volumes/{volume_id}/rename")
+def rename_boot_volume(
+    tenant_id: str,
+    volume_id: str,
+    body: BootVolumeRename,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> PowerActionResult:
+    """给引导卷改名。孤儿卷全叫「<已终止实例名> (Boot Volume)」，重建几次之后
+    列表里就是几行几乎一样的名字，没法判断哪个能删。"""
+    row = _row(db, user.id, tenant_id)
+    try:
+        session = get_session_for_row(row)
+        result = session.rename_boot_volume(volume_id, body.display_name)
+        write_audit(
+            db,
+            owner_id=user.id,
+            action="boot_volume.rename",
+            target=volume_id,
+            detail={"tenant_id": tenant_id, "ok": result.ok, "name": body.display_name[:255]},
+        )
+        return PowerActionResult(**op_result_dict(result))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 @router.post("/tenants/{tenant_id}/instances/{instance_id}/create-image")
 def create_custom_image(
     tenant_id: str,

@@ -5336,6 +5336,109 @@ class TenantSession:
         except Exception as exc:  # noqa: BLE001
             return OperationResult(ok=False, message=str(exc))
 
+    def _boot_volume_attachments(self, volume_id: str, availability_domain: str, compartment_id: str) -> list:
+        """Live (non-detached) attachments for a boot volume.
+
+        Separate from the block-volume path: boot volumes have their own
+        attachment API (`list_boot_volume_attachments`), and it takes the AD
+        positionally-first, unlike `list_volume_attachments`. Getting that wrong
+        is not loud — it raises TypeError, which an `except Exception` around the
+        guard would swallow, leaving "still attached?" silently answered "no".
+        That exact mistake is recorded in delete_block_volume above.
+        """
+        atts = self.compute.list_boot_volume_attachments(
+            availability_domain, compartment_id, boot_volume_id=volume_id
+        ).data or []
+        return [
+            a
+            for a in atts
+            if str(getattr(a, "lifecycle_state", "") or "") not in {"DETACHED", "DETACHING", ""}
+        ]
+
+    def delete_boot_volume(self, volume_id: str) -> OperationResult:
+        """Delete a detached boot volume. Irreversible — the data is gone.
+
+        Exists because terminating an instance with "preserve boot volume" (the
+        default in the OCI console) leaves the volume behind, and those orphans
+        keep consuming the tenancy's 200 GB Always Free block-storage allowance.
+        The panel already counts them (`free_quota.summarize_storage` ->
+        `orphan_boot_count`) and shows the number in the quota panel; until now
+        there was no way to act on it.
+
+        Refuses an attached volume rather than letting OCI reject it later: the
+        API error for that case names neither the volume nor the instance, so the
+        operator is left guessing which of several look-alike orphans they hit.
+        """
+        volume_id = (volume_id or "").strip()
+        if not volume_id:
+            return OperationResult(ok=False, message="缺少 boot volume id")
+        try:
+            vol = self.blockstorage.get_boot_volume(volume_id).data
+            state = str(getattr(vol, "lifecycle_state", "") or "")
+            if state not in {"AVAILABLE", "FAULTY"}:
+                return OperationResult(
+                    ok=False, message=f"引导卷状态为 {state}，无法删除（需要先卸载或等待操作完成）"
+                )
+            ad = getattr(vol, "availability_domain", "") or ""
+            cid = getattr(vol, "compartment_id", "") or self.resolve_compartment()
+            if ad:
+                try:
+                    live = self._boot_volume_attachments(volume_id, ad, cid)
+                except Exception as exc:  # noqa: BLE001
+                    # Fail CLOSED. An unreadable attachment list means we cannot
+                    # prove the volume is detached, and the cost of being wrong
+                    # here is destroying a running machine's disk.
+                    return OperationResult(
+                        ok=False,
+                        message=f"无法确认引导卷是否仍被挂载，已中止删除：{exc}",
+                    )
+                if live:
+                    inst = str(getattr(live[0], "instance_id", "") or "")
+                    hint = f"（实例 {inst[-12:]}）" if inst else ""
+                    return OperationResult(
+                        ok=False, message=f"引导卷仍挂载在实例上{hint}，请先终止或分离该实例"
+                    )
+            name = str(getattr(vol, "display_name", "") or volume_id[-12:])
+            size = int(getattr(vol, "size_in_gbs", 0) or 0)
+            self.blockstorage.delete_boot_volume(volume_id)
+            return OperationResult(
+                ok=True,
+                message=f"已删除引导卷「{name}」，释放 {size} GB",
+                data={"size_in_gbs": size, "display_name": name},
+            )
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=str(exc))
+
+    def rename_boot_volume(self, volume_id: str, display_name: str) -> OperationResult:
+        """Set a boot volume's display name.
+
+        Orphans are all created as "<terminated instance name> (Boot Volume)", so
+        after a couple of rebuilds the list is several near-identical rows and the
+        operator cannot tell which one is safe to delete. Renaming is the cheapest
+        way to make that decision recoverable.
+        """
+        volume_id = (volume_id or "").strip()
+        name = (display_name or "").strip()
+        if not volume_id:
+            return OperationResult(ok=False, message="缺少 boot volume id")
+        if not name:
+            return OperationResult(ok=False, message="名称不能为空")
+        # OCI caps display names at 255; truncate rather than let the API reject
+        # the whole call over a detail the operator cannot see.
+        name = name[:255]
+        try:
+            self.blockstorage.update_boot_volume(
+                volume_id,
+                oci.core.models.UpdateBootVolumeDetails(display_name=name),
+            )
+            return OperationResult(ok=True, message=f"已重命名为「{name}」")
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=str(exc))
+
     # ------------------------------------------------------------------
     # Block (data) volumes
     # ------------------------------------------------------------------
