@@ -118,6 +118,19 @@ def make_session():
     s.list_volume_attachments.return_value = R(True, "", {"attachments": []})
     s.list_boot_volume_backups.return_value = [{"id": "b1", "display_name": "bk"}]
     s.create_boot_volume_backup.return_value = R(True, "已创建备份", {})
+    # 容量雷达。桩在 TenantSession 这一层（而不是让 radar 直接碰 session.compute）：
+    # 这个会话是 MagicMock，迭代 mock.data.shape_availabilities 会抛 TypeError，
+    # 被路由的 except Exception -> 502 吞掉，测试当场变红而看不出原因。
+    s.get_capacity_report.return_value = R(True, "", {
+        "compartment_id": "ocid1.compartment.oc1..c1",
+        "used_root_compartment": False,
+        "rows": [
+            {"fault_domain": "FAULT-DOMAIN-1", "ocpus": 4.0, "memory_in_gbs": 24.0,
+             "available_count": None, "status": "available"},
+            {"fault_domain": "FAULT-DOMAIN-2", "ocpus": 4.0, "memory_in_gbs": 24.0,
+             "available_count": None, "status": "out_of_capacity"},
+        ],
+    })
     s.delete_boot_volume_backup.return_value = R(True, "已删除")
     s.list_custom_images.return_value = [{"id": "img1", "display_name": "custom"}]
     s.delete_custom_image.return_value = R(True, "已删除")
@@ -330,6 +343,14 @@ def test_every_endpoint_is_wired() -> None:
 
         posts = [
             (f"/api/tenants/{tid}/test", {}),
+            # 容量雷达。AD 必须是 _stub_launch_meta 的 ads 里的值 —— 路由会拿
+            # fetch_launch_meta 的 ads 做白名单，不在里面的直接 400。
+            (f"/api/tenants/{tid}/capacity-report",
+             {"shape": "VM.Standard.A1.Flex", "ocpus": 4, "memory_in_gbs": 24,
+              "availability_domain": "AD-1"}),
+            # AD 留空 = 探全部已知 AD，走并行分支。
+            (f"/api/tenants/{tid}/capacity-report",
+             {"shape": "VM.Standard.A1.Flex", "ocpus": 1, "memory_in_gbs": 6}),
             (f"/api/tenants/{tid}/launch-meta/refresh", None),
             (f"/api/tenants/{tid}/regions/subscribe",
              {"region": "ap-osaka-1", "confirm": True, "add_tenant": True}),

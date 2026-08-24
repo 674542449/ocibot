@@ -525,3 +525,36 @@ class HealthOut(BaseModel):
     status: str
     version: str
     app: str
+
+
+# ---------------------------------------------------------------- 容量雷达
+
+# 上限 4 组:一次探测把「主配置 + 备用配置」放在同一个请求里,不为多配置多花请求。
+MAX_RADAR_CONFIGS = 4
+
+
+class RadarShapeConfig(BaseModel):
+    # 必须有上下界。LaunchInstanceRequest.ocpus 是裸 Optional[float],照抄的话
+    # `1e308` 或 `NaN` 会被原样序列化进发给 Oracle 的请求体里。
+    ocpus: float = Field(gt=0, le=64)
+    memory_in_gbs: float = Field(gt=0, le=1024)
+
+
+class CapacityReportRequest(BaseModel):
+    """容量雷达的探测请求。
+
+    刻意**不含 compartment_id**:容量是可用域的物理属性,compartment 只决定用哪条
+    IAM 策略判权,让客户端传它买不到任何功能,却会把一个无长度约束的、攻击者可控的
+    字符串放进发往 Oracle 的请求体,并顺带做成一个 compartment 存在性探针
+    (本仓的 OCI 路由普遍把 ServiceError 原文塞进 502 detail 回显)。
+    availability_domain 由服务端按该租户的 AD 白名单校验后才使用,同理。
+    """
+
+    shape: str = Field(default="VM.Standard.A1.Flex", max_length=MAX_SHAPE)
+    ocpus: float = Field(gt=0, le=64)
+    memory_in_gbs: float = Field(gt=0, le=1024)
+    # "" = 探测该租户已知的全部可用域。
+    availability_domain: BoundedAvailabilityDomain = ""
+    fallback_configs: list[RadarShapeConfig] = Field(
+        default_factory=list, max_length=MAX_RADAR_CONFIGS
+    )

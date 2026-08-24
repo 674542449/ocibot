@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.oci_client import (
@@ -51,6 +51,7 @@ from web.backend.quota_guard import (
     usage_snapshot,
 )
 from web.backend.schemas import (
+    CapacityReportRequest,
     InstanceOut,
     LaunchInstanceRequest,
     LaunchInstanceResult,
@@ -643,6 +644,142 @@ def free_quota(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"读取免费额度失败: {exc}") from exc
+
+
+@router.post("/tenants/{tenant_id}/capacity-report")
+def capacity_report(
+    tenant_id: str,
+    body: CapacityReportRequest,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    """容量雷达:探测目标 shape 在各可用域的实时容量。**只读,绝不创建实例。**
+
+    刻意**不在 launch 路由里也拦一道**,和上面那个 launch-quota-check 的取舍正好相反。
+    免费额度那道门可以由服务端硬拦,是因为它的判决权威且不可逆:规则是常量、快照是
+    事实、放行的代价是真金白银。容量报告两条都不满足 ——
+
+      * 它是一个瞬时快照,和随后那次 LaunchInstance 之间必然有竞态;
+      * oracle/oci-cli issue #748 记录过 A1.Flex 上结论完全倒置的案例(报告说有货的
+        AD 开不出来、说无货的反而开得出来),该 issue 至今未关闭;
+      * CreateComputeCapacityReport 需要一条和 LaunchInstance **完全不相交**的 IAM
+        授权(manage compute-capacity-reports),「能创建但调不了报告」是常见配置。
+
+    做成后端硬门就会重演 launch_quota_check 上面那段注释记录的 0.4.84/0.4.85:
+    预检比服务端严格 → 缺某项权限的租户从 UI 上**永久**无法创建实例。所以这里只出
+    结论,拦不拦由用户在确认框里决定。
+
+    整个响应恒为 HTTP 200,除非租户不存在(404)、租户被禁用(400)、或者撞到面板
+    自己的限流(429)。Oracle 侧的失败表现为 status="unknown" + reason,**不是** 5xx ——
+    「读不到」和「没有容量」是两件事,混成一件会让人放弃一台其实开得出来的机器。
+
+    也刻意**不进 tenant_launch_lock**:那把锁保护的是「取额度快照 → LaunchInstance」
+    这个 check-then-act 窗口,而探测什么都不改。进去只会让探测把创建堵住。
+    """
+    from web.backend.capacity_radar import RADAR_SHAPE, probe_capacity
+    from web.backend.rate_limit import capacity_report_limiter
+
+    row = _tenant_or_404(db, user.id, tenant_id)
+    # 被禁用的租户不该继续花 OCI 预算。launch-meta 那三条路由都有这个检查。
+    if not row.enabled:
+        raise HTTPException(status_code=400, detail="租户已禁用")
+
+    allowed, retry_after = capacity_report_limiter.check(f"caprad:{user.id}:{tenant_id}")
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"容量探测过于频繁,请 {int(retry_after) + 1} 秒后再试。"
+                "容量报告和创建实例走的是同一个 Oracle 请求速率桶,"
+                "探测太密会挤占抢机重试的预算。"
+            ),
+            headers={"Retry-After": str(int(retry_after) + 1)},
+        )
+
+    shape = (body.shape or RADAR_SHAPE).strip() or RADAR_SHAPE
+    if shape != RADAR_SHAPE:
+        # 只支持 A1.Flex。别的机型要么不是免费的(抢不到不是常态),要么是固定规格
+        # (没有 shape config 可探),现在放开只会让人以为面板支持一件它没验证过的事。
+        raise HTTPException(
+            status_code=400,
+            detail=f"容量雷达目前只支持 {RADAR_SHAPE}(收到 {shape})",
+        )
+
+    try:
+        session = get_session_for_row(row)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    # AD 白名单。用 fetch_launch_meta 而不是直接把前端传来的字符串发给 Oracle:
+    # 命中缓存时它不发任何请求,而且和 launch 路由用的是同一个入口,所以雷达看到的
+    # AD 列表和创建时可选的那份天然一致。
+    known_ads: list[str] = []
+    meta_error = ""
+    try:
+        meta = fetch_launch_meta(session, tenant_id=row.id, force=False)
+        known_ads = [str(a) for a in (meta.get("ads") or []) if a]
+    except Exception as exc:  # noqa: BLE001
+        meta_error = str(exc)
+
+    wanted = (body.availability_domain or "").strip()
+    if wanted:
+        if known_ads and wanted not in known_ads:
+            raise HTTPException(
+                status_code=400,
+                detail="未知的可用域。请先在「创建实例」页点「加载配置」,再回来探测。",
+            )
+        ads = [wanted]
+    else:
+        ads = known_ads
+
+    if not ads:
+        return {
+            "ok": False,
+            "shape": shape,
+            "region": row.region or "",
+            "checked_at": "",
+            "overall": "unknown",
+            "results": [],
+            "retry_job_active": False,
+            "secondary_region": False,
+            "message": (
+                "还没有这个租户的可用域列表,无法探测。请先到「创建实例」页点一次"
+                "「加载配置」。" + (f"(读取失败:{meta_error})" if meta_error else "")
+            ),
+        }
+
+    configs: list[tuple[float, float]] = [(float(body.ocpus), float(body.memory_in_gbs))]
+    for fb in body.fallback_configs or []:
+        pair = (float(fb.ocpus), float(fb.memory_in_gbs))
+        if pair not in configs:
+            configs.append(pair)
+
+    out = probe_capacity(
+        session,
+        tenant_id=row.id,
+        shape=shape,
+        configs=configs,
+        availability_domains=ads,
+    )
+    out["region"] = row.region or ""
+    # 有在跑的抢机任务时提醒用户:探测和那个循环共用同一个速率桶。
+    out["retry_job_active"] = bool(
+        db.scalar(
+            select(func.count())
+            .select_from(CapacityJob)
+            .where(CapacityJob.tenant_id == row.id, CapacityJob.enabled.is_(True))
+        )
+        or 0
+    )
+    # 副区没有 Always Free,那边创建出来的一律计费 —— 一个绿色的「有货」很容易被
+    # 读成「免费的有货」,所以把这个事实一起带给前端由它挂警告。
+    try:
+        from web.backend.quota_guard import resolve_secondary
+
+        out["secondary_region"] = bool(resolve_secondary(session, row))
+    except Exception:  # noqa: BLE001
+        out["secondary_region"] = bool(getattr(row, "parent_tenant_id", "") or "")
+    return out
 
 
 @router.post("/tenants/{tenant_id}/launch-quota-check")

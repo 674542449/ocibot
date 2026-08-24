@@ -33,6 +33,11 @@ const router = createRouter({
           component: () => import('@/views/InstanceDetailView.vue'),
         },
         {
+          path: 'radar',
+          name: 'radar',
+          component: () => import('@/views/CapacityRadarView.vue'),
+        },
+        {
           path: 'launch',
           name: 'launch',
           component: () => import('@/views/LaunchView.vue'),

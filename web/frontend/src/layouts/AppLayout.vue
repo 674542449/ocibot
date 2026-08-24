@@ -168,6 +168,9 @@ type NavItem = {
 
 const primaryNav: NavItem[] = [
   { to: '/', label: '实例', icon: 'instances', match: 'instances' },
+  // 顺序即流程：先探容量、再开机器、再看后台重试。放在「创建实例」之前是因为
+  // 它是创建流程的第 0 步，而不是一个独立的查询工具。
+  { to: '/radar', label: '容量雷达', icon: 'radar', match: 'exact' },
   { to: '/launch', label: '创建实例', icon: 'launch', match: 'exact' },
   { to: '/jobs', label: '任务中心', icon: 'jobs', match: 'exact' },
 ]
@@ -282,6 +285,7 @@ function prefetchRoutes() {
   // list here is only the routes that are still split out.
   const load = [
     () => import('@/views/LaunchView.vue'),
+    () => import('@/views/CapacityRadarView.vue'),
     () => import('@/views/StorageView.vue'),
     () => import('@/views/AccountView.vue'),
     () => import('@/views/JobsView.vue'),
