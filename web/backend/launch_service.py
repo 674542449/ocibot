@@ -470,7 +470,12 @@ def fetch_launch_meta(
     def _images_for(fam: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
         try:
             return fam["id"], session.list_images(
-                compartment_id=tenant.tenancy_ocid,
+                # default_comp（= compartment_ocid or tenancy_ocid），不是写死租户根。
+                # 两个原因：(1) 密钥的 IAM 策略可能只覆盖子 compartment，问根直接
+                # 404；(2) list_images 自带一个「子 compartment 结果太少就退回根」
+                # 的回退，而那个回退的条件是 `compartment != tenancy_ocid` ——
+                # 直接把根传进来，恰好让这条专为此设计的退路失效。
+                compartment_id=default_comp,
                 operating_system=fam["operating_system"],
                 ubuntu_only=(fam["id"] == "ubuntu"),
             )
@@ -485,8 +490,8 @@ def fetch_launch_meta(
 
     with ThreadPoolExecutor(max_workers=_META_FETCH_WORKERS) as pool:
         f_comps = pool.submit(session.list_compartments)
-        f_ads = pool.submit(session.list_availability_domains)
-        f_shapes = pool.submit(session.list_shapes, compartment_id=tenant.tenancy_ocid)
+        f_ads = pool.submit(session.list_availability_domains, default_comp)
+        f_shapes = pool.submit(session.list_shapes, compartment_id=default_comp)
         f_custom = pool.submit(_custom_images)
         f_network = pool.submit(
             session.ensure_default_network, compartment_id=default_comp, create_if_missing=True

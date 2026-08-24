@@ -58,7 +58,9 @@ class _Session:
         self._slow()
         return [{"id": "ocid1.compartment.oc1..c1", "name": "root"}]
 
-    def list_availability_domains(self):
+    # 现在按 compartment 取：可用域是租户级的，但**权限是按 compartment 判的**，
+    # 写死 tenancy 根会让只授权到子 compartment 的密钥直接 404。
+    def list_availability_domains(self, compartment_id=None):
         self._slow()
         return ["AD-1"]
 

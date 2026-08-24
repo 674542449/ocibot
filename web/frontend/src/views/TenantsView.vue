@@ -98,6 +98,11 @@
                 >
                   {{ isTenantLocked(t.id) ? '取消锁定' : '锁定为默认' }}
                 </button>
+                <!-- 诊断权限问题的入口。以前 /tenants/{id}/test 全站只有一个调用点:
+                     粘贴导入时那个「保存后自动测试连接」复选框。手动添加、编辑、
+                     以及任何已存在的租户都没有办法再跑一次 —— 而这恰恰是
+                     NotAuthorizedOrNotFound 时唯一能说清「到底哪一项读不到」的检查。 -->
+                <button :disabled="busy === t.id" @click="testTenant(t)">测试连接</button>
                 <button :disabled="busy === t.id" @click="detectTier(t)">等级查询</button>
                 <button
                   v-if="!t.parent_tenant_id"
@@ -853,6 +858,26 @@ async function subscribeRegion(region: string, alreadySubscribed: boolean) {
     showToast(e?.message || '开通副区失败', 'err', 6000)
   } finally {
     regionBusy.value = ''
+  }
+}
+
+async function testTenant(t: Tenant) {
+  busy.value = t.id
+  error.value = ''
+  try {
+    const { data } = await api.post<{ ok: boolean; message: string }>(`/tenants/${t.id}/test`)
+    if (data.ok) {
+      showToast(`${t.name}：${data.message}`, 'ok', 4000)
+    } else {
+      // 失败的诊断刻意**不**走 toast：它有 300 字左右，而 showToast 会截断到
+      // 200 字，被砍掉的恰好是「该加哪条策略」那半句 —— 整条信息里唯一可操作的
+      // 部分。而且 toast 6 秒自动消失、点一下是关闭而不是选中，没法复制去查。
+      error.value = `${t.name}：${data.message}`
+    }
+  } catch (e: any) {
+    error.value = `${t.name}：${e?.message || '测试失败'}`
+  } finally {
+    busy.value = ''
   }
 }
 

@@ -909,19 +909,64 @@ class TenantSession:
         return self.tenant.tenancy_ocid.strip()
 
     def test_connection(self) -> OperationResult:
+        """Verify the credentials **and** that they can actually read what the panel needs.
+
+        It used to call `get_user()` only — and `get_user` succeeds with virtually
+        any valid key regardless of IAM policy. So a tenant whose policy does not
+        cover the configured compartment got 连接成功 here and then
+        `NotAuthorizedOrNotFound` on every real page, with the panel advising them
+        to check the very key this test had just validated. Circular and unactionable.
+
+        The extra probes are cheap reads against the compartment the panel will
+        actually use. Each is reported separately: "which of these can I not read"
+        is precisely the fact that turns an opaque 404 into a policy the operator
+        can go fix.
+        """
+        compartment = self.resolve_compartment()
         try:
-            compartment = self.resolve_compartment()
-            # Lightweight call: get tenancy / list regions or get user
             user = self.identity.get_user(self.tenant.user_ocid.strip()).data
-            return OperationResult(
-                ok=True,
-                message=f"连接成功：{getattr(user, 'description', '') or user.name}",
-                data={"user": user.name, "compartment": compartment},
-            )
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
             return OperationResult(ok=False, message=str(exc))
+
+        # Credentials are good past this point; anything below is a policy/scope
+        # problem, and saying so is the whole value of this check.
+        probes: list[tuple[str, Callable[[], Any]]] = [
+            ("列出实例", lambda: self.compute.list_instances(compartment, limit=1)),
+            ("列出子 Compartment", lambda: self.identity.list_compartments(
+                compartment, compartment_id_in_subtree=True, access_level="ACCESSIBLE", limit=1
+            )),
+            ("列出可用域", lambda: self.identity.list_availability_domains(compartment)),
+        ]
+        failures: list[str] = []
+        for label, call in probes:
+            try:
+                call()
+            except ServiceError as exc:
+                failures.append(f"{label}：{getattr(exc, 'code', '') or getattr(exc, 'status', '')}")
+            except Exception as exc:  # noqa: BLE001
+                failures.append(f"{label}：{exc}")
+
+        name = getattr(user, "description", "") or user.name
+        if failures:
+            return OperationResult(
+                ok=False,
+                message=(
+                    f"凭据有效（用户 {user.name}），但对 Compartment "
+                    f"{compartment[-16:] or '(未配置)'} 的读取权限不足：\n  "
+                    + "\n  ".join(failures)
+                    + "\n\n这是 IAM 策略范围的问题，不是密钥的问题 —— 重新生成密钥不会有帮助。"
+                    "\n请在 Oracle 控制台给该用户所在的组添加对应 Compartment 的读取策略，"
+                    "或把租户配置里的 Compartment OCID 改成资源实际所在的那个。"
+                ),
+                data={"user": user.name, "compartment": compartment, "failures": failures},
+            )
+        return OperationResult(
+            ok=True,
+            message=f"连接成功：{name}（已验证可读取 Compartment {compartment[-16:]}）",
+            data={"user": user.name, "compartment": compartment},
+        )
 
     def list_compartments(
         self,
@@ -1399,17 +1444,42 @@ class TenantSession:
         # the quota snapshot, which reads _last_tree_errors, that must treat it as
         # incomplete.
         if not all_items and errors and len(compartments) == 1:
-            # Surface the only compartment's error instead of empty silent list
-            raise OCIClientError(errors[0])
+            # Surface the only compartment's error instead of empty silent list.
+            #
+            # 但要说清楚「只扫了一个 compartment」这件事本身，因为这正是间歇性
+            # 报错的来源：枚举成功时会扫到子 compartment、找到实例、什么都不报；
+            # 枚举失败时退化成只扫根，根里没有实例、又没权限，于是硬报错。同一个
+            # 租户、同样的密钥，看起来就是「有时候好有时候坏」。
+            # 只抛 errors[0] 的话，操作者拿到的是一句光秃秃的 Oracle 404，
+            # 完全看不出扫描范围已经塌缩成一个 compartment 了。
+            detail = errors[0]
+            if enum_error:
+                raise OCIClientError(
+                    f"{detail}\n\n注意：本次未能枚举子 Compartment（{enum_error}），"
+                    f"因此只扫描了 {root[-16:]} 这一个 Compartment。"
+                    "如果实例其实在子 Compartment 里，这里就会既列不出实例、又报无权限 —— "
+                    "而枚举成功的那几次则一切正常，表现为「时好时坏」。"
+                    "\n请到租户页点「测试连接」确认具体是哪一项读不到。"
+                )
+            raise OCIClientError(detail)
         if resolve_ips:
             targets = [i for i in all_items if i.lifecycle_state not in ("TERMINATED", "TERMINATING")]
             self._enrich_instances_parallel(targets, root)
         all_items.sort(key=lambda i: (i.lifecycle_state != "RUNNING", i.display_name.lower()))
         return all_items
 
-    def list_availability_domains(self) -> list[str]:
+    def list_availability_domains(self, compartment_id: Optional[str] = None) -> list[str]:
+        """可用域列表。
+
+        默认用 resolve_compartment() 而不是写死 tenancy 根：可用域本身是租户级的，
+        传哪个 compartment 拿到的都是同一份，但**权限是按 compartment 判的**。
+        一个 IAM 策略只覆盖子 compartment 的密钥，问根会得到
+        NotAuthorizedOrNotFound —— 而这一步是「加载配置」里第一个硬失败的调用，
+        于是整页报一个和可用域毫无关系的 404。
+        """
+        comp = (compartment_id or self.resolve_compartment()).strip()
         try:
-            ads = self.identity.list_availability_domains(self.tenant.tenancy_ocid.strip()).data
+            ads = self.identity.list_availability_domains(comp).data
             return [a.name for a in ads]
         except ServiceError as exc:
             raise OCIClientError(_format_service_error(exc)) from exc
@@ -6489,9 +6559,34 @@ def _format_service_error(exc: ServiceError) -> str:
     parts = [p for p in [f"[{status}]", code, message] if p]
     text = " ".join(parts)
     # Friendly hints
+    #
+    # 判断顺序很重要，而且以前是错的：`NotAuthorizedOrNotFound` 里含
+    # "notauthorized"，所以它总是先命中「请检查 API Key」那一条，永远走不到
+    # 下面那个正确得多的 404 分支。
+    #
+    # 这不是措辞问题，是把人指向错误的排查方向：`NotAuthorizedOrNotFound` 是
+    # Oracle 故意做成模糊的 404，意思是「没权限 **或** 不存在」，谈的是 IAM 策略
+    # 的作用范围、compartment 或区域选错了 —— 几乎从来不是密钥本身的问题。而且
+    # 「测试连接」通过恰恰证明了密钥是好的，于是操作者被要求去检查一个刚刚验证过
+    # 没问题的东西，重新生成密钥也不会有任何变化。
     low = text.lower()
-    if "notauthorized" in low or "not authenticated" in low or status == 401:
-        text += "\n提示：请检查 API Key、Fingerprint、Tenancy/User OCID 是否匹配。"
+    code_low = code.lower()
+    if "notauthorizedornotfound" in code_low or (status == 404 and "notauthorized" in low):
+        text += (
+            # 纯文本，不要 markdown 星号：这段会直接显示在面板的错误条里，
+            # `**` 会原样出现。
+            "\n提示：这不是密钥错误。Oracle 用同一个错误码表示「没有权限」和"
+            "「资源不存在」。常见原因："
+            "\n  1) 该用户的 IAM 策略没有覆盖这个 Compartment（最常见）；"
+            "\n  2) 租户里配置的 Compartment OCID 填错，或资源其实在别的 Compartment；"
+            "\n  3) 资源在另一个区域。"
+            "\n可在租户页点「测试连接」，它会具体报出是哪一项读不到。"
+        )
+    elif "not authenticated" in low or status == 401:
+        # 401 才是真正的凭据问题：签名没通过。
+        text += "\n提示：签名校验失败，请检查 API Key、Fingerprint、Tenancy/User OCID 是否匹配。"
+    elif status == 403 or "notallowed" in code_low:
+        text += "\n提示：凭据有效，但该用户没有执行此操作的权限（IAM 策略缺少对应的 verb）。"
     elif status == 404:
         text += "\n提示：资源不存在，或当前用户对该 Compartment 无权限。"
     elif is_rate_limit_error(exc) or "too many requests" in low or status == 429:

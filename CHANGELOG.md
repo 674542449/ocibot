@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.4.84 — 2026-08-24
+
+修 `[404] NotAuthorizedOrNotFound` 时好时坏,以及面板对它的**错误诊断**。
+
+### 修复
+
+- **「加载配置」向租户根读取镜像 / Shape / 可用域,而不是租户配置的 Compartment。**
+  这是那个 404 最直接的原因。`fetch_launch_meta` 第 456 行已经算好了
+  `default_comp = compartment_ocid or tenancy_ocid`,自定义镜像和网络也用的它,
+  唯独镜像、Shape 传了 `tenancy_ocid`;`list_availability_domains` 更是把租户根
+  写死在函数里。**IAM 权限是按 Compartment 判的** —— 密钥只授权到子 Compartment
+  时,问根就是 404,而可用域恰好是并行块里第一个硬抛的调用,于是整页报一个和
+  可用域毫无关系的错。
+
+  还有一层:`list_images` **自带**一个「子 Compartment 结果太少就退回根」的回退,
+  它的条件是 `compartment != tenancy_ocid` —— 把根直接传进去,恰好让这条专为
+  此场景设计的退路失效。后面那两个顺序回退(`if not images` / `if not shapes`)
+  用的是正确的 Compartment,但并行块已经先抛了,永远走不到。
+
+- **`NotAuthorizedOrNotFound` 不再被诊断成「请检查 API Key」。**
+  这是 Oracle 故意做成模糊的 404,含义是「没权限 **或** 不存在」,谈的是 IAM 策略
+  的作用范围。而判断顺序有 bug:它含 `notauthorized`,所以永远先命中凭据那条,
+  下面本来就有的、正确得多的 404 分支**从来没被执行过**。
+
+  现在按状态码分开:404 明说不是密钥问题并列出三个真实原因;401 才提示检查
+  Key/Fingerprint/OCID(那才是签名没过);403 说明凭据有效但缺少 verb。
+
+- **「测试连接」以前不测该测的东西。** 它算出 `compartment` 变量后**根本没用**,
+  只调 `get_user` —— 而那个调用几乎任何有效密钥都能成功,和 IAM 策略无关。
+  于是策略配错的租户一路绿灯,然后在每个真实页面上 404,面板还建议去检查刚刚
+  被验证过没问题的密钥。现在会额外探测「列出实例 / 列出子 Compartment /
+  列出可用域」,**逐项报出哪一项读不到**,并说明这是策略范围问题、重新生成密钥没用。
+
+- **租户页新增「测试连接」按钮。** 此前 `POST /tenants/{id}/test` 全站只有一个
+  调用点:粘贴导入时那个「保存后自动测试连接」复选框。手动添加、编辑,以及任何
+  已存在的租户,都没有办法再跑一次 —— 而这恰恰是排查权限问题唯一能用的检查。
+
+- **实例列表报错会说明扫描范围塌缩了。** 硬报错的条件是「只扫了 1 个 Compartment、
+  没找到实例、且有错误」。枚举子 Compartment 成功时能扫到实例、一切正常;枚举失败时
+  退化成只扫根,根里没实例又没权限,于是报错 —— 同一个租户、同一把密钥,
+  **表现出来就是时好时坏**。以前只甩一句光秃秃的 Oracle 404,看不出扫描范围已经塌了。
+
+- **错误提示的换行不再被压掉。** `.error-box` / `.success-box` 补上
+  `white-space: pre-line`。权限诊断是分条写的(哪一项没权限、该加哪条策略),
+  以前只有 `LaunchView` 自己加了内联样式,其余 12 处都会塌成一长串跑不断的句子。
+  失败诊断也改走错误框而不是 toast —— `showToast` 会截断到 200 字,
+  而被砍掉的恰好是「该加哪条策略」那半句。
+
+### 维护
+
+- 新增 `tests/test_error_diagnosis.py`(9 个)与
+  `tests/test_launch_meta_compartment_scope.py`(3 个),后者钉死「所有元数据读取
+  都必须用租户配置的 Compartment」。
+
+### 升级
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.84
+```
+
+升级后请到**租户页点一次「测试连接」** —— 它会直接告诉你是哪一项没权限。
+
 ## 0.4.83 — 2026-08-24
 
 实例侧四项:引导日志、终止保护、监控插件提示、以此为模板创建。

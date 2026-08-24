@@ -537,7 +537,13 @@ html[data-theme='dark'] .badge.err {
   border-color: rgba(255, 123, 118, 0.28);
 }
 
+/* 换行必须保留。后端有几条诊断是分条写的（哪一项没权限、该加哪条 IAM 策略、
+   资源可能在别的 compartment），没有 pre-line 就会被压成一长串跑不断的句子，
+   而那几条恰恰是操作者唯一能照着做的东西。
+   pre-line 只保留换行、仍然折叠多余空格，所以对单行消息没有任何影响。
+   以前只有 LaunchView 自己加了内联样式，其余 12 处都会塌成一行。 */
 .error-box {
+  white-space: pre-line;
   background: var(--danger-soft);
   border: 1px solid rgba(245, 63, 63, 0.12);
   color: var(--danger);
@@ -549,6 +555,7 @@ html[data-theme='dark'] .badge.err {
 }
 
 .success-box {
+  white-space: pre-line;
   background: var(--ok-soft);
   border: 1px solid rgba(0, 180, 42, 0.12);
   color: #0a6e22;
