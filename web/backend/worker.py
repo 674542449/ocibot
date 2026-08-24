@@ -15,6 +15,7 @@ operator asking. Capacity retry stays because it only runs while a job exists.
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import sys
@@ -56,6 +57,7 @@ from web.backend.meta import (  # noqa: E402
     set_meta,
 )
 from web.backend.models import (  # noqa: E402
+    AuditLog,
     CapacityAttempt,
     CapacityJob,
     Tenant,
@@ -97,6 +99,7 @@ class Worker:
         self.worker_id = self.settings.worker_id
         self.sessions = SessionManager()
         self._busy_tenants: set[str] = set()
+        self._launch_lock: Any = None
 
     def run_forever(self) -> None:
         init_db()
@@ -286,6 +289,9 @@ class Worker:
                 )
                 self._release_job_after_crash(db, job.id, exc)
             finally:
+                # 兜底：正常路径在 LaunchInstance 之后就放了；这里挡住所有
+                # 提前 return / 抛异常的分支，避免锁被一直攥着。
+                self._release_launch_lock()
                 self._busy_tenants.discard(job.tenant_id)
                 if handled:
                     job.locked_by = None
@@ -293,6 +299,51 @@ class Worker:
                     # Persist this attempt's result + lease release before the next job,
                     # so a crash cannot roll back a completed LaunchInstance outcome.
                     db.commit()
+
+    def _acquire_launch_lock(self, job: CapacityJob, interval: int, now: datetime) -> bool:
+        """拿到租户级创建锁则返回 True；被浏览器端占着就推迟本次尝试并返回 False。
+
+        手工 __enter__ 而不是 `with`，是为了让锁的范围恰好是「取快照 → LaunchInstance」
+        那一段，而不用把中间一百多行整体缩进 —— 释放点在 launch 之后的 finally 里，
+        以及 tick_capacity 的 finally 里兜底。
+
+        拿不到锁**不消耗尝试次数**：attempts += 1 在这个点之后。别人正在创建不是这个
+        任务的失败，等下一轮即可。
+        """
+        from web.backend.quota_guard import TenantLaunchLockBusy, tenant_launch_lock
+
+        cm = tenant_launch_lock(job.tenant_id)
+        try:
+            cm.__enter__()
+        except TenantLaunchLockBusy:
+            delay = max(MIN_RETRY_INTERVAL_SEC, int(interval))
+            job.next_run_at = now + timedelta(seconds=delay)
+            job.status = "idle"
+            log.info(
+                "capacity job=%s deferred %ss: another launch for tenant %s holds the lock",
+                job.id,
+                delay,
+                job.tenant_id,
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001
+            # 锁机制本身出问题（文件系统只读、数据库连接断了…）不该让抢机停摆：
+            # 记一条日志后按无锁继续，行为退回到这次修复之前，而不是拒绝服务。
+            log.warning("capacity launch lock unavailable job=%s: %s", job.id, exc)
+            return True
+        self._launch_lock = cm
+        return True
+
+    def _release_launch_lock(self) -> None:
+        """幂等：正常路径在 launch 之后调一次，tick_capacity 的 finally 再兜一次。"""
+        cm = getattr(self, "_launch_lock", None)
+        if cm is None:
+            return
+        self._launch_lock = None
+        try:
+            cm.__exit__(None, None, None)
+        except Exception:  # noqa: BLE001
+            log.exception("releasing the tenant launch lock failed")
 
     def _release_job_after_crash(self, db: Session, job_id: str, exc: BaseException) -> None:
         """Put a job that blew up outside its own handler back into a sane state.
@@ -416,6 +467,17 @@ class Worker:
             except Exception:  # noqa: BLE001
                 log.exception("decrypt user_data failed job=%s (continuing without it)", job.id)
 
+        # 从这里开始到 LaunchInstance 返回为止，整段要和浏览器端的创建互斥。
+        #
+        # AUDIT.md pass 11 把「check-then-act 没有互斥」列为 High，并写着
+        # 「Wired around snapshot→launch in routers/instances.py **and the worker**」——
+        # 后半句从来没有成立过：全仓库 `with tenant_launch_lock` 只有
+        # routers/instances.py 一处。worker 自己的 _busy_tenants 和数据库租约只让
+        # **worker 的任务之间**串行，挡不住一个正在页面上点「创建实例」的人：两边
+        # 各自读到同一份「已用 0」的快照，然后各开一台，Always Free 额度双花。
+        # 抢机任务一挂一整夜，撞上的概率并不低。
+        if not self._acquire_launch_lock(job, interval, now):
+            return
         # Quota re-check runs BEFORE the attempt counter moves, so deferring on an
         # unreadable quota does not burn attempts during an Oracle API outage.
         tier = getattr(tenant, "account_tier", "") or ""
@@ -586,6 +648,11 @@ class Worker:
             self._log_attempt(db, job, ok=False, message=msg, ad=ad, config_label=cfg_label)
             self._handle_capacity_error(db, job, msg, interval, exc=exc, cfg=cfg_override)
             return
+        finally:
+            # LaunchInstance 一返回就放锁：额度已经变了，互斥的目的达成。
+            # 后面还有写库和推送通知（notify_user 最坏几十秒的网络 I/O），
+            # 把跨进程锁攥到那时候，等于让一次推送超时去堵住别人在页面上的创建。
+            self._release_launch_lock()
 
         if result.ok:
             job.status = "success"
@@ -640,8 +707,11 @@ class Worker:
             # 而机器已经开出来了。通知是 best-effort 的，本来就不需要待在事务里。
             owner_id = job.owner_id
             job_name, job_attempts = job.name, job.attempts
+            # job.id 也要在 commit 之前取：commit 会 expire 这些属性，之后再读
+            # job.id 会多打一次 SELECT，而任务如果刚好被删掉还会抛出来。
+            job_id = job.id
             db.commit()
-            notify_user(
+            results = notify_user(
                 db,
                 owner_id,
                 "capacity",
@@ -654,6 +724,15 @@ class Worker:
                     f"OCID：{inst_id or '待查询'}\n"
                     "公网 IP 请稍后在面板实例列表查看。"
                 ),
+            )
+            # 通知之后才写审计，不破坏上面那条「先落库、再做网络 I/O」的顺序：
+            # 这行只是加进 session，由外层 finally 的 commit 一起提交。
+            self._record_notify_failures(
+                db,
+                owner_id=owner_id,
+                target=f"capacity_job:{job_id}",
+                event="capacity",
+                results=results,
             )
             return
 
@@ -727,6 +806,81 @@ class Worker:
             # SAVEPOINT 已经回滚，外层事务仍然可用 —— 调用方接着写 last_error /
             # next_run_at / 推送通知都不会受影响。
             log.exception("log attempt failed job=%s", job.id)
+
+    @staticmethod
+    def _record_notify_failures(
+        db: Session,
+        *,
+        owner_id: str,
+        target: str,
+        event: str,
+        results: list[dict[str, Any]],
+    ) -> None:
+        """把「这次通知有渠道没推出去」写成一条审计事件。
+
+        两个 notify_user 调用点原来都把返回值直接丢掉，而 notify_user 从不抛异常。
+        于是「抢机成功，五个渠道全部推送失败」在面板上是一条**绿色的成功任务**：
+        任务中心是 success、尝试日志是 ok、审计表里什么都没有，唯一的线索是 worker
+        容器日志里的一行 warning —— 自托管部署的操作员多半根本没在看容器日志，
+        等他发现的时候实例可能已经因为没人接手而被回收了。
+
+        选审计事件而不是给 capacity_jobs 加字段：CLAUDE.md 那条「不要给已部署的
+        数据库加不可空列」的规则意味着新列必须 nullable 并且要在 _ensure_schema
+        里加，代价更大；而 audit_logs 是现成的、面板已经有页面在渲染、还有
+        prune_audit_log 管着它不会无限长。AuditView 的 ACTION_LABELS 里没有
+        notify.* 时会原样显示 action 字符串，不会渲染不出来。
+
+        不用 audit.write_audit 是因为它自己 commit / 失败时 rollback：
+        _notify_capacity_end 是在**调用方那笔还没提交的事务**里被调用的（job.status、
+        enabled=False、attempts 都还挂着），一次 rollback 就会把它们一起撤销 ——
+        正是 _log_attempt 文档里记着的那个死循环（attempts 回滚 → 永远够不到
+        max_attempts → 租约过期后重新认领 → 再发一次 LaunchInstance）。所以这里
+        沿用 _log_attempt 的做法：先 flush 调用方的改动，再用 SAVEPOINT 把这行
+        写入隔离起来，让它最坏只回滚自己，由调用方原有的 commit 一起落库。
+        """
+        failed = [r for r in results if not r.get("ok")]
+        if not failed:
+            return
+        detail = {
+            "event": event,
+            "failed": len(failed),
+            # "attempted" 而不是 "total":results 里只有**真的试过**的渠道。
+            # notify_user 有 _MAX_SENDS_PER_EVENT(20) 和 _SEND_BUDGET_SEC(60s)
+            # 两道截断,被截掉的渠道压根不进 results,叫 total 会读成「一共就这些渠道」,
+            # 而真实情况可能是「还有几个连试都没试」。
+            "attempted": len(results),
+            # 渠道名和 detail 都可能带远端字节；json.dumps 会把换行转义成 \n，
+            # 所以进不了库的是「一行伪造的日志」，而 AuditView 不用 v-html，渲染
+            # 时会转义。这里只做长度上的克制，避免一个用户把审计详情撑到 4000 字符。
+            "channels": [
+                {
+                    "name": str(r.get("channel") or "")[:64],
+                    "kind": str(r.get("kind") or "")[:16],
+                    "detail": str(r.get("detail") or "")[:200],
+                }
+                for r in failed[:5]
+            ],
+        }
+        try:
+            db.flush()
+        except Exception:  # noqa: BLE001
+            log.exception("flush before notify audit failed target=%s", target)
+            return
+        try:
+            with db.begin_nested():
+                db.add(
+                    AuditLog(
+                        owner_id=owner_id or None,
+                        action="notify.failed",
+                        target=(target or "")[:256],
+                        detail=json.dumps(detail, ensure_ascii=False)[:4000],
+                    )
+                )
+                db.flush()
+        except Exception:  # noqa: BLE001
+            # SAVEPOINT 已回滚，外层事务仍然可用 —— 这一行记不上账可以接受，
+            # 把这次抢机的结果打掉不可以。
+            log.exception("record notify failure failed target=%s", target)
 
     def _handle_capacity_error(
         self,
@@ -866,7 +1020,16 @@ class Worker:
                 f"任务「{job.name}」遇到非容量错误，已停止（第 {job.attempts} 次尝试）。\n"
                 f"错误：{(job.last_error or '')[:400]}"
             )
-        notify_user(db, job.owner_id, "capacity", title, body)
+        results = notify_user(db, job.owner_id, "capacity", title, body)
+        # 「任务停了」这条通知没送到，比「抢机成功」没送到还要静默：任务在面板上
+        # 只是变成 failed / 停止，操作员不会收到任何提醒，可能一整晚都以为还在跑。
+        self._record_notify_failures(
+            db,
+            owner_id=job.owner_id,
+            target=f"capacity_job:{job.id}",
+            event="capacity",
+            results=results,
+        )
 
     # ------------------------------------------------------------------
     # Daily checks: budget + password expiry

@@ -81,8 +81,23 @@ def region_area(region: str) -> str:
     return region.strip()
 
 
+# 全仓字节口径：十进制 SI，1 KB = 1000 B，标签写 KB/MB/GB。
+#
+# 定这个口径的理由：这些数字最后是拿去和 Oracle 控制台 / 账单对照的，Oracle 那边的
+# 出网流量、对象存储都按十进制 GB 计；网络速率本身也是十进制惯例（1 Mbps = 10^6 bit）。
+# 原来这里除以 1024 却打 SI 标签，等于每上一档偏 2.4%、到 GB 档累计偏 7.4%：
+# 一个 Oracle 记作「1 GB」的桶，面板上显示成 953.7 MB，用户会以为哪一边算错了。
+# 前端 web/frontend/src/views/InstanceDetailView.vue 的 formatMetricValue 一直是
+# 1000 + KB/MB/GB，两处从此一致；要改口径必须两处一起改，否则同一个字节数在
+# 实例详情页和这里会差出一整档。
+# （另一条路是保留 1024 改标签成 KiB/MiB/GiB，也自洽，但跟控制台对不上号，
+#  而且前端的速率单位没法跟着改成 KiB/s——速率没人用二进制。）
+_BYTE_STEP = 1000.0
+_BYTE_UNITS = ("B", "KB", "MB", "GB", "TB", "PB")
+
+
 def human_bytes(num: float) -> str:
-    """Format a byte count with binary units (e.g. 1536 -> '1.5 KB')."""
+    """Format a byte count with decimal SI units (e.g. 1536 -> '1.5 KB')."""
     try:
         value = float(num)
     except (TypeError, ValueError):
@@ -91,14 +106,30 @@ def human_bytes(num: float) -> str:
         return "—"
     sign = "-" if value < 0 else ""
     value = abs(value)
-    units = ["B", "KB", "MB", "GB", "TB", "PB"]
     idx = 0
-    while value >= 1024 and idx < len(units) - 1:
-        value /= 1024.0
+    while value >= _BYTE_STEP and idx < len(_BYTE_UNITS) - 1:
+        value /= _BYTE_STEP
         idx += 1
-    if idx == 0:
-        return f"{sign}{int(value)} {units[idx]}"
-    return f"{sign}{value:.1f} {units[idx]}"
+    # 单位是按未舍入的值选的，而 .1f 的进位发生在之后：999_950 落在 KB 档，
+    # /1000 = 999.95，打印出来就是 '1000.0 KB'（旧的 1024 版同理会打出 '1024.0 KB'）。
+    # 循环不会回头再判一次，所以这里按**实际要显示的精度**补判一次进位。
+    # 只需判一次：value < step，除一次之后必然落在 [0.99…, 1.0]。
+    if idx < len(_BYTE_UNITS) - 1 and round(value, 1) >= _BYTE_STEP:
+        value /= _BYTE_STEP
+        idx += 1
+    if idx == 0 and value == int(value):
+        text = str(int(value))
+    else:
+        # 旧代码在 B 档用 int() 截断，0.5 B 显示成 '0 B'、-0.5 B 显示成 '-0 B'
+        # ——一个带负号的零。小数在 B 档保留一位，比截断成 0 诚实。
+        text = f"{value:.1f}"
+    if float(text) == 0.0:
+        # 舍到零之后统一成 '0'：负号没有意义了（别打出 '-0.0 B'），而且
+        # 0 和 0.04 都显示成零时，写法也该一致 —— 否则同一列里会同时出现
+        # '0 B' 和 '0.0 B' 两种零。
+        sign = ""
+        text = "0"
+    return f"{sign}{text} {_BYTE_UNITS[idx]}"
 
 
 def axis_max(values: list[float], minimum: float = 1.0) -> float:
@@ -107,6 +138,9 @@ def axis_max(values: list[float], minimum: float = 1.0) -> float:
     Rounds up to 1/2/5 x 10^n so gridlines land on readable numbers. Never
     returns less than ``minimum`` so a flat-zero series still yields a usable
     axis instead of collapsing to a single line at the top.
+
+    The result is always > 0: a non-positive (or non-finite) ``minimum`` is read
+    as "no floor" rather than as a real bound.
     """
     peak = 0.0
     for v in values:
@@ -118,9 +152,21 @@ def axis_max(values: list[float], minimum: float = 1.0) -> float:
             continue
         if fv > peak:
             peak = fv
-    peak = max(peak, float(minimum))
+    try:
+        floor = float(minimum)
+    except (TypeError, ValueError):
+        floor = 0.0
+    if not math.isfinite(floor):
+        floor = 0.0
+    if floor > 0:
+        peak = max(peak, floor)
     if peak <= 0:
-        return float(minimum)
+        # 上界要拿去当除数（scale_points 的 y_max、调用方自己的 v / y_max）。
+        # 默认 minimum=1.0 时走不到这里，但调用方传自定义 minimum 就能踩到：
+        # 旧代码 axis_max([0,0,0], minimum=0) 原样返回 0.0 -> 调用方 ZeroDivisionError；
+        # axis_max([0], minimum=-3.0) 返回 -3.0，一个比所有数据点都低的「上界」，
+        # 曲线会整条画到坐标轴外面去。数据没有正的峰值时退回 1.0，画出一根贴底的平线。
+        peak = 1.0
     exponent = math.floor(math.log10(peak))
     base = 10.0**exponent
     for mult in (1, 2, 5, 10):

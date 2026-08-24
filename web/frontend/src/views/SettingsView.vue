@@ -78,11 +78,53 @@
         </div>
         <div v-else-if="addForm.kind === 'smtp'" class="grid-2">
           <div class="field"><label>SMTP 服务器</label><input v-model="addConfig.host" placeholder="smtp.example.com" /></div>
-          <div class="field"><label>端口</label><input v-model="addConfig.port" placeholder="465" /></div>
+          <!-- placeholder 写 465 会被读成「不填就是 465」，但后端 validate_channel_config
+               的 smtp 必填清单里有 port，留空直接 400「smtp 渠道缺少字段: port」——
+               提示语承诺了一个默认值，保存却报缺字段，操作员只会以为是别的地方填错了。
+               notify._smtp_port 自己的兜底就是 465，所以这里补 465 而不是标必填：两边
+               取同一个默认值，谁也不会先于谁做出不同的解释。
+               选 465 还有 TLS 上的含义 —— _send_smtp 的 use_ssl 默认 (port == 465)，
+               所以「留空」落在全程 SSL 的那一档，而不是落在需要 STARTTLS 升级、
+               失败还要靠下面那个开关兜底的 587/25。 -->
+          <div class="field">
+            <label>端口</label>
+            <input v-model="addConfig.port" inputmode="numeric" placeholder="留空按 465 处理" />
+            <p class="field-hint">465 = 连上就是 SSL；587 / 25 / 2525 = 先明文连接再 STARTTLS 升级。只接受这四个端口。</p>
+          </div>
           <div class="field"><label>用户名</label><input v-model="addConfig.username" /></div>
           <div class="field"><label>密码 / 授权码</label><input v-model="addConfig.password" type="password" /></div>
           <div class="field"><label>收件邮箱</label><input v-model="addConfig.to_addr" /></div>
           <div class="field"><label>发件地址（可选，默认用户名）</label><input v-model="addConfig.from_addr" /></div>
+
+          <!-- require_tls 以前只能手发 PATCH 才能改。_send_smtp 在服务器不宣告
+               STARTTLS 时直接中止发送，错误里让操作员「在渠道配置中显式设置
+               require_tls=false」—— 而面板上根本没有这一项，于是这条提示指向一个
+               不存在的开关：邮件通知彻底发不出去，抢机成功也没人知道。
+               默认必须是开（true）。关掉等于同意把邮箱密码明文丢上网，这种选择要
+               当场看见后果，所以不做成一个混在其它字段里的小方块。 -->
+          <div class="field span-2">
+            <label>传输加密</label>
+            <div class="tls-box" :class="{ 'tls-risky': !addRequireTls }">
+              <label class="choice">
+                <input v-model="addRequireTls" type="checkbox" />
+                <span>要求 TLS 后再发送账号密码（推荐保持开启）</span>
+              </label>
+              <span v-if="!addRequireTls" class="badge err">高风险</span>
+              <p class="field-hint tls-note">
+                <template v-if="addRequireTls">
+                  服务器不支持 STARTTLS 时<strong>中止发送</strong>，不会降级成明文。
+                  <template v-if="smtpPort === 465">当前端口 465 本身全程 SSL，走不到这一步。</template>
+                </template>
+                <template v-else>
+                  已关闭：服务器不支持 STARTTLS 时仍会继续登录发信，
+                  <strong>SMTP 用户名和密码 / 授权码会以明文经过网络</strong>，
+                  链路上任何人（同一 WiFi、机房交换机、上游网络）都能读到并接管这个邮箱。
+                  只有自建内网邮件服务器、且这个密码不在别处复用时才考虑关闭。
+                  <template v-if="smtpPort === 465">当前端口是 465（全程 SSL），并不需要关掉它。</template>
+                </template>
+              </p>
+            </div>
+          </div>
         </div>
 
         <div class="field">
@@ -117,7 +159,15 @@
               <td>{{ c.name }}</td>
               <td>{{ kindLabel(c.kind) }}</td>
               <td class="muted" style="font-size: 12px; max-width: 240px; word-break: break-all">{{ c.config_hint }}</td>
-              <td class="muted" style="font-size: 12px">{{ c.events.map(eventLabel).join(' / ') }}</td>
+              <!-- events 为空数组时 join('') 出来是**空字符串**，这一格就是一片空白，
+                   跟「还没加载出来」长得一模一样 —— 而它其实是「一个事件都不订阅，
+                   这个渠道永远不会收到推送」。后端读回时已经把 NULL（老库里的
+                   「订阅全部」）展开成完整事件键，所以现在能走到空数组的只剩下真正
+                   取消订阅的渠道，必须显式说出来，否则它和一个正常渠道在列表里毫无区别。 -->
+              <td class="muted" style="font-size: 12px">
+                <span v-if="c.events.length">{{ c.events.map(eventLabel).join(' / ') }}</span>
+                <span v-else class="badge warn">未订阅 · 不会推送</span>
+              </td>
               <td><span class="badge" :class="c.enabled ? 'running' : ''">{{ c.enabled ? '启用' : '停用' }}</span></td>
               <td>
                 <div class="row">
@@ -206,7 +256,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import api from '@/api/client'
 import { useAuthStore } from '@/stores/auth'
@@ -237,6 +287,24 @@ const showAdd = ref(false)
 const addForm = reactive({ kind: 'telegram', name: '' })
 const addConfig = reactive<Record<string, string>>({})
 const addEvents = ref<string[]>(EVENTS.map((e) => e.key))
+// 单独一个 ref 而不是塞进 addConfig，两个原因：
+//
+// 1. addConfig 的类型是 Record<string, string>，往里放布尔值 vue-tsc 直接报错。
+//    （不是「会被写成字符串 'false'」—— checkbox 的 v-model 在没有
+//    true-value/false-value 时赋的是真布尔，见 @vue/runtime-dom 的
+//    getCheckboxValue：`key in el ? el[key] : checked`。）
+// 2. 更要紧的是 clearAddConfig 会 `Object.keys(addConfig).forEach(delete)` 无差别
+//    清空。require_tls 一旦跟着被删掉，checkbox 会渲染成**未勾选**，而后端在
+//    缺这个键时默认是 true —— 界面显示「已关闭 TLS 要求」，实际行为却是要求 TLS，
+//    正好反着。这个开关是安全开关，显示和实际反过来比没有这个开关更糟。
+const addRequireTls = ref(true)
+
+// 端口留空按 465 算 —— 和 createChannel 里真正发出去的值、和 notify._smtp_port
+// 的兜底保持同一套规则，免得提示语说的是一回事、发出去的是另一回事。
+const smtpPort = computed(() => {
+  const raw = String(addConfig.port ?? '').trim()
+  return raw === '' ? 465 : Number(raw)
+})
 
 function clearAddConfig() {
   Object.keys(addConfig).forEach((k) => delete addConfig[k])
@@ -245,6 +313,10 @@ function clearAddConfig() {
   // 渠道**都继承了这个空列表：界面上状态显示「启用」、点测试也报绿，实际一条都不发。
   // 列表页又没有事件编辑入口，只能改数据库或手发 PATCH 才能救回来。
   addEvents.value = EVENTS.map((e) => e.key)
+  // 同理，而且后果更重：为某台内网自建服务器关掉过一次 TLS 要求，如果不复位，
+  // 之后新建的每个 SMTP 渠道都带着 require_tls=false —— 下一个渠道很可能是
+  // 公网邮箱，密码就这样明文出去了，而界面上开关默认长得像是开着的。
+  addRequireTls.value = true
 }
 
 // 换渠道类型必须清空 addConfig。它是所有类型共用的**一个** dict，切类型只是换了
@@ -284,7 +356,14 @@ async function createChannel() {
   saving.value = true
   try {
     const config: Record<string, unknown> = { ...addConfig }
-    if (addForm.kind === 'smtp' && config.port) config.port = Number(config.port)
+    if (addForm.kind === 'smtp') {
+      const rawPort = String(addConfig.port ?? '').trim()
+      // 非数字原样送上去，让后端回「SMTP 端口必须是数字」。以前是无条件
+      // Number()，"abc" 变成 NaN，JSON.stringify 又把 NaN 写成 null，后端看到的是
+      // 「没填」，于是报「缺少字段: port」—— 明明填了，提示却说没填。
+      config.port = rawPort === '' ? 465 : /^\d+$/.test(rawPort) ? Number(rawPort) : rawPort
+      config.require_tls = addRequireTls.value
+    }
     await api.post('/notifications', {
       kind: addForm.kind,
       name: addForm.name,
@@ -426,6 +505,40 @@ onMounted(async () => {
 </script>
 
 <style scoped>
+/* .grid-2 是两列 grid，传输加密这一块要横跨整行 —— 挤在半列里就又变成一个
+   「不起眼的复选框」，而这是本页唯一一个会把密码明文送上网的选项。 */
+.span-2 {
+  grid-column: 1 / -1;
+}
+
+.tls-box {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.6rem 0.75rem;
+  background: var(--panel-2);
+}
+
+/* 关掉之后整块变红：勾选框本身太小，光靠一行说明文字扫一眼是看不见的。 */
+.tls-box.tls-risky {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.tls-box .badge {
+  margin-left: 0.4rem;
+  vertical-align: middle;
+}
+
+.tls-note strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.tls-box.tls-risky .tls-note,
+.tls-box.tls-risky .tls-note strong {
+  color: var(--danger);
+}
+
 .totp-secret {
   background: var(--panel-2);
   padding: 0.15rem 0.5rem;

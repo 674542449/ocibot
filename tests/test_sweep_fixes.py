@@ -243,7 +243,7 @@ def test_aware_datetimes_are_left_alone():
     assert out.created_at.utcoffset() == timedelta(hours=8)
 
 
-def test_notify_fan_out_is_bounded():
+def test_notify_fan_out_is_bounded(monkeypatch):
     """One trigger must not turn into an unbounded outbound flood."""
     import web.backend.notify as notify_mod
 
@@ -270,7 +270,8 @@ def test_notify_fan_out_is_bounded():
 
             return _R()
 
-    notify_mod.send_to_channel = fake_send
+    # 见 test_feature_fixes.py 同名问题:裸赋值会把桩泄漏给后续测试文件。
+    monkeypatch.setattr(notify_mod, "send_to_channel", fake_send)
     results = notify_mod.notify_user(_DB(), "owner", "capacity", "t", "b")
     assert sent["n"] <= 20, f"sent {sent['n']} notifications for one event"
     assert len(results) == sent["n"]

@@ -134,14 +134,60 @@ def encode_channel_config(config: dict[str, Any]) -> str:
     return encrypt_text(json.dumps(config, ensure_ascii=False))
 
 
+class UndecryptableConfig(dict):
+    """解密失败时代替 `{}` 返回的空 dict，额外带上「为什么」。
+
+    为什么是 dict 的子类而不是抛异常：decode_channel_config 有三个调用方，其中
+    routers/notifications.py 的 `_out()` 是列表页每一行都要走的，抛出去会让**整个**
+    渠道列表 500 —— 主密钥不匹配时恰恰最需要那个列表还能打开。所以对不关心原因的
+    调用方它就是一个空 dict（config_hint 照常渲染成空），而发送路径
+    （send_to_channel）能认出它并把真正的原因报出来。
+
+    用子类而不是往 dict 里塞一个 `__decrypt_error__` 键：后者会和用户自己存的配置
+    键冲突，也会被 config_hint / _send_* 当成普通字段看。
+    """
+
+    __slots__ = ("reason",)
+
+    def __init__(self, reason: str) -> None:
+        super().__init__()
+        self.reason = reason
+
+
+# 面向操作员的说明。注意只讲现象和处置，绝不带密文、主密钥或任何密钥材料 ——
+# 这条字符串会进 API 响应、worker 日志和审计详情。
+_DECRYPT_FAILED_DETAIL = (
+    "无法解密该渠道的配置：主密钥不匹配或数据已损坏。"
+    "这通常是 OCIBOT_MASTER_KEY 变了或 .env 未加载："
+    "请恢复原来的主密钥；若主密钥确实无法找回，只能删除该渠道后重新填写配置"
+    "（旧密文无法再还原）。"
+)
+
+
 def decode_channel_config(encrypted: str) -> dict[str, Any]:
+    """解出渠道配置；解不开时返回 UndecryptableConfig 而不是干净的 `{}`。
+
+    原来这里是一个 `except Exception: return {}`，把「主密钥换了」和「配置真的是
+    空的」混成同一件事。后果是主密钥一轮换，Telegram 报「invalid bot_token」、
+    webhook 报「URL 不能为空」、SMTP 报「缺少字段 host, username…」—— 五个渠道
+    五种说法，每一种都指向操作员去改一个其实没问题的字段，而真正的原因
+    （OCIBOT_MASTER_KEY 变了 / .env 没加载）一个字都没提。
+    routers/auth.py 的 _verify_totp 对 2FA 密钥就是明确报出这种情况的，照抄那条先例。
+    """
     if not encrypted:
         return {}
     try:
-        data = json.loads(decrypt_text(encrypted))
-        return data if isinstance(data, dict) else {}
+        plain = decrypt_text(encrypted)
     except Exception:  # noqa: BLE001
+        # decrypt_text 对密钥不匹配抛 ValueError；密文被截断/改坏还可能抛
+        # UnicodeEncodeError（.encode("ascii")）。两种都是「这串东西还原不回来」。
+        return UndecryptableConfig(_DECRYPT_FAILED_DETAIL)
+    try:
+        data = json.loads(plain)
+    except ValueError:
+        # 解密成功但里面不是 JSON：那是真正的数据损坏，跟主密钥无关，保持旧行为。
         return {}
+    return data if isinstance(data, dict) else {}
 
 
 def config_hint(kind: str, config: dict[str, Any]) -> str:
@@ -202,6 +248,10 @@ def validate_channel_config(kind: str, config: dict[str, Any]) -> None:
 
 def send_to_channel(kind: str, config: dict[str, Any], title: str, body: str) -> tuple[bool, str]:
     """Send one message. Returns (ok, detail). Never raises."""
+    # 配置根本没解开的时候，往下走只会让每个渠道各自报一句「缺少字段」/「URL 非法」。
+    # 在这里拦住，是为了让「测试」按钮和 worker 的失败详情都说出同一个真正的原因。
+    if isinstance(config, UndecryptableConfig):
+        return False, config.reason
     try:
         if kind == "telegram":
             return _send_telegram(config, title, body)
@@ -235,14 +285,45 @@ def _send_telegram(config: dict[str, Any], title: str, body: str) -> tuple[bool,
         )
         if status == 200 and _json_ok(payload):
             return True, "sent"
-        # Markdown parse errors: retry as plain text
-        status, payload = _post(
-            client, url, json={"chat_id": chat_id, "text": f"{title}\n{body}" if title else body}
-        )
-        if status == 200 and _json_ok(payload):
-            return True, "sent"
+        # 只有「Markdown 没解析成功」才值得去掉 parse_mode 重发一次。
+        #
+        # 这里原来是无条件重发：第一次失败是什么原因都不看。于是一个
+        # 429 {"parameters":{"retry_after":30}} 变成**两次** POST，第二次紧接着打向
+        # 一个刚刚明确要求暂停 30 秒的端点 —— 抢机高峰上每个渠道的请求量直接翻倍，
+        # 把本来几十秒就能恢复的限流拖成持续限流，Telegram 侧还可能因此收紧这个
+        # bot。chat not found / bot 被踢出群这类 400 同理：纯文本重发一样救不了，
+        # 白发一次而已。
+        if _telegram_parse_error(status, payload):
+            status, payload = _post(
+                client, url, json={"chat_id": chat_id, "text": f"{title}\n{body}" if title else body}
+            )
+            if status == 200 and _json_ok(payload):
+                return True, "sent"
         # api.telegram.org is a fixed host, so its error description is ours to show.
         return False, _http_error(status, payload, echo=True)
+
+
+def _telegram_parse_error(status: int, payload: str) -> bool:
+    """这次失败是不是 Markdown 实体没解析出来（去掉 parse_mode 重发才有意义）。
+
+    Telegram 用 400 + description 报解析错误，典型文案是
+    `Bad Request: can't parse entities: Can't find end of the entity starting at
+    byte offset 7`。判据放宽到 "parse" / "entit"，是因为这句话历年改过好几版
+    （曾经是 `can't parse message text`），但这两个词根一直在；同时把 429、
+    401、chat not found 这些**重发也没用**的失败排除在外。
+    """
+    if status != 400:
+        return False
+    try:
+        data = json.loads(payload)
+    except ValueError:
+        # 400 但连 JSON 都不是（网关插了一页 HTML）：无从判断，按「不是解析错误」
+        # 处理 —— 猜错时多发一次请求的代价，大于少发一次。
+        return False
+    if not isinstance(data, dict):
+        return False
+    desc = str(data.get("description") or "").lower()
+    return "parse" in desc or "entit" in desc
 
 
 def _json_ok(payload: str) -> bool:
@@ -391,10 +472,21 @@ def _send_smtp(config: dict[str, Any], title: str, body: str) -> tuple[bool, str
                 # setup, i.e. the ordinary configuration. Not sending beats leaking
                 # the mailbox credential to anyone on the path.
                 if require_tls:
+                    # 提示必须指向操作员**真的做得到**的动作。
+                    #
+                    # 原文是「或在渠道配置中显式设置 require_tls=false」，读起来像
+                    # 面板里有这么一个开关；SettingsView 的 SMTP 表单只有
+                    # host/port/username/password/to_addr，操作员会在表单里翻上一
+                    # 圈然后来问「require_tls 在哪」。所以：把 465+SSL 这条自助路径
+                    # 放在前面，逃生开关说清楚它是 config 里的一个字段、面板没暴露
+                    # 时得手工 PATCH，而不是暗示它就在眼前。
                     return False, (
                         "SMTP 服务器不支持 STARTTLS，已中止发送（继续会以明文发送账号密码）。"
-                        "请改用 465 端口的 SSL 连接，或在渠道配置中显式设置 require_tls=false "
-                        "以接受明文风险"
+                        "推荐修法：把该渠道改成 465 端口并使用 SSL 连接。"
+                        "若确实要接受明文风险：设置页「添加渠道」的 SMTP 表单里有"
+                        "「传输加密」开关，取消勾选后重新创建一个渠道即可"
+                        "（现有渠道没有编辑入口，PATCH 也不行 —— update_channel 是整包"
+                        "替换 config 并做必填校验，只提交 require_tls 会被拒成「缺少字段」）。"
                     )
                 log.warning(
                     "smtp channel %s:%s authenticating without TLS (require_tls=false)", host, port
@@ -451,33 +543,56 @@ def notify_user(
     results: list[dict[str, Any]] = []
     try:
         rows = db.scalars(
-            select(NotificationChannel).where(
+            select(NotificationChannel)
+            .where(
                 NotificationChannel.owner_id == owner_id,
                 NotificationChannel.enabled.is_(True),
             )
+            # 排序不是为了好看，是为了让「预算把扇出截断」这件事可解释。
+            #
+            # 没有 ORDER BY 时行序由数据库自行决定（SQLite 的 rowid、Postgres 的
+            # 堆顺序，都会随 VACUUM / 更新而变）。渠道数超过 _MAX_SENDS_PER_EVENT
+            # 或者前面几个渠道拖满 60 秒预算时，**哪几个渠道被丢掉每次都可能不一样**：
+            # 同一台机器上同一个用户，这次抢机成功推到了 Telegram，下次只推到了邮件，
+            # 而操作员根本无从复现。按创建时间排序后，被丢掉的永远是最后建的那几个，
+            # 面板里的渠道列表（routers/notifications.py 也是按 created_at 排的）
+            # 从上往下看就是实际的发送顺序。
+            #
+            # 第二个键是 id：created_at 只精确到微秒，同一次备份导入建出来的多个渠道
+            # 完全可能落在同一个值上，只按它排仍然是不确定的。id 是主键，一定唯一。
+            # （这一列不会是 NULL：models.py 里 NotificationChannel.created_at 声明成
+            # `Mapped[datetime]` 而非 Optional，所以是 NOT NULL。events 那一列才是
+            # 后加的、老行上为 NULL 的那个。）
+            .order_by(NotificationChannel.created_at.asc(), NotificationChannel.id.asc())
         ).all()
     except Exception:  # noqa: BLE001
         log.exception("notify_user: query channels failed")
         return results
+    # None vs []: rows created before the events column existed have NULL and
+    # must keep receiving everything (_ensure_schema cannot backfill a callable
+    # default), while an explicitly empty list means the user switched every
+    # event off and must receive nothing. `list(row.events or [])` collapsed
+    # both to "send everything".
+    targets = [
+        row for row in rows if row.events is None or event in list(row.events)
+    ]
     # Bound the fan-out: channels are uncapped per user and each send has a 15-20s
     # timeout, so one trigger could otherwise stall the worker tick for minutes.
     started = time.monotonic()
     sent = 0
-    for row in rows:
-        # None vs []: rows created before the events column existed have NULL and
-        # must keep receiving everything (_ensure_schema cannot backfill a callable
-        # default), while an explicitly empty list means the user switched every
-        # event off and must receive nothing. `list(row.events or [])` collapsed
-        # both to "send everything".
-        events = row.events
-        if events is not None and event not in list(events):
-            continue
+    for idx, row in enumerate(targets):
         if sent >= _MAX_SENDS_PER_EVENT or time.monotonic() - started > _SEND_BUDGET_SEC:
+            # 报的必须是「订阅了这个事件、但没轮到」的渠道数。
+            #
+            # 原来是 len(rows) - sent —— rows 是这个用户**全部**启用的渠道，包含刚
+            # 才被事件过滤器跳过的那些。一个订了 2 个渠道、另有 100 个只订别的事件
+            # 的用户，日志会写「102 个渠道没来得及发」，排障的人于是去查为什么扇出
+            # 会到 102，而真实答案是 0 或者 1。
             log.warning(
                 "notify budget reached for owner=%s event=%s; %d channel(s) not attempted",
                 owner_id,
                 event,
-                len(rows) - sent,
+                len(targets) - idx,
             )
             break
         config = decode_channel_config(row.config_encrypted)

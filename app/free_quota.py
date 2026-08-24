@@ -17,12 +17,15 @@ FREE_BLOCK_STORAGE_GB = 200.0
 FREE_OBJECT_STORAGE_GB = 20.0
 # Soft visibility only — ephemeral public IPs on free VMs are free; not a hard block.
 FREE_PUBLIC_IP_SOFT = 2
-# Outbound data transfer included per month (10 TB, binary units to match the byte
-# counter it is compared against). Tracked for visibility/alerting only: the figure
-# it is compared with is an upper bound from VCN metrics, not a bill, and egress is
-# not knowable at launch time — so it never blocks a create. See
+# Outbound data transfer included per month. Tracked for visibility/alerting only:
+# the figure it is compared with is an upper bound from VCN metrics, not a bill, and
+# egress is not knowable at launch time — so it never blocks a create. See
 # TenantSession.get_network_egress_usage.
-FREE_EGRESS_GB = 10240.0
+# 10 TB/月，十进制 —— Oracle 的流量额度就是这么计的（1 TB = 10^12 字节），
+# get_network_egress_usage 也已改成除以 1000**3。以前写 10240（= 10*1024 GiB）
+# 把阈值抬高了约 10%：真实上限 9313 GiB，守卫却要到 10240 GiB 才报警，
+# 中间那 900 多 GiB 是要计费的，而面板显示「仍在免费额度内」。
+FREE_EGRESS_GB = 10000.0
 
 # Default boot size assumed when the launch form leaves size empty (~Ubuntu image).
 DEFAULT_BOOT_GB_ASSUMED = 47

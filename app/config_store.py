@@ -397,12 +397,26 @@ class TenantConfig:
         return base + timedelta(days=days)
 
     def password_days_left(self) -> Optional[int]:
-        """Whole days until the password should be changed (negative if overdue)."""
+        """Whole days until the password should be changed (negative if overdue).
+
+        「今天」取**本地**日历日,而不是 UTC 日历日:这个数字是给操作员看的
+        「还有几天」,那就该按操作员自己的日历数。UTC-5 的操作员在当地 20:00 时,
+        UTC 已经是第二天,按 UTC 数会平白少一天。
+
+        和 `oci_client.TenantSession._effective_password_expiry` 的**契约不同**,
+        两者不该互相对齐,这是刻意的:
+          * 这里的输入是操作员自己填的一个**日期**(password_changed_at 常常就是
+            "2026-01-15"),加上天数之后仍然是一个日期。把它做时区换算是错的 ——
+            他填的那一天不会因为人在纽约就变成前一天。所以只换算「今天」。
+          * 那边的输入是 Oracle 给的一个**时刻**(last_set + 策略天数),必须整体
+            换算到本地,因为它同时还要印出一个日期,两者必须出自同一个时区。
+        同一个到期时刻交给两边会差一天(实测 UTC+8 下 9 对 8),那不是 bug,
+        是两种输入形状的正确答案不同。改动任何一边之前先读这两段。
+        """
         expiry = self.password_expiry_date()
         if expiry is None:
             return None
-        now = datetime.now(timezone.utc)
-        return (expiry.date() - now.date()).days
+        return (expiry.date() - datetime.now().astimezone().date()).days
 
     def tier_label(self) -> str:
         """Short account-tier text for the sidebar: 免费 / 已升级 / 未知."""

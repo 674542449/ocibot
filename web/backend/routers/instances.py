@@ -893,8 +893,27 @@ def launch_instance(
     # 同时提交 4 OCPU/24GB 的 A1，各自读到「已用 0」，就会双双放行、真的开出
     # 8 OCPU/48GB —— 免费额度的两倍。窗口还特别宽，因为 prepare_launch_network
     # 夹在判定和创建之间，它可能要新建 NSG 甚至 VCN，是几十秒而不是几微秒，
-    # 所以它必须留在锁**里面**。抢机任务与手工创建之间同样靠这把锁串行化 ——
-    # 「每租户一个活动任务」只管任务之间，管不到任务与手工创建之间。
+    # 所以它必须留在锁**里面**。
+    #
+    # 抢机任务和手工创建之间也靠这把锁串行化 —— worker.py 从 0.4.87 起在自己的
+    # 「取快照 → LaunchInstance」窗口上取同一把锁（Worker._acquire_launch_lock），
+    # 拿不到就推迟本次尝试。在那之前全仓库只有下面这一处 with，两条路径各自读到
+    # 同一份「已用 0」的快照就会各开一台，把 Always Free 额度花两遍。
+    #
+    # 锁内实际发出的 OCI 调用（tests/test_launch_lock_scope.py 逐个钉住，
+    # 往里加一次就会红）：home_region（按 session 缓存）→ list_instances_tree
+    # → list_boot_volumes → list_block_volumes → list_buckets + 每个桶若干次
+    # list_objects → prepare_launch_network → launch_from_payload × count。
+    # 其中桶枚举是纯开销：validate_launch_against_quota 只读 A1 / E2 / 块存储四项，
+    # object_storage_gb 只喂仪表盘那几根进度条。代价是「1 + 各桶页数之和」次调用
+    # （estimate_object_storage_usage: max_buckets=50，每桶最多 5000 个对象、每页
+    # limit=min(1000, 剩余)，所以对象多的桶是 5 页就撞上对象数上限退出，那个
+    # `pages > 20` 的闸门只有在每页返回不足 1000 条时才轮得到生效），真正兜底的是
+    # deadline_sec=25.0 —— 桶多的租户能让这把每租户互斥锁多握近半分钟，同租户的
+    # 下一次创建就干等这么久，换不来判决上的任何差别。
+    # 去掉它要给 oci_client.get_free_quota_usage 加一个 include_object 开关
+    # （它已经有 include_block / include_egress），那是另一个文件的事；**不要**
+    # 改成把快照挪到锁外来省这段，那等于把上面说的双花窗口原样放回去。
     with tenant_launch_lock(row.id):
         free_only = free_only_for_tenant(row)
         launch_guard = None

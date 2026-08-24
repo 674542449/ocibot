@@ -41,12 +41,16 @@ def _session(series, *, raises=None):
 
 
 def test_hourly_buckets_are_summed_into_gb():
-    gib = 1024**3
+    # 十进制 GB（10^9），不是 GiB。Oracle 的「每月 10 TB 出网」是十进制计的，
+    # 而 FREE_EGRESS_GB 要和这个数字比。旧断言用的是 1024**3，两边都是二进制时
+    # 看着自洽，实际把免费阈值抬高了约 10%：真实上限 9313 GiB，守卫却要到
+    # 10240 GiB 才报警，中间 900 多 GiB 是要计费的。
+    gb = 1000**3
     s = _session(
         [
-            SimpleNamespace(aggregated_datapoints=[_dp(gib), _dp(gib)]),
+            SimpleNamespace(aggregated_datapoints=[_dp(gb), _dp(gb)]),
             # A second VNIC's series must add to the same total, not replace it.
-            SimpleNamespace(aggregated_datapoints=[_dp(2 * gib)]),
+            SimpleNamespace(aggregated_datapoints=[_dp(2 * gb)]),
         ]
     )
     result = s.get_network_egress_usage()
@@ -79,7 +83,7 @@ def test_garbage_datapoints_are_skipped():
                     _dp(float("nan")),
                     _dp(-5.0),  # counter reset
                     _dp("not a number"),
-                    _dp(1024**3),
+                    _dp(1000**3),
                 ]
             )
         ]

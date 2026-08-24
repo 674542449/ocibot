@@ -1146,11 +1146,21 @@ function formatMetricValue(v: number, key: string) {
   if (!Number.isFinite(n)) return '—'
   if (key.startsWith('net')) {
     // Backend returns bytes/sec (MQL .rate() on NetworksBytes*).
+    // 除数 1000 + KB/MB/GB 标签是全仓统一的字节口径（另一处是 app/formatting.py 的
+    // human_bytes，那边原来除 1024 却打 SI 标签，每 GB 和这里差 7.4%，已改成和这里一致）。
+    // 依据：这些数字要和 Oracle 控制台的出网流量对照，Oracle 按十进制 GB 计；速率本身
+    // 也是十进制惯例（1 Mbps = 10^6 bit）。要换口径必须两处一起换。
     const abs = Math.abs(n)
-    if (abs >= 1e9) return (n / 1e9).toFixed(2) + ' GB/s'
-    if (abs >= 1e6) return (n / 1e6).toFixed(2) + ' MB/s'
-    if (abs >= 1e3) return (n / 1e3).toFixed(1) + ' KB/s'
-    return n.toFixed(0) + ' B/s'
+    // 单位是按未舍入的值选的，toFixed 的进位发生在之后：999_995_000 B/s 落进 MB 档，
+    // /1e6 = 999.995，toFixed(2) 进到 1000.00，页面上就写成「1000.00 MB/s」而不是
+    // 「1.00 GB/s」；999.96 同理会打出「1000 B/s」。所以按**实际显示位数**再判一次进位。
+    const rounds = (div: number, digits: number) => Number((abs / div).toFixed(digits)) >= 1e3
+    if (abs >= 1e9 || rounds(1e6, 2)) return (n / 1e9).toFixed(2) + ' GB/s'
+    if (abs >= 1e6 || rounds(1e3, 1)) return (n / 1e6).toFixed(2) + ' MB/s'
+    if (abs >= 1e3 || rounds(1, 0)) return (n / 1e3).toFixed(1) + ' KB/s'
+    // (-0.4).toFixed(0) === '-0'：JS 保留了负号，屏幕上就是一个「-0 B/s」。
+    const bytes = n.toFixed(0)
+    return (bytes === '-0' ? '0' : bytes) + ' B/s'
   }
   // CPU / memory utilization percent
   const pct = Math.max(0, Math.min(100, n))

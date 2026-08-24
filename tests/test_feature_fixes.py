@@ -151,7 +151,7 @@ def test_empty_event_selection_is_preserved():
     assert _clean_events(["capacity"]) == ["capacity"]
 
 
-def test_notify_respects_an_empty_event_list():
+def test_notify_respects_an_empty_event_list(monkeypatch):
     import web.backend.notify as notify_mod
 
     sent: list[str] = []
@@ -174,7 +174,16 @@ def test_notify_respects_an_empty_event_list():
 
             return _R()
 
-    notify_mod.send_to_channel = lambda kind, cfg, t, b: (sent.append(t), (True, "sent"))[1]
+    # monkeypatch.setattr,不是直接赋值:直接赋值**不会**在测试结束后还原,
+    # 这个恒返回 (True, "sent") 的桩会留在模块上,把后面所有按文件名排序在本文件
+    # 之后、又真正依赖 send_to_channel 行为的测试全部染绿。
+    # 已经发生过:tests/test_notify_reliability.py 里验证「主密钥轮换要报出真正
+    # 原因」的那条,单独跑通过、全量跑失败,因为它拿到的是这里留下的桩。
+    monkeypatch.setattr(
+        notify_mod,
+        "send_to_channel",
+        lambda kind, cfg, t, b: (sent.append(t), (True, "sent"))[1],
+    )
 
     # Explicitly empty -> nothing sent.
     sent.clear()

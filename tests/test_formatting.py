@@ -15,11 +15,18 @@ from app.formatting import (
 
 
 def test_human_bytes_units():
+    # 口径已统一为十进制 SI（1 KB = 1000 B），见 app/formatting.py 顶部的说明。
+    # 旧断言写的是二进制分档配 SI 标签：human_bytes(1023) == "1023 B" 和
+    # human_bytes(5 * 1024**3) == "5.0 GB" 恰恰是被修掉的那个 bug 本身——后者
+    # 5_368_709_120 字节在 Oracle 控制台上就是 5.37 GB，不是 5.0 GB。断言按新口径重写，
+    # 边界行为另见 tests/test_formatting_units.py。
     assert human_bytes(0) == "0 B"
-    assert human_bytes(1023) == "1023 B"
+    assert human_bytes(999) == "999 B"
+    assert human_bytes(1000) == "1.0 KB"
     assert human_bytes(1536) == "1.5 KB"
-    assert human_bytes(1024 * 1024) == "1.0 MB"
-    assert human_bytes(5 * 1024**3) == "5.0 GB"
+    assert human_bytes(10**6) == "1.0 MB"
+    assert human_bytes(5 * 10**9) == "5.0 GB"
+    assert human_bytes(5 * 1024**3) == "5.4 GB"
     assert human_bytes(-2048) == "-2.0 KB"
     assert human_bytes(None) == "—"
 

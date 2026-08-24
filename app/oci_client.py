@@ -4316,7 +4316,14 @@ class TenantSession:
                     continue
                 total_bytes += value
 
-        egress_gb = total_bytes / (1024**3)
+        # 十进制 GB，不是 GiB。
+        #
+        # 这个数字要和 free_quota.FREE_EGRESS_GB 比较，而那条免费额度来自 Oracle
+        # 的「每月 10 TB 出网」—— 云厂商的流量一律按十进制计（1 TB = 10^12 字节）。
+        # 以前两边都用 1024**3，看着自洽，实际把阈值抬高了约 10%：真实上限是
+        # 9313 GiB，而守卫要到 10240 GiB 才报警，中间那 900 多 GiB 是**要计费**的，
+        # 面板却还显示在免费额度内。标签写的也一直是「GB」。
+        egress_gb = total_bytes / (1000**3)
         return OperationResult(
             ok=True,
             message="",
@@ -4527,6 +4534,28 @@ class TenantSession:
             "applicable_policy_name": str(getattr(applicable, "display", "") or "") if applicable else "",
         }
 
+    @staticmethod
+    def _to_local(value: Any) -> Any:
+        """把一个 aware datetime 转成本机时区，按**那一刻**的偏移量。
+
+        必须是 `value.astimezone()`（不带参数），不能先取一个时区对象再套上去。
+        `datetime.now().astimezone().tzinfo` 拿到的是一个**固定偏移**的
+        `datetime.timezone`，记录的是「此刻」的偏移量；而密码到期日通常在 30–365 天
+        之后,中间大概率跨过一次夏令时切换。拿今天的偏移去渲染那一刻,算出来的
+        日历日会差一天 —— 这正是本函数存在的意义(修「少算一天」),反而在夏令时
+        地区把结果弄得比原来的 UTC 版本更糟:
+            operator 在 America/New_York,今天 2026-01-15(EST, -05:00),
+            到期 2026-05-15T04:30Z(那天已是 EDT, -04:00)
+            冻结偏移 -> 2026-05-14  ✗    真实偏移 -> 2026-05-15  ✓    旧的 UTC -> 2026-05-15 ✓
+        不带参数的 `.astimezone()` 由 CPython 按该时间戳去问操作系统要偏移量,
+        夏令时是对的。
+
+        抽成一个函数是为了留一个测试接缝：时区来自操作系统，而 `time.tzset()` 在
+        Windows 上根本不存在，只能 monkeypatch 这里才能确定性地验证
+        「UTC 日历日 ≠ 本地日历日」那条分支。
+        """
+        return value.astimezone()
+
     @classmethod
     def _effective_password_expiry(
         cls, policies: list[dict[str, Any]], user: dict[str, Any]
@@ -4624,11 +4653,28 @@ class TenantSession:
             return out
 
         expires_at = base + timedelta(days=days)
-        left = (expires_at - datetime.now(timezone.utc)).days
+        now = datetime.now(timezone.utc)
+        # 到期日期按本地时区渲染。原来 expires_at.strftime() 取的是 UTC 日历日，
+        # 而 SPA 里其余日期都是本地时区：一个 2026-09-01T20:00Z 到期的密码，对
+        # UTC+8 的操作员来说本地已经是 09-02 了，面板却印 09-01 —— 少一天，
+        # 而且和同一屏幕上别处的日期对不上。
+        expires_local = cls._to_local(expires_at)
+        now_local = cls._to_local(now)
+        # 剩余天数取「日历日之差」，和 config_store.TenantConfig.password_days_left() 同一套
+        # 语义（今天到期=0、明天=1、昨天=-1）。原来写的是
+        #     (expires_at - now).days
+        # timedelta.days 向下取整，而 last_set 总是过去若干小时，于是几乎每个真实
+        # 密码都少算一天：120 天策略下今天刚改的密码只报 119 天；明天到期的密码
+        # 报成「2026-08-25 到期（还有 0 天）」—— 日期说明天、天数说 0，自相矛盾。
+        left = (expires_local.date() - now_local.date()).days
         out["expires_at"] = expires_at.isoformat()
         out["days_left"] = left
-        date_text = expires_at.strftime("%Y-%m-%d")
-        if user.get("expired") or left < 0:
+        date_text = expires_local.strftime("%Y-%m-%d")
+        # 是否已过期改用真正的时刻比较。不能再沿用 left < 0：日历日之差对「半小时前
+        # 刚过期」给出的是 0（还是同一天），照旧判断会把一个已经登不进控制台的密码
+        # 报成「今天到期，还有 0 天」。反过来旧写法对这种情况给 -1，日期与天数同样
+        # 打架 —— 一个刚过期半小时的密码不该显示成过期了一整天。
+        if user.get("expired") or now >= expires_at:
             out["summary"] = f"已过期（{date_text}）"
         else:
             out["summary"] = f"{date_text} 到期（还有 {left} 天）"
@@ -6295,7 +6341,9 @@ class TenantSession:
                     {
                         "name": getattr(obj, "name", "") or "",
                         "size": size,
-                        "size_gb": round(size / (1024**3), 6),
+                        # 十进制 GB：和 FREE_OBJECT_STORAGE_GB(20) 的口径一致，
+                        # 也和 Oracle 控制台/账单一致。见 get_network_egress_usage。
+                        "size_gb": round(size / (1000**3), 6),
                         "md5": getattr(obj, "md5", "") or "",
                         "time_created": self._ts_iso(getattr(obj, "time_created", None)),
                         "time_modified": self._ts_iso(getattr(obj, "time_modified", None)),
@@ -6456,7 +6504,7 @@ class TenantSession:
                     if pages > 20:
                         truncated = True
                         break
-                size_gb = round(size_bytes / (1024**3), 4)
+                size_gb = round(size_bytes / (1000**3), 4)
                 total_bytes += size_bytes
                 details.append(
                     {
@@ -6467,7 +6515,7 @@ class TenantSession:
                         "object_count": obj_count,
                     }
                 )
-            total_gb = round(total_bytes / (1024**3), 4)
+            total_gb = round(total_bytes / (1000**3), 4)
             msg = ""
             if notes:
                 msg = "；".join(notes)
