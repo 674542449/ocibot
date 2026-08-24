@@ -6,6 +6,7 @@ import base64
 import ipaddress
 import re
 import secrets
+import socket
 import threading
 import time
 import uuid
@@ -443,7 +444,16 @@ def build_root_cloud_init(
         f"    lock_passwd: {'true' if auth_mode == 'key' else 'false'}",
     ]
     if auth_mode == "key":
-        lines.extend(["    ssh_authorized_keys:", f"      - {key}"])
+        # 引号包起来，不能裸着写。
+        #
+        # 上面的正则只锚定了开头（类型 + base64 块），公钥尾部的注释是完全自由的
+        # 文本。裸标量 `- ssh-rsa AAAA... foo: bar` 在 YAML 里会被解析成一个映射，
+        # `- ssh-rsa AAAA... #x` 里的注释会被截掉 —— 两种情况都会让整份 cloud-config
+        # 解析失败或者装错，结果是一台**没有任何 SSH 公钥、连不上去**的机器，
+        # 而创建流程一路显示成功。
+        if "\n" in key or "\r" in key:
+            raise ValueError("SSH 公钥不能包含换行符")
+        lines.extend(["    ssh_authorized_keys:", "      - '" + key.replace("'", "''") + "'"])
     else:
         lines.append(f"    passwd: '{password_hash}'")
     # Named 00- so it is read BEFORE Ubuntu's 50-cloud-init.conf /
@@ -1350,9 +1360,24 @@ class TenantSession:
             content = self.compute.get_console_history_content(
                 history_id, length=length_bytes
             ).data
-            text = getattr(content, "value", None)
-            if text is None:
-                text = content if isinstance(content, str) else str(content or "")
+            # `.data` 是 **bytes**：这个调用在 SDK 里声明的是
+            # response_type="bytes"（oci/core/compute_client.py），base_client
+            # 直接返回 response.content。
+            #
+            # 之前这里先试 `getattr(content, "value")`，bytes 没有这个属性 ——
+            # 于是落到 `str(content)`，把整段日志变成一行 `b'...\\n...'` 的
+            # Python repr：换行是字面的两个字符，中文变成 \xNN。而这个功能的
+            # 全部意义就是「机器起不来时让人读串口输出」。
+            if isinstance(content, (bytes, bytearray)):
+                # 串口输出不保证是干净的 UTF-8（内核早期可能是别的编码，
+                # 也可能被截断在多字节字符中间），所以 replace 而不是 strict——
+                # 抓到一半的日志也比抛异常有用。
+                text = bytes(content).decode("utf-8", errors="replace")
+            elif isinstance(content, str):
+                text = content
+            else:
+                # 兜底：旧 SDK 曾用带 .value 的对象包装。
+                text = str(getattr(content, "value", "") or "")
             return OperationResult(
                 ok=True,
                 message=f"已抓取控制台输出（{len(text)} 字符）",
@@ -1847,8 +1872,24 @@ class TenantSession:
             ):
                 # Optionally top-up ::/0 if this VCN actually supports IPv6.
                 if include_ipv6:
-                    existing_dests = {(getattr(r, "destination", "") or "").strip() for r in rules}
-                    if "::/0" not in existing_dests:
+                    # 目的地址**和**下一跳都要对上，不能只看目的地址。
+                    #
+                    # 只比 destination 的话，一条已经存在但指向别处（NAT 网关、
+                    # 另一个 IGW、服务网关）的 ::/0 会被当成「已经配好了」，于是
+                    # 什么都不做 —— 实例拿到 IPv6 地址、路由表看着也有 ::/0，
+                    # 但出网根本不通，而创建流程一路报成功。
+                    v6 = [
+                        r
+                        for r in rules
+                        if (getattr(r, "destination", "") or "").strip() == "::/0"
+                    ]
+                    correct = any(
+                        (getattr(r, "network_entity_id", "") or "") == igw_id for r in v6
+                    )
+                    if not correct:
+                        # 指错地方的那条要换掉，不是再加一条：同一个目的地址出现
+                        # 两条规则，Oracle 会直接拒绝这次 update。
+                        rules = [r for r in rules if r not in v6]
                         rules.append(
                             oci.core.models.RouteRule(
                                 destination="::/0",
@@ -6570,6 +6611,60 @@ def is_rate_limit_message(text: str) -> bool:
             "user-rate limit",
             "rate limit exceeded",
             "[429]",
+        )
+    )
+
+
+def is_transient_error(exc: Any = None, text: str = "") -> bool:
+    """区分「等一会儿再试就好」和「配置错了，再试一万次也一样」。
+
+    抢机任务的错误分类以前只有两档：容量错误 → 退避重试，**其他一律永久失败**
+    （enabled=False、状态 failed、不再调度）。于是一次 DNS 抖动、一次 TLS 握手
+    超时、Oracle 侧一个 503，都会把一个准备跑一整夜的任务在第一次抖动时杀死 ——
+    操作员早上看到的是「❌ 遇到非容量错误」，机器一台没有，而错误本身早就过去了。
+
+    这里只认那些**明确**属于传输层/服务端临时故障的形态；认不出来的仍然按永久
+    错误处理（配置错误必须停下来，而不是拿着错参数无限重发）。
+    """
+    status = getattr(exc, "status", None) if exc is not None else None
+    try:
+        # 500/502/503/504：Oracle 自己的服务端故障或网关问题，重试是正确响应。
+        # 注意 500 InternalError 里带 "capacity" 的那种由 is_capacity_error 先接走。
+        if int(status) in (500, 502, 503, 504):
+            return True
+    except (TypeError, ValueError):
+        pass
+    if exc is not None and isinstance(
+        exc, (TimeoutError, ConnectionError, socket.timeout, socket.gaierror)
+    ):
+        return True
+    code = str(getattr(exc, "code", "") or "").lower() if exc is not None else ""
+    blob = f"{code} {getattr(exc, 'message', '') if exc is not None else ''} {text}".lower()
+    return any(
+        k in blob
+        for k in (
+            "[500]",
+            "[502]",
+            "[503]",
+            "[504]",
+            "internalservererror",
+            "serviceunavailable",
+            "service unavailable",
+            "bad gateway",
+            "gateway timeout",
+            "connection reset",
+            "connection aborted",
+            "connection refused",
+            "connectionerror",
+            "read timed out",
+            "readtimeout",
+            "connecttimeout",
+            "timed out",
+            "temporary failure in name resolution",
+            "name or service not known",
+            "eof occurred in violation of protocol",
+            "remote end closed connection",
+            "max retries exceeded",
         )
     )
 

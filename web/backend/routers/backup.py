@@ -215,6 +215,25 @@ def export_encrypted_zip(
                 f"tenants.json 为加密信封（格式版本 {BACKUP_ENVELOPE_VERSION}）：\n"
                 "  PBKDF2-HMAC-SHA256 / 390000 轮 + Fernet，口令与本 zip 相同。\n"
                 "  只能通过面板的「导入备份」还原，用解压工具打开只会看到密文。\n"
+                f"\n本备份包含 {len(tenants_payload)} 个租户。\n"
+                # 漏掉的租户必须写进压缩包本身。
+                #
+                # 这份清单以前只出现在 X-OCIBot-Backup-Notice 响应头里，而前端一个
+                # 读它的地方都没有 —— 主密钥轮换之后，导出会安静地少掉几个租户，
+                # 界面照样显示「备份已下载」。几个月后拿着这个文件去恢复的人，正是
+                # 最需要知道「少了谁」的人，而他手边只有这个 zip。
+                + (
+                    "".join(
+                        [
+                            f"\n⚠ 另有 {len(skipped)} 个租户**未包含**在本备份中"
+                            "（私钥无法解密，通常是 OCIBOT_MASTER_KEY 变了）：\n"
+                        ]
+                        + [f"  - {item['name']}（{item['reason']}）\n" for item in skipped]
+                        + ["恢复这些租户需要原来的主密钥，或者重新填一次 API Key。\n"]
+                    )
+                    if skipped
+                    else ""
+                )
             ).encode("utf-8"),
         )
     buf.seek(0)

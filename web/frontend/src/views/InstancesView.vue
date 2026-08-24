@@ -477,10 +477,19 @@ async function batchPower(action: string) {
       const ins = targets[i]
       batchProgress.value = `${i + 1}/${targets.length} · ${ins.display_name}`
       try {
-        await api.post(`/tenants/${ins.tenant_id || tenantId.value}/instances/${ins.id}/power`, {
-          action,
-        })
-        okCount++
+        // 2xx ≠ 成功。这个接口把 OCI 的失败包成 200 + {ok:false,message}（只有
+        // 传输层/权限错误才抛 502），所以以前的 `await; okCount++` 会把「全部失败」
+        // 报成「N/N 成功」的绿条，失败原因一条都不显示。root-password 那条路径
+        // 一直是查 data.ok 的，这里当时漏了。
+        const { data } = await api.post<{ ok?: boolean; message?: string }>(
+          `/tenants/${ins.tenant_id || tenantId.value}/instances/${ins.id}/power`,
+          { action },
+        )
+        if (data && data.ok === false) {
+          failures.push(`${ins.display_name}: ${data.message || '失败'}`)
+        } else {
+          okCount++
+        }
       } catch (e: any) {
         failures.push(`${ins.display_name}: ${e?.message || '失败'}`)
       }
@@ -762,13 +771,27 @@ async function power(ins: Instance, action: string) {
   try {
     const tid = ins.tenant_id || tenantId.value
     const { data } = await api.post(`/tenants/${tid}/instances/${ins.id}/power`, { action })
-    msg.value = data.message || `${action} 已提交`
+    applyResult(data, `${action} 已提交`)
     await load()
   } catch (e: any) {
     error.value = e?.message || '操作失败'
   } finally {
     acting.value = ''
   }
+}
+
+/**
+ * 把 {ok, message} 这类响应分发到绿框或红框。
+ *
+ * 这些接口只有传输层/权限错误才抛 502；OCI 自己拒绝（实例状态不对、被终止保护
+ * 挡下、配额不足…）返回的是 **200 + ok:false**。以前这几处一律 `msg.value =
+ * data.message`，于是失败原因被印在绿色的成功框里 —— 文案是对的，颜色是反的，
+ * 操作员据此以为机器已经关掉/改名/终止了。
+ */
+function applyResult(data: any, fallback: string) {
+  const text = (data && data.message) || fallback
+  if (data && data.ok === false) error.value = text
+  else msg.value = text
 }
 
 async function rename(ins: Instance) {
@@ -782,7 +805,7 @@ async function rename(ins: Instance) {
     const { data } = await api.post(`/tenants/${tid}/instances/${ins.id}/rename`, {
       display_name: name.trim(),
     })
-    msg.value = data.message || '已重命名'
+    applyResult(data, '已重命名')
     await load()
   } catch (e: any) {
     error.value = e?.message || '重命名失败'
@@ -801,7 +824,7 @@ async function terminate(ins: Instance) {
     const { data } = await api.post(`/tenants/${tid}/instances/${ins.id}/terminate`, {
       preserve_boot_volume: false,
     })
-    msg.value = data.message || '终止已提交'
+    applyResult(data, '终止已提交')
     await load()
   } catch (e: any) {
     error.value = e?.message || '终止失败'

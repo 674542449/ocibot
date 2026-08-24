@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 from datetime import datetime, timezone
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
@@ -347,6 +347,14 @@ def update_tenant(
     return _to_out(row)
 
 
+def _home_region_of(session: Any) -> str:
+    """这个账号的主区 id，读不出来就返回 ""（调用方据此放行，不做拦截）。"""
+    from web.backend.quota_guard import region_pair
+
+    _current, home = region_pair(session)
+    return home
+
+
 def _root_tenant(db: Session, row: Tenant) -> Tenant:
     """The primary row of this tenancy — 副区 rows hang off it, never off each other."""
     parent_id = getattr(row, "parent_tenant_id", "") or ""
@@ -530,6 +538,19 @@ def subscribe_tenant_region(
         if existing is not None:
             tenant_out = _to_out(existing)
             message += f"；面板中已有该区域租户「{existing.name}」"
+        elif region_name == _home_region_of(session):
+            # 主区不能被添加成「副区」行。
+            #
+            # 副区行带 parent_tenant_id 且 free_only_mode=False，而这两样正是
+            # enforce_launch_quota 跳过免费额度检查的依据 —— 给主区建这样一行，
+            # 等于在**唯一存在 Always Free 的区域**里永久关掉了额度守卫。
+            # 到得了这里的前提是主租户行的 region 和真实主区不一致（改过 Region、
+            # 或当初下载 config 时控制台停在别的区域），并不罕见。
+            message += (
+                f"；{region_name} 是该账号的主区，不能添加为副区租户。"
+                "如果面板里主租户的 Region 填的不是主区，请直接在「编辑」里改过来 —— "
+                "副区行会关闭免费额度检查，用在主区上会让 Always Free 的限额失效。"
+            )
         else:
             label = region_area(region_name)
             # Tenant.name is VARCHAR(128) and the parent may already be that long.

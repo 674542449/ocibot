@@ -240,6 +240,11 @@ const addEvents = ref<string[]>(EVENTS.map((e) => e.key))
 
 function clearAddConfig() {
   Object.keys(addConfig).forEach((k) => delete addConfig[k])
+  // 事件勾选也要复位。EVENTS 目前只有一项，取消勾选就 POST events: []，
+  // 后端会照收（空列表 = 谁也不订阅），而这里以前不复位，于是**之后新建的每一个
+  // 渠道**都继承了这个空列表：界面上状态显示「启用」、点测试也报绿，实际一条都不发。
+  // 列表页又没有事件编辑入口，只能改数据库或手发 PATCH 才能救回来。
+  addEvents.value = EVENTS.map((e) => e.key)
 }
 
 // 换渠道类型必须清空 addConfig。它是所有类型共用的**一个** dict，切类型只是换了

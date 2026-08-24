@@ -365,7 +365,13 @@ def boot_volume_update(
             )
             if not in_secondary:
                 usage = quota_guard.usage_snapshot(session, free_only_mode=free_only)
-                blocked = quota_guard._blocked_by_incomplete_read(usage, free_only)
+                # tier 必须传：不传的话这道闸门退回 `hard = bool(free_only_mode)`，
+                # 而紧接着两行的 validate_boot_resize_against_quota 用的是
+                # hard_free_caps(free_only, tier)。于是一个 account_tier=""/"free"
+                # 却关掉了 free_only 的租户，用量读得到时被硬挡、读失败（429）时
+                # 反而放行 —— 限流路径比正常路径更宽松。
+                # 0.4.85 修 storage.py 时漏了这一处，是同一个 bug 的另一半。
+                blocked = quota_guard._blocked_by_incomplete_read(usage, free_only, tier)
                 if blocked:
                     raise HTTPException(status_code=503, detail=blocked)
                 guard = free_quota.validate_boot_resize_against_quota(

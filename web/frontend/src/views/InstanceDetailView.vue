@@ -188,7 +188,7 @@
               <polygon
                 v-if="(metricsSeries[key] || []).length > 1"
                 :fill="`url(#g-${key})`"
-                :points="sparkArea(metricsSeries[key] || [])"
+                :points="sparkArea(metricsSeries[key] || [], key)"
               />
               <polyline
                 fill="none"
@@ -196,7 +196,7 @@
                 stroke-width="2.2"
                 stroke-linecap="round"
                 stroke-linejoin="round"
-                :points="sparkPoints(metricsSeries[key] || [])"
+                :points="sparkPoints(metricsSeries[key] || [], key)"
               />
               <circle
                 v-if="metricHover[key]"
@@ -1168,42 +1168,56 @@ function formatMetricTime(ts: string | null | undefined) {
   }
 }
 
-function sparkLayout(points: any[]) {
+// cpu / memory 是百分比，天然的坐标轴就是 0–100，不该按本段数据的峰值归一化。
+// 归一化的后果是：一台常年 2% 的空闲机器和一台跑满 99% 的机器画出来**一模一样**
+// 的一条高位曲线（卡片上没有轴、没有网格线、没有刻度，看不出区别），只有页脚那个
+// 数字是对的。net_in / net_out 没有天然上限，仍然按峰值缩放。
+const FIXED_PCT_KEYS = new Set(['cpu', 'memory'])
+
+function sparkLayout(points: any[], key = '') {
   const vals = points
     .map((p) => Number(p?.[1] ?? 0))
     .map((v) => (Number.isFinite(v) ? v : 0))
+  const fixed = FIXED_PCT_KEYS.has(key)
   if (!vals.length) {
-    return { vals: [] as number[], max: 1, min: 0, span: 1 }
+    return { vals: [] as number[], max: fixed ? 100 : 1, min: 0, span: fixed ? 100 : 1 }
   }
-  const max = Math.max(...vals, 1)
-  const min = Math.min(...vals, 0)
+  // 固定轴仍然对超过 100 的读数让步（Oracle 偶尔会报 >100 的瞬时值），
+  // 否则曲线会画到卡片外面去。
+  const max = fixed ? Math.max(100, ...vals) : Math.max(...vals, 1)
+  const min = fixed ? 0 : Math.min(...vals, 0)
   const span = Math.max(max - min, 1e-9)
   return { vals, max, min, span }
 }
 
-function sparkXY(points: any[], index: number) {
-  const { vals, min, span } = sparkLayout(points)
-  if (!vals.length) return { x: 0, y: svgH / 2 }
-  const i = Math.max(0, Math.min(index, vals.length - 1))
-  const x = (i / Math.max(vals.length - 1, 1)) * (svgW - 8) + 4
-  const y = svgH - 8 - ((vals[i] - min) / span) * (svgH - 16)
-  return { x, y }
+function sparkY(v: number, min: number, span: number) {
+  return svgH - 8 - ((v - min) / span) * (svgH - 16)
 }
 
-function sparkPoints(points: any[]) {
-  const { vals, min, span } = sparkLayout(points)
+function sparkXY(points: any[], index: number, key = '') {
+  const { vals, min, span } = sparkLayout(points, key)
+  if (!vals.length) return { x: 0, y: svgH / 2 }
+  const i = Math.max(0, Math.min(index, vals.length - 1))
+  // 只有一个采样时把它放在卡片中间：`i / max(n-1, 1)` 会把它钉在最左边，
+  // 而 polyline 只有一个点又画不出线段，于是卡片全空、悬停圆点却贴在左上角。
+  const x =
+    vals.length === 1 ? svgW / 2 : (i / (vals.length - 1)) * (svgW - 8) + 4
+  return { x, y: sparkY(vals[i], min, span) }
+}
+
+function sparkPoints(points: any[], key = '') {
+  const { vals, min, span } = sparkLayout(points, key)
   if (!vals.length) return ''
   return vals
     .map((v, i) => {
-      const x = (i / Math.max(vals.length - 1, 1)) * (svgW - 8) + 4
-      const y = svgH - 8 - ((v - min) / span) * (svgH - 16)
-      return `${x.toFixed(1)},${y.toFixed(1)}`
+      const x = vals.length === 1 ? svgW / 2 : (i / (vals.length - 1)) * (svgW - 8) + 4
+      return `${x.toFixed(1)},${sparkY(v, min, span).toFixed(1)}`
     })
     .join(' ')
 }
 
-function sparkArea(points: any[]) {
-  const line = sparkPoints(points)
+function sparkArea(points: any[], key = '') {
+  const line = sparkPoints(points, key)
   if (!line) return ''
   // Close the area path against the bottom of the sparkline viewport.
   return `4,${(svgH - 4).toFixed(1)} ${line} ${(svgW - 4).toFixed(1)},${(svgH - 4).toFixed(1)}`
@@ -1233,9 +1247,13 @@ function onMetricHover(ev: MouseEvent | TouchEvent, key: string) {
   let clientX = 0
   if ('touches' in ev && ev.touches.length) clientX = ev.touches[0].clientX
   else if ('clientX' in ev) clientX = (ev as MouseEvent).clientX
-  const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / Math.max(rect.width, 1)))
+  // 采样点画在 viewBox 的 4..(svgW-4) 之间，不是 0..svgW —— 按整个卡片宽度换算
+  // 会在两端各错约 1.3% 的采样数（24 小时窗口 = 十几分钟），悬停圆点跟光标也对不齐。
+  const frac = (clientX - rect.left) / Math.max(rect.width, 1)
+  const inPlot = (frac * svgW - 4) / Math.max(svgW - 8, 1)
+  const ratio = Math.min(1, Math.max(0, inPlot))
   const index = Math.round(ratio * Math.max(points.length - 1, 0))
-  const { x, y } = sparkXY(points, index)
+  const { x, y } = sparkXY(points, index, key)
   const raw = points[index] || []
   const value = Number(raw?.[1] ?? 0)
   const tipPct = Math.min(86, Math.max(8, (x / svgW) * 100))
@@ -1490,6 +1508,25 @@ async function loadBoot() {
   }
 }
 async function updateBoot() {
+  // 没读过当前值就不许提交。
+  //
+  // bootForm.vpus_per_gb 的初值是 10，而这张表单不管有没有加载过引导卷信息都会
+  // 渲染。于是在一块 120 VPUs/GB 的盘上，只填个新容量点提交 —— 表单会把「10」
+  // 一起发上去，把性能从 120 静默降到 10，界面上没有任何地方提示过这件事。
+  if (!bootInfo.value) {
+    error.value = '请先点「刷新状态」读取当前引导卷，否则会用默认值覆盖现有的性能等级。'
+    return
+  }
+  if (
+    bootInfo.value.vpus_per_gb != null &&
+    bootForm.vpus_per_gb < bootInfo.value.vpus_per_gb &&
+    !confirm(
+      `性能等级将从 ${bootInfo.value.vpus_per_gb} 降到 ${bootForm.vpus_per_gb} VPUs/GB，` +
+        '磁盘吞吐和 IOPS 会随之下降。确认继续？',
+    )
+  ) {
+    return
+  }
   // 这一发会把 SSH 凭证连同扩容请求一起送到某台机器上，返回的还是那台机器的
   // shell 输出 —— 目标必须在入口就锁死，回来时人已经换页就别再往下写。
   const act = beginAction()
@@ -1534,6 +1571,18 @@ async function updateBoot() {
 async function updateShape() {
   if (!isFlexShape.value) {
     error.value = '当前 Shape 为固定规格，不允许修改 OCPU / 内存'
+    return
+  }
+  // 改规格是要重启机器的（Oracle 的 UpdateInstance 走的是 reboot migration），
+  // 页面上却只有一个「应用规格」按钮，没有任何地方说过这件事。跑着服务的机器
+  // 会当场断线，所以这一步必须先问一句 —— 其他会中断服务的操作（终止、关机）
+  // 一直都有确认框，这里当时漏了。
+  if (
+    !confirm(
+      `将规格改为 ${shapeForm.ocpus} OCPU / ${shapeForm.memory_in_gbs} GB。\n\n` +
+        'Oracle 会为此重启这台实例，运行中的服务会中断。确认继续？',
+    )
+  ) {
     return
   }
   const act = beginAction()

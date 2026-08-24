@@ -259,8 +259,14 @@ def build_quota_snapshot(
         remaining = max(0.0, float(limit) - float(used))
         ratio = (float(used) / float(limit)) if limit else 0.0
         if used > limit + 1e-9:
-            # Soft caps (public IP) never contribute a hard "over" to overall.
-            status = "critical" if soft else "over"
+            # soft 桶也报 "over"。
+            #
+            # 「不参与硬性 overall」这件事已经由下面的汇总循环做了（`if b.get("soft"):
+            # continue`），在这里把状态降级成 critical 是多余的，代价是徽章说谎：
+            # 前端把 critical 显示成「接近上限」，于是一个 3/2 个公网 IP、或者用掉
+            # 15000/10240 GB 出网（超出部分是要计费的）的桶，徽章写着「接近上限」，
+            # 紧挨着的数字却明明白白写着已经超了。
+            status = "over"
         elif limit and used >= limit - 1e-9:
             # Exactly at the cap. On a *free allowance* that is the intended end
             # state — two of two free micros running is the whole point — so it is

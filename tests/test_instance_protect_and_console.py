@@ -171,7 +171,16 @@ class _ConsoleCompute(_Compute):
         return _Resp(SimpleNamespace(id=hid, lifecycle_state=self._states[0]))
 
     def get_console_history_content(self, hid, length=None):
-        return _Resp(SimpleNamespace(value=self._content))
+        raw = getattr(self, "_content_bytes", None)
+        if raw is not None:
+            return _Resp(raw)
+        # **bytes**，不是带 .value 的对象：SDK 对这个调用声明的是
+        # response_type="bytes"，base_client 直接返回 response.content。
+        #
+        # 这里原本 stub 成 SimpleNamespace(value=...)，那是 SDK 根本产生不出来的
+        # 形状 —— 于是测试断言的是一条只存在于测试里的代码路径，而真实路径把整段
+        # 日志渲染成了 Python 的 bytes repr，测试却全绿。
+        return _Resp(self._content.encode("utf-8"))
 
 
 def test_capture_returns_the_boot_log():
@@ -181,6 +190,36 @@ def test_capture_returns_the_boot_log():
     assert r.ok, r.message
     assert r.data["content"] == "fstab: mount failed"
     assert c.captured == 1
+
+
+def test_the_log_is_decoded_not_repr_ed():
+    """The bug the old stub hid.
+
+    `.data` is bytes; str(bytes) yields a one-line Python repr where newlines
+    are two literal characters and non-ASCII becomes an escape. Asserted on a
+    multi-line, non-ASCII payload because both symptoms appear there.
+    """
+    log = "[    0.000000] Linux version 6.8\\n[    3.114] 挂载失败\\n"
+    c = _ConsoleCompute(["SUCCEEDED"], content=log)
+
+    out = _session(c).capture_console_output("ocid1.instance.oc1..i").data["content"]
+
+    assert not out.startswith("b'"), "rendered a bytes repr: %r" % out[:40]
+    assert out.count("\\n") == 2, "newlines were escaped instead of preserved"
+    assert "挂载失败" in out
+    assert "\\\\x" not in out
+
+
+def test_undecodable_bytes_do_not_raise():
+    """Serial output is not guaranteed to be clean UTF-8 — early kernel output
+    can be another encoding, and the read can cut a multi-byte character in
+    half. A partially garbled log still beats an exception."""
+    c = _ConsoleCompute(["SUCCEEDED"])
+    c._content_bytes = b"ok \\xff\\xfe bad"
+
+    r = _session(c).capture_console_output("ocid1.instance.oc1..i")
+    assert r.ok, r.message
+    assert "ok" in r.data["content"]
 
 
 def test_capture_polls_until_ready():

@@ -741,7 +741,21 @@ def launch_quota_check(
     # 才被 503 挡下。本路由的 docstring 写着「面板的预检结论不会和服务端漂移」，
     # 而这正是一处漂移。read_incomplete 虽然也传了出去，但它只渲染在额度预览
     # 面板里，那个看起来更权威的「校验结论」框对此只字不提。
-    if out["read_incomplete"]:
+    # 只在**创建路径真的会拒绝**时才拦。
+    #
+    # 0.4.85 修「预检比服务端宽松」时把这里写成了无条件拦截，于是在另一个方向
+    # 造出了同样的漂移：enforce_launch_quota 只在 hard_free_caps(free_only, tier)
+    # 为真时才 503，而 (free_only=False, tier="paid") 这一组合是不拦的。结果预检
+    # 说「创建会被服务端拒绝」，LaunchView 据此连确认框都不打开 —— 付费租户从 UI
+    # 上彻底无法创建，而实际提交是会成功的。
+    #
+    # 而且这不是偶发：0.4.84 查明缺少 inspect compartments 权限会让 read_incomplete
+    # **永久为真**，正是那一类租户会被永久锁死，还附一条假的权限解释。
+    # 局部 import：本模块里 `free_quota` 已经是下面那个路由函数的名字，
+    # 模块名被它遮住了。
+    from app.free_quota import hard_free_caps
+
+    if out["read_incomplete"] and hard_free_caps(free_only, out["account_tier"]):
         reason = (
             "无法完整读取 Always Free 用量（部分 compartment 读取失败），"
             "因此无法判断额度是否够用。创建会被服务端拒绝 —— "

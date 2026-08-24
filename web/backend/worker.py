@@ -36,6 +36,7 @@ from app.oci_client import (  # noqa: E402
     is_capacity_message,
     is_rate_limit_error,
     is_rate_limit_message,
+    is_transient_error,
     SessionManager,
 )
 from app.scheduler import (  # noqa: E402
@@ -425,20 +426,38 @@ class Worker:
         # billing, so the free-cap machinery is skipped for the whole attempt.
         secondary_region = False
         try:
-            from web.backend.quota_guard import is_secondary_region, tenant_is_secondary
+            from web.backend.quota_guard import resolve_secondary
 
-            secondary_region = tenant_is_secondary(tenant) or is_secondary_region(session)
+            # 以前是 `tenant_is_secondary(tenant) or is_secondary_region(session)` ——
+            # DB hint 排在前面，于是一个 region 等于主区的子行会被判成副区，
+            # 下面整段免费额度检查被跳过。判定统一收在 resolve_secondary 里。
+            secondary_region = resolve_secondary(session, tenant)
         except Exception as exc:  # noqa: BLE001
             log.warning("capacity region probe job=%s failed: %s", job.id, exc)
         try:
             from web.backend.quota_guard import free_only_for_tenant, usage_snapshot
 
+            # 判断依据必须是 hard_free_caps，不是 free_only_for_tenant。
+            #
+            # 「免费上限是硬阻断还是只警告」的规则是
+            # `free_only or tier in {"", "free", "unknown"}`。account_tier 默认就是
+            # ""（没人点过「等级查询」的租户都是），所以一个关掉了「仅使用免费额度」
+            # 的普通租户满足 hard_free_caps 但不满足 free_only_for_tenant ——
+            # 于是这个「读不全就推迟」的兜底整个被跳过，而 check_launch_quota 自己
+            # 那次读取失败时会退化成 {"read_incomplete": True}，校验器把它当成
+            # 「一点没用」，于是限流路径**比正常路径更宽松**，真的开出一台计费实例。
+            #
+            # API 路径对同样的配置是 503 拒绝的。这是 AUDIT pass 11 那条「一个共享
+            # 判断函数」的第三个调用点，当时没接上。
+            from app.free_quota import hard_free_caps
+
+            free_only = free_only_for_tenant(tenant)
             if (
                 not secondary_region
                 and hasattr(session, "get_free_quota_usage")
-                and free_only_for_tenant(tenant)
+                and hard_free_caps(free_only, tier)
             ):
-                snapshot = usage_snapshot(session, free_only_mode=True)
+                snapshot = usage_snapshot(session, free_only_mode=free_only)
                 pre_snapshot = snapshot
                 if snapshot.get("read_incomplete"):
                     # Do NOT launch on an undercount — a partial read looks like
@@ -474,8 +493,23 @@ class Worker:
         # have changed since the job was enqueued). Hard block → fail the job
         # instead of burning attempts / creating billable overage.
         try:
-            from web.backend.quota_guard import check_launch_quota
+            # free_only_for_tenant 也在这里再导一次：上面那处 import 在自己的
+            # try 里，那个 try 失败时这个名字就不存在了，而这里的判断不能跟着消失。
+            from web.backend.quota_guard import check_launch_quota, free_only_for_tenant
 
+            if secondary_region and free_only_for_tenant(tenant):
+                # 任务入队时这个租户是允许计费的（API 不接受 free_only 的副区任务），
+                # 但用户之后可以在租户页把「仅使用免费额度」重新勾上。任务是长期
+                # 挂着跑的，这个翻转必须被看见 —— 否则一个明确表示「只要免费」的
+                # 用户，会在副区被开出一台按量计费的机器。
+                msg = "该副区租户已勾选「仅使用免费额度」，而副区资源一律计费，任务已停止"
+                self._log_attempt(db, job, ok=False, message=msg, ad=ad, config_label=cfg_label)
+                job.enabled = False
+                job.status = "failed"
+                job.last_error = msg
+                job.next_run_at = None
+                self._notify_capacity_end(db, job, reason=f"额度守卫：{msg}")
+                return
             if secondary_region:
                 log.info("capacity quota check skipped job=%s (副区，按量计费)", job.id)
             elif not hasattr(session, "get_free_quota_usage"):
@@ -550,7 +584,7 @@ class Worker:
         except Exception as exc:  # noqa: BLE001
             msg = str(exc)
             self._log_attempt(db, job, ok=False, message=msg, ad=ad, config_label=cfg_label)
-            self._handle_capacity_error(db, job, msg, interval, exc=exc)
+            self._handle_capacity_error(db, job, msg, interval, exc=exc, cfg=cfg_override)
             return
 
         if result.ok:
@@ -593,13 +627,27 @@ class Worker:
                     log.exception("schedule boot vpu failed job=%s", job.id)
             display_name = str(payload.get("display_name") or "instance")
             shape = str(payload.get("shape") or "")
+            # 先落库，再发通知 —— 顺序不能反。
+            #
+            # notify_user 会做网络 I/O（SMTP 最坏情况几分钟，见 notify.py 的
+            # _TOTAL_DEADLINE_SEC 注释）。在它之前，job.status/success_instance_id
+            # 和 _log_attempt 的 INSERT 都还只是未提交的写事务：
+            #   * SQLite（默认部署）：整库写锁被占住，这段时间内所有登录、审计、
+            #     租户编辑全部 `database is locked`；
+            #   * PostgreSQL：一个几分钟的 idle-in-transaction 压着 capacity_jobs 的行锁。
+            # 更糟的是 notify_user 内部失败会让 PG 事务进入 aborted 状态，finally
+            # 里的 commit 随之抛出，**这次抢机成功的结果连同 OCID 一起被回滚**，
+            # 而机器已经开出来了。通知是 best-effort 的，本来就不需要待在事务里。
+            owner_id = job.owner_id
+            job_name, job_attempts = job.name, job.attempts
+            db.commit()
             notify_user(
                 db,
-                job.owner_id,
+                owner_id,
                 "capacity",
                 "🎉 OCIBot 抢机成功",
                 (
-                    f"任务「{job.name}」第 {job.attempts} 次尝试成功！\n"
+                    f"任务「{job_name}」第 {job_attempts} 次尝试成功！\n"
                     f"实例：{display_name}\n"
                     f"型号：{shape}" + (f"（{cfg_label}）" if cfg_label else "") + "\n"
                     f"可用域：{ad}\n"
@@ -611,7 +659,7 @@ class Worker:
 
         msg = result.message or "Launch failed"
         self._log_attempt(db, job, ok=False, message=msg, ad=ad, config_label=cfg_label)
-        self._handle_capacity_error(db, job, msg, interval, exc=None)
+        self._handle_capacity_error(db, job, msg, interval, exc=None, cfg=cfg_override)
 
     def _log_attempt(
         self,
@@ -688,6 +736,7 @@ class Worker:
         interval: int,
         *,
         exc: Optional[BaseException],
+        cfg: Optional[dict[str, Any]] = None,
     ) -> None:
         job.last_error = msg[:2000]
         now = _utcnow()
@@ -719,12 +768,80 @@ class Worker:
             log.info("capacity OutOfHost job=%s next_in=%ss", job.id, delay)
             return
 
+        if is_transient_error(exc, msg):
+            # 传输层抖动 / Oracle 5xx 不是「永久错误」。
+            #
+            # 以前这里只有「容量」和「其他」两档，一次 DNS 抖动、一次读超时、一个
+            # 503，都会走到下面把任务 enabled=False 彻底停掉。抢机任务本来就是要挂
+            # 一整夜的，第一次网络抖动就死掉，早上看到的是一条「遇到非容量错误」，
+            # 而那个错误早已不存在。按容量错误同样的节奏退避重试即可，最大次数的
+            # 停止条件仍然生效，不会变成无限重试。
+            jitter = interval * RETRY_JITTER_FRACTION * random.random()
+            delay = max(MIN_RETRY_INTERVAL_SEC, int(interval + jitter))
+            job.next_run_at = now + timedelta(seconds=delay)
+            job.status = "idle"
+            if job.attempts >= clamp_max_attempts(job.max_attempts):
+                job.enabled = False
+                job.status = "failed"
+                job.last_error = f"已达最大次数：{msg}"[:2000]
+                self._notify_capacity_end(db, job, reason="max_attempts")
+            log.warning("capacity transient job=%s next_in=%ss: %s", job.id, delay, msg[:200])
+            return
+
         # Non-capacity permanent error
+        #
+        # 只有备用配置这一档失败时，不该把整个任务判死：AD × 配置的轮换里，
+        # 备用配置只占其中几格，主配置和其他 AD 可能完全正常。把这一格从轮换里
+        # 摘掉继续跑，比让一个填错的备用规格拖垮整晚的抢机划算。
+        dropped = self._drop_failing_fallback(job, cfg)
+        if dropped:
+            jitter = interval * RETRY_JITTER_FRACTION * random.random()
+            delay = max(MIN_RETRY_INTERVAL_SEC, int(interval + jitter))
+            job.next_run_at = now + timedelta(seconds=delay)
+            job.status = "idle"
+            job.last_error = f"备用配置 {dropped} 被 Oracle 拒绝，已从轮换中移除：{msg}"[:2000]
+            log.warning("capacity dropped fallback %s job=%s: %s", dropped, job.id, msg[:200])
+            return
+
         job.enabled = False
         job.status = "failed"
         job.next_run_at = None
         log.error("capacity permanent fail job=%s: %s", job.id, msg[:300])
         self._notify_capacity_end(db, job, reason="permanent")
+
+    @staticmethod
+    def _drop_failing_fallback(job: CapacityJob, cfg: Optional[dict[str, Any]]) -> str:
+        """把这次尝试用的备用配置从轮换里摘掉，返回它的标签；主配置则返回 ""。
+
+        cfg 是 _attempt_plan 这一轮实际选中的那一格，由调用方原样传下来 —— 不在这里
+        用 attempts 反推，因为 attempts 在调用 OCI 之前就 +1 过了，反推必然差一格，
+        摘错的那一格会是无辜的。
+
+        主配置（cfg is None）那一格不摘：主配置错了就是任务本身填错了，应该停下来
+        让操作员改，而不是拿着同样的错参数继续发请求。
+        """
+        if not isinstance(cfg, dict):
+            return ""
+        want = (cfg.get("ocpus"), cfg.get("memory_in_gbs"))
+        kept = []
+        hit = False
+        for fb in job.fallback_configs or []:
+            if (
+                not hit
+                and isinstance(fb, dict)
+                and (fb.get("ocpus"), fb.get("memory_in_gbs")) == want
+            ):
+                hit = True
+                continue
+            kept.append(fb)
+        if not hit:
+            return ""
+        try:
+            label = f"{float(want[0]):g}C/{float(want[1]):g}G"
+        except (TypeError, ValueError):
+            label = "?"
+        job.fallback_configs = kept
+        return label
 
     def _notify_capacity_end(self, db: Session, job: CapacityJob, *, reason: str) -> None:
         title = "⏹ OCIBot 容量重试已停止"
@@ -733,6 +850,15 @@ class Worker:
                 f"任务「{job.name}」已达最大重试次数（{job.attempts}/{job.max_attempts}），已自动停止。\n"
                 f"最近错误：{(job.last_error or '')[:300]}\n"
                 "如需继续，请在任务中心调整后重新启动。"
+            )
+        elif reason.startswith("额度守卫："):
+            # 这条分支以前不存在，于是额度守卫的停止落进了下面的 else，被标题成
+            # 「❌ 容量重试失败 / 遇到非容量错误」—— 把面板自己做出的免费额度拦截
+            # 说成是 Oracle 报的错，操作员会去查 API Key 而不是去看额度。
+            body = (
+                f"任务「{job.name}」被面板的免费额度守卫拦下，已停止（第 {job.attempts} 次尝试）。\n"
+                f"{reason[len('额度守卫：'):][:400]}\n"
+                "这不是 Oracle 的错误：继续尝试会开出计费实例。请先在「账户」页确认剩余免费额度。"
             )
         else:
             title = "❌ OCIBot 容量重试失败"

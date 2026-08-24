@@ -40,6 +40,17 @@ _HTTP_TIMEOUT = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
 _TOTAL_DEADLINE_SEC = 15.0
 _MAX_RESPONSE_BYTES = 16 * 1024
 _SMTP_TIMEOUT = 20.0
+# 一次 SMTP 会话的**总**墙钟上限。
+#
+# _SMTP_TIMEOUT 传给 smtplib 后只是 socket 超时，管的是单次 recv，不是整个会话。
+# 一次投递要走 connect / banner / EHLO / STARTTLS / EHLO / AUTH / MAIL / RCPT /
+# DATA / end-of-data 十来个来回，每一个都能各自用满 20 秒 —— 实测一台每次响应
+# 前拖 0.8 秒的服务器就能把「20 秒超时」变成 6.5 倍，而恶意/半死的服务器可以到
+# 200 秒。notify_user 只在**每个渠道之前**看一眼 60 秒预算（_SEND_BUDGET_SEC），
+# 中途不看，所以一个卡住的邮件服务器会直接顶穿预算，并且因为
+# notify_user 是在 worker 的抢机循环里调用的，全站其他用户的抢机尝试跟着一起等。
+# HTTP 路径早就有等价的 _TOTAL_DEADLINE_SEC，SMTP 当时漏掉了。
+_SMTP_TOTAL_DEADLINE_SEC = 45.0
 # Fan-out limits for one notify_user() call.
 _MAX_SENDS_PER_EVENT = 20
 _SEND_BUDGET_SEC = 60.0
@@ -271,7 +282,23 @@ def _send_serverchan(config: dict[str, Any], title: str, body: str) -> tuple[boo
             f"https://sctapi.ftqq.com/{key}.send",
             data={"title": (title or "OCIBot")[:32], "desp": body},
         )
+        # Server酱把成败放在**响应体的 code 里**，HTTP 状态只在 429 时才是错的。
+        # 只看 status == 200 的话，SendKey 过期、当天推送次数用完这类
+        # `200 + {"code":40001,...}` 全都会被报成「已发送」——「测试」按钮跟着一起
+        # 报绿，操作员于是对一条从来没通过的通知链路建立信心。
         if status == 200:
+            try:
+                data = json.loads(payload)
+            except ValueError:
+                data = None
+            if isinstance(data, dict) and "code" in data:
+                if int(data.get("code") or 0) == 0:
+                    return True, "sent"
+                # 固定的厂商域名，回显它自己的 message 是唯一的诊断信息。
+                reason = _sanitize(str(data.get("message") or ""), 120)
+                return False, f"Server酱返回 code={data.get('code')}" + (f"：{reason}" if reason else "")
+            # 响应体不是预期的 JSON（网关插了一页 HTML 之类）：保持旧行为，
+            # 200 依然算发出去了，不因为解析不了就把能用的渠道判死。
             return True, "sent"
         # Fixed vendor host, so a short excerpt is safe and is the only diagnostic.
         return False, _http_error(status, payload, echo=True)
@@ -295,6 +322,24 @@ def _send_webhook(config: dict[str, Any], title: str, body: str) -> tuple[bool, 
             return True, "sent"
         # `url` is user-supplied — status only, never the body. See _http_error.
         return False, _http_error(status)
+
+
+def _smtp_step(server: Optional[smtplib.SMTP], deadline: float) -> None:
+    """在会话的下一步之前收紧 socket 超时，让每一步都不能超过剩余总预算。
+
+    过了总期限就抛 timeout；否则把 socket 超时压到 min(单步超时, 剩余)，
+    这样「所有步骤之和」也被 _SMTP_TOTAL_DEADLINE_SEC 挡住，而不只是单步。
+    """
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise TimeoutError("smtp session exceeded total deadline")
+    if server is not None:
+        sock = getattr(server, "sock", None)
+        if sock is not None:
+            try:
+                sock.settimeout(min(_SMTP_TIMEOUT, left))
+            except OSError:
+                pass
 
 
 def _send_smtp(config: dict[str, Any], title: str, body: str) -> tuple[bool, str]:
@@ -328,6 +373,7 @@ def _send_smtp(config: dict[str, Any], title: str, body: str) -> tuple[bool, str
     msg["To"] = to_addr
 
     server: Optional[smtplib.SMTP] = None
+    deadline = time.monotonic() + _SMTP_TOTAL_DEADLINE_SEC
     try:
         if use_ssl:
             server = smtplib.SMTP_SSL(
@@ -335,6 +381,7 @@ def _send_smtp(config: dict[str, Any], title: str, body: str) -> tuple[bool, str
             )
         else:
             server = smtplib.SMTP(host, port, timeout=_SMTP_TIMEOUT)
+            _smtp_step(server, deadline)
             try:
                 server.starttls(context=ssl.create_default_context())
             except smtplib.SMTPNotSupportedError:
@@ -352,8 +399,13 @@ def _send_smtp(config: dict[str, Any], title: str, body: str) -> tuple[bool, str
                 log.warning(
                     "smtp channel %s:%s authenticating without TLS (require_tls=false)", host, port
                 )
+        _smtp_step(server, deadline)
         server.login(username, password)
+        _smtp_step(server, deadline)
         server.sendmail(from_addr, [to_addr], msg.as_string())
+    except TimeoutError:
+        log.warning("smtp %s:%s exceeded the %.0fs session deadline", host, port, _SMTP_TOTAL_DEADLINE_SEC)
+        return False, f"SMTP 服务器响应过慢，已在 {_SMTP_TOTAL_DEADLINE_SEC:.0f} 秒后放弃本次发送"
     except smtplib.SMTPAuthenticationError:
         return False, "SMTP 认证失败：用户名或密码/授权码不正确"
     except smtplib.SMTPResponseException as exc:
@@ -369,6 +421,14 @@ def _send_smtp(config: dict[str, Any], title: str, body: str) -> tuple[bool, str
         return False, "无法连接 SMTP 服务器（连接失败、超时或 TLS 握手失败）"
     finally:
         if server is not None:
+            # QUIT 也要等对端回一行 221，同样能挂住；给它一个固定的小超时，
+            # 别让收尾动作把上面刚立好的总期限又还回去。
+            sock = getattr(server, "sock", None)
+            if sock is not None:
+                try:
+                    sock.settimeout(5.0)
+                except OSError:
+                    pass
             try:
                 server.quit()
             except Exception:  # noqa: BLE001

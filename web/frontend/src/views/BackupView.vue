@@ -75,7 +75,29 @@ async function doExport() {
     a.download = `ocibot-backup-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.zip`
     a.click()
     URL.revokeObjectURL(url)
-    msg.value = '备份已下载'
+    // 服务端会把「哪些租户没能导出」放在 X-OCIBot-Backup-Notice 里（百分号编码的
+    // JSON，因为 HTTP 头只能是 latin-1）。这里以前不读它，于是主密钥轮换后备份
+    // 悄悄少了几个租户，界面依旧只说一句「备份已下载」—— 等到需要恢复时才发现。
+    let skipped: Array<{ name?: string; reason?: string }> = []
+    let exported: number | null = null
+    try {
+      const raw = res.headers?.['x-ocibot-backup-notice']
+      if (raw) {
+        const notice = JSON.parse(decodeURIComponent(String(raw)))
+        skipped = Array.isArray(notice?.skipped) ? notice.skipped : []
+        exported = typeof notice?.exported === 'number' ? notice.exported : null
+      }
+    } catch {
+      // 头解析失败不该影响已经下载成功的文件；下面退回到原来的提示。
+    }
+    msg.value = exported === null ? '备份已下载' : `备份已下载，包含 ${exported} 个租户`
+    if (skipped.length) {
+      error.value =
+        `⚠ 有 ${skipped.length} 个租户未能写入本次备份（私钥无法解密，通常是 ` +
+        `OCIBOT_MASTER_KEY 变了或 .env 没加载）：` +
+        skipped.map((s) => s?.name || '?').join('、') +
+        '。请先恢复原来的主密钥再重新导出，否则这些租户无法从备份还原。'
+    }
   } catch (e: any) {
     // blob error may need parse
     if (e?.response?.data instanceof Blob) {

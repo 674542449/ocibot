@@ -305,12 +305,12 @@
               :x="barX(i)"
               :y="barY(pt.amount)"
               :width="barW"
-              :height="Math.max(1, svgH - 24 - barY(pt.amount))"
+              :height="Math.max(0, barBaseY - barY(pt.amount))"
               fill="#3b82f6"
               opacity="0.85"
             />
           </g>
-          <line x1="0" :y1="svgH - 20" :x2="svgW" :y2="svgH - 20" stroke="#334155" />
+          <line x1="0" :y1="barBaseY" :x2="svgW" :y2="barBaseY" stroke="#334155" />
         </svg>
         <div class="row muted" style="font-size: 11px; justify-content: space-between">
           <span>{{ usage.daily[0]?.date }}</span>
@@ -388,6 +388,15 @@ function barX(i: number) {
   const n = Math.max(1, (usage.value?.daily || []).length)
   return 10 + i * ((svgW - 20) / n)
 }
+// 柱底所在的 y。必须和 barY 的零点是同一个数：barY(0) = 8 + (svgH-24) = svgH-16。
+//
+// 高度以前算的是 `svgH - 24 - barY(...)`，比真正的零点高 8 —— 于是高度成了
+// `(a/max)*h - 8` 这样一个**仿射**函数而不是线性的：柱子之间的比例全是错的
+// （1.2 和 2.4 这样 2:1 的两天画出来是 2.4:1），低于峰值 5.9% 的一天直接被
+// 那个 Math.max(1, …) 压成 1px，跟零成本的一天长得一样；而零成本那根柱子的
+// 底边又比其他柱子低 8，横轴线卡在中间，两边都挨不着。
+const barBaseY = svgH - 16
+
 function barY(amount: number) {
   const h = svgH - 24
   return 8 + h - (Number(amount || 0) / maxAmount.value) * h

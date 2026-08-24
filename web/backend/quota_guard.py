@@ -57,6 +57,20 @@ def is_secondary_region(session: Any) -> bool:
     return bool(current and home and current != home)
 
 
+def resolve_secondary(session: Any, row: Any) -> bool:
+    """把「这是不是副区」的判定收在一个地方，DB hint 和 OCI 读取的优先级只写一次。
+
+    优先级：一次**成功**的 OCI 读取说了算；读不出来（region_pair 返回 ""）才退回
+    DB 里的 parent_tenant_id。反过来写会出事 —— 一个 region 恰好等于主区的子行
+    会被当成副区，而副区是整段跳过免费额度检查的，等于在唯一有 Always Free 的
+    区域里关掉了守卫。enforce_secondary_region 里有同样的判断，两处必须一致。
+    """
+    current, home = region_pair(session)
+    if current and home:
+        return current != home
+    return tenant_is_secondary(row)
+
+
 def secondary_region_gate(session: Any, row: Any, *, free_only_mode: bool) -> str:
     """``enforce_secondary_region`` for callers that hold the tenant row.
 
@@ -97,6 +111,15 @@ def enforce_secondary_region(
     read succeeding.
     """
     current, home = region_pair(session)
+    # 一次**成功**的读取说「当前就是主区」时，它必须压过 DB 的 secondary_hint。
+    #
+    # hint 的职责（见上方 docstring）是在 OCI 读取失败时兜底，而不是推翻一次读成功
+    # 的结论。以前 hint 排在前面，于是一个 region 恰好等于主区的「副区」行会被
+    # 当成副区：enforce_launch_quota 被整段跳过，免费额度检查在**唯一存在
+    # Always Free 的区域**里失效。自相矛盾的报错「副区「ap-tokyo-1」…（主区
+    # ap-tokyo-1）」就是这个 bug 的外在表现。
+    if current and home and current == home:
+        return ""
     if not secondary_hint and (not current or current == home):
         return ""
     region_text = current or (region_hint or "").strip() or "副区"

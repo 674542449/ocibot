@@ -62,7 +62,17 @@ def _out(row: NotificationChannel) -> ChannelOut:
         kind=row.kind,
         name=row.name or row.kind,
         enabled=bool(row.enabled),
-        events=[e for e in (row.events or []) if e in EVENT_KEYS],
+        # NULL 和 [] 在发送侧是**相反**的意思，读回来时不能都塌成 []。
+        #
+        # events 是带 Python 端 default 的列，_ensure_schema 因此加列时不带 NOT NULL，
+        # 所以升级上来的库里老渠道的 events 就是 NULL。notify_user 把 NULL 当作
+        # 「订阅全部事件」（正确），而这里以前 `row.events or []` 把它显示成
+        # 「一个事件都没订阅」，跟真正 events=[] 的渠道长得一模一样。
+        events=(
+            list(EVENT_KEYS)
+            if row.events is None
+            else [e for e in row.events if e in EVENT_KEYS]
+        ),
         config_hint=config_hint(row.kind, decode_channel_config(row.config_encrypted)),
         # Offset-less on SQLite otherwise; see iso_utc.
         created_at=iso_utc(row.created_at),
@@ -185,4 +195,18 @@ def test_channel(
         "OCIBot 测试通知",
         f"这是一条测试消息。渠道：{row.name or row.kind}。收到即表示配置正确。",
     )
+    # 「测试」验的是链路通不通，不是这个渠道真会不会响。
+    #
+    # 前端保存后就提示「建议点『测试』确认可以收到」，操作员把绿色当作最终确认。
+    # 但 send_to_channel 完全不看 enabled / events：一个被停用的、或者事件订阅被
+    # 取消勾选（events=[]）的渠道，测试照样报绿，而真正的抢机通知一条都不会发给它。
+    # 所以测试成功时要把这两个「发得出去但不会发」的状态一起说明白。
+    if ok:
+        blocked = []
+        if not row.enabled:
+            blocked.append("该渠道当前为「停用」")
+        if row.events is not None and not [e for e in row.events if e in EVENT_KEYS]:
+            blocked.append("该渠道没有订阅任何事件")
+        if blocked:
+            detail = f"{detail}（注意：{'；'.join(blocked)}，实际事件不会推送到这里）"
     return TestResult(ok=ok, detail=detail)
