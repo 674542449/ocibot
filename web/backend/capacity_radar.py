@@ -141,12 +141,17 @@ def radar_error_hint(message: str, status: Optional[int]) -> str:
     东西,正是那段注释当初为了消除而写的体验。
     """
     if status in (401, 403, 404):
+        # 措辞不能把话说死。Oracle 的 NotAuthorizedOrNotFound 是**故意做成歧义**的:
+        # 「没权限」和「这东西不存在」返回同一个 404。所以这里只能给出最可能的原因
+        # 和排查顺序,不能断言「你没有权限」—— 断错了会让人去改一个本来没问题的策略。
         return (
-            "该 API 密钥没有容量报告权限,雷达跳过本次探测(这不代表没有容量)。\n"
-            "CreateComputeCapacityReport 需要一条**独立于创建实例**的 IAM 授权,"
-            "所以「测试连接」通过并不能说明它可用。\n"
-            "在 IAM 策略里加一条即可:Allow group <你的用户组> to manage "
-            "compute-capacity-reports in tenancy"
+            "没能读到容量报告,雷达跳过本次探测。**这不代表没有容量**,创建实例不受影响。\n"
+            "最可能的原因是缺一条 IAM 授权。CreateComputeCapacityReport 需要一条"
+            "**独立于创建实例**的授权,所以「测试连接」通过并不能说明它可用:\n"
+            "    Allow group <你的用户组> to manage compute-capacity-reports in tenancy\n"
+            "如果你用的是注册账号本人(租户管理员)的 API Key,Administrators 组默认的"
+            "「manage all-resources in tenancy」已经包含它,那就不是权限问题 —— "
+            "更可能是该区域暂不提供这个接口。"
         )
     if status == 429:
         return "Oracle 正在限流(429),雷达跳过本次探测。稍后再试,或直接尝试创建。"

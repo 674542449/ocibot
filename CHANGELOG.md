@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.89 — 2026-08-24
+
+### 修复
+
+- **容量雷达读不到时的提示把话说死了。** 原文是「该 API 密钥没有容量报告权限」——
+  但 Oracle 的 `NotAuthorizedOrNotFound` 是**故意做成歧义**的:「没权限」和
+  「这东西不存在」返回同一个 404。断言成权限问题会让人去改一条本来没问题的策略,
+  而真正的原因可能是该区域暂不提供这个接口。改成给出最可能的原因和排查顺序,
+  并写明:**用注册账号本人(租户管理员)的 API Key 时,`Administrators` 组默认的
+  `manage all-resources in tenancy` 已经包含 `compute-capacity-reports`,不用加任何策略。**
+  0.4.88 的升级说明同样改口(原来写的是「需要一条新的 IAM 策略」)。
+
+### 升级
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.89
+```
+
 ## 0.4.88 — 2026-08-24
 
 新功能:**容量雷达**。创建实例之前先问 Oracle「这个可用域现在还开不开得出这台机器」,
@@ -90,12 +109,18 @@ cd ~/ocibot && bash scripts/install.sh update
 curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.88
 ```
 
-**需要一条新的 IAM 策略**才能用这个功能(不加也不影响创建实例,雷达会显示「读不到」
-并把这条策略贴给你):
+**可能需要一条 IAM 策略。** 先直接点一次「开始探测」——
+
+* 用注册账号本人(租户管理员)的 API Key:`Administrators` 组默认的
+  `manage all-resources in tenancy` 已经包含 `compute-capacity-reports`,**不用加**。
+* 专门给面板建了受限 IAM 用户:需要加下面这条,否则雷达显示「读不到」。
 
 ```
 Allow group <你的用户组> to manage compute-capacity-reports in tenancy
 ```
+
+不加不影响任何其它功能 —— 探测失败是刻意 fail-open 的,创建实例、抢机任务、
+额度守卫都照常工作,只是雷达那一页用不了。
 
 ## 0.4.87 — 2026-08-24
 
