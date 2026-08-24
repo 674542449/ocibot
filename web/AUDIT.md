@@ -1,5 +1,104 @@
 # Web audit notes
 
+## Pass 11 — 12-agent parallel sweep, then parallel remediation (0.4.80-0.4.81, 2026-08-23)
+
+Twelve independent reviewers, each given a disjoint slice (auth, tenant isolation,
+crypto/backup, SSRF/notify, WebSSH, self-update, OCI client, worker/scheduler,
+DB/schema, injection/validation, frontend logic, deployment/supply-chain) plus the
+standing instruction not to re-report anything already accepted here. Remediation
+then ran the same way, partitioned by **file ownership** so no two writers could
+touch the same file.
+
+Two findings were exploitable for real loss, and both had been reachable by any
+ordinary authenticated user since long before this pass.
+
+### Fixed
+
+| Issue | Severity | Notes |
+| --- | --- | --- |
+| **`Tenant.region` was free text and becomes the OCI SDK's endpoint host.** `oci/regions.py` has a backwards-compatibility branch: a region containing `.` is treated as the complete domain. `TenantConfig.validate()` only checked non-empty, and `oci.config.validate_config`'s `PATTERNS` covers only fingerprint/tenancy/user. Verified against the installed SDK: `region='@127.0.0.1:6379'` dials `127.0.0.1:6379`; `region='@169.254.169.254'` dials the metadata endpoint — `iaas.` is swallowed as URI userinfo. This path never touches `url_safety.py`, so every address/port/IDNA control from passes 3-4 was bypassed, and `POST /tenants/{id}/test` reflects the connection outcome synchronously, making it an internal port scanner. | **Critical** | Charset rule (letters/digits/hyphen) in `TenantConfig.validate()` — the shared choke point for create, update and paste-import — plus a matching Pydantic `pattern` on `TenantCreate`/`TenantUpdate` for a clean 422. Banning `.` `@` `:` `/` makes every construction impossible. `subscribe_tenant_region` was the one write path reaching `Tenant.region` through neither guard; it now validates too. `tests/test_region_ssrf.py` asserts the attack worked pre-fix against the real SDK, so the test cannot decay into a tautology. |
+| **Batch launch of E2.1.Micro ignored `count`.** `validate_launch_against_quota` multiplies every resource by `count` into `units`, and the A1 and block-storage branches compare against it — the E2 branch asked `e2_rem < 1`, i.e. "is there one slot", never "are there n". With 1 of 2 free micros running, `count=3` passed and issued three `LaunchInstance` calls. `projected` computed the correct `e2_micro_count_after` (4 vs a cap of 2); nothing consulted it. The 200 GB storage cap only incidentally blocked `count>4`. | **Critical** (billing) | Compares the whole batch. `tests/test_launch_count.py` covered A1 OCPU, A1 memory and boot volume — E2.1.Micro was the one shape it never exercised, which is why the suite stayed green. |
+| **One tenant whose stored config the SDK rejects stalled capacity retry for every user on the installation.** The per-job body in `Worker.tick_capacity` was `try/finally` with **no `except`**, and the session build sits outside any handler. The raise escaped the `for job in candidates` loop before `attempts += 1` and before any `next_run_at` write, so the broken job's `next_run_at` never advanced — and candidates are ordered `next_run_at.nullsfirst()`, making it the permanent queue head within one cycle. `attempts` stayed 0 so `max_attempts` was unreachable; `last_error` was never written and `status` stuck at `running`, so the panel showed 运行中 with no error. Deleting a job mid-attempt took the same escape route via `StaleDataError`. | **Critical** (availability, cross-tenant) | Per-job `except` that rolls back, re-reads by id, releases the lease, counts the attempt and advances `next_run_at`, in its own transaction — the caller's session may already be aborted on PostgreSQL. |
+| **副区管理 could create an irreversible Oracle region subscription on a tenant the operator never selected.** `openRegions` had no sequence guard and the 副区管理 button is disabled on `busy` while `openRegions` sets `regionsLoading`, so every row stayed clickable during the read. A→B with A's response landing last left the header on B and the table on A's regions, while `subscribeRegion` posts to `regionsFor` (B). The server re-checks **B's** real subscription list, so A's "already subscribed" state does not apply — and the confirm text for that branch promises only a panel row. Oracle cannot un-subscribe a region. | **Critical** (irreversible, wrong account) | Sequence guard, plus a `regionsOwner` second check before the request, plus the spinner released by sequence only. |
+| **Quadratic ReDoS in the OCI-config sniffer.** `re.search(r"^\s*\[.+\]\s*$", raw, re.M)` — `\s` includes `\n`, so under `re.M` the engine restarts at every line start and backtracks to end-of-string. `api_text` caps at 64 000 chars, which is also the worst case: 13.3 s of pure CPU that does not release the GIL (4 concurrent → 25.8 s, 8 → 52.9 s). Reachable unauthenticated-adjacent via `/tenants/parse` and `/tenants/import`, neither rate-limited; ~16 concurrent requests wedge the panel at the default two workers. | High | Per-line check, linear by construction. `tests/test_parse_config_redos.py` asserts the complexity ratio rather than a wall-clock number, so it does not go flaky on a loaded CI box. |
+| **Capacity retry was the only path that re-issues `LaunchInstance` and the only one without `opc-retry-token`.** The lease commits before the OCI call; `attempts += 1` and the outcome commit only in the `finally`. A container restart in between (the panel's own one-click update, OOM, host reboot) rolls both back, and after the lease expires the job re-issues an identical `LaunchInstanceDetails` — a second instance nobody is accounting for. | High | `derive_retry_token(launch_token, attempts)`: a replay of the *same* attempt collapses at Oracle, while the next attempt gets a distinct token and cannot trip `IdempotentParameterMismatch`. |
+| **A failed quota read was more permissive than a successful one.** The "are free caps hard or advisory" rule was duplicated: `validate_*` used `free_only or tier in {"", "free", "unknown"}`, `_blocked_by_incomplete_read` used `free_only` alone. A free-tier tenant that had switched free-only off was hard-blocked when the read succeeded and **waved through when it 429'd**. | High | One shared predicate, `free_quota.hard_free_caps()`. A parametrized test pins both call sites to it, so re-splitting them fails. |
+| **`check_launch_quota` is check-then-act with no mutual exclusion.** Two tabs each submitting a 4 OCPU/24 GB A1 both read "0 used" and both launched — 8 OCPU/48 GB, double the allowance. The window is unusually wide because `prepare_launch_network` (which can create an NSG and even a VCN) runs between verdict and launch. | High | `quota_guard.tenant_launch_lock()`: `pg_try_advisory_xact_lock` on a dedicated connection (the request Session commits mid-window, which would drop a transaction-scoped lock), or a `flock` beside the database file on SQLite — the one directory API workers and the worker process are guaranteed to share. Degrades to in-process with a warning rather than wedging launches. Wired around snapshot→launch in `routers/instances.py` and the worker. |
+| **`list_compartments` swallowed `ServiceError` with no error channel**, and all three quota readers swallowed it again. An IAM policy lacking `inspect compartments in tenancy` (Oracle answers 404) made every snapshot report `read_incomplete: False` with child-compartment usage counted as zero — the fail-closed guard never learned. | High | `strict=` mode folded into `_last_tree_errors` / the volume `errors` lists. `tests/test_quota_fail_closed.py` stubs `get_free_quota_usage` wholesale and never reached this code; the new tests drive the real path. |
+| **Backup export protected every tenant's plaintext OCI private key with a 6-char password over PBKDF2-HMAC-SHA1/1000.** WinZip AES fixes that KDF for interoperability, so password strength was the only control, and the archive is a complete, immediately usable credential set for every tenant. | High | A strong-KDF envelope *inside* the zip (PBKDF2-HMAC-SHA256, 390 000 rounds — the same parameters `ConfigStore` already used for its local master password), versioned so pre-existing archives still import. Floor raised to 12 characters with wording that says the file is equivalent to the accounts. |
+| **The private key was never parsed** — only grepped for `BEGIN` + `PRIVATE KEY`. A passphrase-protected key (which the OCI console will hand you) or a truncated paste stored with a 201 and `has_private_key: true`; since 保存后自动测试连接 defaults off, the operator saw 已添加 and every later page 502'd with an opaque SDK deserialization error. | Medium | `load_pem_private_key` in `TenantConfig.validate()`, with a specific message for the encrypted-key case. |
+| **The self-update mutex was released before the update ran.** `_apply_job` wrote `state="success"` before launching the helper, and both mutexes only reject `"running"`. A second apply's first action is `docker rm -f ocibot-self-update-restart`, SIGKILLing the privileged container mid `compose build`/`up -d` while the second job `git reset --hard`s the build context out from under it — the API container can be destroyed and not recreated. | High | Stays `running` until the helper container exits, reconciled through `docker inspect` (the helper recreates the container the worker thread lives in, so the in-process flag cannot be the source of truth), plus a second guard refusing a new apply while a live helper exists. |
+| **`last_error`/`message` bypassed `_redact`** (only `log_tail` went through it), so on a private-repo install a git failure wrote `https://ghp_…@github.com/…` verbatim into `app_meta` and returned it from `GET /api/admin/update`. | Medium | Redaction moved into `_write_status` so all five sites are covered, and `_redact` extended with a `scheme://creds@host` pattern — env-value matching cannot catch a PAT that lives in `.git/config`. |
+| **WebSSH:** stdin was never drained (asyncssh's send buffer is uncapped — one user could OOM the shared API process); the session ran `errors='strict'`, so `cat /bin/ls` tore down the whole SSH connection while the browser still looked connected; and because all output left as text frames, guest shell output could impersonate the panel's own control JSON and talk the user into 「重置主机密钥」, eroding the TOFU pin the guest is not supposed to be able to touch. | Medium | `drain()` plus a 1 MiB frame cap; byte-transparent session with terminal data on **binary** frames and control messages on text, which closes the impersonation structurally; host key pinned per key type so a dependency upgrade cannot flip every instance to "possible MITM" at once. |
+| **An unauthenticated login flood could erase the audit trail.** The limiter returns False without appending, so the 30/5min cap throttled guesses but placed no ceiling on `auth.login_blocked` audit writes; past `OCIBOT_AUDIT_MAX_ROWS` the hourly prune then deleted the real history to make room. Pass 10 bounded the disk and converted unbounded growth into unbounded eviction. | Medium | Throttled the blocked-login write, and the prune no longer evicts security-relevant history for throwaway rows. |
+| **Audit timestamps were serialized without a UTC offset.** SQLite returns naive values for `DateTime(timezone=True)`, and JS parses an offset-less string as **local** time, so a UTC+8 operator saw every event 8 hours early — on the one page whose purpose is "when did this happen". `schemas.py`'s `UtcDatetime` already fixed this class; three hand-built dicts were missed. | Medium | `routers/audit.py`, `instance_ops.py` (host key), `notifications.py` all normalized. |
+| **`GET .../console` returned `ok:true, connections:[]` on a failed read**, i.e. "this instance has no console connection". `create_console_connection` uses the same helper to clear stale connections, so a throttled read made that a silent no-op — and Oracle allows only one, so the create then failed for an invisible reason. | Medium | The client raises; the route reports the failure. |
+| **`_ensure_schema` started the app after a failed migration.** All `ALTER`s shared one transaction, so on PostgreSQL one failure aborted it, every later statement raised `InFailedSqlTransaction`, and the implicit COMMIT degraded to ROLLBACK — **columns added earlier in the same run were silently discarded** while `init_db()` returned success. Trigger: a role with DML but not table ownership. | Medium | Per-statement transactions; a failed migration is loud. |
+| Unbounded strings reaching `String(n)` columns: `TenantUpdate` (every field bare `Optional[str]` while `TenantCreate` bounded all of them), paste-import, `display_name`, `CapacityJobCreate.name`, `availability_domains`. SQLite ignores varchar width so the suite stayed green; PostgreSQL raises `StringDataRightTruncation` at an unguarded `commit()`. For `display_name` + `as_retry` the failure lands **after** `prepare_launch_network` created a real NSG, which the 409-only cleanup never removes — one orphan per retry. | Medium | Bounds aligned to the columns. |
+| SMTP silently downgraded to cleartext AUTH when the server did not advertise STARTTLS, applied no port restriction (the HTTP path's blocklist was unreachable from it) and reflected the remote banner — an authenticated port scanner. Outbound notification clients had no response size cap, and the 15 s timeout is per-chunk, so a slow-drip endpoint pinned a thread and grew RSS without bound, sailing past the worker's 60 s budget (checked only *between* channels). | Medium | STARTTLS failure is fatal; port blocklist shared with the HTTP path; overall deadline and byte ceiling; banner no longer reflected. |
+| Frontend stale-state races. `InstanceDetailView` reused across an instance switch rendered the previous instance while every action targeted the new one — `doRename` read the stale name and wrote to the current id (renaming B to A's name), `power()` had no confirm, and the confirms for 终止 / 防火墙全开 / 换IP named nothing. Also: `LaunchView` dropped the new tenant's quota request entirely (silent `if (loading) return`) and rendered A's allowance under B; `AccountView`'s spinner was gated on the tenant so a mid-load switch disabled 刷新用量 permanently; `StorageView` carried a tenancy-prefixed AD across a switch; `SettingsView` shipped an abandoned channel's token into an unrelated channel; `JobsView` showed 已删除 and 删除失败 together. | Medium-High | Sequence guards throughout, state cleared on navigation, actions locked to the id captured at entry, and confirms that name the target only when the displayed object *is* the target. |
+| Deployment: `docker.sock` and the whole repo (including `web/.env`) were mounted into the API container unconditionally, ignoring `OCIBOT_UPDATE_ENABLED` — so the real trust boundary was "any code execution in the API process owns the host", not "admin compromise owns the host". `install.sh` also re-exported `OCIBOT_UPDATE_ENABLED=1` on every subcommand, and Compose resolves shell env ahead of `.env`, so the documented lever silently did nothing. Containers ran as root; `.env.example` shipped working default secrets with `REQUIRE_SECURE_SECRETS=0`; `install.sh` copied `web/.env` to a predictable `/tmp` path as root with no `trap`. | High | Socket + rw repo + the flag moved into `docker-compose.update.yml` (opt-in as one unit; the base file hardcodes `"0"`); `user: 10001`, `cap_drop: ALL`, `read_only`, tmpfs; `install.sh update-on/off`; secrets removed from `.env.example` and `OCIBOT_REQUIRE_SECURE_SECRETS` now defaults to **1**; the `/tmp` copy is held in a shell variable instead (matching the pass-9 fix in `self_update.py`). |
+| Supply chain: no lockfile and no hashes, with `compose build --pull` re-resolving the whole closure on the operator's server on every update, into a **root** container holding `docker.sock`. Base images on mutable tags; the Docker CLI fetched as an unverified tarball; `npm ci … || npm install` silently degraded to an unlocked resolution on lockfile drift. | Critical | `web/backend/requirements.lock` — full closure, every package hash-pinned, cross-resolved for linux/cp312 — installed with `--require-hashes`. Base images via `ARG` so digests can be pinned from `web/.env`; the CLI now `COPY --from=` the official image; the `npm ci` fallback removed. New `.dockerignore` (the context previously shipped `.venv/`, `.git/`, `web_data/` and `web/.env` to the daemon, and a host `node_modules` could overwrite the `npm ci` result). |
+| CSP `connect-src` allowed `ws:`/`wss:` to any host — the one exfiltration channel left open in an otherwise same-origin-locked policy. `/openapi.json`, `/docs`, `/redoc` served the full route map unauthenticated. `BodySizeLimitMiddleware` was innermost, not outermost. | Medium-Low | `connect-src 'self'`; docs behind `OCIBOT_DEBUG`; body cap moved outermost (and it now emits the security headers itself, preserving the pass-10 property that a 413 carries them). |
+
+### Corrections to earlier passes
+
+- Pass 10 recorded *"JWT: HS256 hardcoded (not env-overridable, so no algorithm
+  confusion)"*. It **was** env-overridable: `jwt_algorithm` carried no alias, so
+  pydantic-settings read a bare `JWT_ALGORITHM`. Not exploitable (python-jose
+  refuses `none`), so the protection was accidental rather than designed. Same
+  hole on `app_version` — a stray `APP_VERSION` made `/api/health` report a
+  version unrelated to the running code, defeating the one check CLAUDE.md's
+  release rule exists to provide. Both are now `ClassVar`, so no environment
+  variable can reach them, and a test pins the "every field has an explicit
+  alias" invariant.
+
+### Checked, no finding
+
+- **Object-level authorization across all 104 routes.** Enumerated by AST, then
+  re-derived by a second reviewer instructed to prove the first wrong: every
+  tenant-scoped route resolves ownership through `get_owned_tenant`, and
+  jobs/notifications use their own `owner_id` filters. 22 cross-user probes all
+  returned 404. Resource ids (volume/backup/image/public-ip/bucket/object) are
+  not re-validated against the tenant — the panel relies on OCI IAM — but a
+  caller can only pair them with a tenant row they own, so there is no gain.
+- SPA path traversal: 11 encodings tested, all confined.
+- Backup import bounds: inflation bounded at the stream (not the attacker-supplied
+  `file_size`), 64 entries, 200 tenants, no extraction to disk, archive `owner_id`
+  and `id` discarded. A 30 MB member declaring 1024 bytes was rejected at a
+  10.6 MB peak allocation.
+- cloud-init YAML: no break-out. `\u2028`, `\x85`, `\r` and embedded `runcmd:`
+  all rejected by the `splitlines()` screen before assembly.
+- No SQL injection, no `eval`/`exec`/`pickle`/`shell=True`/`os.system`, no YAML
+  loader anywhere in `app/` or `web/backend`.
+- OCI credentials never reach disk, a log line, an exception message or a
+  response model; `SessionManager` keys on the tenant uuid with a credential
+  fingerprint, so no cross-tenant reuse.
+
+### Accepted, unchanged
+
+- Everything in pass 10's accepted list still stands (dev CORS origins, TOTP
+  replay within ~90 s, the in-process rate limiter being per-worker, DNS
+  rebinding on outbound notifications, no integrity verification of fetched
+  update code, docker.sock == host compromise **when the update override is
+  deliberately enabled**).
+- `TenantConfig` is a plain dataclass, so its generated `__repr__` renders the
+  full PEM. Nothing reprs it today; noted so a future `log.exception("… %s", cfg)`
+  is recognised as the leak it would be.
+- Usernames now normalize (NFKC) and reject control characters, but pre-existing
+  names that no longer validate are compared normalized rather than rejected, so
+  no operator is locked out.
+
+### Not verified
+
+The deployment changes could not be exercised — no Docker on the machine this
+pass ran on. The dependency lock was validated by a `--require-hashes` dry-run
+resolution for linux/cp312 (all 49 packages, every hash matched, `uvloop` present
+so the closure really is the Linux one), which covers the two ways it could break
+a build, but **the image build itself, the non-root + read-only + `cap_drop: ALL`
+startup, and Compose's by-target volume merge for the update override remain
+unbuilt and unrun.** Build once before relying on `install.sh update`.
+
 ## Pass 10 — full sweep: bugs, proactive OCI calls, common vulns (0.4.37, 2026-07-30)
 
 Requested as three questions: are there bugs, is anything calling Oracle without

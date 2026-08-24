@@ -48,7 +48,12 @@ def _guard_storage_delta(
     # usage_snapshot flags a partial/failed read; treating that as zero usage let
     # a throttled read look like a full free quota.
     snap = quota_guard.usage_snapshot(session, free_only_mode=free_only)
-    blocked = quota_guard._blocked_by_incomplete_read(snap, free_only)
+    # 必须把 tier 一起传进去：判断「免费上限是硬阻断还是只警告」的规则以前被抄了
+    # 两份，这里只看 free_only，而 validate_* 里看的是 free_only or tier in
+    # {"", "free", "unknown"}。于是一个 account_tier="free" 却关掉了 free_only 的
+    # 租户，用量读得到时被硬挡、读失败（429）时反而放行 —— 限流路径比正常路径更
+    # 宽松，正好是这个守卫存在意义的反面。现在两边都问 free_quota.hard_free_caps。
+    blocked = quota_guard._blocked_by_incomplete_read(snap, free_only, tier)
     if blocked:
         raise HTTPException(status_code=503, detail=blocked)
     guard = free_quota.validate_block_volume_against_quota(

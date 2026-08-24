@@ -22,7 +22,7 @@
     <div class="card stack">
       <div class="field">
         <label>租户</label>
-        <select v-model="tenantId">
+        <select v-model="tenantId" @change="onTenantChange">
           <option disabled value="">选择租户</option>
           <option v-for="t in tenants" :key="t.id" :value="t.id">
             {{ t.name }} · {{ t.region }} · {{ tierLabel(t.account_tier) }}
@@ -464,10 +464,15 @@ async function loadTenants() {
 // counter would have each of them bump it and discard all but the last-started.
 const loadSeq: Record<string, number> = {}
 
-function beginLoad(key: string): { stale: () => boolean } {
+function beginLoad(key: string): { stale: () => boolean; superseded: () => boolean } {
   const seq = (loadSeq[key] = (loadSeq[key] || 0) + 1)
   const wanted = tenantId.value
-  return { stale: () => seq !== loadSeq[key] || tenantId.value !== wanted }
+  return {
+    // 该不该把结果**写进** state：换了租户就不能写。
+    stale: () => seq !== loadSeq[key] || tenantId.value !== wanted,
+    // 该不该**关掉** spinner：只看序号。见下方 loadAll 的 finally。
+    superseded: () => seq !== loadSeq[key],
+  }
 }
 
 async function loadAccount() {
@@ -577,6 +582,26 @@ async function loadQuota() {
   }
 }
 
+/** 换租户 = 立刻丢掉上一个租户的全部数据（同 StorageView.onTenantChange）。
+ *
+ *  不清的话最坏的不是数字过时，而是链接会指向**新**租户：实例行的
+ *  `/instances/${tenantId}/${inst.id}` 和「管理存储 →」的 `?tenant=${tenantId}`
+ *  都是用当前 tenantId 现拼的，于是 A 的实例行会把你送到 /instances/B/<A 的 OCID>，
+ *  打开的是 B 里根本不存在的资源。账单和免费额度同理：顶着 B 的名字显示 A 的钱。
+ *  在飞的请求由 beginLoad 的 stale()（含 tenantId 比对）拦下，不会再写回来。
+ *  这里只清空，不主动请求 Oracle —— 用户点「刷新用量」才发请求。 */
+function onTenantChange() {
+  data.value = null
+  quota.value = null
+  usage.value = null
+  usageMsg.value = ''
+  invoices.value = []
+  invoiceMsg.value = ''
+  invoiceError.value = ''
+  msg.value = ''
+  error.value = ''
+}
+
 async function loadAll() {
   if (!tenantId.value) return
   const guard = beginLoad('all')
@@ -588,9 +613,15 @@ async function loadAll() {
     if (guard.stale()) return
     error.value = e?.message || '加载失败'
   } finally {
-    // Only the newest run may clear the spinner. Otherwise an earlier, slower
-    // run finishing second turns it off while the current one is still loading.
-    if (!guard.stale()) loading.value = false
+    // spinner 只归**序号**管，不能带上租户判断。
+    //
+    // 原来这里是 `if (!guard.stale())`，而 stale() 里含 `tenantId !== wanted`：
+    // 加载途中切换租户，这一次的 finally 不满足条件、不关 spinner，而切换本身
+    // 又不会启动新的 loadAll 来接管所有权 —— 于是 loading 永远是 true，
+    // 「刷新用量」按钮（:disabled="loading || !tenantId"）永久卡在「加载中…」，
+    // 只能整页刷新才能恢复。InstancesView 的 load() 踩过并修过同一个坑，
+    // 那里的注释写着「The spinner is owned by SEQUENCE only」。
+    if (!guard.superseded()) loading.value = false
   }
 }
 

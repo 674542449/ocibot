@@ -40,3 +40,8 @@ Thumbs.db
 
 # Stray agent/scratch dirs
 .scratch_tmp/
+
+# 每租户创建锁（SQLite 部署下 quota_guard.tenant_launch_lock 用的文件锁）。
+# 放在数据库文件旁边——那是 API worker 和 worker 进程在 SQLite 下唯一保证
+# 共享的目录。纯运行时产物，测试也会在仓库根目录留下几个。
+.ocibot-launch-*.lock

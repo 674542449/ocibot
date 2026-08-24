@@ -97,9 +97,14 @@
 
     <div v-show="!confirmOpen" class="card stack">
       <div class="grid-2">
+        <!-- 两个下拉在「下一步」的额度预检期间禁用：预检要 await 好几秒，其间换租户
+             会清空 AD / 镜像 / Shape，等 A 的结论回来时确认页就会顶着 B 的租户名、
+             一片「—」的配置和 A 的额度打开。仅禁用「下一步」按钮拦不住这一步。
+             这里不用 loadingQuota，否则选完租户后的免费额度读取（也是好几秒）也会
+             把下拉锁死，换租户要干等。 -->
         <div class="field">
           <label>租户 *</label>
-          <select v-model="primaryId" @change="onTenantPicked">
+          <select v-model="primaryId" :disabled="quotaPrechecking" @change="onTenantPicked">
             <option disabled value="">选择租户</option>
             <option v-for="t in primaryTenants" :key="t.id" :value="t.id">
               {{ t.name }} · {{ t.region }}
@@ -108,7 +113,11 @@
         </div>
         <div class="field">
           <label>区域（主区 / 副区）</label>
-          <select v-model="tenantId" :disabled="!primaryId" @change="onRegionPicked">
+          <select
+            v-model="tenantId"
+            :disabled="!primaryId || quotaPrechecking"
+            @change="onRegionPicked"
+          >
             <option v-for="t in regionRows" :key="t.id" :value="t.id">
               {{ t.region }}{{ t.region_label && t.region_label !== t.region ? ' · ' + t.region_label : '' }}
               {{ t.parent_tenant_id ? '（副区）' : '（主区）' }}
@@ -553,6 +562,10 @@ const freeOnly = computed(() => {
   return t ? t.free_only_mode !== false : true
 })
 const loadingQuota = ref(false)
+/** 仅在「下一步」的额度预检期间为 true，用来禁用租户 / 区域下拉。
+ *  与 loadingQuota 分开：后者也覆盖选中租户后那次免费额度读取，拿它去禁用下拉会
+ *  让用户在几秒内换不了租户。 */
+const quotaPrechecking = ref(false)
 
 /** Rows shown in the 租户 dropdown. A 副区 whose primary is missing (disabled, or
  *  restored from a backup without it) is listed on its own rather than hidden. */
@@ -1039,18 +1052,39 @@ const confirmRows = computed(() => {
   ] as [string, string][]
 })
 
+/** 额度请求的序号，写法同上面 loadMeta 的 metaSeq。
+ *  预检 checkQuotaForForm 共用这一个计数器：两者都写 quotaPreview 和 loadingQuota，
+ *  各记各的就会把对方的响应当成仍然有效的。 */
+let quotaSeq = 0
+
 async function loadQuotaPreview() {
-  if (!tenantId.value || loadingQuota.value) return
+  if (!tenantId.value) return
+  // 「上一次还在跑就 return」防不了重入，只会把新租户的请求整个丢掉。
+  //
+  // /free-quota 要枚举实例、卷和桶，好几秒才回来。选中 A 后 onRegionPicked 发起
+  // 读取，未返回时改选 B：B 这一趟撞上 A 留下的 loadingQuota=true 直接静默返回，
+  // 于是 B 从头到尾没有发过请求；随后 A 的响应落地，面板顶着 B 的租户名渲染
+  // 「该账号 Always Free 已用额度」的 A 的数字，quotaRows 还会拿 A 的用量配 B 的
+  // 表单算出一个并不存在的组合的「创建后剩余 / 超出」。
+  // 改成后发者接管：请求照发，旧响应作废。
+  const seq = ++quotaSeq
+  const wanted = tenantId.value
   loadingQuota.value = true
   quotaLoadError.value = ''
   try {
-    const { data } = await api.get(`/tenants/${tenantId.value}/free-quota`)
+    const { data } = await api.get(`/tenants/${wanted}/free-quota`)
+    if (seq !== quotaSeq || tenantId.value !== wanted) return
     quotaPreview.value = data.data || null
   } catch (e: any) {
+    if (seq !== quotaSeq || tenantId.value !== wanted) return
     quotaPreview.value = null
     quotaLoadError.value = e?.message || '无法读取免费额度（提交时仍会由服务端校验）'
   } finally {
-    loadingQuota.value = false
+    // spinner 只归**序号**管，不能带上租户判断。读取途中切到副区时 onRegionPicked
+    // 会提前 return、不发新请求，没人来接管所有权；带上租户判断这一次就永远关不掉
+    // loadingQuota，「刷新免费额度」与「下一步」（都 :disabled="loadingQuota"）会
+    // 永久卡住，只能刷新整页。上面 loadMeta 的 loadingMeta 也是这么写的。
+    if (seq === quotaSeq) loadingQuota.value = false
   }
 }
 
@@ -1064,9 +1098,13 @@ async function loadQuotaPreview() {
 async function checkQuotaForForm(): Promise<boolean> {
   quotaVerdict.value = null
   if (!tenantId.value) return true
+  // 与 loadQuotaPreview 共用序号：都写 quotaPreview，后发起的说了算。
+  const seq = ++quotaSeq
+  const wanted = tenantId.value
   loadingQuota.value = true
+  quotaPrechecking.value = true
   try {
-    const { data } = await api.post(`/tenants/${tenantId.value}/launch-quota-check`, {
+    const { data } = await api.post(`/tenants/${wanted}/launch-quota-check`, {
       shape: form.shape,
       image_id: form.image_id,
       ocpus: isFlex.value ? form.ocpus : null,
@@ -1075,6 +1113,10 @@ async function checkQuotaForForm(): Promise<boolean> {
       boot_volume_vpus_per_gb: form.boot_volume_vpus_per_gb,
       count: batchCount.value,
     })
+    // 预检期间换了租户的话，这份结论属于上一个账号，写进去就是拿 A 的额度给 B 判卷。
+    // 返回 false（不放行）而不是 true：调用方 openConfirm 会先发现租户变了并给出
+    // 「请重新选择」的提示，不会走到「超出额度」那条分支上去。
+    if (seq !== quotaSeq || tenantId.value !== wanted) return false
     quotaVerdict.value = data
     // Keep the usage panel in sync with the snapshot the verdict used.
     if (data?.buckets) {
@@ -1096,12 +1138,19 @@ async function checkQuotaForForm(): Promise<boolean> {
     }
     return !data?.blocked
   } catch (e: any) {
+    if (seq !== quotaSeq || tenantId.value !== wanted) return false
     // A failed pre-check must not block a launch the server might well accept —
     // the server re-validates on submit either way.
     quotaLoadError.value = e?.message || '无法预检免费额度（提交时仍会由服务端校验）'
     return true
   } finally {
-    loadingQuota.value = false
+    // loadingQuota 只归序号管（理由同 loadQuotaPreview）；被接管时由新的那次负责关。
+    if (seq === quotaSeq) loadingQuota.value = false
+    // quotaPrechecking 无条件复位：只有本函数会写它，而 openConfirm 入口的
+    // `if (loadingQuota.value) return` 保证同时只有一次预检在飞，没有「后来者接管」
+    // 这回事。若照抄序号判断，被 loadQuotaPreview 顶掉时就再没人复位它，租户 / 区域
+    // 下拉会永久禁用。
+    quotaPrechecking.value = false
   }
 }
 
@@ -1121,7 +1170,21 @@ async function openConfirm() {
     error.value = '请完整选择 AD / 镜像 / Shape'
     return
   }
+  // 预检要 await 好几秒，其间表单一直可见（v-show="!confirmOpen"）。租户 / 区域下拉
+  // 此刻已禁用，但那只是 UI 层的拦截，状态层必须自己再确认一次：换租户会走
+  // onRegionPicked 清空 meta / AD / 镜像 / Shape，若不复查，确认页就会带着 B 的租户
+  // 名、「AD —／镜像 —／Shape —」和 A 的额度结论打开，「确认并创建」提交一串空字符串。
+  const wanted = tenantId.value
   const allowed = await checkQuotaForForm()
+  if (
+    tenantId.value !== wanted ||
+    !form.shape ||
+    !form.image_id ||
+    !form.availability_domain
+  ) {
+    error.value = '校验期间租户或配置发生变化，请重新加载配置并选择 AD / 镜像 / Shape'
+    return
+  }
   if (!allowed) {
     // Blocked: the reason is rendered from quotaVerdict above the button.
     error.value = '当前配置会超出 Always Free 免费额度，已阻止提交（详见下方说明）'

@@ -92,6 +92,9 @@
         <button class="danger" :disabled="acting" @click="doTerminate">终止</button>
       </div>
     </div>
+    <!-- 换实例时 instance 会被先清空（见 resetInstanceState），上面的卡片
+         整块消失。没有这句占位，页面看起来像是加载失败了。 -->
+    <div v-else-if="loading" class="card muted" style="font-size: 13px">正在读取实例信息…</div>
 
     <!-- Tabs: horizontal scroll on narrow screens -->
     <div class="tab-row" role="tablist">
@@ -244,14 +247,23 @@
       <div class="row" style="justify-content: space-between">
         <h3 style="margin: 0">防火墙 (NSG)</h3>
         <div class="row">
-          <button @click="loadFirewall">刷新</button>
+          <button :disabled="fwLoading" @click="loadFirewall">刷新</button>
           <button class="danger" :disabled="fwBusy" @click="openAllFirewall">放行全部端口</button>
         </div>
       </div>
       <p class="muted" style="margin: 0; font-size: 12px">{{ fwMsg }}</p>
 
-      <!-- Nothing at all: say so instead of rendering a blank panel. -->
-      <div v-if="!fwGroups.length && !fwSecurityLists.length" class="card" style="padding: 0.75rem">
+      <div v-if="fwLoading" class="card muted" style="padding: 0.75rem; font-size: 13px">
+        正在读取防火墙规则…
+      </div>
+      <!-- Nothing at all: say so instead of rendering a blank panel.
+           但读回来之前不能说「该实例没有 NSG」：换实例会先清空这两张表，
+           那句话会替新机器下一个还没查证的结论。 -->
+      <div
+        v-else-if="!fwGroups.length && !fwSecurityLists.length"
+        class="card"
+        style="padding: 0.75rem"
+      >
         <div class="muted" style="font-size: 13px">
           该实例没有关联的网络安全组（NSG），其子网也没有可读的安全列表。<br />
           放行端口可点「放行全部端口」（为该实例创建并绑定一个 NSG），或在 Oracle 控制台为子网添加安全列表规则。
@@ -385,7 +397,11 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-if="reservedIps.length === 0">
+            <!-- 读取中不说「暂无」：换租户会先清空这张表。 -->
+            <tr v-if="ripBusy && !reservedIps.length">
+              <td colspan="5" class="muted empty">正在读取…</td>
+            </tr>
+            <tr v-else-if="reservedIps.length === 0">
               <td colspan="5" class="muted empty">该区域暂无保留 IP。「新建保留 IP」后即可绑定到实例。</td>
             </tr>
             <tr v-for="ip in reservedIps" :key="ip.id">
@@ -605,7 +621,10 @@
               </tr>
             </thead>
             <tbody>
-              <tr v-if="backups.length === 0">
+              <tr v-if="backupBusy && !backups.length">
+                <td colspan="6" class="muted empty">正在读取…</td>
+              </tr>
+              <tr v-else-if="backups.length === 0">
                 <td colspan="6" class="muted empty">暂无备份</td>
               </tr>
               <tr v-for="b in backups" :key="b.id">
@@ -639,6 +658,11 @@
           </div>
           <button class="primary" :disabled="acting" @click="updateShape">应用规格</button>
         </template>
+        <!-- instance 为 null 时（换实例、清空后还没读回来）既不能显示表单，
+             也不能断言「固定规格」—— 那是在替一台还没读到的机器下结论。 -->
+        <p v-else-if="!instance" class="muted" style="margin: 0; font-size: 13px">
+          正在读取实例规格…
+        </p>
         <p v-else class="muted" style="margin: 0; font-size: 13px">
           当前 Shape <code>{{ instance?.shape || '—' }}</code> 为固定规格，
           <strong>不允许修改 OCPU / 内存</strong>。
@@ -656,7 +680,14 @@
       <p class="muted" style="margin: 0; font-size: 13px">
         通过浏览器 SSH 连接实例（默认 22 端口）。需要公网 IP 或宿主可路由的私网 IP；凭证不会保存。
       </p>
-      <WebSshTerminal :tenant-id="tenantId" :instance-id="instanceId" />
+      <!-- key 上带实例 id：路由复用本组件时，终端组件只会收到新 props，
+           A 的会话仍开着不动，而它的「断开 / 清除主机密钥」已经指向 B。
+           换 key 强制重建，组件的 onBeforeUnmount 会先关掉 A 的 socket。 -->
+      <WebSshTerminal
+        :key="`${tenantId}:${instanceId}`"
+        :tenant-id="tenantId"
+        :instance-id="instanceId"
+      />
     </div>
   </div>
 </template>
@@ -695,6 +726,67 @@ const tabs = [
   { id: 'volume' as const, label: '引导卷/规格' },
 ]
 
+// ---- 请求竞态保护 ----
+//
+// <router-view> 没有加 key，从实例 A 点到实例 B 时路由器**复用**本组件，
+// 只有底部的 watch 重新拉数据。没有守卫的话，A 的响应（OCI 动辄好几秒）
+// 落地时会无条件写进 state：页面显示 A 的名称 / 状态 / IP，而 tenantId、
+// instanceId 两个 computed 早已指向 B，每个按钮拼出来的 URL 也都是 B 的。
+// 看着 A 点关机，停的是 B。慢的 A 迟到覆盖掉新的 B 也是同一个洞。
+//
+// 计数器**按 loader 分**：refreshAll 会依次启动多个 loader，共用一个计数器
+// 会让它们互相判定为过期。与 AccountView / InstancesView 同构。
+const loadSeq: Record<string, number> = {}
+
+function beginLoad(key: string): { stale: () => boolean; superseded: () => boolean } {
+  const seq = (loadSeq[key] = (loadSeq[key] || 0) + 1)
+  const wantedTenant = tenantId.value
+  const wantedInstance = instanceId.value
+  return {
+    // 该不该把结果**写进** state：换了实例（或租户）就不能写。
+    stale: () =>
+      seq !== loadSeq[key] ||
+      tenantId.value !== wantedTenant ||
+      instanceId.value !== wantedInstance,
+    // 该不该**关掉** spinner：只看序号。带上 id 判断的话，加载途中切实例
+    // 会让这一次不关 spinner，而切换本身未必启动同名 loader 来接管所有权
+    // （比如当前不在那个标签页），按钮就永久卡在 disabled。
+    // InstancesView.load() 和 AccountView.loadAll() 都踩过并修过这个坑。
+    superseded: () => seq !== loadSeq[key],
+  }
+}
+
+/**
+ * 动作入口处锁定目标实例。
+ *
+ * URL 一律用锁定的 id 拼，而不是发请求那一刻的 tenantId.value —— 确认框问的
+ * 是哪台，打出去的请求就必须是哪台。await 回来后若路由已经换人，就不再写
+ * msg / error、也不重新加载，否则 A 的操作结果会显示在 B 的页面上。
+ */
+function beginAction() {
+  const tenant = tenantId.value
+  const target = instanceId.value
+  return {
+    tenant,
+    target,
+    moved: () => tenantId.value !== tenant || instanceId.value !== target,
+  }
+}
+
+/**
+ * 确认框里用来指代目标机器的字样。
+ *
+ * 只有当已加载的 instance 确实就是当前路由指向的那台时才敢用它的名字：
+ * 否则确认框写着 A 的名称、请求却打向 B，用户是照着错的东西点的「确定」。
+ * 拿不准就退回 OCID 尾段 —— 不好读，但一定是即将被操作的那台。
+ */
+function targetLabel(id?: string): string {
+  const wanted = id || instanceId.value
+  const ins = instance.value
+  const name = ins && ins.id === wanted ? ins.display_name : ''
+  return name ? `「${name}」` : `OCID …${wanted.slice(-12)}`
+}
+
 // ---- reserved public IPs ----
 type ReservedIp = {
   id: string
@@ -707,14 +799,17 @@ const reservedIps = ref<ReservedIp[]>([])
 const ripBusy = ref(false)
 
 async function loadReservedIps() {
+  const guard = beginLoad('reservedIps')
   ripBusy.value = true
   try {
     const { data } = await api.get(`/tenants/${tenantId.value}/reserved-ips`)
+    if (guard.stale()) return
     reservedIps.value = data.items || []
   } catch (e: any) {
+    if (guard.stale()) return
     error.value = e?.message || '加载保留 IP 失败'
   } finally {
-    ripBusy.value = false
+    if (!guard.superseded()) ripBusy.value = false
   }
 }
 
@@ -739,9 +834,12 @@ async function createReservedIp() {
 }
 
 async function attachReservedIp(ip: ReservedIp) {
+  // 「本实例」是哪一台要说清楚，并且说的必须是请求真正打向的那一台。
+  const act = beginAction()
   if (
     !confirm(
-      `将保留 IP ${ip.ip_address} 绑定到本实例？实例当前的临时公网 IP 会被释放（地址不可找回）。`,
+      `将保留 IP ${ip.ip_address} 绑定到实例 ${targetLabel(act.target)}？` +
+        `实例当前的临时公网 IP 会被释放（地址不可找回）。`,
     )
   )
     return
@@ -749,13 +847,15 @@ async function attachReservedIp(ip: ReservedIp) {
   error.value = ''
   try {
     const { data } = await api.post(
-      `/tenants/${tenantId.value}/instances/${instanceId.value}/reserved-ip/attach`,
+      `/tenants/${act.tenant}/instances/${act.target}/reserved-ip/attach`,
       { public_ip_id: ip.id },
     )
+    if (act.moved()) return
     if (data.ok) msg.value = data.message
     else error.value = data.message
     await Promise.all([loadReservedIps(), loadInstance()])
   } catch (e: any) {
+    if (act.moved()) return
     error.value = e?.message || '绑定失败'
   } finally {
     ripBusy.value = false
@@ -810,16 +910,19 @@ const backupBusy = ref(false)
 
 async function loadBackups() {
   if (!bootInfo.value?.boot_volume_id) return
+  const guard = beginLoad('backups')
   backupBusy.value = true
   try {
     const { data } = await api.get(`/tenants/${tenantId.value}/boot-volume-backups`, {
       params: { boot_volume_id: bootInfo.value.boot_volume_id },
     })
+    if (guard.stale()) return
     backups.value = data.items || []
   } catch (e: any) {
+    if (guard.stale()) return
     error.value = e?.message || '加载备份失败'
   } finally {
-    backupBusy.value = false
+    if (!guard.superseded()) backupBusy.value = false
   }
 }
 
@@ -923,9 +1026,13 @@ function formatTime(v: string) {
 }
 
 async function loadInstance() {
+  const guard = beginLoad('instance')
   const { data } = await api.get<Instance>(
     `/tenants/${tenantId.value}/instances/${instanceId.value}`,
   )
+  // 这一份是上一台机器的答复（或者迟到的旧答复）：写进去就等于页面显示 A、
+  // 按钮操作 B。整个页面的正确性都压在这一行上。
+  if (guard.stale()) return
   instance.value = data
   if (data.ocpus != null) shapeForm.ocpus = data.ocpus
   if (data.memory_in_gbs != null) shapeForm.memory_in_gbs = data.memory_in_gbs
@@ -1089,12 +1196,15 @@ function onMetricHover(ev: MouseEvent | TouchEvent, key: string) {
 }
 
 async function loadMetrics() {
+  const guard = beginLoad('metrics')
   loadingMetrics.value = true
   try {
     const { data } = await api.get(
       `/tenants/${tenantId.value}/instances/${instanceId.value}/metrics`,
       { params: { hours: metricHours.value } },
     )
+    // 曲线不带标识，画错了没人看得出来 —— 只能靠这里拦住。
+    if (guard.stale()) return
     metricsMsg.value = data.message || ''
     const series = data.data?.series || {}
     // normalize to array of [ts, value]
@@ -1107,9 +1217,10 @@ async function loadMetrics() {
     metricsSeries.value = out
     metricHover.value = {}
   } catch (e: any) {
+    if (guard.stale()) return
     metricsMsg.value = e?.message || '加载监控失败'
   } finally {
-    loadingMetrics.value = false
+    if (!guard.superseded()) loadingMetrics.value = false
   }
 }
 
@@ -1121,12 +1232,17 @@ const consoleBusy = ref(false)
 async function loadConsole() {
   // Surface failures instead of leaving a stale list on screen with no hint that
   // the refresh failed (the sibling loaders already do this).
+  const guard = beginLoad('console')
   try {
     const { data } = await api.get(
       `/tenants/${tenantId.value}/instances/${instanceId.value}/console`,
     )
+    // 列表里每条的「删除」按钮都是按当前 id 拼 URL 的，混进上一台的连接
+    // 就会去删另一台机器的控制台。
+    if (guard.stale()) return
     consoleList.value = data.connections || []
   } catch (e: any) {
+    if (guard.stale()) return
     error.value = e?.message || '加载控制台连接失败'
   }
 }
@@ -1178,6 +1294,9 @@ const fwGroups = ref<any[]>([])
 const fwSecurityLists = ref<any[]>([])
 const fwMsg = ref('')
 const fwBusy = ref(false)
+// 与 fwBusy 分开：fwBusy 是「正在改规则」，这个是「正在读规则」。读取期间
+// 两张表是空的，模板要靠它区分「还没读到」和「确实没有 NSG」。
+const fwLoading = ref(false)
 const ruleForm = reactive({
   direction: 'INGRESS',
   protocol: '6',
@@ -1186,30 +1305,46 @@ const ruleForm = reactive({
 })
 
 async function loadFirewall() {
+  const guard = beginLoad('firewall')
+  fwLoading.value = true
   try {
     const { data } = await api.get(
       `/tenants/${tenantId.value}/instances/${instanceId.value}/firewall`,
     )
+    // 规则表上的「删」按钮按当前 id 发请求，显示成上一台的规则就会删错机器。
+    if (guard.stale()) return
     fwMsg.value = data.message || ''
     if (data.ok === false) error.value = data.message || '加载防火墙规则失败'
     fwGroups.value = data.data?.groups || []
     fwSecurityLists.value = data.data?.security_lists || []
   } catch (e: any) {
+    if (guard.stale()) return
     error.value = e?.message || '加载防火墙规则失败'
+  } finally {
+    if (!guard.superseded()) fwLoading.value = false
   }
 }
 async function openAllFirewall() {
-  if (!confirm('将清空关联 NSG 规则并全开放，确认？')) return
+  const act = beginAction()
+  if (
+    !confirm(
+      `将实例 ${targetLabel(act.target)} 关联的 NSG 规则全部清空，并改为全开放，确认？\n` +
+        '所有端口都会对 0.0.0.0/0 开放，原有规则不可恢复。',
+    )
+  )
+    return
   fwBusy.value = true
   error.value = ''
   try {
     const { data } = await api.post(
-      `/tenants/${tenantId.value}/instances/${instanceId.value}/firewall/open-all`,
+      `/tenants/${act.tenant}/instances/${act.target}/firewall/open-all`,
     )
+    if (act.moved()) return
     if (data.ok) msg.value = data.message
     else error.value = data.message
     await loadFirewall()
   } catch (e: any) {
+    if (act.moved()) return
     error.value = e?.message || '操作失败'
   } finally {
     fwBusy.value = false
@@ -1276,23 +1411,31 @@ const growCreds = reactive<SshCredModel>({
 const fsGrowResult = ref<any>(null)
 
 async function loadBoot() {
+  const guard = beginLoad('boot')
   bootBusy.value = true
   try {
     const { data } = await api.get(
       `/tenants/${tenantId.value}/instances/${instanceId.value}/boot-volume`,
     )
+    // 引导卷 OCID 会被「创建备份 / 调整容量」直接拿去用，串了台就是在改
+    // 另一台机器的盘。
+    if (guard.stale()) return
     if (data.ok) {
       bootInfo.value = data.data
       bootForm.size_in_gbs = data.data.size_in_gbs
       bootForm.vpus_per_gb = data.data.vpus_per_gb
     } else error.value = data.message
   } catch (e: any) {
+    if (guard.stale()) return
     error.value = e?.message || '读取失败'
   } finally {
-    bootBusy.value = false
+    if (!guard.superseded()) bootBusy.value = false
   }
 }
 async function updateBoot() {
+  // 这一发会把 SSH 凭证连同扩容请求一起送到某台机器上，返回的还是那台机器的
+  // shell 输出 —— 目标必须在入口就锁死，回来时人已经换页就别再往下写。
+  const act = beginAction()
   bootBusy.value = true
   error.value = ''
   fsGrowResult.value = null
@@ -1314,9 +1457,10 @@ async function updateBoot() {
       }
     }
     const { data } = await api.post(
-      `/tenants/${tenantId.value}/instances/${instanceId.value}/boot-volume`,
+      `/tenants/${act.tenant}/instances/${act.target}/boot-volume`,
       payload,
     )
+    if (act.moved()) return
     if (data.data) fsGrowResult.value = data.data
     if (data.ok) {
       msg.value = data.message
@@ -1324,6 +1468,7 @@ async function updateBoot() {
       await loadBoot()
     } else error.value = data.message
   } catch (e: any) {
+    if (act.moved()) return
     error.value = e?.message || '调整失败'
   } finally {
     bootBusy.value = false
@@ -1334,21 +1479,24 @@ async function updateShape() {
     error.value = '当前 Shape 为固定规格，不允许修改 OCPU / 内存'
     return
   }
+  const act = beginAction()
   acting.value = true
   error.value = ''
   try {
     const { data } = await api.post(
-      `/tenants/${tenantId.value}/instances/${instanceId.value}/shape`,
+      `/tenants/${act.tenant}/instances/${act.target}/shape`,
       {
         ocpus: shapeForm.ocpus,
         memory_in_gbs: shapeForm.memory_in_gbs,
       },
     )
+    if (act.moved()) return
     if (data.ok) {
       msg.value = data.message
       await loadInstance()
     } else error.value = data.message
   } catch (e: any) {
+    if (act.moved()) return
     error.value = e?.message || '修改失败'
   } finally {
     acting.value = false
@@ -1356,14 +1504,32 @@ async function updateShape() {
 }
 
 // ---- power helpers ----
+const POWER_LABEL: Record<string, string> = {
+  START: '开机',
+  SOFTSTOP: '关机',
+  SOFTRESET: '重启',
+  STOP: '强制关机',
+  RESET: '强制重启',
+}
+
 async function power(action: string) {
+  const act = beginAction()
+  // 关机 / 重启会中断这台机器上跑的一切，点错一台就是一次线上事故，所以要
+  // 确认、并且把机器名写进去。开机不会打断任何东西，不值得多一次点击。
+  if (
+    action !== 'START' &&
+    !confirm(`确认对实例 ${targetLabel(act.target)} 执行「${POWER_LABEL[action] || action}」？`)
+  ) {
+    return
+  }
   acting.value = true
   error.value = ''
   try {
     const { data } = await api.post(
-      `/tenants/${tenantId.value}/instances/${instanceId.value}/power`,
+      `/tenants/${act.tenant}/instances/${act.target}/power`,
       { action },
     )
+    if (act.moved()) return
     // The API answers 200 with ok=false when OCI refuses the action (wrong
     // lifecycle state, etc.) — showing data.message as a success banner told the
     // user it worked. Branch on ok, like doReplaceIp already does.
@@ -1371,68 +1537,94 @@ async function power(action: string) {
     else error.value = data.message || '操作失败'
     await loadInstance()
   } catch (e: any) {
+    if (act.moved()) return
     error.value = e?.message || '操作失败'
   } finally {
     acting.value = false
   }
 }
 async function doRename() {
-  const name = prompt('新名称', instance.value?.display_name || '')
+  const act = beginAction()
+  // 预填的旧名字必须来自请求真正要改的那台机器：曾经这里直接读 instance.value，
+  // 而 instance 可能还是上一台的，于是 B 被改成了 A 的名字。targetLabel /
+  // currentName 都只在 instance.id 与目标 id 相符时才采信。
+  const currentName =
+    instance.value && instance.value.id === act.target ? instance.value.display_name : ''
+  const name = prompt(`重命名实例 ${targetLabel(act.target)}\n新名称`, currentName)
   if (!name?.trim()) return
   acting.value = true
   try {
     const { data } = await api.post(
-      `/tenants/${tenantId.value}/instances/${instanceId.value}/rename`,
+      `/tenants/${act.tenant}/instances/${act.target}/rename`,
       { display_name: name.trim() },
     )
+    if (act.moved()) return
     if (data.ok) msg.value = data.message
     else error.value = data.message || '重命名失败'
     await loadInstance()
   } catch (e: any) {
+    if (act.moved()) return
     error.value = e?.message || '失败'
   } finally {
     acting.value = false
   }
 }
 async function doReplaceIp() {
-  if (!confirm('更换临时公网 IPv4？')) return
+  const act = beginAction()
+  if (
+    !confirm(
+      `更换实例 ${targetLabel(act.target)} 的临时公网 IPv4？\n` +
+        '旧地址会被释放且不可找回，指向它的 DNS / 防火墙规则会失效。',
+    )
+  )
+    return
   acting.value = true
   try {
     const { data } = await api.post(
-      `/tenants/${tenantId.value}/instances/${instanceId.value}/public-ip/replace`,
+      `/tenants/${act.tenant}/instances/${act.target}/public-ip/replace`,
     )
+    if (act.moved()) return
     if (data.ok) msg.value = data.message
     else error.value = data.message
     await loadInstance()
   } catch (e: any) {
+    if (act.moved()) return
     error.value = e?.message || '失败'
   } finally {
     acting.value = false
   }
 }
 async function doIpv6() {
+  // 分配地址是增量操作，不删不断，不加确认。
+  const act = beginAction()
   acting.value = true
   try {
-    const { data } = await api.post(
-      `/tenants/${tenantId.value}/instances/${instanceId.value}/ipv6`,
-    )
+    const { data } = await api.post(`/tenants/${act.tenant}/instances/${act.target}/ipv6`)
+    if (act.moved()) return
     if (data.ok) msg.value = data.message
     else error.value = data.message
     await loadInstance()
   } catch (e: any) {
+    if (act.moved()) return
     error.value = e?.message || '失败'
   } finally {
     acting.value = false
   }
 }
 async function doRemoveIpv6() {
-  const list = (instance.value?.ipv6_addresses || []).join('、')
+  const act = beginAction()
+  // 地址清单同样只在 instance 确实是目标机器时才敢列出来 —— 列出 A 的地址
+  // 却删 B 的，用户在确认框里根本看不出被删的是什么。
+  const list =
+    instance.value && instance.value.id === act.target
+      ? (instance.value.ipv6_addresses || []).join('、')
+      : ''
   // Confirmed because the address is not recoverable: assigning again produces a
   // NEW one, so anything pointing at the old address (DNS, firewall rules on
   // other hosts) stops matching.
   if (
     !confirm(
-      `确认取消该实例的 IPv6？\n${list}\n\n` +
+      `确认取消实例 ${targetLabel(act.target)} 的 IPv6？\n${list}\n\n` +
         '重新分配会得到一个不同的地址，指向旧地址的 DNS / 防火墙规则将失效。\n' +
         '子网与 VCN 的 IPv6 前缀和路由保持不变，同子网的其他实例不受影响。',
     )
@@ -1441,13 +1633,13 @@ async function doRemoveIpv6() {
   }
   acting.value = true
   try {
-    const { data } = await api.delete(
-      `/tenants/${tenantId.value}/instances/${instanceId.value}/ipv6`,
-    )
+    const { data } = await api.delete(`/tenants/${act.tenant}/instances/${act.target}/ipv6`)
+    if (act.moved()) return
     if (data.ok) msg.value = data.message
     else error.value = data.message
     await loadInstance()
   } catch (e: any) {
+    if (act.moved()) return
     error.value = e?.message || '失败'
   } finally {
     acting.value = false
@@ -1455,13 +1647,21 @@ async function doRemoveIpv6() {
 }
 
 async function doTerminate() {
-  if (!confirm('确认终止该实例？')) return
+  const act = beginAction()
+  if (
+    !confirm(
+      `确认终止实例 ${targetLabel(act.target)}？\n` +
+        '实例和它的引导卷都会被删除，数据不可恢复。',
+    )
+  )
+    return
   acting.value = true
   try {
     const { data } = await api.post(
-      `/tenants/${tenantId.value}/instances/${instanceId.value}/terminate`,
+      `/tenants/${act.tenant}/instances/${act.target}/terminate`,
       { preserve_boot_volume: false },
     )
+    if (act.moved()) return
     if (!data.ok) {
       // Navigating away on a refused terminate left the user believing the
       // instance was gone.
@@ -1471,83 +1671,120 @@ async function doTerminate() {
     msg.value = data.message
     setTimeout(() => router.push('/'), 800)
   } catch (e: any) {
+    if (act.moved()) return
     error.value = e?.message || '失败'
   } finally {
     acting.value = false
   }
 }
 
+/** 当前标签页对应的那一份数据；其余标签页按需加载，不在这里预取。 */
+async function loadCurrentTab() {
+  if (tab.value === 'metrics') await loadMetrics()
+  else if (tab.value === 'console') await loadConsole()
+  else if (tab.value === 'firewall') await loadFirewall()
+  else if (tab.value === 'network') await loadReservedIps()
+  else if (tab.value === 'volume') {
+    await loadBoot()
+    await loadBackups()
+  }
+}
+
 async function refreshAll() {
+  const guard = beginLoad('page')
   loading.value = true
   error.value = ''
   try {
     await loadInstance()
-    if (tab.value === 'metrics') await loadMetrics()
-    if (tab.value === 'console') await loadConsole()
-    if (tab.value === 'firewall') await loadFirewall()
-    if (tab.value === 'network') await loadReservedIps()
-    if (tab.value === 'volume') {
-      await loadBoot()
-      await loadBackups()
-    }
+    await loadCurrentTab()
   } catch (e: any) {
+    if (guard.stale()) return
     error.value = e?.message || '加载失败'
   } finally {
-    loading.value = false
+    // spinner 只归序号管：刷新途中切实例时，若这里还带上 id 判断，本次不关、
+    // 而接管的是路由 watch 里同 key 的那一次 —— 它会关。但反过来，一旦把
+    // id 判断写进来，任何没有后继者的场景都会让「刷新」按钮永久 disabled。
+    if (!guard.superseded()) loading.value = false
   }
 }
 
-watch(tab, async (t) => {
+watch(tab, async () => {
   try {
-    if (t === 'metrics') await loadMetrics()
-    if (t === 'console') await loadConsole()
-    if (t === 'firewall') await loadFirewall()
-    if (t === 'network') await loadReservedIps()
-    if (t === 'volume') {
-      await loadBoot()
-      await loadBackups()
-    }
+    await loadCurrentTab()
   } catch (e: any) {
     error.value = e?.message || '加载失败'
   }
 })
 
 onMounted(async () => {
+  const guard = beginLoad('page')
+  loading.value = true
   try {
     // Only the instance summary is required to open the page.
     // Metrics / console / firewall / volume load when the user opens that tab
     // (or clicks 刷新全部), to avoid background Oracle polling.
     await loadInstance()
-    if (tab.value === 'metrics') await loadMetrics()
-    else if (tab.value === 'console') await loadConsole()
-    else if (tab.value === 'firewall') await loadFirewall()
-    else if (tab.value === 'network') await loadReservedIps()
-    else if (tab.value === 'volume') {
-      await loadBoot()
-      await loadBackups()
-    }
+    await loadCurrentTab()
   } catch (e: any) {
+    if (guard.stale()) return
     error.value = e?.message || '加载失败'
+  } finally {
+    if (!guard.superseded()) loading.value = false
   }
 })
+
+/**
+ * 换实例前先清空本实例的所有数据。
+ *
+ * <router-view> 没有 key，A→B 时组件被复用，只有下面的 watch 重新拉数据。
+ * 不清空的话，在 B 的响应回来之前（OCI 要好几秒）页面渲染的全是 A 的名称、
+ * 状态、IP、规则、备份，而按钮拼 URL 用的已经是 B 的 id —— 看着 A 点关机，
+ * 停的是 B。宁可空几秒，也不能显示一台、操作另一台。
+ */
+function resetInstanceState() {
+  instance.value = null
+  error.value = ''
+  msg.value = ''
+  metricsSeries.value = {}
+  metricHover.value = {}
+  metricsMsg.value = ''
+  consoleList.value = []
+  fwGroups.value = []
+  fwSecurityLists.value = []
+  fwMsg.value = ''
+  reservedIps.value = []
+  bootInfo.value = null
+  bootForm.size_in_gbs = null
+  bootForm.vpus_per_gb = 10
+  backups.value = []
+  fsGrowResult.value = null
+  // 表单默认值：不清的话，A 的 OCPU/内存会留在框里，B 一点「应用规格」就被
+  // 改成 A 的规格。loadInstance 只在字段非空时回填，兜不住这一步。
+  shapeForm.ocpus = 1
+  shapeForm.memory_in_gbs = 6
+  // SSH 凭证是按机器给的：为 A 输入的私钥 / 密码绝不能跟着页面漂到 B，
+  // 那等于把 A 的凭证发到另一台主机上去。
+  autoGrowFs.value = false
+  growCreds.privateKeyPem = ''
+  growCreds.password = ''
+}
 
 // If the router reuses this component for a different instance, reload its data.
 // Mirrors onMounted exactly: the summary, then only the tab actually on screen.
 // It used to pull metrics unconditionally, so switching between instances while
 // sitting on the firewall tab spent a Monitoring query nobody asked for.
 watch([tenantId, instanceId], async () => {
+  resetInstanceState()
+  const guard = beginLoad('page')
+  loading.value = true
   try {
     await loadInstance()
-    if (tab.value === 'metrics') await loadMetrics()
-    else if (tab.value === 'console') await loadConsole()
-    else if (tab.value === 'firewall') await loadFirewall()
-    else if (tab.value === 'network') await loadReservedIps()
-    else if (tab.value === 'volume') {
-      await loadBoot()
-      await loadBackups()
-    }
+    await loadCurrentTab()
   } catch (e: any) {
+    if (guard.stale()) return
     error.value = e?.message || '加载失败'
+  } finally {
+    if (!guard.superseded()) loading.value = false
   }
 })
 </script>

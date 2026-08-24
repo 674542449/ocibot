@@ -148,6 +148,7 @@ ensure_env() {
   local envf="$REPO_DIR/web/.env"
   if [ -f "$envf" ]; then
     log "保留已有 web/.env"
+    ensure_update_flag_present
     link_root_env
     return
   fi
@@ -157,7 +158,15 @@ ensure_env() {
   pg_pass="$(rand_hex | cut -c1-32)"
   master="$(rand_hex)"
   jwt="$(rand_hex)"
-  cat >"$envf" <<EOF
+  # umask 077 套在整段 heredoc 外面，不是写完再 chmod。
+  #
+  # 原来是先 `cat >` 再 `chmod 600`：文件在这两步之间以 0644 存在，主密钥、JWT
+  # 密钥、数据库密码在那个窗口里对机器上任何一个本地用户可读。窗口很短不等于不存在
+  # —— 一个 inotify 监听就够了。而且后面跟着 `|| true`，chmod 真失败时脚本照样报成功，
+  # 于是文件长期停在 0644 而没有任何提示。
+  (
+    umask 077
+    cat >"$envf" <<EOF
 POSTGRES_PASSWORD=${pg_pass}
 OCIBOT_MASTER_KEY=${master}
 OCIBOT_JWT_SECRET=${jwt}
@@ -173,11 +182,41 @@ OCIBOT_DB_MAX_OVERFLOW=20
 OCIBOT_PORT=8000
 OCIBOT_BIND=0.0.0.0
 OCIBOT_TRUST_PROXY=0
+OCIBOT_UPDATE_ENABLED=0
 COMPOSE_PROFILES=
 EOF
-  chmod 600 "$envf" || true
+  )
+  chmod 600 "$envf"
   link_root_env
   warn "已写入随机密钥到 web/.env —— 请备份该文件；丢失 OCIBOT_MASTER_KEY 将无法解密租户私钥"
+}
+
+# 面板内一键更新的开关，只认 web/.env 这一处，而且只在缺键时写一次默认值。
+#
+# 原来 export_build_env 里是 `export OCIBOT_UPDATE_ENABLED="${OCIBOT_UPDATE_ENABLED:-1}"`，
+# 并且每条子命令都会走到它。compose 解析 ${VAR} 时 shell 环境优先于 .env 文件，
+# 所以操作者按 README 在 web/.env 里写的 0 会被这个导出的 1 覆盖掉 —— 文档给出的
+# 那个开关根本不生效，而且下一次 `install.sh update` 会把「管理员会话 ≈ 宿主机
+# root」这条路悄悄接回去。
+ensure_update_flag_present() {
+  local envf="$REPO_DIR/web/.env"
+  [ -f "$envf" ] || return 0
+  [ -z "$(get_env_kv OCIBOT_UPDATE_ENABLED)" ] || return 0
+  set_env_kv OCIBOT_UPDATE_ENABLED 0
+  warn "面板内一键更新已默认关闭：它要把 docker.sock 和可写仓库交给 API 容器，"
+  warn "  等于任何一个管理员会话都是宿主机 root。需要的话执行："
+  warn "      bash scripts/install.sh update-on"
+}
+
+# 是否叠加 docker-compose.update.yml（docker.sock + 可写仓库 + 路由开关）。
+# 环境变量可以临时覆盖，但默认值来自 web/.env，脚本不再自作主张塞一个 1。
+update_override_enabled() {
+  local from_file
+  from_file="$(get_env_kv OCIBOT_UPDATE_ENABLED)"
+  case "${OCIBOT_UPDATE_ENABLED:-$from_file}" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # ---------------------------------------------------------------- 访问方式
@@ -528,8 +567,16 @@ compose() {
   if [ -f "$dir/web/.env" ] && grep -qx 'COMPOSE_PROFILES=tls' "$dir/web/.env"; then
     profile_args=(--profile tls)
   fi
+  # 面板内一键更新所需的挂载（docker.sock + 可写仓库）在单独的叠加文件里，默认不带。
+  # 显式写两个 -f，而不是改名成 compose 会自动发现的 docker-compose.override.yml：
+  # 那个名字留给操作者自己的覆盖文件（sync_repo_to_origin 的注释里就提到有人这么用），
+  # 占掉它会在更新时把人家的配置顶掉。
+  local file_args=(-f docker-compose.yml)
+  if [ -f "$dir/docker-compose.update.yml" ] && update_override_enabled; then
+    file_args+=(-f docker-compose.update.yml)
+  fi
   # ${a[@]+"${a[@]}"}：set -u 下展开空数组在 bash 4.3 及更早会报 unbound variable。
-  (cd "$dir" && $COMPOSE ${profile_args[@]+"${profile_args[@]}"} "$@")
+  (cd "$dir" && $COMPOSE ${profile_args[@]+"${profile_args[@]}"} "${file_args[@]}" "$@")
 }
 
 export_build_env() {
@@ -553,8 +600,14 @@ export_build_env() {
   fi
   REPO_DIR="$abs"
   export OCIBOT_HOST_REPO="$abs"
-  export OCIBOT_UPDATE_ENABLED="${OCIBOT_UPDATE_ENABLED:-1}"
+  # OCIBOT_UPDATE_ENABLED 这里**不导出**。它的唯一来源是 web/.env（见
+  # ensure_update_flag_present），容器里的值由 docker-compose.yml / .update.yml
+  # 写死，两者不会再各说各话。
   export OCIBOT_UPDATE_BRANCH="${OCIBOT_UPDATE_BRANCH:-$BRANCH}"
+  # 先看 web/.env 再回落到默认值。直接 `${VAR:-docker:27-cli}` 再 export，会让这个
+  # 导出的默认值盖掉操作者写在 web/.env 里的钉版 digest —— compose 插值时 shell
+  # 环境优先于 .env 文件。和 OCIBOT_UPDATE_ENABLED 曾经踩的是同一个坑。
+  OCIBOT_DOCKER_CLI_IMAGE="${OCIBOT_DOCKER_CLI_IMAGE:-$(get_env_kv OCIBOT_DOCKER_CLI_IMAGE)}"
   export OCIBOT_DOCKER_CLI_IMAGE="${OCIBOT_DOCKER_CLI_IMAGE:-docker:27-cli}"
   if [ -d "$REPO_DIR/.git" ] && command -v git >/dev/null 2>&1; then
     export OCIBOT_GIT_SHA
@@ -564,10 +617,12 @@ export_build_env() {
     export OCIBOT_GIT_SHA="${OCIBOT_GIT_SHA:-unknown}"
   fi
   log "OCIBOT_HOST_REPO=$OCIBOT_HOST_REPO"
-  # Pre-pull helper image used by in-panel updates (best-effort).
+  # 这个镜像有两个用途：构建时 web/Dockerfile 从它里面 COPY 静态 docker 二进制
+  # （替掉原来那个无校验的 curl tgz），在线更新时又用它跑 compose。所以无论开没开
+  # 在线更新都先拉一次，失败不致命。
   if command -v docker >/dev/null 2>&1; then
     docker pull "$OCIBOT_DOCKER_CLI_IMAGE" >/dev/null 2>&1 || \
-      warn "预拉取 $OCIBOT_DOCKER_CLI_IMAGE 失败（在线更新时会再试）"
+      warn "预拉取 $OCIBOT_DOCKER_CLI_IMAGE 失败（构建时会再拉一次）"
   fi
 }
 
@@ -589,7 +644,9 @@ do_install() {
     if curl -fsS "http://127.0.0.1:${OCIBOT_PORT:-8000}/api/health" >/dev/null 2>&1; then
       reconcile_proxy_subnet
       log "首次打开页面 → 注册管理员账号"
-      log "管理员「用户管理」页可检查/执行在线更新"
+      log "更新：cd $REPO_DIR && bash scripts/install.sh update"
+      log "  面板内一键更新默认关闭（它要把 docker.sock 交给 API 容器）。"
+      log "  确实需要、且所有管理员可信时：bash scripts/install.sh update-on"
       print_access_summary
       return 0
     fi
@@ -643,9 +700,21 @@ sync_repo_to_origin() {
     return 0
   fi
   log "同步代码到 origin/$BRANCH …"
-  # Keep secrets even if reset is hard.
+  # Keep secrets even if reset is hard —— 但只留在内存里，不落 /tmp。
+  #
+  # 原来是 `cp -a web/.env /tmp/ocibot.env.backup.$$`，两个问题：
+  #   1) 全文件没有 trap。下面任何一个 die（fetch 失败、找不到 origin/分支）或
+  #      set -e 触发的退出，都会把含主密钥 / JWT 密钥 / 数据库密码的副本永久留在
+  #      /tmp，没有任何东西会去收它。
+  #   2) $$ 取值范围小且可预测，而脚本以 root 运行：攻击者预先在那个路径放一个
+  #      符号链接，cp 就会顺着它把主密钥写到任意位置，或截断一个 root 拥有的文件。
+  # 换成 mktemp+trap 能堵住 (2) 也能堵住 (1)，但密钥仍要在磁盘上走一趟。
+  # web/AUDIT.md 第 9 轮把 self_update.py 里一模一样的模式改成了「只在内存中持有」，
+  # 这里照做 —— 反正 reset --hard 不会动未跟踪文件，这份备份本来就只是兜底。
+  local env_backup="" env_saved=0
   if [ -f "$REPO_DIR/web/.env" ]; then
-    cp -a "$REPO_DIR/web/.env" "/tmp/ocibot.env.backup.$$" || true
+    env_backup="$(cat "$REPO_DIR/web/.env")"
+    env_saved=1
   fi
   # Show divergence for operators (best-effort).
   git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null | awk '{print "本地 HEAD: "$0}' || true
@@ -671,11 +740,14 @@ sync_repo_to_origin() {
     git -C "$REPO_DIR" clean -nd --exclude=web/.env --exclude=web_data || true
     git -C "$REPO_DIR" clean -fd --exclude=web/.env --exclude=web_data || true
   fi
-  if [ -f "/tmp/ocibot.env.backup.$$" ]; then
+  # 只在文件真的没了的时候重建（0600 落盘，不是先建后 chmod）。正常情况下
+  # reset --hard 不碰未跟踪文件，这一段不会执行。
+  if [ "$env_saved" = "1" ] && [ ! -f "$REPO_DIR/web/.env" ]; then
     mkdir -p "$REPO_DIR/web"
-    mv -f "/tmp/ocibot.env.backup.$$" "$REPO_DIR/web/.env"
+    ( umask 077; printf '%s\n' "$env_backup" > "$REPO_DIR/web/.env" )
     log "已恢复 web/.env"
   fi
+  env_backup=""
   log "代码已对齐：$(git -C "$REPO_DIR" rev-parse --short HEAD)"
 }
 
@@ -706,9 +778,41 @@ do_update() {
   curl -fsS "http://127.0.0.1:${OCIBOT_PORT:-8000}/api/health" && echo || warn "API 暂未就绪，稍候再 curl"
 }
 
+# 打开 / 关闭面板内一键更新。
+#
+# 这两个动作改的是同一件事的两半：web/.env 里的开关（决定 compose 带不带
+# docker-compose.update.yml），以及由那个叠加文件带进来的 docker.sock 挂载 +
+# 可写仓库 + OCIBOT_UPDATE_ENABLED=1。分开设置只会得到「按钮在但一按就报错」
+# 或者「明明关了 socket 还挂着」，所以只留这一个入口。
+do_update_toggle() {
+  local want="$1"
+  ensure_docker
+  ensure_repo
+  [ -f "$REPO_DIR/web/.env" ] || die "还没安装过，请先执行：$0 install"
+  ensure_env
+  set_env_kv OCIBOT_UPDATE_ENABLED "$want"
+  export_build_env
+  if [ "$want" = "1" ]; then
+    warn "已开启面板内一键更新。请清楚这意味着什么："
+    warn "  API 容器改为 root 运行，持有宿主机 docker.sock 与可写仓库目录"
+    warn "  （目录里就有 web/.env：主密钥、JWT 密钥、数据库密码）。"
+    warn "  也就是任何一个管理员会话 ≈ 宿主机 root。多管理员或管理员不完全可信时"
+    warn "  请改用 SSH 更新：cd $REPO_DIR && bash scripts/install.sh update"
+  else
+    log "已关闭面板内一键更新：docker.sock 不再挂进容器，仓库改为只读挂载"
+    log "  以后更新走：cd $REPO_DIR && bash scripts/install.sh update"
+  fi
+  log "重建 api 使配置生效…"
+  compose up -d --force-recreate api
+  compose ps
+}
+
 do_status() {
   ensure_docker
   ensure_repo
+  # POSTGRES_PASSWORD 现在是必填（compose 里的 ${VAR:?}），而它只从项目根的 .env
+  # 插值。少了这个软链，连 `status` / `uninstall` 都会因为变量为空而报错退出。
+  link_root_env
   compose ps
   echo
   curl -fsS "http://127.0.0.1:${OCIBOT_PORT:-8000}/api/health" && echo || warn "API 未响应"
@@ -718,6 +822,7 @@ do_status() {
 do_uninstall() {
   ensure_docker
   ensure_repo
+  link_root_env   # 同 do_status：compose 插值需要项目根的 .env
   warn "将停止容器。默认保留 PostgreSQL 数据卷 ocibot_pg。"
   # 显式带上 tls profile：如果 web/.env 里没有 COMPOSE_PROFILES=tls（例如手工改过），
   # 不带这个参数会把 caddy 留在后台继续占着 80/443。
@@ -745,13 +850,19 @@ case "$cmd" in
     ACCESS_MODE="ip"
     do_switch_mode
     ;;
+  update-on)  do_update_toggle 1 ;;
+  update-off) do_update_toggle 0 ;;
   *)
     cat <<EOF
-用法: $0 {install|update|status|uninstall|domain <域名>|ip}
+用法: $0 {install|update|status|uninstall|domain <域名>|ip|update-on|update-off}
 
 访问方式（装完后可随时互换，不影响数据）:
   $0 domain panel.example.com   域名 + 自动 HTTPS（内置 Caddy 签证书，不需要另装反代）
   $0 ip                         直接 http://服务器IP:8000（明文，无需域名）
+
+面板内一键更新（默认关闭）:
+  $0 update-on                  挂 docker.sock 打开它 —— 管理员会话 ≈ 宿主机 root
+  $0 update-off                 关掉；更新改走 SSH：$0 update
 
 环境变量:
   OCIBOT_REPO_URL     git clone 地址（远程一键安装时必填）

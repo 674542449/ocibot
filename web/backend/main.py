@@ -18,27 +18,40 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from web.backend.body_limit import BodySizeLimitMiddleware
-from web.backend.config import get_settings
-from web.backend.origin_guard import UNSAFE_METHODS, origin_allowed
-from web.backend.db import SessionLocal, init_db
-from web.backend.routers import (
-    admin,
-    audit,
-    auth,
-    backup,
-    instance_ops,
-    instances,
-    jobs,
-    notifications,
-    storage,
-    system,
-    tenants,
-    webssh,
-)
-from web.backend.schemas import HealthOut
+from web.backend.config import InsecureSecretsError, get_settings
 
 log = logging.getLogger("ocibot.web")
+
+# 密钥预检必须跑在 db / routers 之前：db.py 在 import 时就建引擎并调用
+# get_settings()，所以配置不合格时异常会从一条 import 语句里冒出来，操作员看到的是
+# 一段与原因无关的 traceback。而 run.py 以 workers=2 起 uvicorn，启动异常发生在子
+# 进程里，父进程会不停把它拉起来 —— 变成滚屏的重启循环。这里先把失败接住，改为启动
+# 一个"只会解释原因"的应用（见 _fail_closed_app）。
+_STARTUP_BLOCK: str | None = None
+try:
+    get_settings()
+except InsecureSecretsError as exc:  # 只接这一种；其它启动错误仍应原样抛出
+    _STARTUP_BLOCK = str(exc)
+
+if _STARTUP_BLOCK is None:
+    from web.backend.body_limit import BodySizeLimitMiddleware
+    from web.backend.origin_guard import UNSAFE_METHODS, origin_allowed
+    from web.backend.db import SessionLocal, init_db
+    from web.backend.routers import (
+        admin,
+        audit,
+        auth,
+        backup,
+        instance_ops,
+        instances,
+        jobs,
+        notifications,
+        storage,
+        system,
+        tenants,
+        webssh,
+    )
+    from web.backend.schemas import HealthOut
 
 # Built frontend (web/frontend/dist). When present, the API process serves the
 # SPA directly — single-service deployment without a separate static host.
@@ -63,16 +76,22 @@ def _bootstrap_admin() -> None:
 
 
 def _warn_insecure_secrets() -> None:
-    """Loudly warn about weak/default secrets (not a hard fail unless
-    OCIBOT_REQUIRE_SECURE_SECRETS=1, which get_settings() enforces separately)."""
+    """Loudly warn about weak/default secrets.
+
+    自 OCIBOT_REQUIRE_SECURE_SECRETS 默认改为 1 起，还能走到这里只有一种情况：操作员
+    显式写了 =0 把检查关掉了。所以这条警告不再是"你可能忘了配"，而是"你正在明知故犯"，
+    措辞按后者写 —— 面板每次启动都得再说一遍。
+    """
     settings = get_settings()
     reasons = settings.weak_secret_reasons()
     if reasons:
         log.warning(
-            "SECURITY: %s. The master key is stretched with a single SHA-256 into the "
-            "Fernet key, so a short/guessable value is brute-forceable offline against a "
-            "stolen database. Set long random values (>=24 chars) and "
-            "OCIBOT_REQUIRE_SECURE_SECRETS=1 before exposing this panel on a network. "
+            "SECURITY: %s（OCIBOT_REQUIRE_SECURE_SECRETS=0 让启动检查被跳过了）。"
+            "The master key is stretched with a single SHA-256 into the "
+            "Fernet key, so a default/short value means anyone who reads the database can "
+            "decrypt every stored OCI private key, and the default JWT secret lets anyone "
+            "mint an admin session. Set long random values (>=24 chars, openssl rand -hex 48) "
+            "and remove OCIBOT_REQUIRE_SECURE_SECRETS=0 before exposing this panel on a network. "
             "Rotating OCIBOT_MASTER_KEY makes existing encrypted private keys undecryptable.",
             "；".join(reasons),
         )
@@ -97,18 +116,54 @@ async def lifespan(_app: FastAPI):
     yield
 
 
+def _fail_closed_app(message: str) -> FastAPI:
+    """密钥不合格时启动的替身应用：进程活着，但除了这段说明什么都不提供。
+
+    比让进程崩掉更有用的原因：崩溃发生在 uvicorn 的工作子进程里，父进程会无限重启，
+    操作员翻日志翻到的是同一段 traceback 反复出现；而这里进程稳定存活，日志里只出现
+    一次原因，`curl /api/health`（以及容器 healthcheck）也会直接把修复步骤打回来。
+    仍然是 fail closed：数据库、鉴权、加密一个都没初始化，没有挂载任何业务路由，
+    任何请求只可能拿到 503。
+    """
+    log.error("%s", message)
+    app = FastAPI(
+        title="OCIBot（配置错误）",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+
+    @app.api_route(
+        "/{_path:path}",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+        include_in_schema=False,
+    )
+    def blocked(_path: str) -> Response:
+        return JSONResponse(
+            {"status": "config_error", "detail": message},
+            status_code=503,
+            headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"},
+        )
+
+    return app
+
+
 def create_app() -> FastAPI:
+    if _STARTUP_BLOCK is not None:
+        return _fail_closed_app(_STARTUP_BLOCK)
+
     settings = get_settings()
     app = FastAPI(
         title=settings.app_name,
         version=settings.app_version,
         lifespan=lifespan,
+        # 交互式文档默认关闭。/openapi.json 未鉴权就返回全部路由与请求/响应 schema，
+        # 等于在登录之前把 admin、自更新这些入口的地图交出去。开发时用 OCIBOT_DEBUG=1
+        # 打开，免得调接口时无从下手。
+        openapi_url="/openapi.json" if settings.debug else None,
+        docs_url="/docs" if settings.debug else None,
+        redoc_url="/redoc" if settings.debug else None,
     )
-    # Largest request body accepted anywhere. The biggest legitimate payload is a
-    # 20MB backup ZIP. Enforced on bytes actually received, not just on a declared
-    # Content-Length, so a chunked body cannot stream unbounded data to the disk
-    # spool before any route-level check runs.
-    app.add_middleware(BodySizeLimitMiddleware, max_bytes=32 * 1024 * 1024)
     app.add_middleware(GZipMiddleware, minimum_size=500)
     app.add_middleware(
         CORSMiddleware,
@@ -204,7 +259,13 @@ def create_app() -> FastAPI:
             "font-src 'self' data:; "
             "style-src 'self' 'unsafe-inline'; "
             "script-src 'self'; "
-            "connect-src 'self' ws: wss:; "
+            # 只允许同源连接。裸 ws:/wss: 曾经在这里，语义是"任意主机的 WebSocket"，
+            # 于是这条策略里最值钱的那道外发防线（default-src 'self' 挡住的数据外传）
+            # 被自己打开了一个口子：一段注入脚本或一个被投毒的前端依赖，就能把 DOM、
+            # 会话状态和 WebSSH 终端输出源源不断送去 wss://attacker.example。
+            # CSP3 里 'self' 本来就覆盖同源的 ws://wss://（现代浏览器均已实现），
+            # 前端 client.ts::wsUrl() 也只用 location.host 拼同源地址，所以 WebSSH 不受影响。
+            "connect-src 'self'; "
             "form-action 'self'",
         )
         # Caching for the SPA bundle. Vite writes content-hashed filenames under
@@ -225,6 +286,21 @@ def create_app() -> FastAPI:
             # 浏览器强刷" line in README's troubleshooting table.
             response.headers.setdefault("Cache-Control", "no-cache")
         return response
+
+    # Largest request body accepted anywhere. The biggest legitimate payload is a
+    # 20MB backup ZIP. Enforced on bytes actually received, not just on a declared
+    # Content-Length, so a chunked body cannot stream unbounded data to the disk
+    # spool before any route-level check runs.
+    #
+    # 位置很重要，必须是最后一个 add_middleware：add_middleware 是往队首插入，
+    # 最后注册的那个才在最外层。这个上限要包住其他所有中间件，否则将来任何一个会读
+    # 请求体的中间件（请求日志、HMAC 校验、WAF 垫片）都会落在上限外面，先把整个 body
+    # 读进内存/磁盘之后才轮到这里数字节 —— 上限就形同虚设。
+    # 新增中间件请加在这一行【之前】。
+    #
+    # 代价是 413 不再经过上面的 security_headers，所以那几个必要的响应头改由
+    # body_limit._send_413 自己带上（AUDIT 第 10 轮核对过 413 带安全头，别让它退化）。
+    app.add_middleware(BodySizeLimitMiddleware, max_bytes=32 * 1024 * 1024)
 
     if _DIST_DIR.is_dir() and (_DIST_DIR / "index.html").is_file():
         assets_dir = _DIST_DIR / "assets"

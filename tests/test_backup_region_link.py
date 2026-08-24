@@ -31,7 +31,11 @@ from web.backend.db import SessionLocal, init_db  # noqa: E402
 from web.backend.main import app  # noqa: E402
 from web.backend.models import Tenant, User  # noqa: E402
 
-_PEM = "-----BEGIN PRIVATE KEY-----\nMIIBOgIBAAJBAK\n-----END PRIVATE KEY-----"
+from tests._keys import TEST_PEM
+
+# 必须是**能真正解析**的 PEM：TenantConfig.validate() 现在用
+# load_pem_private_key 解析私钥，标记形状的假串会被正确拒绝。
+_PEM = TEST_PEM
 _USER = "backup-region-user"
 
 
@@ -78,12 +82,12 @@ def client():
 
 def test_restored_secondary_region_still_points_at_its_primary(client):
     c = client
-    export = c.post("/api/backup/export", json={"password": "backup-pass"})
+    export = c.post("/api/backup/export", json={"password": "Str0ng-backup-pass"})
     assert export.status_code == 200, export.text
 
     restored = c.post(
         "/api/backup/import",
-        data={"password": "backup-pass"},
+        data={"password": "Str0ng-backup-pass"},
         files={"file": ("b.zip", io.BytesIO(export.content), "application/zip")},
     )
     assert restored.status_code == 200, restored.text

@@ -8,11 +8,9 @@ import pytest
 
 from app.config_store import ConfigStore, TenantConfig
 
-VALID_KEY = (
-    "-----BEGIN PRIVATE KEY-----\n"
-    "MIITESTKEYCONTENTDOESNOTNEEDTOBEREAL\n"
-    "-----END PRIVATE KEY-----\n"
-)
+from tests._keys import TEST_PEM
+
+VALID_KEY = TEST_PEM
 
 
 def _make_tenant(name: str) -> TenantConfig:

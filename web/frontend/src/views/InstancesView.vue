@@ -58,18 +58,20 @@
             </th>
             <th>名称</th>
             <th>状态</th>
-            <th>租户</th>
+            <!-- 没有「租户」列：这张表一次只列一个租户（顶部下拉选的那个），
+                 每行重复同一个名字既占宽度又没有信息量。全租户聚合的
+                 GET /api/instances 是故意返回 400 的，不存在混合列表。 -->
             <th>Shape</th>
             <th>公网 IP</th>
             <th>私网 IP</th>
             <th>创建时间</th>
             <th>root 密码</th>
-            <th>操作</th>
+            <th class="action-col">操作</th>
           </tr>
         </thead>
         <tbody>
           <tr v-if="!loading && filtered.length === 0">
-            <td colspan="10" class="muted empty">
+            <td colspan="9" class="muted empty">
               {{ instances.length ? '没有匹配搜索的实例' : '暂无实例。请先在「租户」添加 API，再「创建实例」。' }}
             </td>
           </tr>
@@ -81,25 +83,24 @@
                 @change="toggleSelect(ins)"
               />
             </td>
-            <td>
+            <td class="name-cell">
+              <!-- 截断而不是折行：名称是唯一长度完全由用户决定的字段，
+                   一台机器起个长名字就会把整行撑高。完整值在 title 里。 -->
               <router-link
+                class="name-link"
                 :to="`/instances/${ins.tenant_id || tenantId}/${ins.id}`"
-                style="font-weight: 600; color: var(--text)"
-              >
-                {{ ins.display_name }}
-              </router-link>
+                :title="ins.display_name"
+              >{{ ins.display_name }}</router-link>
             </td>
             <td>
               <span class="badge" :class="stateClass(ins.lifecycle_state)">{{ ins.lifecycle_state }}</span>
             </td>
-            <td>{{ ins.tenant_name || '—' }}</td>
             <td>
               {{ ins.shape }}
               <span v-if="ins.free_tier_tag" class="badge">{{ ins.free_tier_tag }}</span>
-              <div class="muted" style="font-size: 12px">
-                <template v-if="ins.ocpus != null">{{ ins.ocpus }} OCPU</template>
-                <template v-if="ins.memory_in_gbs != null"> · {{ ins.memory_in_gbs }} GB</template>
-              </div>
+              <!-- 行内，不是 <div>：独立一行的规格会让「弹性 shape」的行比
+                   固定 shape 的行高一截，同一张表里出现两种行高。 -->
+              <span v-if="specText(ins)" class="muted spec">{{ specText(ins) }}</span>
             </td>
             <td>
               <span
@@ -111,19 +112,19 @@
                 @click="copyIp(ins.public_ip, $event)"
                 @keydown.enter.prevent="copyIp(ins.public_ip)"
               >{{ ins.public_ip || '—' }}</span>
-              <div v-if="ins.ipv6_addresses?.length" class="muted" style="font-size: 11px; margin-top: 2px">
-                <span
-                  v-for="ip6 in ins.ipv6_addresses"
-                  :key="ip6"
-                  class="copyable"
-                  title="单击复制 IPv6"
-                  style="display: inline-block; margin-right: 0.35rem"
-                  role="button"
-                  tabindex="0"
-                  @click="copyIp(ip6, $event)"
-                  @keydown.enter.prevent="copyIp(ip6)"
-                >{{ ip6 }}</span>
-              </div>
+              <!-- IPv6 跟 IPv4 同一行（不再另起一行），并且只显示首尾两段：
+                   完整地址最长 39 字符，一行一台机器的表里会把「操作」列
+                   顶出屏幕。悬停看完整地址，单击复制的也是完整地址。 -->
+              <span
+                v-for="ip6 in ins.ipv6_addresses || []"
+                :key="ip6"
+                class="copyable ipv6-chip"
+                :title="`单击复制 IPv6：${ip6}`"
+                role="button"
+                tabindex="0"
+                @click="copyIp(ip6, $event)"
+                @keydown.enter.prevent="copyIp(ip6)"
+              >{{ shortIpv6(ip6) }}</span>
             </td>
             <td>
               <span
@@ -174,7 +175,7 @@
                 </button>
               </div>
             </td>
-            <td>
+            <td class="action-cell">
               <div class="btn-group" role="group" :aria-label="`${ins.display_name} 操作`">
                 <router-link :to="`/instances/${ins.tenant_id || tenantId}/${ins.id}`">
                   <button type="button" class="ghost" title="查看详情">详情</button>
@@ -215,15 +216,9 @@
                 >
                   重命名
                 </button>
-                <button
-                  type="button"
-                  class="ghost"
-                  :disabled="acting === ins.id"
-                  title="更换临时公网 IP"
-                  @click="replaceIp(ins)"
-                >
-                  换IP
-                </button>
+                <!-- 没有「换IP」：换公网 IP 会释放旧地址，是个不可撤销的动作，
+                     放在列表里一排小按钮中间太容易点错。详情页有「换公网IP」，
+                     那里同时能看到当前地址、IPv6 和实例状态。 -->
                 <button
                   type="button"
                   class="danger"
@@ -246,6 +241,103 @@
 </template>
 
 <style scoped>
+/* ── 一行一台机器 ────────────────────────────────────────────────
+   这张表是用来「扫」的：行高一致时，眼睛沿着一列往下走就能比出状态、
+   IP、创建时间；只要有一行因为自己的参数（长名字、弹性规格、多个 IPv6）
+   变高，节奏就断了，而且高的那几行看起来像是更重要。
+   所以宽度不够时一律横向滚动（外层 .table-wrap 本来就 overflow:auto），
+   绝不折行。 */
+.table-wrap td {
+  white-space: nowrap;
+}
+
+/* 例外：空列表那一格是整句话，让它正常折行，否则一句提示就把表撑到
+   要横向滚动才看得完。 */
+.table-wrap td.empty {
+  white-space: normal;
+}
+
+/* flex 容器的换行不受 white-space 管，得单独关掉 —— 否则按钮组在窄屏
+   下会折成两排，正是要避免的那种「某几行特别高」。 */
+.table-wrap .btn-group {
+  flex-wrap: nowrap;
+}
+
+/* 名称是唯一长度完全由用户决定的字段。给一个上限并省略号截断，
+   nowrap 才不会把整张表拉到几屏宽。 */
+.name-cell {
+  max-width: 20rem;
+}
+
+.name-link {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  color: var(--text);
+  text-decoration: none;
+}
+
+/* 规格跟在 shape 后面同一行，压小一号以免抢了 shape 名字的位置。 */
+.spec {
+  font-size: 12px;
+  margin-left: 0.35rem;
+}
+
+.ipv6-chip {
+  font-size: 11px;
+  margin-left: 0.35rem;
+}
+
+/* ── 「操作」列吸附在右边缘 ──────────────────────────────────────
+   不折行的代价是表格变宽（实测约 1670px）。1440 的笔记本上可用宽度只有
+   1130 左右，最右边这一列会被推出可视区 —— 偏偏它就是要点的那一列。
+   吸附之后横向滚动只影响中间那几个只读字段，按钮始终停在原地。
+
+   两个坑：
+   - 背景必须**不透明**，否则滚到下面去的单元格会透上来。
+   - 分隔线用 inset box-shadow，不用 border：表格是 border-collapse:
+     collapse，合并后的边框由 <table> 绘制，不会跟着吸附的单元格移动。
+   用 .action-cell 而不是 :last-child，是因为空列表那一行的 colspan 单元格
+   也是它那一行的最后一格，不该被吸附。 */
+.table-wrap th.action-col,
+.table-wrap td.action-cell {
+  position: sticky;
+  right: 0;
+  background: var(--panel);
+  box-shadow: inset 1px 0 0 var(--border), inset 0 -1px 0 var(--border);
+}
+
+/* 最后一行本来就没有下边框（tbody tr:last-child td），别用阴影补一条出来。 */
+.table-wrap tbody tr:last-child td.action-cell {
+  box-shadow: inset 1px 0 0 var(--border);
+}
+
+/* 右上角这一格要同时压住两个方向：表头已经 sticky 到顶部并占了 z-index:1。 */
+.table-wrap th.action-col {
+  z-index: 2;
+  background: var(--panel-2);
+}
+
+/* 行 hover 的底色也得给吸附的这一格补上，否则整行变色时它自己不变。 */
+.table-wrap tbody tr:hover td.action-cell {
+  background: var(--row-hover);
+}
+
+/* 深色下表头用的是半透明底（styles.css 里的 `html[data-theme='dark'] th`，
+   rgba(24,25,30,.94)），吸附的格子不能半透明，换成叠加后的同色实色，
+   免得右上角和表头其余部分差出一块。
+
+   这里**不要**写成 `:global(html[data-theme='dark']) .table-wrap …`：
+   Vue 编译这种「:global 开头 + 后代」的写法会把后代部分整个丢掉，只剩下
+   `html[data-theme=dark]{…}`，等于把样式糊到 <html> 上（本项目另有 9 处
+   老代码踩了这个坑）。作用的元素本来就在本组件里，直接写祖先选择器即可，
+   scope 属性会挂在最后一段上。 */
+html[data-theme='dark'] .table-wrap th.action-col {
+  background: #191a1e;
+}
+
 /* 定宽等宽字体 + 不换行：秒级时间戳在窄屏上会被折成两行，同一列的数字就
    对不齐了，扫一眼比较先后的用途也就没了。表格外层是 .table-wrap，横向
    滚动本来就有。 */
@@ -428,6 +520,26 @@ function formatCreated(v?: string | null) {
     `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
     `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
   )
+}
+
+/** 弹性 shape 的规格，压成一段行内文本；固定 shape 两个字段都是 null，
+ *  返回空串，模板就整个不渲染 —— 空的 `·` 比不显示更难读。 */
+function specText(ins: Instance) {
+  const parts: string[] = []
+  if (ins.ocpus != null) parts.push(`${ins.ocpus} OCPU`)
+  if (ins.memory_in_gbs != null) parts.push(`${ins.memory_in_gbs} GB`)
+  return parts.join(' · ')
+}
+
+/** IPv6 缩写成「首段:…:末段」。前缀认子网、后缀认机器，这两段就够在列表里
+ *  区分同一台机器的多个地址；完整值走 title 和复制，一个字符都不丢。
+ *  段数不足 3（含 `::1` 这类高度压缩的写法）时原样返回，缩了反而更长。 */
+function shortIpv6(ip: string) {
+  const groups = String(ip || '')
+    .split(':')
+    .filter(Boolean)
+  if (groups.length < 3) return ip
+  return `${groups[0]}:…:${groups[groups.length - 1]}`
 }
 
 function stateClass(state: string) {
@@ -651,24 +763,6 @@ async function rename(ins: Instance) {
     await load()
   } catch (e: any) {
     error.value = e?.message || '重命名失败'
-  } finally {
-    acting.value = ''
-  }
-}
-
-async function replaceIp(ins: Instance) {
-  if (!confirm(`更换「${ins.display_name}」的临时公网 IPv4？旧地址会释放。`)) return
-  error.value = ''
-  msg.value = ''
-  acting.value = ins.id
-  try {
-    const tid = ins.tenant_id || tenantId.value
-    const { data } = await api.post(`/tenants/${tid}/instances/${ins.id}/public-ip/replace`)
-    if (data.ok) msg.value = data.message
-    else error.value = data.message
-    await load()
-  } catch (e: any) {
-    error.value = e?.message || '更换失败'
   } finally {
     acting.value = ''
   }

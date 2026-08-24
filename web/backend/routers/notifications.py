@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from web.backend.audit import iso_utc
 from web.backend.auth import get_current_user
 from web.backend.db import get_db
 from web.backend.models import NotificationChannel, User
@@ -63,7 +64,8 @@ def _out(row: NotificationChannel) -> ChannelOut:
         enabled=bool(row.enabled),
         events=[e for e in (row.events or []) if e in EVENT_KEYS],
         config_hint=config_hint(row.kind, decode_channel_config(row.config_encrypted)),
-        created_at=row.created_at.isoformat() if row.created_at else "",
+        # Offset-less on SQLite otherwise; see iso_utc.
+        created_at=iso_utc(row.created_at),
     )
 
 
@@ -72,6 +74,17 @@ def _owned(db: Session, user_id: str, channel_id: str) -> NotificationChannel:
     if row is None or row.owner_id != user_id:
         raise HTTPException(status_code=404, detail="通知渠道不存在")
     return row
+
+
+def _clean_name(name: str, fallback: str) -> str:
+    """Channel names are echoed into the worker's line-oriented log on a failed send.
+
+    `.strip()[:64]` only touches the ends, so an interior newline forged a complete
+    extra log record — 62 characters is enough for a convincing fake one. The log site
+    sanitizes too; this keeps the forged text from being stored in the first place.
+    """
+    cleaned = "".join(" " if (ch < " " or ch == "\x7f") else ch for ch in (name or ""))
+    return " ".join(cleaned.split())[:64] or fallback
 
 
 def _clean_events(events: list[str]) -> list[str]:
@@ -110,7 +123,7 @@ def create_channel(
     row = NotificationChannel(
         owner_id=user.id,
         kind=kind,
-        name=(body.name or kind).strip()[:64],
+        name=_clean_name(body.name, kind),
         enabled=bool(body.enabled),
         config_encrypted=encode_channel_config(body.config),
         events=_clean_events(body.events),
@@ -130,7 +143,7 @@ def update_channel(
 ) -> ChannelOut:
     row = _owned(db, user.id, channel_id)
     if body.name is not None:
-        row.name = body.name.strip()[:64]
+        row.name = _clean_name(body.name, row.kind)
     if body.enabled is not None:
         row.enabled = bool(body.enabled)
     if body.events is not None:

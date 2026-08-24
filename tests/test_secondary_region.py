@@ -45,7 +45,11 @@ from web.backend.quota_guard import (  # noqa: E402
     region_pair,
 )
 
-_PEM = "-----BEGIN PRIVATE KEY-----\nMIIBOgIBAAJBAK\n-----END PRIVATE KEY-----"
+from tests._keys import TEST_PEM, TEST_PEM_PKCS1
+
+# 必须是**能真正解析**的 PEM：TenantConfig.validate() 现在用
+# load_pem_private_key 解析私钥，标记形状的假串会被正确拒绝。
+_PEM = TEST_PEM
 
 
 class _Result:
@@ -539,7 +543,7 @@ def test_rotating_the_primary_key_updates_its_secondary_rows(client, monkeypatch
     secondary region authenticating with the old one until it failed as a 401."""
     c, tid = client
     sub_id = _secondary_tenant()
-    new_pem = "-----BEGIN PRIVATE KEY-----\nROTATEDKEYMATERIAL\n-----END PRIVATE KEY-----"
+    new_pem = TEST_PEM_PKCS1  # 另一把、同样能解析的密钥
 
     r = c.patch(
         f"/api/tenants/{tid}",

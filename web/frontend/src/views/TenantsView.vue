@@ -460,6 +460,21 @@ const regionsLoading = ref(false)
 const regionsError = ref('')
 const regionBusy = ref('')
 const regionToAdd = ref('')
+/** 递增序号：只有最新一次 openRegions 的响应可以写 regions。 */
+let regionsSeq = 0
+/**
+ * `regions` 里那份列表**属于哪个租户**。
+ *
+ * 「副区管理」按钮只在 `busy === t.id` 时禁用，而 openRegions 设的是
+ * regionsLoading，所以读取期间每一行的按钮都还能点。先点 A 再点 B，若 A 的
+ * 响应后到，标题显示的是 B、表格里却是 A 的区域列表 —— 而开通请求是打给
+ * regionsFor（B）的。后果不是显示错乱那么轻：区域一旦开通**Oracle 侧无法
+ * 取消**（见 app/oci_client.py::subscribe_region 的说明），而且服务端是拿
+ * B 的真实已开通列表重新判断的，A 那边「已开通」的状态不作数，于是那句
+ * 「把已开通区域…添加为面板租户」的确认文案承诺了不会动 Oracle，实际却在
+ * 一个用户根本没选中的租户上创建了不可逆的订阅。
+ */
+const regionsOwner = ref('')
 
 /** Primaries in name order, each immediately followed by its 副区 rows. */
 const orderedTenants = computed(() => {
@@ -769,20 +784,30 @@ function closeRegions() {
 async function openRegions(t: Tenant) {
   regionsFor.value = t
   regions.value = null
+  regionsOwner.value = ''
   regionsError.value = ''
   regionToAdd.value = ''
   regionsLoading.value = true
+  const seq = ++regionsSeq
   try {
     const { data } = await api.get<TenantRegions>(`/tenants/${t.id}/regions`)
+    // 被更新的一次 openRegions 取代了，这份响应必须丢掉：写进去就会出现
+    // 「标题是 B、列表是 A」的错配，而开通请求是打给标题那个租户的。
+    if (seq !== regionsSeq) return
     if (!data.ok) {
       regionsError.value = data.message || '读取区域失败'
       return
     }
     regions.value = data
+    regionsOwner.value = t.id
   } catch (e: any) {
+    if (seq !== regionsSeq) return
     regionsError.value = e?.message || '读取区域失败'
   } finally {
-    regionsLoading.value = false
+    // spinner 只认序号，不认租户：若把租户判断也加进来，切换途中的那次请求
+    // 回来时不满足条件，regionsLoading 就再也没人关掉了（InstancesView
+    // 的 load() 踩过同一个坑，那里的注释写了原委）。
+    if (seq === regionsSeq) regionsLoading.value = false
   }
 }
 
@@ -793,6 +818,14 @@ async function openRegions(t: Tenant) {
 async function subscribeRegion(region: string, alreadySubscribed: boolean) {
   const t = regionsFor.value
   if (!t || !region) return
+  // 第二道闸：开通是**不可逆**的，所以在发请求前再确认一次「屏幕上这份区域
+  // 列表确实属于当前这个租户」。openRegions 的序号守卫已经挡住了错配，这里
+  // 兜住任何以后新增的、绕过它的写入路径 —— 代价是一次比较，收益是不会在
+  // 用户没选中的账号上创建永久订阅。
+  if (regionsOwner.value !== t.id) {
+    showToast('区域列表与当前租户不一致，请重新打开「副区管理」后再试', 'err', 6000)
+    return
+  }
   const question = alreadySubscribed
     ? `把已开通区域「${region}」添加为面板租户？\n\n` +
       `会用「${t.name}」的同一份 API 凭据创建一个副区租户。\n` +

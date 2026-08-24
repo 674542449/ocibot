@@ -1,0 +1,58 @@
+# 构建上下文是仓库根目录（docker-compose.yml: context: .）。
+#
+# 没有这个文件时，`compose build` 会把整棵树打包发给 Docker daemon —— 包括
+# .venv/（几百 MB）、.git/、web_data/（SQLite 数据库），以及 **web/.env**，
+# 里面是主密钥、JWT 密钥和数据库口令。上下文会完整落到 daemon 那一侧，
+# 在远程/rootless daemon 上这就是一次实打实的密钥外泄。
+#
+# 还有一处更隐蔽的：Dockerfile 的 frontend 阶段先 `npm ci` 再 `COPY web/frontend ./`，
+# 所以宿主机上如果存在 web/frontend/node_modules，它会**盖掉** npm ci 刚装好的那份 ——
+# 构建结果变成「宿主机上碰巧有什么就用什么」，lockfile 的意义随之消失。
+#
+# 写法是白名单式的排除：只排除明确不需要的东西，不用 `*` + `!` 反选，
+# 免得以后新增目录被静默漏掉（漏进去只是慢一点，漏出去才是事故）。
+
+# --- 机密 / 状态：绝不能进上下文 ---
+.env
+web/.env
+**/.env
+*.pem
+*.key
+web_data/
+*.db
+*.db-shm
+*.db-wal
+.ocibot-launch-*.lock
+
+# --- 版本控制与开发环境 ---
+.git/
+.gitignore
+.github/
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- 前端：node_modules 必须排除（见上方说明），dist 由 builder 阶段自己产出 ---
+web/frontend/node_modules/
+web/frontend/dist/
+
+# --- 构建产物 / 编辑器 / 系统垃圾 ---
+*.egg-info/
+build/
+dist/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# --- 不参与运行时镜像的内容 ---
+tests/
+docs/
+*.md
+!README.md
+.scratch_tmp/

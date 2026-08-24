@@ -50,6 +50,25 @@ def is_e2_micro_shape(shape: str) -> bool:
     return s == E2_MICRO_SHAPE.lower() or s.endswith(".e2.1.micro") or "e2.1.micro" in s
 
 
+def hard_free_caps(free_only_mode: bool, account_tier: str = "") -> bool:
+    """免费额度是「硬上限」还是「只警告」——所有守卫必须问同一个函数。
+
+    这个判断以前被抄了两份：validate_* 里是 ``free_only or tier in {...}``，而
+    quota_guard._blocked_by_incomplete_read 只看 ``free_only``。于是一个
+    account_tier="free" 却取消了「仅使用免费额度」的租户，用量**读得到**时被硬挡，
+    读**失败**（429 限流）时反而放行——快照退化成 ``{"read_incomplete": True}``，
+    校验器把它当成「一点没用」，硬上限于是轻松通过。限流路径比正常路径更宽松，
+    正好是这个守卫存在的意义的反面（那台机器就是账单）。
+
+    只有明确的付费账号、且租户自己关掉了 free_only，才允许超额计费。
+    """
+    if bool(free_only_mode):
+        return True
+    # 空串 / unknown 一律按免费处理：一个拼错的或从备份里导进来的 tier
+    # 不该悄悄把上限关掉。
+    return (account_tier or "").strip().lower() in {"", "free", "unknown"}
+
+
 def _as_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None or value == "":
@@ -436,11 +455,11 @@ def validate_launch_against_quota(
     e2_rem = _as_int(rem.get("e2_micro_count"), max(0, FREE_E2_MICRO_COUNT - e2_used))
 
     free_only = bool(free_only_mode)
-    tier = (account_tier or "").strip().lower()
     # Free accounts always hard-guard free caps even if free_only was toggled off by mistake.
-    hard_free_caps = free_only or tier in {"", "free", "unknown"}
+    # 与 quota_guard._blocked_by_incomplete_read 共用同一个谓词，二者不能再各写一份。
+    hard = hard_free_caps(free_only, account_tier)
     if enforce_storage_cap is None:
-        enforce_storage_cap = hard_free_caps
+        enforce_storage_cap = hard
 
     issues: list[GuardIssue] = []
     warnings: list[GuardIssue] = []
@@ -483,7 +502,7 @@ def validate_launch_against_quota(
                 f"A1 规格 {need_cpu:g} OCPU / {need_mem:g} GB 已超过免费上限 "
                 f"{FREE_A1_OCPU:g} / {FREE_A1_MEMORY_GB:g}。"
             )
-            if hard_free_caps:
+            if hard:
                 issues.append(GuardIssue("a1_over_free_cap", msg))
             else:
                 warnings.append(GuardIssue("a1_over_free_cap", msg + " 付费账号将产生费用。", "warn"))
@@ -492,18 +511,31 @@ def validate_launch_against_quota(
                 f"A1 额度不足：需要 {need_cpu:g} OCPU / {need_mem:g} GB，"
                 f"剩余 {a1_rem:g} OCPU / {a1_mem_rem:g} GB。"
             )
-            if hard_free_caps:
+            if hard:
                 issues.append(GuardIssue("a1_insufficient", msg))
             else:
                 warnings.append(GuardIssue("a1_insufficient", msg + " 超出部分将计费。", "warn"))
 
     if is_e2_micro_shape(shape):
-        if e2_rem < 1:
-            msg = f"E2.1.Micro 免费额度已满（{e2_used}/{FREE_E2_MICRO_COUNT}）。"
-            if hard_free_caps:
+        # 必须比较**整批**要的台数，不是「还剩没剩」。
+        #
+        # 这里原来是 `if e2_rem < 1`，只问了「至少还有一个空位吗」。上面
+        # `units = {k: v * n ...}` 已经按批量算好了，A1 / 块存储两条分支也都用的
+        # 批量值，只有这一条没用 —— 于是免费额度还剩 1 个位置时，
+        # `count=3` 的请求照样全过，直接发出 3 次 LaunchInstance。
+        # 讽刺的是 projected 里算出来的 e2_micro_count_after 是对的（4 > 上限 2），
+        # 只是没人拿它做判断。
+        # 默认 47GB 的块存储上限只在 count>4 时才顺带挡住，count=2..4 一路畅通。
+        need_e2 = max(1, int(units.get("e2_micro_count", n) or n))
+        if need_e2 > e2_rem:
+            msg = (
+                f"E2.1.Micro 免费额度不足：需要 {need_e2} 台，"
+                f"剩余 {max(0, int(e2_rem))} 台（已用 {e2_used}/{FREE_E2_MICRO_COUNT}）。"
+            )
+            if hard:
                 issues.append(GuardIssue("e2_insufficient", msg))
             else:
-                warnings.append(GuardIssue("e2_insufficient", msg + " 继续创建可能计费。", "warn"))
+                warnings.append(GuardIssue("e2_insufficient", msg + " 超出部分将计费。", "warn"))
 
     batch_boot = boot_gb * n
     projected_disk = disk_used + batch_boot
@@ -569,8 +601,7 @@ def validate_shape_resize_against_quota(
     a1_used = _as_float(used.get("a1_ocpu"), 0.0)
     a1_mem_used = _as_float(used.get("a1_memory_gb"), 0.0)
     free_only = bool(free_only_mode)
-    tier = (account_tier or "").strip().lower()
-    hard = free_only or tier in {"", "free", "unknown"}
+    hard = hard_free_caps(free_only, account_tier)
 
     issues: list[GuardIssue] = []
     warnings: list[GuardIssue] = []
@@ -620,9 +651,7 @@ def validate_boot_resize_against_quota(
     disk_used = _as_float(used.get("block_storage_gb"), 0.0)
     cur = _as_float(current_size_gb, 0.0)
     new = _as_float(new_size_gb, 0.0)
-    free_only = bool(free_only_mode)
-    tier = (account_tier or "").strip().lower()
-    hard = free_only or tier in {"", "free", "unknown"}
+    hard = hard_free_caps(bool(free_only_mode), account_tier)
 
     issues: list[GuardIssue] = []
     warnings: list[GuardIssue] = []

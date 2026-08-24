@@ -237,9 +237,16 @@ async function connect() {
       term?.write(ev.data)
       return
     }
-    const buf = ev.data as ArrayBuffer
-    const text = new TextDecoder('utf-8', { fatal: false }).decode(buf)
-    term?.write(text)
+    // 直接把字节交给 xterm，不要自己 TextDecoder。
+    //
+    // 每来一帧就 new 一个 TextDecoder，等于把每帧都当成一段完整的 UTF-8：
+    // 一个多字节字符如果正好被 8KiB 的读边界劈成两半，前半帧末尾和后半帧开头
+    // 会各自解成替换字符（），中文输出里这种情况很常见。xterm.js 自带的是
+    // 跨 write 保持状态的流式 UTF-8 解码器，交给它就不会在边界上出错。
+    //
+    // 后端现在把终端数据一律走**二进制**帧、控制消息才走文本帧，所以这条分支
+    // 拿到的就是原始字节。
+    term?.write(new Uint8Array(ev.data as ArrayBuffer))
   }
 
   ws.onerror = () => {

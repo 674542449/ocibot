@@ -9,7 +9,9 @@ import uuid
 
 from app.config_store import ConfigStore, TenantConfig
 
-KEY = "-----BEGIN PRIVATE KEY-----\nX\n-----END PRIVATE KEY-----\n"
+from tests._keys import TEST_PEM
+
+KEY = TEST_PEM
 
 
 def _mk(name: str, tid: str = "") -> TenantConfig:

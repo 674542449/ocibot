@@ -31,6 +31,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from app.oci_client import (  # noqa: E402
+    derive_retry_token,
     is_capacity_error,
     is_capacity_message,
     is_rate_limit_error,
@@ -208,6 +209,28 @@ class Worker:
             if cooldown and cooldown > now:
                 continue
 
+            # 间隔下限的服务端兜底 —— 不信任任何写 next_run_at 的路径。
+            #
+            # 候选条件只看 next_run_at <= now，全文件从来没有拿 last_attempt_at
+            # 比过一次。于是任何把 next_run_at 写成「现在」的 API 都能把两次
+            # LaunchInstance 压到一个轮询周期（5s）之内：
+            # /jobs/capacity/{id}/resume 就是这么写的，而面板上「停止→继续」是
+            # 用户表达「立刻再试一次」的唯一手势（两个按钮共用一格，且没有
+            # 「立即重试」）。连点几下就是约 12 次/分钟，对着
+            # app/scheduler.py::MIN_RETRY_INTERVAL_SEC 的 1 次/60 秒。
+            # 429 冷却由上面的 cooldown_until 管，这里管的是普通间隔。
+            last_attempt = _as_utc(job.last_attempt_at)
+            if last_attempt is not None:
+                earliest = last_attempt + timedelta(
+                    seconds=clamp_retry_interval(job.interval_sec)
+                )
+                if earliest > now:
+                    # 顺手把 next_run_at 推回合规位置：否则每个轮询周期都要重新
+                    # 算一遍，而且面板上显示的「下次尝试」会一直是骗人的。
+                    job.next_run_at = earliest
+                    db.commit()
+                    continue
+
             # Atomically claim the lease so a second worker cannot take the same job.
             # Committed BEFORE any OCI call, so the lock is durable and visible across
             # processes — per-tenant single-flight, crash-safe.
@@ -233,15 +256,85 @@ class Worker:
             db.refresh(job)
             locked_tenants.add(job.tenant_id)
             self._busy_tenants.add(job.tenant_id)
+            handled = True
             try:
                 self._run_capacity_once(db, job)
+            except Exception as exc:  # noqa: BLE001
+                # 一个任务炸掉，绝不能掀翻整个循环。
+                #
+                # 这里原来只有 try/finally，没有 except。_run_capacity_once 里
+                # 建 OCI 会话那两行（tenant_row_to_config / sessions.get）本身
+                # 不在任何 try 里，于是一个配置坏掉的租户（比如 fingerprint
+                # 格式不合法 —— TenantConfig.validate 放行，oci.config
+                # .validate_config 拒绝）抛出的异常会一路逃出 for 循环。后果有三层：
+                #
+                #   1. 抛点在 attempts += 1 和任何 next_run_at 写入之前，所以这个
+                #      任务的 next_run_at 永远不推进。而候选是按
+                #      next_run_at.nullsfirst() 排序的，它会在一个周期内变成永久
+                #      队头 —— **全站所有用户的抢机任务从此都不再被执行**。
+                #   2. attempts 不增，max_attempts 的停止条件永远够不着，每 5 秒
+                #      重来一次，无穷无尽。
+                #   3. last_error 没写、status 卡在 running，面板显示「运行中」
+                #      且没有任何错误，唯一线索是 worker 日志里每 5 秒一条堆栈。
+                #
+                # 删除任务时 worker 正好在跑同一个任务，也会走到这里：下面 finally
+                # 里的 commit 会撞上 StaleDataError（UPDATE 匹配 0 行）。
+                handled = False
+                log.exception(
+                    "capacity job %s raised outside its own error handling", job.id
+                )
+                self._release_job_after_crash(db, job.id, exc)
             finally:
                 self._busy_tenants.discard(job.tenant_id)
-                job.locked_by = None
-                job.locked_until = None
-                # Persist this attempt's result + lease release before the next job,
-                # so a crash cannot roll back a completed LaunchInstance outcome.
-                db.commit()
+                if handled:
+                    job.locked_by = None
+                    job.locked_until = None
+                    # Persist this attempt's result + lease release before the next job,
+                    # so a crash cannot roll back a completed LaunchInstance outcome.
+                    db.commit()
+
+    def _release_job_after_crash(self, db: Session, job_id: str, exc: BaseException) -> None:
+        """Put a job that blew up outside its own handler back into a sane state.
+
+        Runs in a transaction of its own, because the caller's session may already
+        be unusable: on PostgreSQL a failed statement aborts the transaction, and
+        every later statement then raises ``InFailedSqlTransaction`` /
+        ``PendingRollbackError`` — including the lease release. So: roll back
+        first, re-read the row by id (it may have been deleted mid-attempt, which
+        is one of the ways we get here), then write.
+
+        Advancing ``next_run_at`` and ``attempts`` is the point. Leaving either
+        untouched is what turned one broken tenant into a permanent, silent,
+        installation-wide stall: the job stayed at the head of the
+        ``next_run_at.nullsfirst()`` ordering and never aged out.
+        """
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001
+            log.exception("rollback failed while recovering capacity job %s", job_id)
+            return
+        try:
+            row = db.get(CapacityJob, job_id)
+            if row is None:
+                # Deleted while the worker held it — nothing to release.
+                return
+            now = _utcnow()
+            row.locked_by = None
+            row.locked_until = None
+            row.status = "idle"
+            # Count it: otherwise a permanently broken job never reaches
+            # max_attempts and retries until someone notices by hand.
+            row.attempts = int(row.attempts or 0) + 1
+            row.last_attempt_at = now
+            row.next_run_at = now + timedelta(seconds=clamp_retry_interval(row.interval_sec))
+            row.last_error = f"任务执行异常：{exc}"[:2000]
+            db.commit()
+        except Exception:  # noqa: BLE001
+            log.exception("failed to release capacity job %s after a crash", job_id)
+            try:
+                db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
 
     @staticmethod
     def _attempt_plan(job: CapacityJob) -> tuple[str, Optional[dict[str, Any]], str]:
@@ -434,8 +527,26 @@ class Worker:
         except Exception as exc:  # noqa: BLE001
             log.warning("capacity quota check job=%s skipped: %s", job.id, exc)
 
+        # opc-retry-token：抢机是**唯一**会重发同一个 LaunchInstance 的路径，
+        # 却曾是唯一不带幂等 token 的（浏览器路径 routers/instances.py 一直带）。
+        #
+        # lease 在调用 OCI 之前就 commit 了，而 attempts+=1 和这次尝试的结果要到
+        # finally 才 commit。容器如果在这两者之间重启（面板自带的一键更新、OOM、
+        # 宿主机重启都会），事务回滚：attempts 没涨、状态还是 running。等 10 分钟
+        # 租约过期被回收后，_attempt_plan 用的还是同一个 attempts，于是以**完全
+        # 相同**的 LaunchInstanceDetails 再发一次 —— 多出来一台没人记账的机器，
+        # 吃掉 Always Free 额度或者直接产生费用。
+        #
+        # 用 attempts 做 index 而不是时间戳：同一次尝试的重放会拿到同一个 token，
+        # Oracle 侧折叠成重放；而下一次尝试（AD / 配置可能不同）拿到不同的 token，
+        # 不会撞上 IdempotentParameterMismatch。
+        retry_token = derive_retry_token(
+            str(payload.get("launch_token") or job.id), int(job.attempts or 0)
+        )
         try:
-            result = session.launch_from_payload(payload, custom_user_data=custom_user_data)
+            result = session.launch_from_payload(
+                payload, custom_user_data=custom_user_data, idempotency_key=retry_token
+            )
         except Exception as exc:  # noqa: BLE001
             msg = str(exc)
             self._log_attempt(db, job, ok=False, message=msg, ad=ad, config_label=cfg_label)
@@ -512,32 +623,61 @@ class Worker:
         ad: str,
         config_label: str,
     ) -> None:
+        """Write one attempt-log row. Must never damage the caller's transaction.
+
+        写日志失败是可以接受的；把事务打坏不是。这个方法原来只有一个
+        ``except: log.exception``，在 PostgreSQL 上远远不够：一条语句失败之后整个
+        事务进入 aborted 状态，后面每一条语句都抛 ``InFailedSqlTransaction`` /
+        ``PendingRollbackError``。也就是说 _log_attempt 吞掉的那个异常，会以
+        ``_handle_capacity_error`` / ``_notify_capacity_end`` 崩掉的形式重新出现，
+        而 ``attempts += 1`` 也一起回滚 —— max_attempts 那道上限从此永远够不到，
+        租约一过期任务就重新认领、再发一次 LaunchInstance，无限循环。整个文件为
+        了合规而维护的尝试次数上限就是这样被绕过的。
+
+        具体的触发器是 ``availability_domains`` 里一个 200 字符的 AD：Oracle 拒
+        绝这个 AD（正常），然后这里把它原样写进 ``String(128)``，flush 抛
+        ``DataError``。所以两道防线都要有 —— 按列宽截断，**以及** 用 SAVEPOINT
+        把这次写入隔离起来，这样任何没预料到的宽度/约束错误都只回滚它自己。
+        """
+        # 先把 job 自身的改动（attempts、last_attempt_at…）刷进当前事务，再开
+        # SAVEPOINT。顺序反过来的话，SAVEPOINT 回滚会连 attempts += 1 一起撤销，
+        # 正好是上面描述的那个死循环。
         try:
-            db.add(
-                CapacityAttempt(
-                    job_id=job.id,
-                    owner_id=job.owner_id,
-                    n=int(job.attempts or 0),
-                    seq=int(job.attempts or 0),
-                    ok=ok,
-                    capacity=is_capacity_message(message or ""),
-                    rate_limited=is_rate_limit_message(message or ""),
-                    message=(message or "")[:2000],
-                    availability_domain=ad or "",
-                    config_label=config_label or "",
-                )
-            )
-            # Prune old rows so long-running jobs do not grow unbounded.
-            cutoff = int(job.attempts or 0) - MAX_ATTEMPT_ROWS_PER_JOB
-            if cutoff > 0:
-                db.execute(
-                    delete(CapacityAttempt).where(
-                        CapacityAttempt.job_id == job.id,
-                        CapacityAttempt.seq <= cutoff,
-                    )
-                )
             db.flush()
         except Exception:  # noqa: BLE001
+            log.exception("flush before attempt log failed job=%s", job.id)
+            return
+        try:
+            with db.begin_nested():
+                db.add(
+                    CapacityAttempt(
+                        job_id=job.id,
+                        owner_id=job.owner_id,
+                        n=int(job.attempts or 0),
+                        seq=int(job.attempts or 0),
+                        ok=ok,
+                        capacity=is_capacity_message(message or ""),
+                        rate_limited=is_rate_limit_message(message or ""),
+                        message=(message or "")[:2000],
+                        # 按 models.CapacityAttempt 的列宽截断。日志行被截断，
+                        # 总好过让一次尝试记不上账。
+                        availability_domain=(ad or "")[:128],
+                        config_label=(config_label or "")[:64],
+                    )
+                )
+                # Prune old rows so long-running jobs do not grow unbounded.
+                cutoff = int(job.attempts or 0) - MAX_ATTEMPT_ROWS_PER_JOB
+                if cutoff > 0:
+                    db.execute(
+                        delete(CapacityAttempt).where(
+                            CapacityAttempt.job_id == job.id,
+                            CapacityAttempt.seq <= cutoff,
+                        )
+                    )
+                db.flush()
+        except Exception:  # noqa: BLE001
+            # SAVEPOINT 已经回滚，外层事务仍然可用 —— 调用方接着写 last_error /
+            # next_run_at / 推送通知都不会受影响。
             log.exception("log attempt failed job=%s", job.id)
 
     def _handle_capacity_error(

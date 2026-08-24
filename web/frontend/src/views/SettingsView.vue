@@ -202,7 +202,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import api from '@/api/client'
 import { useAuthStore } from '@/stores/auth'
@@ -233,6 +233,16 @@ const showAdd = ref(false)
 const addForm = reactive({ kind: 'telegram', name: '' })
 const addConfig = reactive<Record<string, string>>({})
 const addEvents = ref<string[]>(EVENTS.map((e) => e.key))
+
+function clearAddConfig() {
+  Object.keys(addConfig).forEach((k) => delete addConfig[k])
+}
+
+// 换渠道类型必须清空 addConfig。它是所有类型共用的**一个** dict，切类型只是换了
+// 渲染哪几个输入框，之前填的键一个都没走。Telegram 填完 bot_token / chat_id 再切到
+// Webhook 保存，就会把这两个键连同 url 一起 POST 上去；后端整包收下（加密存库），
+// 于是一个 webhook 渠道里躺着一个 bot token —— 界面上既看不见也删不掉。
+watch(() => addForm.kind, clearAddConfig)
 
 const pwdForm = reactive({ old: '', next: '' })
 const totpSetup = ref<{ secret: string; otpauth_url: string } | null>(null)
@@ -275,7 +285,7 @@ async function createChannel() {
     })
     msg.value = '渠道已保存，建议点「测试」确认可以收到'
     showAdd.value = false
-    Object.keys(addConfig).forEach((k) => delete addConfig[k])
+    clearAddConfig()
     await load()
   } catch (e: any) {
     error.value = e?.message || '保存失败'

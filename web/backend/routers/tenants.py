@@ -12,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.config_store import TenantConfig
+from app.config_store import _REGION_RE, TenantConfig
 from app.formatting import region_area
 from web.backend.audit import write_audit
 from web.backend.auth import get_current_user
@@ -284,7 +284,24 @@ def update_tenant(
 
     from web.backend.crypto_util import decrypt_text
 
-    pem = new_pem.strip() if isinstance(new_pem, str) and new_pem.strip() else decrypt_text(row.private_key_encrypted)
+    if isinstance(new_pem, str) and new_pem.strip():
+        pem = new_pem.strip()
+    else:
+        # decrypt_text raises ValueError when OCIBOT_MASTER_KEY no longer matches
+        # the stored ciphertext, and main.py registers no handler for it — so
+        # editing anything at all about a tenant (even just its colour) answered a
+        # blank 500 after a master-key rotation, with nothing saying why. The user
+        # can get out of it from this very form by pasting the key again, so say so.
+        try:
+            pem = decrypt_text(row.private_key_encrypted)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{exc}。请在本次编辑中重新粘贴该租户的私钥，"
+                    "或先把 OCIBOT_MASTER_KEY 恢复成保存这条记录时使用的值。"
+                ),
+            ) from exc
     _validate_fields(
         name=row.name,
         user_ocid=row.user_ocid,
@@ -521,6 +538,16 @@ def subscribe_tenant_region(
             # irreversible action followed by a 500.
             suffix = f" · {label}"
             child_name = (parent.name[: 128 - len(suffix)] + suffix)[:128]
+            # region 现在是一条安全边界（带 "." / "@" / ":" 就能改写 OCI SDK 拼出的
+            # endpoint 主机名，详见 app/config_store.py::TenantConfig.validate）。
+            # 这是**唯一**一条既不过 Pydantic 的 pattern、也不过 TenantConfig.validate
+            # 就能写进 Tenant.region 的路径 —— 当前 region_name 全部来自 Oracle 的
+            # 区域列表、拿不到用户输入，但既然它已经是边界，就不该依赖「上游恰好干净」。
+            if not _REGION_RE.fullmatch(region_name or ""):
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Oracle 返回的区域名不合法，已中止：{region_name!r}",
+                )
             child = Tenant(
                 owner_id=user.id,
                 name=child_name,

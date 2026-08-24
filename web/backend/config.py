@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import ClassVar
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -15,12 +16,23 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    app_name: str = "OCIBot Web"
+    # 每个字段都必须写出 alias。pydantic-settings 在没有 alias 时会回落到裸字段名，
+    # 于是 CI 镜像或 PaaS 运行时里一个通用的 APP_NAME / DEBUG 就能改掉面板配置。
+    # tests/test_app_config_security.py 会遍历所有字段，漏写 alias 直接测试失败。
+    app_name: str = Field(default="OCIBot Web", alias="OCIBOT_APP_NAME")
+
     # MUST be bumped in the same commit as any shipped change, together with a new
     # CHANGELOG.md heading — /api/health is how an operator verifies a deploy
     # actually landed. tests/test_version_bump.py enforces that the two agree.
-    app_version: str = "0.4.78"
-    debug: bool = False
+    #
+    # 刻意用 ClassVar 而不是字段：版本号只能来自代码。它曾经是普通字段，于是环境里
+    # 随便一个 APP_VERSION 就会让 /api/health 报出与实际运行代码无关的版本 —— 而
+    # /api/health 正是操作员确认"更新有没有装上"的唯一手段（README 排障表第一行），
+    # test_version_bump.py 也看不见这种偏差。ClassVar 不参与 pydantic 解析，任何环境
+    # 变量都改不动它。
+    app_version: ClassVar[str] = "0.4.81"
+
+    debug: bool = Field(default=False, alias="OCIBOT_DEBUG")
 
     # sqlite+pysqlite:////absolute/path.db  or  postgresql+psycopg://user:pass@host/db
     database_url: str = Field(
@@ -32,7 +44,12 @@ class Settings(BaseSettings):
     master_key: str = Field(default="dev-only-change-me-ocibot-web-master-key", alias="OCIBOT_MASTER_KEY")
 
     jwt_secret: str = Field(default="dev-only-jwt-secret-change-me", alias="OCIBOT_JWT_SECRET")
-    jwt_algorithm: str = "HS256"
+
+    # 同样刻意做成 ClassVar：签名算法不可由环境改写。它进 jwt.encode()，也进
+    # jwt.decode(algorithms=[...])，是算法混淆类攻击唯一的着力点；AUDIT.md 第 10 轮
+    # 记的"HS256 hardcoded (not env-overridable)"就是后来者会依赖的性质，而当时它其实
+    # 能被裸 JWT_ALGORITHM 改掉。没有互操作需求，配置面不该存在。
+    jwt_algorithm: ClassVar[str] = "HS256"
     jwt_expire_minutes: int = Field(default=60 * 12, alias="OCIBOT_JWT_EXPIRE_MINUTES")  # 12h default
 
     # Auth cookie flags. Set OCIBOT_COOKIE_SECURE=1 behind HTTPS so the JWT
@@ -92,8 +109,12 @@ class Settings(BaseSettings):
     # the panel sits behind a reverse proxy that overwrites these headers.
     trust_proxy: bool = Field(default=False, alias="OCIBOT_TRUST_PROXY")
 
-    # Reject requests when still using built-in dev secrets (optional hard fail).
-    require_secure_secrets: bool = Field(default=False, alias="OCIBOT_REQUIRE_SECURE_SECRETS")
+    # 默认 fail closed：内置默认密钥就写在公开仓库里，而主密钥只经一次无盐 SHA-256
+    # 就成为 Fernet 密钥 —— 用默认值起面板，等于任何拿到数据库的人都能解出全部 OCI
+    # 私钥，默认 JWT 密钥还能让人自己签发管理员会话。此前默认 0，照 docker-compose
+    # 的 quick start 一路 up 起来的面板就是这种状态，且 HTTP 层毫无提示。
+    # 关成 0 仍是保留的应急出口（见 insecure_secret_error() 给出的提示）。
+    require_secure_secrets: bool = Field(default=True, alias="OCIBOT_REQUIRE_SECURE_SECRETS")
 
     def cors_origin_list(self) -> list[str]:
         """Exact browser origins allowed by CORS.
@@ -143,17 +164,70 @@ _INSECURE_DEFAULTS = {
 }
 
 
+class InsecureSecretsError(RuntimeError):
+    """启动被密钥检查拦下。
+
+    是 RuntimeError 的子类，这样既有的 `except RuntimeError` 不会因为换了类型而漏接；
+    单独立一个类是为了让 main.py 只捕获这一种失败（其它启动异常仍应原样炸出来）。
+    """
+
+
+def insecure_secret_error(settings: Settings) -> str | None:
+    """返回一段可直接照做的错误文本；配置没问题时返回 None。
+
+    为什么要把文案写这么长：这条默认值从 0 改成 1 之后，一台按老文档手工部署、
+    一直跑在默认密钥上的面板会在下次重启时起不来。那一刻操作员唯一能看到的东西就是
+    这段话，所以它必须自己说清楚 —— 是哪个变量、怎么生成新值、以及怎样先恢复服务。
+
+    中英各写一遍、命令单独占行：这段话会出现在容器日志和 Windows 控制台里，那些地方
+    的编码不一定是 UTF-8。真被显示成乱码时，纯 ASCII 的变量名和命令行仍然认得出来。
+    """
+    if not settings.require_secure_secrets:
+        return None
+
+    problems: list[str] = []
+    for name, value in (
+        ("OCIBOT_MASTER_KEY", settings.master_key),
+        ("OCIBOT_JWT_SECRET", settings.jwt_secret),
+    ):
+        if value in _INSECURE_DEFAULTS:
+            problems.append(f"  - {name}: still the built-in default 仍是仓库里公开的内置默认值")
+        elif len(value) < _MIN_SECRET_LEN:
+            problems.append(
+                f"  - {name}: only {len(value)} chars, need >= {_MIN_SECRET_LEN} "
+                f"（只有 {len(value)} 个字符，至少需要 {_MIN_SECRET_LEN} 个）"
+            )
+    if not problems:
+        return None
+
+    return "\n".join(
+        [
+            "OCIBot refuses to start: insecure secrets. OCIBot 拒绝启动：密钥仍是不安全的配置。",
+            *problems,
+            "",
+            "主密钥经一次 SHA-256 派生出 Fernet 密钥，用公开的默认值等于把库里所有 OCI",
+            "私钥明文交给任何读到数据库的人；默认 JWT 密钥则允许任何人自行签发管理员会话。",
+            "",
+            "FIX 修复 — 在 web/.env 里写入两个各不相同的随机值，然后重启：",
+            '    echo "OCIBOT_MASTER_KEY=$(openssl rand -hex 48)" >> web/.env',
+            '    echo "OCIBOT_JWT_SECRET=$(openssl rand -hex 48)" >> web/.env',
+            "    docker compose up -d",
+            "（同名旧行要删掉；没有 openssl 时可用 python -c \"import secrets;print(secrets.token_hex(48))\"）",
+            "",
+            "WARNING 注意：更换 OCIBOT_MASTER_KEY 会让已加密的 OCI 私钥无法解密 —— 需要重新",
+            "导入租户，或用改密钥之前导出的备份 ZIP 恢复。",
+            "",
+            "ESCAPE HATCH 应急出口 — 只想先把面板拉起来、暂不换密钥（跳过本检查，继续使用",
+            "不安全的密钥，仅限本机或隔离网络）：",
+            "    OCIBOT_REQUIRE_SECURE_SECRETS=0",
+        ]
+    )
+
+
 @lru_cache
 def get_settings() -> Settings:
     settings = Settings()
-    if settings.require_secure_secrets:
-        if settings.master_key in _INSECURE_DEFAULTS or settings.jwt_secret in _INSECURE_DEFAULTS:
-            raise RuntimeError(
-                "OCIBOT_REQUIRE_SECURE_SECRETS=1 but OCIBOT_MASTER_KEY / OCIBOT_JWT_SECRET "
-                "still use insecure defaults. Generate long random secrets before starting."
-            )
-        if len(settings.master_key) < _MIN_SECRET_LEN or len(settings.jwt_secret) < _MIN_SECRET_LEN:
-            raise RuntimeError(
-                f"OCIBOT_MASTER_KEY and OCIBOT_JWT_SECRET must be at least {_MIN_SECRET_LEN} characters"
-            )
+    problem = insecure_secret_error(settings)
+    if problem:
+        raise InsecureSecretsError(problem)
     return settings

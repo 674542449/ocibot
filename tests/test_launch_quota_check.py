@@ -31,7 +31,11 @@ from web.backend.db import SessionLocal, init_db  # noqa: E402
 from web.backend.main import app  # noqa: E402
 from web.backend.models import Tenant, User  # noqa: E402
 
-_PEM = "-----BEGIN PRIVATE KEY-----\nMIIBOgIBAAJBAK\n-----END PRIVATE KEY-----"
+from tests._keys import TEST_PEM
+
+# 必须是**能真正解析**的 PEM：TenantConfig.validate() 现在用
+# load_pem_private_key 解析私钥，标记形状的假串会被正确拒绝。
+_PEM = TEST_PEM
 
 
 class _Result:

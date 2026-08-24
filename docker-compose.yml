@@ -1,25 +1,39 @@
 # OCIBot — production stack (API + Worker + PostgreSQL)
 #
-# Quick start:
-#   cp web/.env.example web/.env   # edit secrets
+# Quick start（手动部署；一键安装见 scripts/install.sh）:
+#   cp web/.env.example web/.env
+#   # 必须先生成密钥，否则 API 会拒绝启动（OCIBOT_REQUIRE_SECURE_SECRETS=1）：
+#   printf 'OCIBOT_MASTER_KEY=%s\n' "$(openssl rand -hex 48)" >> web/.env
+#   printf 'OCIBOT_JWT_SECRET=%s\n' "$(openssl rand -hex 48)" >> web/.env
+#   printf 'POSTGRES_PASSWORD=%s\n' "$(openssl rand -hex 16)" >> web/.env
+#   chmod 600 web/.env
+#   ln -s web/.env .env          # compose 的 ${VAR} 插值只读项目根的 .env
 #   docker compose up -d --build
 #   open http://<host>:8000
+#
+# 这几行不是「建议改一下密钥」——.env.example 里那三项是空的，照抄它启动会直接失败。
+# 之前示例文件里带着可用的默认主密钥，而主密钥经单次 SHA-256 派生 Fernet 密钥，
+# 等于公开仓库里躺着能解开所有租户 OCI 私钥的钥匙。
 #
 # One-click (from a blank server):
 #   curl -fsSL https://raw.githubusercontent.com/<OWNER>/ocibot/master/scripts/install.sh | bash
 #
 # Update:
 #   ./scripts/install.sh update
-#   # or: docker compose pull && docker compose up -d --build
+#   # or: docker compose up -d --build
+#
+# 面板内一键更新（挂 docker.sock，管理员 ≈ 宿主机 root）是**单独一个文件**，默认不装载：
+#   ./scripts/install.sh update-on          # 打开（写 web/.env 并重建 api）
+#   docker compose -f docker-compose.yml -f docker-compose.update.yml up -d   # 手动等价写法
 
 name: ocibot
 
 services:
   db:
-    image: postgres:16-alpine
+    image: ${OCIBOT_POSTGRES_IMAGE:-postgres:16-alpine}
     environment:
       POSTGRES_USER: ocibot
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ocibot_dev_pass}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 未设置：请在 web/.env 里写一个随机值，并确保项目根有 .env → web/.env 的软链}
       POSTGRES_DB: ocibot
     volumes:
       - ocibot_pg:/var/lib/postgresql/data
@@ -42,6 +56,11 @@ services:
       args:
         OCIBOT_GIT_SHA: ${OCIBOT_GIT_SHA:-unknown}
         FRONTEND_CACHE_BUST: ${OCIBOT_GIT_SHA:-unknown}
+        # 基础镜像可在 web/.env 里钉成 @sha256:… —— 改 Dockerfile 没用，
+        # `install.sh update` 的 git reset --hard 会把手改还原掉。
+        NODE_IMAGE: ${OCIBOT_NODE_IMAGE:-node:22-alpine}
+        PYTHON_IMAGE: ${OCIBOT_PYTHON_IMAGE:-python:3.12-slim}
+        DOCKER_CLI_IMAGE: ${OCIBOT_DOCKER_CLI_IMAGE:-docker:27-cli}
     env_file:
       - web/.env
     environment:
@@ -52,21 +71,22 @@ services:
       # REQUIRE_SECURE_SECRETS=1 that install.sh writes, so the production secret
       # guard never actually ran. They now come from web/.env, falling back to the
       # application defaults in web/backend/config.py.
-      DATABASE_URL: postgresql+psycopg://ocibot:${POSTGRES_PASSWORD:-ocibot_dev_pass}@db:5432/ocibot
+      DATABASE_URL: postgresql+psycopg://ocibot:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 未设置}@db:5432/ocibot
       # Pin the IN-CONTAINER listen port. OCIBOT_PORT is the host publish knob
       # below; run.py also reads it to choose the listen port, so a non-8000 value
       # in web/.env would move the listener away from the port the mapping and the
       # healthcheck target.
       OCIBOT_PORT: 8000
-      # In-panel self-update (admin). Requires mounts below.
-      # OCIBOT_HOST_REPO must be the absolute path on the *host* (set by install.sh).
+      # 写死 "0"，**不是** ${OCIBOT_UPDATE_ENABLED:-0}。
       #
-      # OFF by default: applying an update runs a helper container on the mounted
-      # docker.sock (and may enter the host namespace), so an admin session that
-      # can reach it is effectively host root. scripts/install.sh sets this to 1
-      # explicitly, so the supported install keeps one-click update; enable it for
-      # a manual compose deploy only if every admin is trusted.
-      OCIBOT_UPDATE_ENABLED: ${OCIBOT_UPDATE_ENABLED:-0}
+      # 路由开关和 docker.sock 挂载必须由同一个文件决定，否则两者会分家：以前这里
+      # 读环境变量、挂载却是无条件的列表项，于是「关掉在线更新」的安装照样把
+      # docker.sock 和整个仓库（含 web/.env 里的主密钥）交给 API 进程 —— API 里任何
+      # 一处代码执行都直接是宿主机 root。反过来，把开关调成 1 而没有挂载，则得到一个
+      # 一按就报错的按钮。
+      #
+      # 想打开：docker-compose.update.yml（它同时给出挂载和 =1）。
+      OCIBOT_UPDATE_ENABLED: "0"
       OCIBOT_UPDATE_REPO: ${OCIBOT_UPDATE_REPO:-674542449/ocibot}
       OCIBOT_UPDATE_BRANCH: ${OCIBOT_UPDATE_BRANCH:-main}
       OCIBOT_HOST_DIR: /host/ocibot
@@ -74,13 +94,29 @@ services:
       OCIBOT_GIT_SHA: ${OCIBOT_GIT_SHA:-unknown}
       OCIBOT_DOCKER_CLI_IMAGE: ${OCIBOT_DOCKER_CLI_IMAGE:-docker:27-cli}
     volumes:
+      # 只读。管理页要读它来显示当前版本、有没有新版本、仓库挂没挂上；写权限只有
+      # 真正执行更新时才需要，那是 docker-compose.update.yml 的事。
       # Same absolute path on host and in helper containers (critical for self-update).
-      - ${OCIBOT_HOST_REPO:-/root/ocibot}:/host/ocibot
-      - /var/run/docker.sock:/var/run/docker.sock
+      - ${OCIBOT_HOST_REPO:-/root/ocibot}:/host/ocibot:ro
     ports:
       # Defaults to every interface. Behind a TLS reverse proxy set
       # OCIBOT_BIND=127.0.0.1 so the plain-HTTP port is not reachable directly.
       - "${OCIBOT_BIND:-0.0.0.0}:${OCIBOT_PORT:-8000}:8000"
+    # ------------------------------------------------------------------ 收权
+    # 这个进程解密所有租户的 OCI 私钥，所以它拿到的能力越少越好。四项分别挡住的是：
+    #   user        —— 不以 root 跑（镜像里建了同一个 UID/GID 的 ocibot 用户）
+    #   cap_drop    —— 一个 Web 服务不需要任何 Linux capability，监听的是 8000
+    #   read_only   —— 根文件系统只读，写不进 webshell、写不进 .pth、改不了已装的包
+    #   tmpfs       —— 但 /tmp 必须可写：Starlette 的 multipart 上传超过 1MB 就落盘
+    #                  （备份导入 20MB、对象存储上传），只读容器会让上传直接 500
+    # no-new-privileges 单独一项挡的是 setuid 提权，它对「以 root 跑且挂了
+    # docker.sock」的容器毫无作用 —— 那种情况只能靠上面四项不要发生。
+    user: "10001:10001"
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=128m
     security_opt:
       - no-new-privileges:true
     depends_on:
@@ -103,7 +139,7 @@ services:
   # 或「备份导入失败」这类完全不指向反代的症状出现。
   caddy:
     profiles: ["tls"]
-    image: caddy:2-alpine
+    image: ${OCIBOT_CADDY_IMAGE:-caddy:2-alpine}
     environment:
       OCIBOT_DOMAIN: ${OCIBOT_DOMAIN:-localhost}
     volumes:
@@ -121,6 +157,10 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    # 这里没有跟着 api 一起收权：Caddy 要监听 80/443（特权端口，需要
+    # NET_BIND_SERVICE），并且要往 /data 写证书私钥、按需 chown。没法在本机验证
+    # 一套最小 capability 组合，而配错的后果是证书签不出来 / 容器起不来 —— 那比
+    # 现状更糟。它也没挂 docker.sock，攻击面和 api 不是一个量级。
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped
@@ -129,14 +169,25 @@ services:
     build:
       context: .
       dockerfile: web/Dockerfile
+      args:
+        NODE_IMAGE: ${OCIBOT_NODE_IMAGE:-node:22-alpine}
+        PYTHON_IMAGE: ${OCIBOT_PYTHON_IMAGE:-python:3.12-slim}
+        DOCKER_CLI_IMAGE: ${OCIBOT_DOCKER_CLI_IMAGE:-docker:27-cli}
     command: ["python", "-m", "web.backend.worker"]
     env_file:
       - web/.env
     environment:
-      DATABASE_URL: postgresql+psycopg://ocibot:${POSTGRES_PASSWORD:-ocibot_dev_pass}@db:5432/ocibot
+      DATABASE_URL: postgresql+psycopg://ocibot:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 未设置}@db:5432/ocibot
       OCIBOT_WORKER_ID: ${OCIBOT_WORKER_ID:-worker-1}
       OCIBOT_DB_POOL_SIZE: ${OCIBOT_DB_POOL_SIZE:-5}
       OCIBOT_DB_MAX_OVERFLOW: ${OCIBOT_DB_MAX_OVERFLOW:-10}
+    # 和 api 同样收权。worker 只连数据库和云 API，连仓库目录都不挂。
+    user: "10001:10001"
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=32m
     security_opt:
       - no-new-privileges:true
     depends_on:

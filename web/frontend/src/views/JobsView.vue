@@ -12,7 +12,7 @@
           <input v-model="autoRefresh" type="checkbox" />
           <span>自动刷新</span>
         </label>
-        <button @click="load">刷新</button>
+        <button @click="refresh">刷新</button>
       </div>
     </div>
 
@@ -188,15 +188,33 @@ function fmt(v: string | null | undefined) {
   }
 }
 
+/** 重新拉列表。**永不向外抛**，失败只写自己的提示语。
+ *
+ *  停止/继续/删除都是「先 await 请求（已经成功了），再 await load()」，而两句在
+ *  同一个 try 里：后端刚好这一瞬不可用（典型是面板自己做完一键更新、容器还在重启），
+ *  load() 抛出来就被动作的 catch 接走，页面同时显示「已删除」和「删除失败」，
+ *  表格里那条任务还在 —— 看着像没删掉，于是又删一次。刷新失败和操作失败必须分开说。 */
 async function load() {
+  try {
+    const [jobs, tenantList] = await Promise.all([
+      api.get<CapacityJob[]>('/jobs/capacity'),
+      api.get<Tenant[]>('/tenants'),
+    ])
+    capacityJobs.value = jobs.data
+    tenants.value = tenantList.data
+    if (openLog.value) await loadAttempts(openLog.value)
+  } catch (e: any) {
+    error.value = e?.message ? `刷新列表失败：${e.message}` : '刷新列表失败'
+  }
+}
+
+/** 「刷新」按钮。以前直接绑 load：load 一上来先把 error 清空，随后抛出的异常
+ *  又没人接（unhandled rejection），于是刷新失败的表现是「原有报错消失、什么都
+ *  没发生」。清提示这件事归按钮管，报错归 load 管。 */
+async function refresh() {
   error.value = ''
-  const [jobs, tenantList] = await Promise.all([
-    api.get<CapacityJob[]>('/jobs/capacity'),
-    api.get<Tenant[]>('/tenants'),
-  ])
-  capacityJobs.value = jobs.data
-  tenants.value = tenantList.data
-  if (openLog.value) await loadAttempts(openLog.value)
+  msg.value = ''
+  await load()
 }
 
 async function loadAttempts(jobId: string) {
@@ -227,8 +245,11 @@ async function refreshCapacity() {
   if (openLog.value) await loadAttempts(openLog.value)
 }
 
+// 三个动作都先把上一次的两条提示清干净：只清 error 的话，上一次的「已删除」会
+// 一直挂在页面上，和这一次的「停止失败」并排显示，等于又造出一对自相矛盾的提示。
 async function stopJob(j: CapacityJob) {
   error.value = ''
+  msg.value = ''
   try {
     await api.post(`/jobs/capacity/${j.id}/stop`)
     msg.value = '已停止'
@@ -240,6 +261,7 @@ async function stopJob(j: CapacityJob) {
 
 async function resumeJob(j: CapacityJob) {
   error.value = ''
+  msg.value = ''
   try {
     await api.post(`/jobs/capacity/${j.id}/resume`)
     msg.value = '已继续'
@@ -252,6 +274,7 @@ async function resumeJob(j: CapacityJob) {
 async function deleteJob(j: CapacityJob) {
   if (!confirm(`删除任务「${j.name}」？`)) return
   error.value = ''
+  msg.value = ''
   try {
     await api.delete(`/jobs/capacity/${j.id}`)
     msg.value = '已删除'
@@ -263,12 +286,9 @@ async function deleteJob(j: CapacityJob) {
 }
 
 onMounted(async () => {
-  try {
-    await load()
-    void checkBackground()
-  } catch (e: any) {
-    error.value = e?.message || '加载失败'
-  }
+  // load() 自己把失败写进 error，这里不用再包一层 try —— 包了也永远进不去。
+  await load()
+  void checkBackground()
   timer = window.setInterval(async () => {
     if (!autoRefresh.value) return
     const active = capacityJobs.value.some((j) => j.enabled)

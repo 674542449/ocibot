@@ -61,7 +61,7 @@
     <div v-if="tab === 'boot'" class="stack">
       <div class="page-tools">
         <label class="choice muted" style="flex: 0 0 auto">
-          <input v-model="includeSub" type="checkbox" @change="loadBoot" />
+          <input v-model="includeSub" type="checkbox" @change="onIncludeSubChange" />
           <span>含子 Compartment</span>
         </label>
         <input v-model="bootSearch" type="search" placeholder="搜索引导卷" />
@@ -406,13 +406,28 @@ async function loadQuota() {
 async function loadBoot() {
   if (!tenantId.value) return
   const guard = beginLoad('boot')
-  const { data } = await api.get(`/tenants/${tenantId.value}/boot-volumes`, {
-    params: { include_subcompartments: includeSub.value },
-  })
-  if (guard.stale()) return
-  // Surface a tenant-level failure instead of rendering it as "no volumes".
-  if (data.ok === false) error.value = data.message || '读取引导卷失败'
-  bootVolumes.value = data.data?.volumes || []
+  try {
+    const { data } = await api.get(`/tenants/${tenantId.value}/boot-volumes`, {
+      params: { include_subcompartments: includeSub.value },
+    })
+    if (guard.stale()) return
+    // Surface a tenant-level failure instead of rendering it as "no volumes".
+    if (data.ok === false) error.value = data.message || '读取引导卷失败'
+    bootVolumes.value = data.data?.volumes || []
+  } catch (e: any) {
+    // 自己接住异常，不能只指望 refreshAll 的 Promise.all：「含子 Compartment」
+    // 复选框是直接调本函数的，抛出去就是没人接的 unhandled rejection ——
+    // 勾选框已经翻过去了，表格还是旧范围的数据，页面上一句提示都没有。
+    if (guard.stale()) return
+    error.value = e?.message || '读取引导卷失败'
+  }
+}
+
+/** 复选框改的是查询范围，所以先清掉上一次遗留的报错：否则重试成功了，屏幕上
+ *  还挂着那条旧的失败提示。loadBoot 现在自己报错，这里不用再 try。 */
+async function onIncludeSubChange() {
+  error.value = ''
+  await loadBoot()
 }
 
 async function loadBlock() {
@@ -466,6 +481,12 @@ function onTenantChange() {
   blockVolumes.value = []
   buckets.value = []
   quota.value = null
+  // 创建块卷的表单也归零。AD 名字带 tenancy 前缀（kZpB:US-ASHBURN-AD-1），
+  // 换租户后 loadBlock 的预填是 `if (!availability_domain)`，不会覆盖旧值，
+  // 于是把 A 的 AD 提给 B —— Oracle 只回一句看不懂的错误，而输入框看上去
+  // 填得好好的，没人会怀疑它。名称同理，是给上一个租户起的。
+  createForm.availability_domain = ''
+  createForm.display_name = ''
   router.replace({ query: { ...route.query, tenant: tenantId.value, tab: tab.value } })
 }
 

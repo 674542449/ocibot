@@ -1,18 +1,50 @@
-fastapi>=0.115.0
-uvicorn[standard]>=0.32.0
-sqlalchemy>=2.0.36
-psycopg[binary]>=3.2.0
-pydantic>=2.10.0
-pydantic-settings>=2.6.0
-python-jose[cryptography]>=3.3.0
-passlib[bcrypt]>=1.7.4
-bcrypt>=4.0.0,<4.1.0
-python-multipart>=0.0.17
-httpx>=0.27.0
-pyzipper>=0.3.6
-pyotp>=2.9.0
+# OCIBot Web — 运行时依赖，全部精确钉版。
+#
+# 为什么不用 >=：`scripts/install.sh update` 每次都在操作者自己的服务器上执行
+# `compose build --pull`，也就是把 oci / cryptography / asyncssh / psycopg /
+# starlette 这一整片闭包重新向 PyPI 解析一遍，而且没有任何文件记录上一次装的是
+# 什么。上游任何一个包被投毒发布一次，当天更新的每一台安装都会装上它 —— 而这个
+# 进程持有解密所有租户 OCI 私钥的主密钥。钉死之后，升级依赖变成一次显式的、
+# 能被 review 的提交，而不是「今天更新了一下面板」的副作用。
+#
+# 版本取自本仓库实际跑通测试的那一套（.venv 里 `python -m pip freeze` 的结果）。
+# 升级方法：改这里的版本号 → 本地装上 → `python -m pytest tests -q` 通过 → 提交。
+#
+# 这个文件是**人类维护的直接依赖清单**；真正被安装的是同目录下的
+# requirements.lock —— 全量闭包（含 starlette / pydantic-core / cffi / uvloop 等
+# 间接依赖），每个包都带 sha256，Dockerfile 用 `--require-hashes` 安装。
+#
+# 改完这里的版本号后必须重新生成锁，否则构建会失败（而不是静默退回无校验解析）：
+#     uv pip compile web/backend/requirements.txt \
+#         --python-platform linux --python-version 3.12 \
+#         --generate-hashes -o web/backend/requirements.lock
+#
+# 必须交叉解析到 linux/py3.12（镜像是 python:3.12-slim）。在 Windows 上直接跑会
+# 漏掉 uvloop 这类平台相关依赖 —— 锁里有没有 uvloop 就是判断解析平台对不对的
+# 最快办法。
+
+fastapi==0.139.2
+uvicorn[standard]==0.51.0
+sqlalchemy==2.0.51
+psycopg[binary]==3.3.4
+pydantic==2.13.4
+pydantic-settings==2.14.2
+# 3.4.0 以下有算法混淆 / JWE 拒绝服务的公告。本项目用 HS256 对称密钥、不解 JWE，
+# 实际可利用性很低，但抬高下限不花任何代价。
+python-jose[cryptography]==3.5.0
+passlib[bcrypt]==1.7.4
+# 上限卡在 4.1 不是保守，是硬约束：passlib 1.7.4 通过 `bcrypt.__about__.__version__`
+# 探测版本，而该属性在 bcrypt 4.1 被删除，装上 4.1+ 后每次哈希都会打一条
+# "(trapped) error reading bcrypt version" 并可能失败。
+# 代价要写清楚：这条上限同时挡住了 bcrypt 未来的安全修复。真要往上走，得先把
+# passlib 换掉（直接用 bcrypt 库，或改用 argon2），不能只改这一行。
+bcrypt==4.0.1
+python-multipart==0.0.32
+httpx==0.28.1
+pyzipper==0.4.0
+pyotp==2.10.0
 # Shared OCI business layer
-oci>=2.182.0
-cryptography>=42.0.0
+oci==2.182.0
+cryptography==49.0.0
 # Guest SSH (WebSSH terminal + boot FS grow)
-asyncssh>=2.14.0
+asyncssh==2.24.0

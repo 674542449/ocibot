@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
 import tempfile
 import uuid
@@ -84,7 +85,21 @@ def parse_oci_api_text(text: str) -> dict[str, str]:
         parser = configparser.ConfigParser()
         # ConfigParser needs a section; if missing, inject DEFAULT
         to_parse = raw
-        if not re.search(r"^\s*\[.+\]\s*$", raw, re.M):
+        # 逐行判断，不要用 re.search(r"^\s*\[.+\]\s*$", raw, re.M)。
+        #
+        # `\s` 是包含 `\n` 的，加上 re.M 之后引擎会在**每一个行首**重新起跳，
+        # 每次都把 `\s*` 一路回溯到字符串结尾 —— 对空行数量是 O(n²)。
+        # api_text 上限 64 000 字符，恰好就是最坏情况：实测 64KB 全空行要跑
+        # 13.3 秒，而且是纯 CPU、不放 GIL（4 并发 25.8s / 8 并发 52.9s，
+        # 线性劣化）。默认 OCIBOT_API_WORKERS=2，十几个并发请求就能把整个面板
+        # 挂死，放大倍数约 20 万倍。任何登录用户都能从 /tenants/parse
+        # 和 /tenants/import 打到这里，而这两条路都没有限流。
+        #
+        # 这里只需要回答「有没有某一行长得像 [section]」，逐行判断天然是线性的。
+        if not any(
+            line.strip().startswith("[") and line.strip().endswith("]")
+            for line in raw.split("\n")
+        ):
             to_parse = "[DEFAULT]\n" + raw
         parser.read_string(to_parse)
         # pick first non-empty section, else DEFAULT
@@ -163,15 +178,106 @@ def parse_oci_api_text(text: str) -> dict[str, str]:
     return result
 
 
-def _derive_fernet(password: str, salt: bytes) -> Fernet:
+BACKUP_KDF_ITERATIONS = 390_000
+# 读归档时迭代次数来自归档自身，必须夹在一个区间里：往下没有下限的话，
+# 攻击者递给你一份 iterations=1 的归档，你就用一个几乎没成本的 KDF 去解它；
+# 往上没有上限的话，一份 iterations=10^9 的归档能把一条请求线程钉死几分钟
+# （/api/backup/import 是同步 handler，跑在 FastAPI 的线程池里，池子不大）。
+_BACKUP_KDF_MIN_ITERATIONS = 100_000
+_BACKUP_KDF_MAX_ITERATIONS = 2_000_000
+
+
+def _derive_fernet(password: str, salt: bytes, iterations: int = BACKUP_KDF_ITERATIONS) -> Fernet:
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
         length=32,
         salt=salt,
-        iterations=390_000,
+        iterations=int(iterations),
     )
     key = base64.urlsafe_b64encode(kdf.derive(password.encode("utf-8")))
     return Fernet(key)
+
+
+# ---------------------------------------------------------------------------
+# 备份归档信封（/api/backup/export 与 backup_to_encrypted_zip 共用一种格式）
+# ---------------------------------------------------------------------------
+#
+# 为什么 zip 自己的密码不够：pyzipper 用的 WinZip AES 虽然是 AES-256，但为了
+# 和 7-Zip / WinRAR 互通，它的 KDF 被规范钉死成 PBKDF2-HMAC-**SHA1、1000 轮**，
+# 无法调高。hashcat 的 13600 模式在一块普通显卡上就有 ~10 MH/s——按这个速度，
+# 一个 8 位小写+数字的口令是分钟级的事。而这个归档里装的是每一个租户的
+# **明文 OCI 私钥**，拿到就等于拿到整个租户账号；文件又天然会落在
+# 下载目录 / OneDrive / NAS 上，长期躺着等人来跑字典。
+#
+# 所以真正的机密性由 zip **里面**这一层负责：同一个口令，过 PBKDF2-HMAC-SHA256
+# 390 000 轮（和 ConfigStore 本地主密码同一条参数），再用 Fernet 封住整个
+# tenants.json。zip 的口令保留，只当作第一道门 + 保持「双击能提示输密码」的
+# 用户预期。
+#
+# version 1 = 明文 JSON（0.4.x 早期归档）。读的时候必须继续认，否则一次升级
+# 就让操作者手里所有旧备份全部作废——备份作废是只会在真要用它的那天才被
+# 发现的那种故障。
+BACKUP_ENVELOPE_VERSION = 2
+_BACKUP_KDF_ALGORITHM = "pbkdf2-hmac-sha256"
+
+
+def encode_backup_payload(payload: dict[str, Any], password: str) -> bytes:
+    """Wrap the tenant payload in the strong-KDF envelope (format version 2)."""
+    salt = secrets.token_bytes(16)
+    inner = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    token = _derive_fernet(password, salt, BACKUP_KDF_ITERATIONS).encrypt(inner)
+    envelope = {
+        "version": BACKUP_ENVELOPE_VERSION,
+        "kdf": {
+            "algorithm": _BACKUP_KDF_ALGORITHM,
+            "iterations": BACKUP_KDF_ITERATIONS,
+            "salt": base64.b64encode(salt).decode("ascii"),
+        },
+        "cipher": "fernet",
+        "ciphertext": token.decode("ascii"),
+    }
+    return json.dumps(envelope, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def decode_backup_payload(raw: bytes, password: str) -> Any:
+    """Read either envelope format. Returns the decoded payload (dict or list).
+
+    Raises ValueError with a user-facing message; the caller turns that into a 400.
+    """
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError("备份内容格式无效，可能密码错误或文件损坏") from exc
+    if not isinstance(data, dict) or "ciphertext" not in data:
+        # 旧格式（明文 JSON）。zip 的口令已经验过了，这里直接放行。
+        return data
+
+    kdf = data.get("kdf") if isinstance(data.get("kdf"), dict) else {}
+    algorithm = str(kdf.get("algorithm") or "").strip().lower()
+    if algorithm and algorithm != _BACKUP_KDF_ALGORITHM:
+        raise ValueError(f"备份使用了本版本不支持的密钥派生算法：{algorithm}")
+    try:
+        salt = base64.b64decode(str(kdf.get("salt") or ""), validate=True)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError("备份文件的密钥派生参数已损坏") from exc
+    if not salt:
+        raise ValueError("备份文件的密钥派生参数已损坏")
+    try:
+        iterations = int(kdf.get("iterations") or BACKUP_KDF_ITERATIONS)
+    except (TypeError, ValueError):
+        iterations = BACKUP_KDF_ITERATIONS
+    iterations = max(_BACKUP_KDF_MIN_ITERATIONS, min(iterations, _BACKUP_KDF_MAX_ITERATIONS))
+
+    try:
+        plain = _derive_fernet(password, salt, iterations).decrypt(
+            str(data.get("ciphertext") or "").encode("ascii")
+        )
+    except (InvalidToken, ValueError, TypeError) as exc:
+        raise ValueError("无法解密备份内容，请检查密码是否正确") from exc
+    try:
+        return json.loads(plain.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError("备份内容格式无效") from exc
 
 
 def _machine_secret(path: Path) -> bytes:
@@ -185,6 +291,58 @@ def _machine_secret(path: Path) -> bytes:
     except OSError:
         pass
     return secret
+
+
+# OCI 区域名的字符集：字母、数字、连字符。刻意**不**放行 "." / "@" / ":" / "/"
+# —— 见 TenantConfig.validate() 里的说明，这四个字符任意一个都能把 SDK 拼出的
+# endpoint 主机名改写成任意地址。宽度取 63，够任何现有及未来的 OCI 区域名，
+# 同时也卡在 tenants.region 这一列 String(64) 的宽度之内。
+_REGION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,62}")
+
+
+def private_key_error(pem: str) -> str:
+    """Return a user-facing reason this PEM cannot be used, or "" if it loads.
+
+    在这之前，全系统对私钥的唯一校验就是「字符串里有 BEGIN 和 PRIVATE KEY」，
+    OCI SDK 也不会替我们补上：构造 Signer 时它并不解析密钥，等到第一次真的发
+    请求才炸。实测
+
+        -----BEGIN ENCRYPTED PRIVATE KEY-----
+        not-base64-at-all
+        -----END ENCRYPTED PRIVATE KEY-----
+
+    能拿到 201 和 has_private_key: true。而「保存后自动测试连接」默认是关的，
+    所以操作者看到的是「已添加」，之后每个页面都 502，报的还是 SDK 抛出的
+    看不懂的错——错误离原因隔了好几个页面，基本不可能自己定位到是私钥贴错了。
+
+    带口令的私钥（Encrypted PRIVATE KEY）单独给一句话：Oracle 控制台生成 API
+    Key 时就可能给你这种文件，这是最常见的一种「贴进去、看着对、其实用不了」。
+    """
+    text = (pem or "").strip()
+    if "BEGIN" not in text or "PRIVATE KEY" not in text:
+        return "私钥内容无效（需要 PEM 格式 PRIVATE KEY）"
+    from cryptography.exceptions import UnsupportedAlgorithm
+    from cryptography.hazmat.primitives import serialization
+
+    try:
+        serialization.load_pem_private_key(text.encode("utf-8"), password=None)
+    except TypeError:
+        # cryptography 对「密钥是加密的但没给口令」抛的正是 TypeError。
+        return (
+            "私钥带有口令保护（ENCRYPTED PRIVATE KEY），面板无法使用。"
+            "请用 `openssl pkcs8 -topk8 -nocrypt -in 原文件 -out 新文件` 去掉口令后再粘贴，"
+            "或在 Oracle 控制台重新生成一对不带口令的 API 密钥"
+        )
+    except UnsupportedAlgorithm:
+        return "私钥使用了不受支持的算法，请改用 Oracle 控制台生成的 RSA API 密钥"
+    except ValueError:
+        return (
+            "私钥无法解析：内容不是完整有效的 PEM 私钥"
+            "（常见原因是只复制了一部分、粘贴时被编辑器换行/空格改写，或贴成了公钥）"
+        )
+    except Exception:  # noqa: BLE001
+        return "私钥无法解析，请重新导出后粘贴"
+    return ""
 
 
 @dataclass
@@ -299,11 +457,33 @@ class TenantConfig:
             errors.append("Fingerprint 仍是示例占位内容")
         elif fp.count(":") < 5 and len(fp) < 16:
             errors.append("Fingerprint 格式看起来不正确")
-        if not (self.region or "").strip():
+        region = (self.region or "").strip()
+        if not region:
             errors.append("Region 不能为空")
-        key = (self.private_key_pem or "").strip()
-        if "BEGIN" not in key or "PRIVATE KEY" not in key:
-            errors.append("私钥内容无效（需要 PEM 格式 PRIVATE KEY）")
+        elif not _REGION_RE.fullmatch(region):
+            # 这不是「格式好看点」的校验，是一个 SSRF 边界。
+            #
+            # region 会被原样塞进 OCI SDK 的 config，而 SDK 的 endpoint 拼装
+            # （oci/regions.py::_endpoint_for）有一条「region 里带 '.' 就当成完整
+            # 域名、不再追加 oraclecloud.com」的向后兼容分支。于是：
+            #
+            #   region='attacker.example.com:6379' -> https://iaas.attacker.example.com:6379/...
+            #   region='@127.0.0.1:6379'           -> https://iaas.@127.0.0.1:6379/...
+            #                                         实际拨号 host=127.0.0.1 port=6379
+            #   region='@169.254.169.254'          -> 实际拨号 host=169.254.169.254（云元数据）
+            #
+            # 「iaas.」被当成 userinfo 吃掉，真正连的是 '@' 后面那截。这条路径
+            # 完全不经过 url_safety.py，所有地址/端口/IDNA 控制都不生效，而且
+            # /tenants/{id}/test 会把连接结果同步回显，等于一个内网端口探测器。
+            # oci.config.validate_config 也管不着——它的 PATTERNS 只有
+            # fingerprint / tenancy / user 三项。
+            #
+            # 只要禁掉 '.'、'@'、':'、'/' 这几个字符，上面每一种构造都不成立：
+            # 拼出来的 host 必然是 <service>.<region>.oraclecloud.com。
+            errors.append("Region 格式不正确（只允许字母、数字和连字符，如 ap-tokyo-1）")
+        key_error = private_key_error(self.private_key_pem)
+        if key_error:
+            errors.append(key_error)
         if self.compartment_ocid and not self.compartment_ocid.startswith("ocid1."):
             errors.append("Compartment OCID 格式不正确")
         return errors
@@ -549,8 +729,11 @@ class ConfigStore:
     def backup_to_encrypted_zip(self, path: Path, password: str) -> int:
         """Write all tenants (including private keys) into an AES-256 encrypted zip.
 
-        The archive is protected by ``password`` and can be opened by any tool
-        that supports WinZip AES (7-Zip, WinRAR, etc.). Returns the tenant count.
+        The zip password is the outer door only — the payload itself is sealed with
+        the PBKDF2-SHA256/390k envelope (see ``encode_backup_payload``), because
+        WinZip AES pins its own KDF at SHA1/1000 rounds for interoperability and
+        that alone is not enough to protect plaintext OCI private keys sitting in
+        a file that lives in someone's Downloads folder. Returns the tenant count.
         """
         import pyzipper
 
@@ -560,7 +743,7 @@ class ConfigStore:
         if self.count() == 0:
             raise ValueError("没有可备份的租户")
         payload = self._export_payload(include_private_key=True)
-        content = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        content = encode_backup_payload(payload, password)
         path = Path(path)
         with pyzipper.AESZipFile(
             path, "w", compression=pyzipper.ZIP_DEFLATED, encryption=pyzipper.WZ_AES
@@ -589,10 +772,11 @@ class ConfigStore:
         except (RuntimeError, pyzipper.BadZipFile) as exc:
             # Wrong password surfaces as RuntimeError / bad CRC in pyzipper.
             raise ValueError("无法解密备份文件，请检查密码是否正确") from exc
-        try:
-            data = json.loads(raw.decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise ValueError("备份内容格式无效，可能密码错误或文件损坏") from exc
+        # Reads both formats: version 2 (encrypted envelope) and the plain JSON that
+        # every archive written before it used. Dropping the old format would quietly
+        # invalidate every backup an operator already holds — a failure they would
+        # only discover on the day they actually need one.
+        data = decode_backup_payload(raw, password or "")
         imported: list[TenantConfig] = []
         tenants = data.get("tenants", data if isinstance(data, list) else [])
         for item in tenants:

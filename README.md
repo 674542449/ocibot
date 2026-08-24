@@ -108,8 +108,24 @@ irm https://raw.githubusercontent.com/674542449/ocibot/main/scripts/install.ps1 
 .\scripts\install.ps1 update
 ```
 
-更新会拉取代码、重建镜像并滚动重启，**保留 PostgreSQL 数据卷与 `web/.env` 密钥**。  
-Docker 部署且已挂载仓库与 `docker.sock` 时，也可在管理员页使用「一键更新」。
+更新会拉取代码、重建镜像并滚动重启，**保留 PostgreSQL 数据卷与 `web/.env` 密钥**。
+
+**面板内「一键更新」默认关闭**，需要显式打开：
+
+```bash
+./scripts/install.sh update-on    # 打开
+./scripts/install.sh update-off   # 关掉
+```
+
+打开它 = API 容器改为 root 运行、挂载宿主机 `docker.sock`、把整个仓库目录（里面就有
+`web/.env`：主密钥 / JWT 密钥 / 数据库密码）以可写方式挂进去，执行更新时还会进宿主机
+命名空间。**任何一个管理员会话，或 API 进程里任何一处代码执行，都等于宿主机 root。**
+多管理员、或管理员账号不完全可信的安装，请保持关闭并用上面的 SSH 方式更新。
+
+> 0.4.80 之前这些挂载是无条件的：`OCIBOT_UPDATE_ENABLED=0` 只关掉了按钮，socket 和
+> 仓库照样挂着；而且 `install.sh` 每次都导出 `=1` 覆盖掉操作者写在 `web/.env` 里的 `0`。
+> 现在开关和挂载在同一个文件（`docker-compose.update.yml`）里，不会再分家。
+> **既有安装升级后一键更新会变成关闭状态**，这是刻意的 —— 需要就跑一次 `update-on`。
 
 ### 常用命令
 
@@ -118,6 +134,8 @@ Docker 部署且已挂载仓库与 `docker.sock` 时，也可在管理员页使�
 | `./scripts/install.sh status` | 容器状态、健康检查与当前访问地址 |
 | `./scripts/install.sh domain <域名>` | 切换到域名 + 自动 HTTPS |
 | `./scripts/install.sh ip` | 切换回 IP + 端口直连 |
+| `./scripts/install.sh update-on` | 打开面板内一键更新（挂 `docker.sock`，管理员 ≈ 宿主机 root） |
+| `./scripts/install.sh update-off` | 关闭面板内一键更新 |
 | `./scripts/install.sh uninstall` | 停止服务（默认保留数据卷） |
 | `OCIBOT_PURGE_DATA=1 ./scripts/install.sh uninstall` | 停止并删除数据卷 |
 
@@ -129,21 +147,33 @@ Docker 部署且已挂载仓库与 `docker.sock` 时，也可在管理员页使�
 git clone https://github.com/674542449/ocibot.git
 cd ocibot
 cp web/.env.example web/.env
-# 编辑 web/.env，至少设置：
-#   POSTGRES_PASSWORD
-#   OCIBOT_MASTER_KEY
-#   OCIBOT_JWT_SECRET
+
+# 三个密钥项在 .env.example 里是空的，必须自己生成 —— 留空会让 API 拒绝启动
+# （OCIBOT_REQUIRE_SECURE_SECRETS=1），compose 也会因 POSTGRES_PASSWORD 为空直接报错。
+printf 'OCIBOT_MASTER_KEY=%s\n' "$(openssl rand -hex 48)" >> web/.env
+printf 'OCIBOT_JWT_SECRET=%s\n' "$(openssl rand -hex 48)" >> web/.env
+printf 'POSTGRES_PASSWORD=%s\n' "$(openssl rand -hex 16)" >> web/.env
+chmod 600 web/.env
 
 # 必须：compose 的 ${VAR} 插值只读项目根目录的 .env，不读服务的 env_file。
-# 少了这一步，POSTGRES_PASSWORD 会回退到内置默认密码。
 ln -s web/.env .env
 
-export OCIBOT_HOST_REPO="$(pwd -P)"   # 在线更新需要绝对路径
 docker compose up -d --build
 ```
 
 访问：`http://127.0.0.1:8000`  
 健康检查：`curl -s http://127.0.0.1:8000/api/health`
+
+> **不要照抄 `.env.example` 里的值就上线。** 以前它带着一组可用的默认主密钥，而主密钥
+> 只经一次 SHA-256 派生 Fernet 密钥 —— 用默认值跑起来的面板，等于把每个租户的 OCI 私钥
+> 交给任何看过这个公开仓库的人。现在那几项是空的，照抄会起不来，这是故意的。
+>
+> 手动部署默认**不含**面板内一键更新（不挂 `docker.sock`）。要它的话：
+> ```bash
+> export OCIBOT_HOST_REPO="$(pwd -P)"    # 必须是宿主机绝对路径
+> docker compose -f docker-compose.yml -f docker-compose.update.yml up -d
+> ```
+> 代价见上面「更新」一节。
 
 ---
 
@@ -169,10 +199,16 @@ docker compose up -d --build
 | `OCIBOT_PORT` | 默认 `8000` | 宿主机映射端口 |
 | `OCIBOT_BIND` | 反代后设 `127.0.0.1` | 端口绑定的宿主机网卡，默认 `0.0.0.0` |
 | `OCIBOT_WORKER_BACKGROUND_OCI` | 默认 `1` | 设 `0` 则 Worker 完全不主动发起云 API 请求；容量重试任务将**不执行**（面板会明确提示） |
-| `OCIBOT_UPDATE_ENABLED` | 默认 `0` | 面板内自更新开关（`install.sh` 会置 `1`） |
-| `OCIBOT_HOST_REPO` | 宿主机绝对路径 | 自更新绑定的代码目录 |
+| `OCIBOT_UPDATE_ENABLED` | 默认 `0` | 面板内自更新。改这一行不够，用 `install.sh update-on/update-off`：它同时决定要不要叠加 `docker-compose.update.yml`（`docker.sock` + 可写仓库） |
+| `OCIBOT_HOST_REPO` | 宿主机绝对路径 | 自更新绑定的代码目录（关闭自更新时以只读方式挂载，仅用于显示版本） |
+| `OCIBOT_NODE_IMAGE` / `OCIBOT_PYTHON_IMAGE` | 建议钉 `@sha256:` | 构建用基础镜像。默认是可变标签，每次更新都会重新拉 |
+| `OCIBOT_POSTGRES_IMAGE` / `OCIBOT_CADDY_IMAGE` / `OCIBOT_DOCKER_CLI_IMAGE` | 建议钉 `@sha256:` | 运行用镜像，同上 |
 
 安装脚本会生成随机密钥并默认开启 `OCIBOT_REQUIRE_SECURE_SECRETS=1`。
+
+镜像钉版写在 `web/.env` 里，**不要改 `web/Dockerfile`** —— `install.sh update` 会
+`git reset --hard`，改仓库文件活不过一次更新。digest 用
+`docker buildx imagetools inspect <标签>` 取。
 
 ---
 
@@ -190,13 +226,22 @@ docker compose up -d --build
 5. `OCIBOT_TRUST_PROXY=1` 只在受信反代后开启，并把 `OCIBOT_FORWARDED_ALLOW_IPS`
    设为反代地址。**直连部署务必保持 `0`**：否则客户端可伪造 `X-Forwarded-For`
    绕过登录限流，无限次尝试密码
-6. 面板内自更新默认关闭。开启后它会驱动挂载的 `docker.sock`（并可能进入宿主机命名空间），
-   **管理员失陷 ≈ 宿主机 root 失陷**；仅在所有管理员可信时设 `OCIBOT_UPDATE_ENABLED=1`
-7. Webhook / Bark / SMTP 目标已拦截私网、元数据、NAT64/6to4 等地址，仍建议只给受信用户开通知配置
+6. 面板内自更新默认关闭，且**开关和挂载绑在一起**：`docker.sock` 与可写仓库只存在于
+   `docker-compose.update.yml` 这个叠加层里，用 `./scripts/install.sh update-on` 才会装载。
+   开启后它会驱动挂载的 `docker.sock`（并可能进入宿主机命名空间），**管理员失陷 ≈ 宿主机
+   root 失陷**；仅在所有管理员可信时开启，否则用 SSH 更新
+7. **不要给容器加回 root。** `api` / `worker` 以 UID 10001 运行，`cap_drop: [ALL]`、
+   根文件系统只读、只有 `/tmp` 是 tmpfs。这个进程持有解密全部租户 OCI 私钥的主密钥，
+   上述四项决定了「Web 层被打穿」和「宿主机被打穿」不是同一件事。要改动它们，先想清楚
+   替代的边界在哪
+8. 建议把基础镜像钉成 `@sha256:`（见配置表）。默认的可变标签配合每次更新的
+   `compose build --pull`，等于每次更新都信任上游当天的内容；依赖同理，
+   `web/backend/requirements.txt` 现在是精确 `==`，升级依赖应当是一次显式提交
+9. Webhook / Bark / SMTP 目标已拦截私网、元数据、NAT64/6to4 等地址，仍建议只给受信用户开通知配置
    - 已知残留风险：DNS rebinding（校验与连接之间 DNS 可变）；详见 [web/AUDIT.md](web/AUDIT.md)
-8. **WebSSH 会校验主机密钥**（首次连接记录指纹，之后不符即拒绝，且在发送任何凭据之前）。
-   指纹按**实例 ID** 记录，所以换公网 IP 不会误报。重装系统后需在实例详情页
-   「重置主机密钥」再连接
+10. **WebSSH 会校验主机密钥**（首次连接记录指纹，之后不符即拒绝，且在发送任何凭据之前）。
+    指纹按**实例 ID** 记录，所以换公网 IP 不会误报。重装系统后需在实例详情页
+    「重置主机密钥」再连接
 
 更细的审计说明见 [web/AUDIT.md](web/AUDIT.md)。
 
@@ -243,6 +288,7 @@ ocibot/
 │   ├── install.sh       # Linux/macOS 安装与更新
 │   └── install.ps1      # Windows 安装与更新
 ├── docker-compose.yml
+├── docker-compose.update.yml   # 可选叠加层：面板内一键更新（docker.sock）
 ├── CHANGELOG.md
 └── README.md
 ```
@@ -271,6 +317,10 @@ ocibot/
 | 容量重试不跑 | 侧栏 Worker 离线提示；检查 worker 容器日志 |
 | 登录限流异常 | 直连部署保持 `OCIBOT_TRUST_PROXY=0`；反代需覆盖客户端 IP 头后再开启 |
 | 私钥解密失败 | `OCIBOT_MASTER_KEY` 被更换；需用旧密钥或重新导入租户 / 恢复备份 |
+| compose 报 `POSTGRES_PASSWORD 未设置` | `web/.env` 里写一个随机值，并确认项目根有 `.env` → `web/.env` 的软链（以前这里会静默回落到内置默认密码） |
+| API 起不来，日志说 `insecure defaults` / `must be at least 24 characters` | `OCIBOT_MASTER_KEY` / `OCIBOT_JWT_SECRET` 还是空的或太短，用 `openssl rand -hex 48` 生成 |
+| 面板里「一键更新」变灰 / 提示未启用 | 默认如此。`./scripts/install.sh update-on`，或用 SSH：`./scripts/install.sh update` |
+| 升级后容器报 `Permission denied` 写文件 | `api` / `worker` 现在以 UID 10001、只读根文件系统运行。它们只应写 `/tmp`（已挂 tmpfs）；出现别处的写入说明有新代码在往镜像里写东西，应改成写数据库或 `/tmp` |
 
 ---
 

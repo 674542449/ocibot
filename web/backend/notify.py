@@ -14,7 +14,7 @@ import time
 from email.header import Header
 from email.mime.text import MIMEText
 from email.utils import formataddr
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 from sqlalchemy import select
@@ -31,7 +31,15 @@ CHANNEL_KINDS = ("telegram", "bark", "serverchan", "webhook", "smtp")
 # alerts were removed). Channels stored with the old keys keep them harmlessly.
 EVENT_KEYS = ("capacity",)
 
-_HTTP_TIMEOUT = 15.0
+# Per-phase timeouts. httpx applies these to each operation separately and `read`
+# bounds ONE chunk, not the whole body, so they are a floor and not a ceiling —
+# _TOTAL_DEADLINE_SEC below is the actual ceiling.
+_HTTP_TIMEOUT = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
+# Wall-clock ceiling for one request+response, and the most of a response body we
+# are ever willing to pull into memory.
+_TOTAL_DEADLINE_SEC = 15.0
+_MAX_RESPONSE_BYTES = 16 * 1024
+_SMTP_TIMEOUT = 20.0
 # Fan-out limits for one notify_user() call.
 _MAX_SENDS_PER_EVENT = 20
 _SEND_BUDGET_SEC = 60.0
@@ -41,6 +49,74 @@ _HTTP_CLIENT_KW = {
     "follow_redirects": False,
     "trust_env": False,
 }
+
+# SMTP is the only channel that dials a raw host:port. url_safety's _BLOCKED_PORTS is
+# a deny-list written for HTTP webhooks and is unusable here (25 is on it, and 25 is
+# SMTP's own port), so restrict by allow-list instead. Without one `port` was any int
+# the user liked: 测试渠道 became a port scanner against everything the panel can
+# reach, with the probe result — and via SMTPConnectError the remote's banner —
+# handed back in the response.
+_SMTP_PORTS = frozenset({25, 465, 587, 2525})
+
+
+def _sanitize(text: str, limit: int) -> str:
+    """Flatten control characters and clip.
+
+    Remote-controlled strings end up in worker log lines and in the settings UI. A
+    newline inside one forges a complete extra log record, so nothing that came off
+    a socket (or out of a user-set channel name) may reach a logger untouched.
+    """
+    cleaned = "".join(" " if (ch < " " or ch == "\x7f") else ch for ch in str(text or ""))
+    return " ".join(cleaned.split())[:limit]
+
+
+def _http_error(status: int, body: str = "", *, echo: bool = False) -> str:
+    """Failure detail for an HTTP push.
+
+    The body is echoed only for the two fixed vendor endpoints (Telegram, ServerChan),
+    where "chat not found" is the whole diagnostic value of the test button. For
+    webhook and Bark the URL is user-supplied, so echoing would give any authenticated
+    user a 200-byte read of an arbitrary URL from the panel's egress IP — an
+    authenticated read primitive against everything the panel can reach.
+    """
+    if echo and body:
+        return f"HTTP {status}: {_sanitize(body, 120)}"
+    return f"HTTP {status}"
+
+
+def _post(client: httpx.Client, url: str, **kwargs: Any) -> tuple[int, str]:
+    """POST, then read a bounded prefix of the response under one overall deadline.
+
+    `client.post()` buffers the entire body before `resp.text[:200]` clips it, so the
+    clip was cosmetic: an endpoint answering 500 and then dripping a byte every ten
+    seconds pinned the calling thread forever and grew RSS without bound, because the
+    15s read timeout only bounds a single chunk. In the worker that is worse than
+    slow — notify_user checks its 60s budget only *between* channels, so one hung send
+    sails past it and stalls the capacity retry tick.
+    """
+    deadline = time.monotonic() + _TOTAL_DEADLINE_SEC
+    with client.stream("POST", url, **kwargs) as resp:
+        chunks: list[bytes] = []
+        size = 0
+        for chunk in resp.iter_bytes():
+            if size < _MAX_RESPONSE_BYTES:
+                chunks.append(chunk[: _MAX_RESPONSE_BYTES - size])
+            size += len(chunk)
+            if size >= _MAX_RESPONSE_BYTES or time.monotonic() >= deadline:
+                break
+        return resp.status_code, b"".join(chunks).decode("utf-8", "replace")
+
+
+def _smtp_port(config: dict[str, Any]) -> int:
+    raw = config.get("port")
+    try:
+        port = int(raw if raw not in (None, "") else 465)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("SMTP 端口必须是数字") from exc
+    if port not in _SMTP_PORTS:
+        allowed = ", ".join(str(p) for p in sorted(_SMTP_PORTS))
+        raise ValueError(f"SMTP 端口只能是 {allowed}（收到 {port}）")
+    return port
 
 
 def encode_channel_config(config: dict[str, Any]) -> str:
@@ -108,6 +184,9 @@ def validate_channel_config(kind: str, config: dict[str, Any]) -> None:
             resolve_and_check_host(host)
         except ValueError as exc:
             raise ValueError(str(exc)) from exc
+        # Normalized back into the config so the stored channel can never hold a
+        # port the send path would then have to reject.
+        config["port"] = _smtp_port(config)
 
 
 def send_to_channel(kind: str, config: dict[str, Any], title: str, body: str) -> tuple[bool, str]:
@@ -125,8 +204,10 @@ def send_to_channel(kind: str, config: dict[str, Any], title: str, body: str) ->
             return _send_smtp(config, title, body)
         return False, f"未知渠道类型: {kind}"
     except Exception as exc:  # noqa: BLE001
-        log.warning("notify %s failed: %s", kind, exc)
-        return False, str(exc)[:300]
+        # An exception message can carry remote bytes (and therefore newlines).
+        detail = _sanitize(str(exc), 300)
+        log.warning("notify %s failed: %s", kind, detail)
+        return False, detail
 
 
 def _send_telegram(config: dict[str, Any], title: str, body: str) -> tuple[bool, str]:
@@ -136,21 +217,29 @@ def _send_telegram(config: dict[str, Any], title: str, body: str) -> tuple[bool,
     if not token or any(c in token for c in "/?# \t\r\n"):
         return False, "invalid bot_token"
     text = f"*{title}*\n{body}" if title else body
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     with httpx.Client(**_HTTP_CLIENT_KW) as client:
-        resp = client.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+        status, payload = _post(
+            client, url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
         )
-        if resp.status_code == 200 and resp.json().get("ok"):
+        if status == 200 and _json_ok(payload):
             return True, "sent"
         # Markdown parse errors: retry as plain text
-        resp2 = client.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": f"{title}\n{body}" if title else body},
+        status, payload = _post(
+            client, url, json={"chat_id": chat_id, "text": f"{title}\n{body}" if title else body}
         )
-        if resp2.status_code == 200 and resp2.json().get("ok"):
+        if status == 200 and _json_ok(payload):
             return True, "sent"
-        return False, f"HTTP {resp2.status_code}: {resp2.text[:200]}"
+        # api.telegram.org is a fixed host, so its error description is ours to show.
+        return False, _http_error(status, payload, echo=True)
+
+
+def _json_ok(payload: str) -> bool:
+    try:
+        data = json.loads(payload)
+    except ValueError:
+        return False
+    return bool(isinstance(data, dict) and data.get("ok"))
 
 
 def _send_bark(config: dict[str, Any], title: str, body: str) -> tuple[bool, str]:
@@ -161,13 +250,15 @@ def _send_bark(config: dict[str, Any], title: str, body: str) -> tuple[bool, str
         return False, str(exc)
     key = str(config.get("device_key") or "").strip()
     with httpx.Client(**_HTTP_CLIENT_KW) as client:
-        resp = client.post(
+        status, _payload = _post(
+            client,
             f"{server}/push",
             json={"device_key": key, "title": title or "OCIBot", "body": body, "group": "ocibot"},
         )
-        if resp.status_code == 200:
+        if status == 200:
             return True, "sent"
-        return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+        # `server` is user-supplied — status only, never the body. See _http_error.
+        return False, _http_error(status)
 
 
 def _send_serverchan(config: dict[str, Any], title: str, body: str) -> tuple[bool, str]:
@@ -175,13 +266,15 @@ def _send_serverchan(config: dict[str, Any], title: str, body: str) -> tuple[boo
     if not key or any(c in key for c in "/?# \t\r\n"):
         return False, "invalid send_key"
     with httpx.Client(**_HTTP_CLIENT_KW) as client:
-        resp = client.post(
+        status, payload = _post(
+            client,
             f"https://sctapi.ftqq.com/{key}.send",
             data={"title": (title or "OCIBot")[:32], "desp": body},
         )
-        if resp.status_code == 200:
+        if status == 200:
             return True, "sent"
-        return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+        # Fixed vendor host, so a short excerpt is safe and is the only diagnostic.
+        return False, _http_error(status, payload, echo=True)
 
 
 def _send_webhook(config: dict[str, Any], title: str, body: str) -> tuple[bool, str]:
@@ -195,10 +288,13 @@ def _send_webhook(config: dict[str, Any], title: str, body: str) -> tuple[bool, 
     if secret:
         headers["X-OCIBot-Secret"] = secret
     with httpx.Client(**_HTTP_CLIENT_KW) as client:
-        resp = client.post(url, json={"title": title, "body": body, "source": "ocibot-web"}, headers=headers)
-        if 200 <= resp.status_code < 300:
+        status, _payload = _post(
+            client, url, json={"title": title, "body": body, "source": "ocibot-web"}, headers=headers
+        )
+        if 200 <= status < 300:
             return True, "sent"
-        return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+        # `url` is user-supplied — status only, never the body. See _http_error.
+        return False, _http_error(status)
 
 
 def _send_smtp(config: dict[str, Any], title: str, body: str) -> tuple[bool, str]:
@@ -213,35 +309,70 @@ def _send_smtp(config: dict[str, Any], title: str, body: str) -> tuple[bool, str
     except ValueError as exc:
         return False, str(exc)
 
-    port = int(config.get("port") or 465)
+    # Re-checked here as well as on save: a stored channel from before the allow-list
+    # existed can still name port 9200.
+    try:
+        port = _smtp_port(config)
+    except ValueError as exc:
+        return False, str(exc)
     username = str(config.get("username") or "").strip()
     password = str(config.get("password") or "")
     to_addr = str(config.get("to_addr") or "").strip()
     from_addr = str(config.get("from_addr") or username).strip()
     use_ssl = bool(config.get("use_ssl", port == 465))
+    require_tls = bool(config.get("require_tls", True))
 
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = Header(title or "OCIBot 通知", "utf-8")
     msg["From"] = formataddr((str(Header("OCIBot", "utf-8")), from_addr))
     msg["To"] = to_addr
 
-    if use_ssl:
-        server: smtplib.SMTP = smtplib.SMTP_SSL(host, port, timeout=20, context=ssl.create_default_context())
-    else:
-        server = smtplib.SMTP(host, port, timeout=20)
+    server: Optional[smtplib.SMTP] = None
     try:
-        if not use_ssl:
+        if use_ssl:
+            server = smtplib.SMTP_SSL(
+                host, port, timeout=_SMTP_TIMEOUT, context=ssl.create_default_context()
+            )
+        else:
+            server = smtplib.SMTP(host, port, timeout=_SMTP_TIMEOUT)
             try:
                 server.starttls(context=ssl.create_default_context())
             except smtplib.SMTPNotSupportedError:
-                pass
+                # This exception means precisely "the server does not advertise
+                # STARTTLS", so swallowing it put AUTH PLAIN <base64 password> on a
+                # plaintext socket — and use_ssl defaults to False for every 587/25
+                # setup, i.e. the ordinary configuration. Not sending beats leaking
+                # the mailbox credential to anyone on the path.
+                if require_tls:
+                    return False, (
+                        "SMTP 服务器不支持 STARTTLS，已中止发送（继续会以明文发送账号密码）。"
+                        "请改用 465 端口的 SSL 连接，或在渠道配置中显式设置 require_tls=false "
+                        "以接受明文风险"
+                    )
+                log.warning(
+                    "smtp channel %s:%s authenticating without TLS (require_tls=false)", host, port
+                )
         server.login(username, password)
         server.sendmail(from_addr, [to_addr], msg.as_string())
+    except smtplib.SMTPAuthenticationError:
+        return False, "SMTP 认证失败：用户名或密码/授权码不正确"
+    except smtplib.SMTPResponseException as exc:
+        # exc.smtp_error is the REMOTE's own response line. Returning it (as the
+        # blanket handler in send_to_channel did) made 测试渠道 a banner grab: the
+        # detail string told open-with-banner, open-but-silent and closed apart for
+        # any host:port the caller chose. Keep it in the local log only.
+        log.warning("smtp %s:%s response error: %s %r", host, port, exc.smtp_code, exc.smtp_error)
+        code = exc.smtp_code if isinstance(exc.smtp_code, int) else 0
+        return False, f"SMTP 服务器拒绝了本次请求（错误码 {code}）"
+    except (smtplib.SMTPException, OSError) as exc:
+        log.warning("smtp %s:%s failed: %s", host, port, _sanitize(str(exc), 200))
+        return False, "无法连接 SMTP 服务器（连接失败、超时或 TLS 握手失败）"
     finally:
-        try:
-            server.quit()
-        except Exception:  # noqa: BLE001
-            pass
+        if server is not None:
+            try:
+                server.quit()
+            except Exception:  # noqa: BLE001
+                pass
     return True, "sent"
 
 
@@ -294,5 +425,14 @@ def notify_user(
         sent += 1
         results.append({"channel": row.name or row.kind, "kind": row.kind, "ok": ok, "detail": detail})
         if not ok:
-            log.warning("notify channel %s(%s) failed: %s", row.name, row.kind, detail)
+            # row.name is user-set and only .strip()[:64] on write, so interior
+            # newlines survived into the worker's line-oriented log: a 62-character
+            # name is enough to forge a complete extra log record. detail can carry
+            # remote bytes for the same reason.
+            log.warning(
+                "notify channel %s(%s) failed: %s",
+                _sanitize(row.name or "", 64),
+                _sanitize(row.kind or "", 16),
+                _sanitize(detail, 200),
+            )
     return results

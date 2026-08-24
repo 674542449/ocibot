@@ -1,5 +1,330 @@
 # Changelog
 
+## 0.4.81 — 2026-08-23
+
+12 个并行 agent 的成果合并。**安全与可靠性大批量加固**：容器不再以 root 运行、
+面板内更新改为显式开启、密钥不再能用弱口令导出、WebSSH 不再能被单用户打爆内存。
+
+### 安全
+
+- **容器降权 + 更新能力改为 opt-in。** `docker.sock` 从基础 compose 里彻底移除，
+  新增 `docker-compose.update.yml` 把「socket + 可写仓库 + `OCIBOT_UPDATE_ENABLED=1`」
+  绑成一个整体 —— 路由开关和它守护的东西现在住同一个文件，不可能一开一关。
+  基础文件写死 `"0"`（不是 `${...:-0}`），**结构上无法**被环境变量打开。
+  `api` / `worker` 改跑 uid 10001、`cap_drop: ALL`、`read_only`、`/tmp` 用 tmpfs。
+
+  之前的实际信任边界是「**任何**能在 API 进程里执行代码的东西 == 宿主机 root」，
+  而不是文档说的「管理员失陷 == 宿主机失陷」：仓库（含 `web/.env`，里面有主密钥）
+  和 socket 都是无条件挂载的，`OCIBOT_UPDATE_ENABLED` 只挡路由不挡挂载。
+
+- **`install.sh` 不再偷偷把面板内更新打开。** 原来 `export_build_env()` 每个子命令
+  都跑 `export OCIBOT_UPDATE_ENABLED="${...:-1}"`，而 compose 解析 shell 环境变量
+  **优先于** `.env` 文件 —— 操作员按 README 把它设成 0，下一次 `install.sh update`
+  就给改回 1，且无任何提示。README 和安全清单教的那个开关一直是失效的。
+  新增 `install.sh update-on` / `update-off` 显式切换。
+
+- **不再有能跑起来的默认密钥。** `OCIBOT_REQUIRE_SECURE_SECRETS` 默认改为 **1**，
+  `.env.example` 的 `POSTGRES_PASSWORD` / `OCIBOT_MASTER_KEY` / `OCIBOT_JWT_SECRET`
+  全部留空。主密钥只过一次无盐 SHA-256 就成为 Fernet 密钥（这是刻意设计），
+  所以跑在仓库里那个公开默认值上 == 任何能读到数据库的人都能解出全部租户私钥。
+
+  **这是一次会影响存量部署的破坏性变更**，见下方「升级」。
+
+- **备份导出不再只靠 zip 口令。** pyzipper 用的 WinZip AES 为了互通，KDF 被规范
+  钉死在 PBKDF2-HMAC-**SHA1、1000 轮**，无法调高；而归档里装的是每个租户的
+  **明文 OCI 私钥**。现在 zip 里面再套一层信封：同一口令过 PBKDF2-HMAC-SHA256
+  390 000 轮（与本地主密码同参数）后用 Fernet 封住整个 `tenants.json`。
+  口令下限提到 12 位并说明这份文件等同于账号本身。**旧归档仍可导入**（信封带版本号）。
+
+- **私钥现在会被真正解析。** 以前只 grep `BEGIN` + `PRIVATE KEY`，于是一份
+  带口令保护的密钥（甲骨文控制台就会给你这种）或截断的粘贴会以 201 存下、
+  `has_private_key: true`，而「保存后自动测试连接」默认关闭，操作员看到「已添加」，
+  之后每个页面都 502 报一句看不懂的 SDK 反序列化错误。
+
+- **WebSSH**：stdin 加 `drain()`（原先单个用户可让 asyncssh 的发送缓冲无限增长，
+  把共享的 API 进程 OOM 掉）；会话改为字节透传（原先 `errors='strict'`，
+  `cat /bin/ls` 就会**整条 SSH 连接**断掉，而且浏览器那边看起来还连着）；
+  终端数据走二进制帧、控制消息走文本帧，于是**客体输出再也无法伪装成面板自己的
+  控制消息**去诱导用户点「重置主机密钥」；主机密钥按密钥类型 pin，
+  避免一次依赖升级把所有实例同时报成「可能是中间人攻击」。
+
+- **通知**：SMTP 不再在服务器不宣告 STARTTLS 时静默降级明文发送凭据；
+  SMTP 端口套用与 HTTP 相同的黑名单（原先可当端口扫描器，且远端 banner 会回显）；
+  出站响应加大小上限与总超时（原先 15s 是**每块**的，慢速滴流可无限占住线程）。
+
+- **自更新**：互斥锁原先在真正执行之前就写 `state=success`，第二次点更新的第一个
+  动作是 `docker rm -f` 掉正在 `compose build` 的特权容器 —— 可能让 API 容器被销毁
+  且不再重建。现在保持 `running` 直到 helper 容器退出，并按容器名二次拦截。
+  `last_error` / `message` 也接入脱敏（原先只有 `log_tail` 走了，私库 PAT 会明文落库）。
+
+- CSP `connect-src` 收紧为 `'self'`（原先裸 `ws:` / `wss:` 允许连任意主机，
+  是这份策略里唯一的外泄通道）；`/openapi.json`、`/docs`、`/redoc` 默认关闭；
+  请求体大小限制移到中间件最外层。
+
+### 修复
+
+- **配额守卫的读取失败不再比正常路径更宽松。** 判断「免费上限是硬阻断还是只警告」
+  的规则被抄成了两份，`_blocked_by_incomplete_read` 只看 `free_only_mode`。于是
+  一个 `account_tier="free"` 但关掉了 free_only 的租户，用量**读得到**时被硬挡、
+  读**失败**（429）时反而放行。现在两边共用 `free_quota.hard_free_caps()`。
+
+- **创建实例加了每租户锁。** 配额校验是 check-then-act，不预留任何东西：两个标签页
+  同时提交 4 OCPU/24GB 的 A1，各自读到「已用 0」，双双放行，真的开出 8 OCPU/48GB。
+  窗口还特别宽 —— `prepare_launch_network` 夹在判定和创建之间，可能新建 NSG 甚至 VCN。
+  Postgres 用 `pg_try_advisory_xact_lock`（独立连接，因为请求 Session 中途会 commit），
+  SQLite 用数据库文件旁边的 `flock`。
+
+- **`list_compartments` 失败不再被静默当成「只有根 compartment」。** 缺
+  `inspect compartments` 权限时（甲骨文回 404），子 compartment 里的用量永远算 0
+  且 `read_incomplete=False`，配额守卫把这个欠计当成权威值。现在有了错误通道。
+
+- **抢机任务的时间下限。** `resume` 直接把 `next_run_at` 设为 now 且无下限，
+  而 worker 也没有独立下限 —— 反复点「停止/继续」可把 LaunchInstance 打到约 12 次/分，
+  绕过 60 秒的合规下限。两侧都补了。
+
+- **审计日志时间戳补上时区偏移。** SQLite 对 `DateTime(timezone=True)` 返回的是
+  naive 值，`.isoformat()` 就没有偏移量，而 JS 把无偏移的串按**本地时间**解析 ——
+  UTC+8 的操作员看到的每条事件都早 8 小时，偏偏这是「什么时候发生的」专用页面。
+  `schemas.py` 里的 `UtcDatetime` 早就修过同样的问题，三个手写 dict 的端点漏了。
+
+- **`GET .../console` 读取失败不再报 `ok:true, connections:[]`**（被读成「没有连接」，
+  而实例只允许一个活动控制台连接，导致后续创建失败且看不出原因）。
+
+- **前端竞态一批**：`InstanceDetailView` 换实例时显示旧实例、按钮打新实例
+  （`doRename` 同一函数内读旧写新，会把 B 改成 A 的名字；`power` 无确认框；
+  终止 / 防火墙全开 / 换 IP 的确认框不带实例名）；`TenantsView` 副区列表与租户错配，
+  可能在**没选中**的账号上创建 Oracle 侧**无法取消**的区域订阅，而确认框写的是
+  「添加为面板租户」；`LaunchView` 切租户时新租户根本不发请求，拿旧租户的额度做决策；
+  `AccountView` 切租户后「刷新用量」永久卡死；`StorageView` 可用域跨租户残留；
+  `SettingsView` 切换渠道类型会把上一个渠道的 token 存进无关渠道；
+  `JobsView` 同时显示「已删除」和「删除失败」。
+
+- **数据库迁移失败不再静默启动。** `_ensure_schema` 把所有 `ALTER` 放在一个事务里，
+  Postgres 上一条失败会中止整个事务，后续每条都 `InFailedSqlTransaction`，
+  最终隐式 COMMIT 退化成 ROLLBACK —— **同一轮里先加成功的列被一起丢掉**，
+  而 `init_db()` 照常返回成功。
+
+- 长度上限：`display_name` / `CapacityJobCreate.name` / `availability_domains`
+  以前无上限，在 Postgres 上是裸 500，而此前 `prepare_launch_network` 已经在
+  甲骨文侧建好了 NSG（孤儿资源，且每次重试再建一个）。
+
+### 维护
+
+- **供应链完整锁定。** 新增 `web/backend/requirements.lock`：49 个包的全量闭包
+  （含 starlette / pydantic-core / cffi / certifi / uvloop 等间接依赖），
+  每个都带 sha256，交叉解析到 linux/cp312，Dockerfile 改用 `--require-hashes` 安装。
+  `compose build --pull` 从此不再是「向 PyPI 重新解析一遍」，而是「装回同一批字节」。
+  `requirements.txt` 保留为人类维护的直接依赖清单，改完必须重新生成锁。
+- **新增 `.dockerignore`。** 构建上下文原先会把 `.venv/`、`.git/`、`web_data/` 和
+  **`web/.env`（主密钥、JWT 密钥、数据库口令）**整个发给 Docker daemon；在远程或
+  rootless daemon 上这就是一次实打实的密钥外泄。还有一处更隐蔽的：frontend 阶段
+  先 `npm ci` 再 `COPY web/frontend ./`，宿主机上若存在 `node_modules` 会**盖掉**
+  刚装好的那份，lockfile 的意义随之消失。
+- `web/AUDIT.md` 新增第 11 次审计记录，并订正了第 10 次的一处错误结论
+  （当时写「JWT 算法硬编码、不可被环境变量覆盖」，实际是可以的）。
+- 基础镜像改用 `ARG` + 可从 `web/.env` 注入 digest；未校验的 `docker-27.5.1.tgz`
+  下载改成从官方 `docker:27-cli` 镜像 `COPY --from=`（内容寻址）。
+- `npm ci` 去掉了 `|| npm install` 回退（lockfile 一旦漂移就会静默改用无校验的解析）。
+- `app_version` / `jwt_algorithm` 改为 `ClassVar`，任何环境变量都碰不到它们。
+  原先 `APP_VERSION=9.9.9` 能让 `/api/health` 谎报版本 —— 正是版本号规则要防的事。
+- 测试夹具改用**真实生成**的 RSA 密钥（`tests/_keys.py`，import 时生成一次），
+  而不是放宽私钥校验来迁就假 PEM。
+
+### 升级
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.81
+```
+
+**本次有三处需要留意：**
+
+1. **必须先有合格的密钥，否则面板会拒绝启动**（返回 503 并在正文里写明改哪个变量、
+   用什么命令生成、以及逃生开关）。已经在跑的部署，`web/.env` 里本来就有强密钥的不受影响。
+   若确实想暂时维持原样：`OCIBOT_REQUIRE_SECURE_SECRETS=0`。
+   注意**轮换 `OCIBOT_MASTER_KEY` 会让已存的租户私钥无法解密**，需重新导入或恢复备份。
+2. **面板内更新会在本次升级后关闭**，需要显式 `bash scripts/install.sh update-on` 再开。
+3. **`POSTGRES_PASSWORD` 变成必填**，不再静默回落到 `ocibot_dev_pass`。
+
+升级后建议手工验一次 WebSSH（CSP 收紧 + 会话改字节透传都影响这条路径）。
+
+## 0.4.80 — 2026-08-23
+
+12 个 agent 并行审计的第一批修复。**两个可造成真实损失的严重问题**：
+任何登录用户可让面板连接内网任意 host:port；批量创建 E2.1.Micro 完全绕过免费额度。
+
+### 修复
+
+- **[严重] `region` 未做校验，可把 OCI SDK 的请求引向任意主机（SSRF）。**
+
+  OCI SDK 拼 endpoint 时有一条向后兼容分支：region 里只要带 `.`，就当成完整域名、
+  不再追加 `oraclecloud.com`。而 `TenantConfig.validate()` 以前只检查「非空」，
+  `oci.config.validate_config` 的 PATTERNS 也只覆盖 fingerprint / tenancy / user。
+  实测（`tests/test_region_ssrf.py` 用真实 SDK 断言）：
+
+      region='@127.0.0.1:6379'  -> 实际连接 127.0.0.1:6379
+      region='@169.254.169.254' -> 实际连接云元数据端点
+
+  `iaas.` 被当作 URL userinfo 吃掉，真正的 authority 是 `@` 后面那截。这条路径
+  **完全不经过 `url_safety.py`**，所有地址/端口/IDNA 控制都不生效；再配合
+  `POST /tenants/{id}/test` 同步回显连接结果，就是一个内网端口探测器。
+
+  改法：`TenantConfig.validate()` 增加字符集校验（只允许字母、数字、连字符），
+  Pydantic 的 `TenantCreate` / `TenantUpdate` 也加上同样的 pattern 提前拦成 422。
+  禁掉 `.` `@` `:` `/` 之后，上述每一种构造都不成立。`subscribe_tenant_region`
+  是唯一不过这两道闸就能写 `Tenant.region` 的路径，也补了同样的校验。
+
+- **[严重] 批量创建 E2.1.Micro 时 `count` 被忽略，免费额度形同虚设。**
+
+  `validate_launch_against_quota` 里 `units` 已按 `count` 算好，A1 和块存储两条
+  分支都用的批量值，唯独 E2 分支写的是 `if e2_rem < 1` —— 只问「还有没有空位」，
+  不问「够不够 n 台」。于是免费额度只剩 1 个位置时，`count=3` 照样全过并真的发出
+  3 次 LaunchInstance。讽刺的是 `projected` 里算出的 `e2_micro_count_after` 是对的
+  （4 > 上限 2），只是没人拿它做判断。默认 47GB 的块存储上限只在 `count>4` 时
+  才顺带挡一下，`count=2..4` 一路畅通。现在比较整批台数。
+
+- **[严重] 一个坏租户会让全站所有用户的抢机任务永久停摆。**
+
+  `worker.tick_capacity` 每个任务的 `try/finally` **没有 `except`**。建 OCI 会话
+  那两行不在任何 try 里，于是一个配置被 SDK 拒绝的租户抛出的异常会一路逃出
+  `for` 循环。抛点在 `attempts += 1` 和任何 `next_run_at` 写入之前，而候选是按
+  `next_run_at.nullsfirst()` 排序的 —— 它会在一个周期内变成永久队头，**其他用户的
+  任务再也不会被执行**；`attempts` 不涨所以 `max_attempts` 永远够不着；
+  `last_error` 没写、`status` 卡在 `running`，面板显示「运行中」且毫无错误。
+  删除任务时 worker 恰好在跑同一个任务（`StaleDataError`）也走同一条逃逸路径。
+
+- **[严重] 副区管理：区域列表与租户错配，可能在**没选中**的账号上创建不可逆的区域订阅。**
+
+  `openRegions` 没有序号守卫。先点 A 再点 B、A 的响应后到，就会「标题是 B、
+  表格是 A 的区域列表」，而开通请求是打给 `regionsFor`（B）的。服务端
+  `subscribe_region` 拿 **B 的真实已开通列表**重新判断，A 那边「已开通」的状态
+  不作数 —— 于是那句「把已开通区域…添加为面板租户」（承诺不动 Oracle）的确认框，
+  实际会在 B 上创建一个 **Oracle 侧无法取消**的区域订阅。「副区管理」按钮的
+  `:disabled` 用的是 `busy`，而 `openRegions` 设的是 `regionsLoading`，
+  所以加载期间按钮一直可点。
+
+- **[高] 粘贴 OCI 配置存在二次方级 ReDoS，十几个并发即可挂死面板。**
+
+  INI 探测用的是 `re.search(r"^\s*\[.+\]\s*$", raw, re.M)`。`\s` 含 `
+`，
+  加上 `re.M` 后引擎在每个行首重新起跳并回溯到串尾，对空行数是 O(n²)。
+  `api_text` 上限 64 000 字符恰好是最坏情况：实测 **13.3 秒**纯 CPU 且不放 GIL。
+  `/tenants/parse` 与 `/tenants/import` 都没有限流。改为逐行判断，天然线性。
+
+- **[高] 抢机重试是唯一会重发 LaunchInstance 的路径，却唯独不带 `opc-retry-token`。**
+
+  lease 在调用 OCI 前 commit，而 `attempts+=1` 和结果要到 `finally` 才 commit。
+  容器在两者之间重启（面板自带的一键更新、OOM、宿主机重启）会回滚这两者，
+  租约过期后以**完全相同**的 payload 再发一次 —— 多出一台没人记账的机器。
+  现在用 `derive_retry_token(launch_token, attempts)`：同一次尝试的重放被 Oracle
+  折叠，下一次尝试拿到不同 token，不会撞 IdempotentParameterMismatch。
+
+- **[高] 账号用量页：加载途中切换租户会让「刷新用量」永久卡在「加载中…」。**
+
+  `beginLoad().stale()` 里含租户判断，而 `finally` 拿它来决定要不要关 spinner；
+  切换租户后这一次不满足条件、不关，又没有新的 loadAll 来接管所有权。
+  `InstancesView` 早就修过同一个坑，注释写着「spinner 只认 SEQUENCE」。
+  现在把「能不能写 state」和「能不能关 spinner」拆成两个判断。
+
+- **[中] `PATCH /tenants/{id}` 与粘贴导入的字符串没有长度上限。**
+
+  `TenantUpdate` 全是裸 `Optional[str]`，而 `TenantCreate` 每个字段都有 bound。
+  SQLite 不检查 varchar 宽度所以测试全绿，PostgreSQL 会抛
+  `StringDataRightTruncation`，且 `update_tenant` 的 commit 没有包 try ——
+  PATCH 一个 200 字符的 name 就是一个不带任何信息的 500。已对齐列宽。
+
+### 测试
+
+新增 4 个回归测试文件、38 个用例（`609 passed`）：
+`test_region_ssrf.py`（含用真实 OCI SDK 断言「攻击在修复前确实成立」）、
+`test_worker_job_crash_isolation.py`、`test_free_quota_batch_e2.py`、
+`test_parse_config_redos.py`（断言复杂度而非墙钟时间，避免 CI 抖动）。
+
+### 升级
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.80
+```
+
+## 0.4.79 — 2026-08-23
+
+实例列表瘦身：去掉「租户」列和「换IP」按钮，并且**一台机器一行**——
+不再有某几行因为自己的参数比别人高一截。
+
+### 功能
+- **去掉「租户」列。** 这张表一次只列一个租户（就是顶部下拉里选的那个），
+  每行重复同一个名字既占宽度又没有信息量。全租户聚合的 `GET /api/instances`
+  是故意返回 400 的，所以不存在「列表里混着几个租户」的情况。
+  租户名仍然参与搜索、仍然写进导出的 CSV。
+
+- **去掉行内的「换IP」按钮。** 换公网 IP 会释放旧地址，是不可撤销的，
+  夹在一排小按钮中间太容易点成隔壁的「重启」。详情页的「换公网IP」保留，
+  那里同时能看到当前地址、IPv6 和实例状态，是做这个决定该有的上下文。
+
+- **一行一台机器。** 表格是用来「扫」的：行高一致时，眼睛沿着一列往下走
+  就能比出状态、IP、创建时间；只要有一行因为自己的参数变高，节奏就断了，
+  而且高出来的那几行看着像是更重要。现在宽度不够一律横向滚动，绝不折行：
+
+  - **规格（OCPU / 内存）从 shape 下面挪到同一行。** 之前它是个 `<div>`，
+    于是弹性 shape 的行比固定 shape 的行高一截 —— 同一张表里两种行高。
+  - **IPv6 从 IPv4 下面挪到同一行**，并缩写成「首段:…:末段」。完整地址最长
+    39 个字符，铺开会把「操作」列顶出屏幕；前缀认子网、后缀认机器，这两段
+    足够在列表里区分同一台机器的多个地址。**悬停看完整地址，单击复制的也是
+    完整地址**，一个字符都不丢。
+  - **长名字截断成省略号**（完整值在 title 里）。名称是唯一长度完全由用户
+    决定的字段，一台机器起个长名字就能把整行撑高。
+  - **按钮组不再折行。** flex 的换行不受 `white-space` 管，得单独关掉，
+    否则窄屏下按钮折成两排，正是要避免的那种「某几行特别高」。
+
+  实测（真实样式 + 五行极端数据：三个 IPv6、60 字符长名、固定/弹性 shape
+  混排）：改之前在 1130px 可用宽度下每行 262px，改之后**每行 52px，
+  从 420px 到 1592px 各种宽度下行高差都只有 0.5px 的亚像素**。
+
+- **「操作」列吸附在表格右边缘。** 不折行的代价是表格变宽（真实机器数据约
+  1420px，极端数据约 1760px）。1440 的笔记本可用宽度只有 1130 左右，
+  最右边这一列会被推出可视区 —— 偏偏它就是要点的那一列。吸附之后横向滚动
+  只影响中间那几个只读字段，按钮始终停在原地；表格宽度够时它就是个空操作。
+
+  两个坑都踩过了：背景必须**不透明**（否则滚到下面的单元格会透上来），
+  分隔线用 `inset box-shadow` 而不是 `border`（表格是 `border-collapse:
+  collapse`，合并后的边框由 `<table>` 画，不会跟着吸附的格子走）。
+  用 `.action-cell` 而不是 `:last-child`，因为空列表那行的 `colspan`
+  单元格也是它那行的最后一格，不该被吸附。
+
+### 修复
+- **「没有公网 IP」的那个「—」占位符会把整行撑到两倍高。**
+
+  `styles.css` 里给「暂无数据」整格提示用的是 `.card > .empty, td.empty,
+  .empty`，**第三个是裸类选择器**，于是它也命中了 `.copyable.empty` ——
+  也就是 IP 为空时显示的那个破折号，给它套上了 `padding: 2.25rem 1rem`。
+  `.copyable.empty` 只声明了 `padding-left/right: 0`，上下就留给它了：
+  一个破折号被撑成 **87px 高**，那一行直接变成别人的两倍。
+
+  这个问题在改动之前就存在（实例详情页的 IP 字段同样中招），只是以前
+  列表本来就在折行、行高本来就参差，没人看得出来是它。改成一行一台机器
+  之后它立刻变成最显眼的破绽，所以一并修掉：`.copyable.empty` 的 padding
+  写成四值 shorthand，靠 (0,2,0) 的 specificity 盖住 `.empty` 的 (0,1,0)。
+
+### 维护
+- **顺带发现（本次未改）：`:global(html[data-theme='dark']) .foo` 这种写法
+  在 Vue 的 scoped CSS 里会被编译坏** —— 后代部分整个丢掉，只剩
+  `html[data-theme=dark]{…}`，样式糊到 `<html>` 上而不是目标元素。
+  本次新加的深色规则改成了直接写祖先选择器 `html[data-theme='dark'] .foo`
+  （作用元素本来就在组件内，scope 属性会挂到最后一段），编译结果正确。
+
+  `AccountView` / `TenantsView` / `ToastHost` 里还有 **8 处**老代码是坏的写法，
+  也就是说那 8 条深色样式一直没生效（因为 `body` 自己的 color/background
+  盖住了糊到 `<html>` 上的值，所以一直没人发现）。改掉它们会真的改变这三处
+  在深色下的观感，需要单独看一遍再动，本次不顺手带。
+
+### 升级
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.79
+```
+
 ## 0.4.78 — 2026-08-20
 
 实例列表新增「创建时间」列，精确到秒。

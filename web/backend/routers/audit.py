@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
+from web.backend.audit import iso_utc
 from web.backend.auth import get_current_user
 from web.backend.db import get_db
 from web.backend.models import AuditLog, User
@@ -50,7 +51,7 @@ def list_audit(
             "action": r.action,
             "target": r.target,
             "detail": r.detail,
-            "created_at": r.created_at.isoformat() if r.created_at else "",
+            "created_at": iso_utc(r.created_at),
         }
         for r in rows
     ]

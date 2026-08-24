@@ -188,7 +188,11 @@ def make_session():
     return s
 
 
-_PEM = "-----BEGIN PRIVATE KEY-----\nMIIBOgIBAAJBAK\n-----END PRIVATE KEY-----"
+from tests._keys import TEST_PEM
+
+# 必须是**能真正解析**的 PEM：TenantConfig.validate() 现在用
+# load_pem_private_key 解析私钥，标记形状的假串会被正确拒绝。
+_PEM = TEST_PEM
 
 SESSION = make_session()
 

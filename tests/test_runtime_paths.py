@@ -15,7 +15,9 @@ from app.runtime_paths import (
 from app.scheduler import JobStore, ScheduleJob
 
 
-KEY = "-----BEGIN PRIVATE KEY-----\nportable-test\n-----END PRIVATE KEY-----\n"
+from tests._keys import TEST_PEM
+
+KEY = TEST_PEM
 
 
 def _tenant() -> TenantConfig:

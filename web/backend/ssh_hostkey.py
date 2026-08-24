@@ -38,6 +38,7 @@ class HostKeyCheck:
     fingerprint: str
     key_type: str = ""
     expected: str = ""
+    expected_key_type: str = ""
     server_key: Any = None
 
     @property
@@ -56,16 +57,95 @@ class HostKeyCheck:
                 f"无法读取 SSH 主机密钥：{self.expected}\n"
                 "请确认实例已 RUNNING、22 端口已在 NSG/安全列表放行，且 sshd 已启动。"
             )
+        type_note = ""
+        if self.expected_key_type and self.key_type and self.expected_key_type != self.key_type:
+            # The probe asks for the pinned key type first, so a different type
+            # coming back means the server stopped offering the old one. Say so —
+            # otherwise a key-type rotation reads as nothing but "possible MITM".
+            type_note = (
+                f"密钥类型也变了（记录 {self.expected_key_type}，本次 {self.key_type}），"
+                "服务器可能已不再提供原类型的主机密钥。\n"
+            )
         return (
             "SSH 主机密钥与首次连接时不一致，已中止连接（未发送任何凭据）。\n"
             f"记录的指纹：{self.expected}\n"
             f"本次的指纹：{self.fingerprint}\n"
+            f"{type_note}"
             "若你重装了系统或重建了实例，请在实例详情页重置主机密钥后重连；"
             "否则这可能是中间人攻击。"
         )
 
 
-async def probe_host_key(host: str, port: int = 22, *, timeout: float = 20.0) -> Any:
+def _default_host_key_algs() -> list[str]:
+    try:
+        from asyncssh.public_key import get_default_public_key_algs
+
+        return [
+            a.decode("ascii", "replace") if isinstance(a, bytes) else str(a)
+            for a in get_default_public_key_algs()
+        ]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _sig_algs_for_key_type(key_type: str) -> list[str]:
+    """Signature algorithms that make the server present a ``key_type`` host key.
+
+    Needed because the pinned *key* type and the negotiated *signature* algorithm
+    are not the same string: an RSA host key is stored as ``ssh-rsa`` but modern
+    sshd only offers it under ``rsa-sha2-256`` / ``rsa-sha2-512``, so asking for
+    ``ssh-rsa`` alone would fail the KEX against the very server we pinned.
+    """
+    kt = (key_type or "").strip()
+    if not kt:
+        return []
+    handler = None
+    try:
+        # asyncssh has no public alg -> key-class lookup; guarded so an upstream
+        # rename degrades to "just ask for the key type itself", never a crash.
+        from asyncssh.public_key import _public_key_alg_map
+
+        handler = _public_key_alg_map.get(kt.encode("ascii", "replace"))
+    except Exception:  # noqa: BLE001
+        handler = None
+    out: list[str] = []
+    for alg in getattr(handler, "sig_algorithms", ()) or ():
+        out.append(alg.decode("ascii", "replace") if isinstance(alg, bytes) else str(alg))
+    if kt not in out:
+        # ECDSA (and anything unmapped): the key algorithm IS the signature algorithm.
+        out.append(kt)
+    return out
+
+
+def host_key_alg_order(prefer_key_type: str = "") -> list[str]:
+    """Client host-key preference putting the already-pinned key type first.
+
+    Only one fingerprint is remembered per (owner, instance, port), so whichever
+    key type asyncssh happened to negotiate first became "the" identity of the
+    host. A dual-key Ubuntu box (RSA + ed25519) then flips to MISMATCH — i.e. the
+    「这可能是中间人攻击」 banner — for entirely benign reasons: sshd's
+    HostKeyAlgorithms edited, one of the two keys regenerated, or an asyncssh
+    upgrade reordering get_default_public_key_algs(). The last one would trip
+    EVERY pinned instance at once right after the panel's own one-click update,
+    which is exactly how users get trained to click through a real warning.
+
+    Re-requesting the remembered type keeps the comparison like-for-like. The rest
+    of the defaults stay in the list behind it so a server that genuinely dropped
+    that key type still completes the KEX and is reported as a mismatch, rather
+    than failing the handshake and being mislabelled "unreachable".
+    """
+    defaults = _default_host_key_algs()
+    preferred = [
+        a for a in _sig_algs_for_key_type(prefer_key_type) if not defaults or a in defaults
+    ]
+    if not preferred:
+        return []  # nothing pinned yet (or unrecognised): use asyncssh's own order
+    return preferred + [a for a in defaults if a not in preferred]
+
+
+async def probe_host_key(
+    host: str, port: int = 22, *, timeout: float = 20.0, prefer_key_type: str = ""
+) -> Any:
     """Return the server's host key without authenticating.
 
     Only the SSH handshake runs, so no username, password or private key is sent.
@@ -74,9 +154,23 @@ async def probe_host_key(host: str, port: int = 22, *, timeout: float = 20.0) ->
 
     import asyncssh
 
-    return await asyncio.wait_for(
-        asyncssh.get_server_host_key(host, port=int(port or 22)), timeout=timeout
+    kwargs: dict[str, Any] = {"port": int(port or 22)}
+    algs = host_key_alg_order(prefer_key_type)
+    if algs:
+        kwargs["server_host_key_algs"] = algs
+    return await asyncio.wait_for(asyncssh.get_server_host_key(host, **kwargs), timeout=timeout)
+
+
+def remembered_key_type(db: Session, *, owner_id: str, instance_id: str, port: int = 22) -> str:
+    """Key type pinned for this target, so the probe can ask for the same one."""
+    row = db.scalar(
+        select(SshHostKey).where(
+            SshHostKey.owner_id == owner_id,
+            SshHostKey.instance_id == instance_id,
+            SshHostKey.port == int(port or 22),
+        )
     )
+    return str(getattr(row, "key_type", "") or "") if row is not None else ""
 
 
 def fingerprint_of(server_key: Any) -> tuple[str, str]:
@@ -176,11 +270,20 @@ def verify_host_key(
             fingerprint=fingerprint,
             key_type=key_type,
             expected=row.fingerprint,
+            expected_key_type=str(row.key_type or ""),
             server_key=server_key,
         )
 
+    dirty = False
     if host and row.last_host != host:
         row.last_host = host
+        dirty = True
+    if key_type and not row.key_type:
+        # Rows learned before the probe asked for a specific type have no type on
+        # record; fill it in so the next probe can request the same one.
+        row.key_type = key_type
+        dirty = True
+    if dirty:
         db.commit()
     return HostKeyCheck(
         verdict=TRUSTED, fingerprint=fingerprint, key_type=key_type, server_key=server_key
@@ -200,8 +303,12 @@ def check_instance_host_key(
     """Probe + verify from synchronous (threadpool) route handlers."""
     import asyncio
 
+    # Ask for the key type we already pinned, so a dual-key host cannot flip to
+    # MISMATCH just because the negotiated algorithm changed (see host_key_alg_order).
+    prefer = remembered_key_type(db, owner_id=owner_id, instance_id=instance_id, port=port)
+
     async def _probe() -> Any:
-        return await probe_host_key(host, port, timeout=timeout)
+        return await probe_host_key(host, port, timeout=timeout, prefer_key_type=prefer)
 
     try:
         loop = asyncio.get_running_loop()

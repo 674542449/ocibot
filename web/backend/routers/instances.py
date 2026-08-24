@@ -41,6 +41,7 @@ from web.backend.quota_guard import (
     free_only_for_tenant,
     region_pair,
     tenant_is_secondary,
+    tenant_launch_lock,
     usage_snapshot,
 )
 from web.backend.schemas import (
@@ -814,224 +815,232 @@ def launch_instance(
 
     # Always Free guard BEFORE network/NSG prep so we don't leave orphan resources.
     timer.mark("pre")
-    free_only = free_only_for_tenant(row)
-    launch_guard = None
-    extra_warnings: list[str] = []
-    try:
-        # 副区: Always Free only exists in the home region, and the free-usage
-        # snapshot is per-region — from a secondary region it reads zero and would
-        # wave through a second "free" machine. So the region gate replaces the
-        # cap check there instead of running alongside it.
-        region_warning = enforce_secondary_region(
-            session,
-            free_only_mode=free_only,
-            secondary_hint=tenant_is_secondary(row),
-            region_hint=row.region or "",
-        )
-        if region_warning:
-            extra_warnings.append(region_warning)
-        else:
-            launch_guard = enforce_launch_quota(
-                session,
-                account_tier=getattr(row, "account_tier", "") or "",
-                shape=str(payload.get("shape") or ""),
-                ocpus=payload.get("ocpus"),
-                memory_in_gbs=payload.get("memory_in_gbs"),
-                boot_volume_size_in_gbs=payload.get("boot_volume_size_in_gbs"),
-                boot_volume_vpus_per_gb=boot_vpu,
-                fallback_configs=list(built.get("fallback_configs") or body.fallback_configs or []),
-                free_only_mode=free_only,
-                count=count,
-            )
-    except HTTPException:
-        timer.emit("quota-refused")
-        raise
-    except Exception as exc:  # noqa: BLE001
-        # A quota-read failure must not surface as an unhandled 500 (this branch
-        # previously re-raised HTTPException only, so anything else escaped).
-        raise HTTPException(status_code=502, detail=f"校验免费额度失败: {exc}") from exc
-
-    # Pre-launch: IPv6 + managed NSG (desktop parity)
-    try:
-        timer.mark("quota")
-        payload = prepare_launch_network(
-            session, payload, meta=meta, for_retry=bool(built["as_retry"])
-        )
-        built["payload"] = payload
-        timer.mark("network")
-    except (ValueError, OCIClientError) as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"准备网络/NSG 失败: {exc}") from exc
-
-    def _audit_launch(ok: bool, message: str, instance_id: str = "", job_id: str = "") -> None:
-        write_audit(
-            db,
-            owner_id=user.id,
-            action="instance.launch",
-            target=instance_id or payload.get("display_name", ""),
-            detail={
-                "tenant_id": tenant_id,
-                "ok": ok,
-                "message": message,
-                "shape": payload.get("shape"),
-                "as_retry": bool(built.get("as_retry")),
-                "capacity_job_id": job_id,
-            },
-        )
-
-    # Capacity retry path: enqueue a job and let the WORKER own every LaunchInstance
-    # call. An immediate launch here would race the worker (a second launch for the
-    # same tenant) and, on a capacity miss, leave next_run_at=now so the worker fires
-    # attempt #2 under the 60s floor. Queue-only keeps retries compliant.
-    if built["as_retry"]:
-        # Compliance: at most one active capacity-retry job per tenant.
-        existing = db.scalar(
-            select(CapacityJob)
-            .where(
-                CapacityJob.tenant_id == row.id,
-                CapacityJob.owner_id == user.id,
-                CapacityJob.enabled.is_(True),
-                CapacityJob.status.in_(("idle", "running")),
-            )
-            .limit(1)
-        )
-        if existing is not None:
-            if payload.get("managed_nsg_id"):
-                try:
-                    session.delete_managed_nsg(str(payload.get("managed_nsg_id")))
-                except Exception:
-                    pass
-            raise HTTPException(
-                status_code=409,
-                detail="该租户已有进行中的容量重试任务，请先在任务中心停止或删除后再新建",
-            )
-        now = datetime.now(timezone.utc)
-        job = CapacityJob(
-            owner_id=user.id,
-            tenant_id=row.id,
-            name=f"容量重试 · {payload.get('display_name') or 'instance'}",
-            enabled=True,
-            status="idle",
-            launch_payload=payload,
-            availability_domains=list(built.get("availability_domains") or []),
-            fallback_configs=list(built.get("fallback_configs") or []),
-            user_data_encrypted=encrypt_text(custom_user_data) if custom_user_data else "",
-            interval_sec=int(built["retry_interval_sec"]),
-            max_attempts=int(built["retry_max_attempts"]),
-            attempts=0,
-            next_run_at=now,
-        )
-        db.add(job)
-        db.commit()
-        db.refresh(job)
-        timer.mark("enqueue")
-        timer.emit("queued-retry")
-        _audit_launch(False, "已加入容量重试队列", "", job.id)
-        retry_msg = (
-            f"已加入容量重试：后台将每 {job.interval_sec}s 尝试一次"
-            f"（最多 {job.max_attempts} 次）。请在「任务中心」查看进度与日志"
-            "（需保持 worker 进程运行）。"
-        )
-        warns = extra_warnings + format_guard_warnings(launch_guard)
-        if warns:
-            retry_msg += " 提醒：" + "；".join(warns)
-        return LaunchInstanceResult(
-            ok=True,
-            message=retry_msg,
-            capacity_job_id=job.id,
-        )
-
-    # Direct launch. One LaunchInstance call per instance — OCI has no batch API.
-    base_name = str(payload.get("display_name") or "instance")
-    # A password the operator typed is reused for the batch; an auto-generated one
-    # is fresh per instance, so a single leak does not hand over every machine.
-    # Each lands in that instance's own tag (see ROOT_PASSWORD_TAG), and the
-    # instance list already shows it per row.
-    user_supplied_password = bool(str(body.root_password or "").strip())
-    auth_mode = str(payload.get("auth_mode") or "key")
-
-    created: list[dict[str, Any]] = []
-    first_result = None
-    failure_message = ""
-    failure_capacity = False
-
-    # Supplied by the browser and held constant across retries of the same
-    # submission, so a launch whose response was lost (proxy timeout, dropped
-    # connection) is not created twice when the operator presses the button
-    # again. Empty when the client is older than this feature; that simply means
-    # no protection, not an error.
-    idempotency_key = str(getattr(body, "idempotency_key", "") or "").strip()
-
-    for index in range(count):
-        item_payload = dict(payload)
-        if count > 1:
-            item_payload["display_name"] = f"{base_name}-{index + 1}"
-        if index == 0 or user_supplied_password or auth_mode != "password":
-            item_password = root_password
-        else:
-            item_password = generate_root_password(16)
-
-        # Per-item token, never the bare key. A retry token tells Oracle "this is
-        # the same request as before", so sending one identical key for all N
-        # items of a batch would make it create the FIRST instance and then hand
-        # back that same instance N-1 more times — the page would report five
-        # machines created and one would exist.
-        #
-        # Derived by a helper rather than an f-string: the token is capped at 64
-        # characters, so a client-supplied key at that limit lost the suffix to
-        # truncation and produced exactly the collision described above.
-        item_key = derive_retry_token(idempotency_key, index) if idempotency_key else ""
-
+    # 从「读用量快照」一直到「最后一次 LaunchInstance」都必须在同一把
+    # 每租户的锁里。配额校验只是 check-then-act，它不预留任何东西：两个标签
+    # 同时提交 4 OCPU/24GB 的 A1，各自读到「已用 0」，就会双双放行、真的开出
+    # 8 OCPU/48GB —— 免费额度的两倍。窗口还特别宽，因为 prepare_launch_network
+    # 夹在判定和创建之间，它可能要新建 NSG 甚至 VCN，是几十秒而不是几微秒，
+    # 所以它必须留在锁**里面**。抢机任务与手工创建之间同样靠这把锁串行化 ——
+    # 「每租户一个活动任务」只管任务之间，管不到任务与手工创建之间。
+    with tenant_launch_lock(row.id):
+        free_only = free_only_for_tenant(row)
+        launch_guard = None
+        extra_warnings: list[str] = []
         try:
-            result = session.launch_from_payload(
-                item_payload,
-                root_password=item_password,
-                custom_user_data=custom_user_data,
-                idempotency_key=item_key,
+            # 副区: Always Free only exists in the home region, and the free-usage
+            # snapshot is per-region — from a secondary region it reads zero and would
+            # wave through a second "free" machine. So the region gate replaces the
+            # cap check there instead of running alongside it.
+            region_warning = enforce_secondary_region(
+                session,
+                free_only_mode=free_only,
+                secondary_hint=tenant_is_secondary(row),
+                region_hint=row.region or "",
             )
+            if region_warning:
+                extra_warnings.append(region_warning)
+            else:
+                launch_guard = enforce_launch_quota(
+                    session,
+                    account_tier=getattr(row, "account_tier", "") or "",
+                    shape=str(payload.get("shape") or ""),
+                    ocpus=payload.get("ocpus"),
+                    memory_in_gbs=payload.get("memory_in_gbs"),
+                    boot_volume_size_in_gbs=payload.get("boot_volume_size_in_gbs"),
+                    boot_volume_vpus_per_gb=boot_vpu,
+                    fallback_configs=list(built.get("fallback_configs") or body.fallback_configs or []),
+                    free_only_mode=free_only,
+                    count=count,
+                )
+        except HTTPException:
+            timer.emit("quota-refused")
+            raise
         except Exception as exc:  # noqa: BLE001
-            if not created and item_payload.get("managed_nsg_id"):
-                try:
-                    session.delete_managed_nsg(str(item_payload.get("managed_nsg_id")))
-                except Exception:
-                    pass
-            if not created:
-                raise HTTPException(status_code=502, detail=str(exc)) from exc
-            failure_message = str(exc)
-            break
+            # A quota-read failure must not surface as an unhandled 500 (this branch
+            # previously re-raised HTTPException only, so anything else escaped).
+            raise HTTPException(status_code=502, detail=f"校验免费额度失败: {exc}") from exc
 
-        data = result.data if isinstance(result.data, dict) else {}
-        instance_id = str(data.get("instance_id") or "")
-        if not result.ok:
-            failure_message = result.message or "创建失败"
-            failure_capacity = bool(data.get("capacity")) or is_capacity_message(failure_message)
+        # Pre-launch: IPv6 + managed NSG (desktop parity)
+        try:
+            timer.mark("quota")
+            payload = prepare_launch_network(
+                session, payload, meta=meta, for_retry=bool(built["as_retry"])
+            )
+            built["payload"] = payload
+            timer.mark("network")
+        except (ValueError, OCIClientError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"准备网络/NSG 失败: {exc}") from exc
+
+        def _audit_launch(ok: bool, message: str, instance_id: str = "", job_id: str = "") -> None:
+            write_audit(
+                db,
+                owner_id=user.id,
+                action="instance.launch",
+                target=instance_id or payload.get("display_name", ""),
+                detail={
+                    "tenant_id": tenant_id,
+                    "ok": ok,
+                    "message": message,
+                    "shape": payload.get("shape"),
+                    "as_retry": bool(built.get("as_retry")),
+                    "capacity_job_id": job_id,
+                },
+            )
+
+        # Capacity retry path: enqueue a job and let the WORKER own every LaunchInstance
+        # call. An immediate launch here would race the worker (a second launch for the
+        # same tenant) and, on a capacity miss, leave next_run_at=now so the worker fires
+        # attempt #2 under the 60s floor. Queue-only keeps retries compliant.
+        if built["as_retry"]:
+            # Compliance: at most one active capacity-retry job per tenant.
+            existing = db.scalar(
+                select(CapacityJob)
+                .where(
+                    CapacityJob.tenant_id == row.id,
+                    CapacityJob.owner_id == user.id,
+                    CapacityJob.enabled.is_(True),
+                    CapacityJob.status.in_(("idle", "running")),
+                )
+                .limit(1)
+            )
+            if existing is not None:
+                if payload.get("managed_nsg_id"):
+                    try:
+                        session.delete_managed_nsg(str(payload.get("managed_nsg_id")))
+                    except Exception:
+                        pass
+                raise HTTPException(
+                    status_code=409,
+                    detail="该租户已有进行中的容量重试任务，请先在任务中心停止或删除后再新建",
+                )
+            now = datetime.now(timezone.utc)
+            job = CapacityJob(
+                owner_id=user.id,
+                tenant_id=row.id,
+                name=f"容量重试 · {payload.get('display_name') or 'instance'}",
+                enabled=True,
+                status="idle",
+                launch_payload=payload,
+                availability_domains=list(built.get("availability_domains") or []),
+                fallback_configs=list(built.get("fallback_configs") or []),
+                user_data_encrypted=encrypt_text(custom_user_data) if custom_user_data else "",
+                interval_sec=int(built["retry_interval_sec"]),
+                max_attempts=int(built["retry_max_attempts"]),
+                attempts=0,
+                next_run_at=now,
+            )
+            db.add(job)
+            db.commit()
+            db.refresh(job)
+            timer.mark("enqueue")
+            timer.emit("queued-retry")
+            _audit_launch(False, "已加入容量重试队列", "", job.id)
+            retry_msg = (
+                f"已加入容量重试：后台将每 {job.interval_sec}s 尝试一次"
+                f"（最多 {job.max_attempts} 次）。请在「任务中心」查看进度与日志"
+                "（需保持 worker 进程运行）。"
+            )
+            warns = extra_warnings + format_guard_warnings(launch_guard)
+            if warns:
+                retry_msg += " 提醒：" + "；".join(warns)
+            return LaunchInstanceResult(
+                ok=True,
+                message=retry_msg,
+                capacity_job_id=job.id,
+            )
+
+        # Direct launch. One LaunchInstance call per instance — OCI has no batch API.
+        base_name = str(payload.get("display_name") or "instance")
+        # A password the operator typed is reused for the batch; an auto-generated one
+        # is fresh per instance, so a single leak does not hand over every machine.
+        # Each lands in that instance's own tag (see ROOT_PASSWORD_TAG), and the
+        # instance list already shows it per row.
+        user_supplied_password = bool(str(body.root_password or "").strip())
+        auth_mode = str(payload.get("auth_mode") or "key")
+
+        created: list[dict[str, Any]] = []
+        first_result = None
+        failure_message = ""
+        failure_capacity = False
+
+        # Supplied by the browser and held constant across retries of the same
+        # submission, so a launch whose response was lost (proxy timeout, dropped
+        # connection) is not created twice when the operator presses the button
+        # again. Empty when the client is older than this feature; that simply means
+        # no protection, not an error.
+        idempotency_key = str(getattr(body, "idempotency_key", "") or "").strip()
+
+        for index in range(count):
+            item_payload = dict(payload)
+            if count > 1:
+                item_payload["display_name"] = f"{base_name}-{index + 1}"
+            if index == 0 or user_supplied_password or auth_mode != "password":
+                item_password = root_password
+            else:
+                item_password = generate_root_password(16)
+
+            # Per-item token, never the bare key. A retry token tells Oracle "this is
+            # the same request as before", so sending one identical key for all N
+            # items of a batch would make it create the FIRST instance and then hand
+            # back that same instance N-1 more times — the page would report five
+            # machines created and one would exist.
+            #
+            # Derived by a helper rather than an f-string: the token is capped at 64
+            # characters, so a client-supplied key at that limit lost the suffix to
+            # truncation and produced exactly the collision described above.
+            item_key = derive_retry_token(idempotency_key, index) if idempotency_key else ""
+
+            try:
+                result = session.launch_from_payload(
+                    item_payload,
+                    root_password=item_password,
+                    custom_user_data=custom_user_data,
+                    idempotency_key=item_key,
+                )
+            except Exception as exc:  # noqa: BLE001
+                if not created and item_payload.get("managed_nsg_id"):
+                    try:
+                        session.delete_managed_nsg(str(item_payload.get("managed_nsg_id")))
+                    except Exception:
+                        pass
+                if not created:
+                    raise HTTPException(status_code=502, detail=str(exc)) from exc
+                failure_message = str(exc)
+                break
+
+            data = result.data if isinstance(result.data, dict) else {}
+            instance_id = str(data.get("instance_id") or "")
+            if not result.ok:
+                failure_message = result.message or "创建失败"
+                failure_capacity = bool(data.get("capacity")) or is_capacity_message(failure_message)
+                if first_result is None:
+                    first_result = result
+                break
+
             if first_result is None:
                 first_result = result
-            break
-
-        if first_result is None:
-            first_result = result
-        schedule_post_launch_adjustments(
-            session,
-            instance_id=instance_id,
-            compartment_id=str(item_payload.get("compartment_id") or ""),
-            boot_vpu=boot_vpu,
-        )
-        created.append(
-            {
-                "ok": True,
-                "display_name": str(item_payload.get("display_name") or ""),
-                "instance_id": instance_id,
-                "work_request_id": result.work_request_id or "",
-                "message": result.message or "创建成功",
-                "root_password": item_password or "",
-            }
-        )
-        _audit_launch(True, result.message or "创建成功", instance_id)
-        # Stop the batch at the first failure rather than pushing the remaining
-        # calls at a rate limit the capacity-retry loop competes for — a capacity
-        # miss means the AD is out, so #3 and #4 would fail the same way.
+            schedule_post_launch_adjustments(
+                session,
+                instance_id=instance_id,
+                compartment_id=str(item_payload.get("compartment_id") or ""),
+                boot_vpu=boot_vpu,
+            )
+            created.append(
+                {
+                    "ok": True,
+                    "display_name": str(item_payload.get("display_name") or ""),
+                    "instance_id": instance_id,
+                    "work_request_id": result.work_request_id or "",
+                    "message": result.message or "创建成功",
+                    "root_password": item_password or "",
+                }
+            )
+            _audit_launch(True, result.message or "创建成功", instance_id)
+            # Stop the batch at the first failure rather than pushing the remaining
+            # calls at a rate limit the capacity-retry loop competes for — a capacity
+            # miss means the AD is out, so #3 and #4 would fail the same way.
 
     warns = extra_warnings + format_guard_warnings(launch_guard)
 

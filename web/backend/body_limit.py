@@ -15,6 +15,10 @@ non-file part at 1MB but keeps every finished part, with max_fields defaulting t
 1000, so without a total cap one request could retain ~1GB. FastAPI 0.139 offers
 no per-route way to pass max_files/max_fields into request.form(), so the byte
 ceiling here is the enforcement point for both the disk and memory variants.
+
+装配位置：必须是 main.py 里最后一个 add_middleware（= 最外层）。这个文件说的"边缘"
+只有那样才成立 —— add_middleware 往队首插入，比它晚注册的中间件都在它外面，而任何
+读请求体的中间件一旦在外面，就会先把整个 body 收完才轮到这里计数。
 """
 
 from __future__ import annotations
@@ -39,6 +43,9 @@ class BodySizeLimitMiddleware:
         send: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
         if scope.get("type") != "http":
+            # WebSocket 刻意不在这里限：单帧大小由 uvicorn 的 ws_max_size（默认 16MiB）
+            # 兜底，而 WebSSH 那条连接本身要先过鉴权。写下来是免得后来者以为 WS 也被这
+            # 个上限盖住了 —— 它没有，改 WS 的帧上限要去 uvicorn 参数或 WS 路由里做。
             await self.app(scope, receive, send)
             return
 
@@ -115,6 +122,14 @@ async def _send_413(send: Callable[[dict[str, Any]], Awaitable[None]], max_bytes
                 (b"content-type", b"application/json; charset=utf-8"),
                 (b"content-length", str(len(body)).encode("ascii")),
                 (b"connection", b"close"),
+                # 这个中间件在最外层，main.py 的 security_headers 包不到它的响应，
+                # 所以这几个头必须自己带 —— AUDIT 第 10 轮专门核对过"413 带安全头"，
+                # 换了装配顺序不能把那条性质弄丢。
+                (b"x-content-type-options", b"nosniff"),
+                (b"x-frame-options", b"DENY"),
+                (b"referrer-policy", b"same-origin"),
+                (b"content-security-policy", b"default-src 'none'; frame-ancestors 'none'"),
+                (b"cache-control", b"no-store"),
             ],
         }
     )

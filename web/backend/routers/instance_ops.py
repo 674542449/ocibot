@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.oci_client import FirewallRuleSpec
 from web.backend import quota_guard
-from web.backend.audit import write_audit
+from web.backend.audit import iso_utc, write_audit
 from web.backend.auth import get_current_user
 from web.backend.db import get_db
 from web.backend.models import SshHostKey, User
@@ -63,6 +63,37 @@ def _row(db: Session, user_id: str, tenant_id: str):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+def _unpack_console_list(result: Any) -> tuple[list[Any], str]:
+    """Split whatever list_console_connections returned into (connections, error).
+
+    That client used to swallow ServiceError and return [], so a throttled or
+    unauthorized read was indistinguishable from "this instance has no console
+    connection" — and the UI then offered to create one, which deletes every
+    existing connection first, so an invisible read failure could tear down the
+    session the operator was in the middle of using.
+
+    app/oci_client.py now raises on a failed read, which the caller turns into a
+    502. Failures are also reported as OperationResult in much of that module, so
+    accept that shape too rather than letting an ok=False object be truthy and pass
+    for a list of one. A plain list stays "success" so this route never 502s on a
+    client that has not been changed.
+    """
+    if result is None:
+        return [], ""
+    # A real bool, because a MagicMock answers hasattr() for anything.
+    if isinstance(getattr(result, "ok", None), bool):
+        data = getattr(result, "data", None)
+        if isinstance(data, dict):
+            data = data.get("connections", data.get("items"))
+        if bool(result.ok):
+            return list(data or []), ""
+        return [], str(getattr(result, "message", "") or "") or "读取失败"
+    try:
+        return list(result), ""
+    except TypeError:
+        return [], f"无法解析控制台连接返回值（{type(result).__name__}）"
+
+
 @router.get("/tenants/{tenant_id}/instances/{instance_id}/console")
 def list_console(
     tenant_id: str,
@@ -74,20 +105,24 @@ def list_console(
     try:
         session = get_session_for_row(row)
         info = session.get_instance(instance_id, resolve_ips=False)
-        conns = session.list_console_connections(instance_id, info.compartment_id)
-        items = []
-        for c in conns:
-            items.append(
-                {
-                    "id": getattr(c, "id", "") or "",
-                    "lifecycle_state": getattr(c, "lifecycle_state", "") or "",
-                    "serial": getattr(c, "connection_string", "") or "",
-                    "vnc": getattr(c, "vnc_connection_string", "") or "",
-                }
-            )
-        return {"ok": True, "connections": items}
+        raw = session.list_console_connections(instance_id, info.compartment_id)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=f"读取控制台连接失败：{exc}") from exc
+    conns, error = _unpack_console_list(raw)
+    if error:
+        # An empty list with ok:true would be read as "none exist"; say it failed.
+        raise HTTPException(status_code=502, detail=f"读取控制台连接失败：{error}")
+    items = []
+    for c in conns:
+        items.append(
+            {
+                "id": getattr(c, "id", "") or "",
+                "lifecycle_state": getattr(c, "lifecycle_state", "") or "",
+                "serial": getattr(c, "connection_string", "") or "",
+                "vnc": getattr(c, "vnc_connection_string", "") or "",
+            }
+        )
+    return {"ok": True, "connections": items}
 
 
 @router.post("/tenants/{tenant_id}/instances/{instance_id}/console")
@@ -498,7 +533,9 @@ def get_host_key(
                 "fingerprint": r.fingerprint,
                 "key_type": r.key_type,
                 "last_host": r.last_host,
-                "created_at": r.created_at.isoformat() if r.created_at else "",
+                # Offset-less on SQLite otherwise; see iso_utc. "First seen" on a
+                # host key is evidence — it must not be shifted by the viewer's zone.
+                "created_at": iso_utc(r.created_at),
             }
             for r in rows
         ],

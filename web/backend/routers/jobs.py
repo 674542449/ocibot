@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.oci_client import sanitize_launch_payload
@@ -28,6 +28,9 @@ from web.backend.quota_guard import (
     tenant_is_secondary,
 )
 from web.backend.schemas import (
+    MAX_AVAILABILITY_DOMAIN,
+    MAX_AVAILABILITY_DOMAINS,
+    MAX_CAPACITY_JOB_NAME,
     CapacityAttemptOut,
     CapacityJobCreate,
     CapacityJobOut,
@@ -35,6 +38,12 @@ from web.backend.schemas import (
 )
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
+
+# 「一个租户只能有一个在跑的任务」那条规则在 enabled=false 时是跳过的（见下面的
+# 注释），所以停用的任务行数原本没有任何上限 —— 唯一的天花板是 32MB 的请求体。
+# 每一行都拖着一份 launch_payload JSON，而 GET /jobs/capacity 是全量返回的，
+# 于是不需要任何 Oracle 调用就能把库和列表接口一起撑爆。
+MAX_CAPACITY_JOBS_PER_USER = 100
 
 
 def _capacity_out(row: CapacityJob) -> CapacityJobOut:
@@ -88,6 +97,21 @@ def create_capacity_job(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    # 行数上限放在 enforce_launch_quota **之前**：那一步是一整轮租户枚举，会实打
+    # 实地花掉 Oracle 的速率预算（抢机循环和它抢的是同一个额度）。任何不需要
+    # Oracle 就能判定的拒绝，都不该排在它后面。
+    total = (
+        db.scalar(
+            select(func.count()).select_from(CapacityJob).where(CapacityJob.owner_id == user.id)
+        )
+        or 0
+    )
+    if total >= MAX_CAPACITY_JOBS_PER_USER:
+        raise HTTPException(
+            status_code=409,
+            detail=f"容量重试任务数量已达上限（{MAX_CAPACITY_JOBS_PER_USER}），请先删除历史任务",
+        )
+
     # Downgrade candidates must survive to the row: the worker reads
     # job.fallback_configs to rotate configs, so dropping them here silently
     # turned a multi-config retry into a single-config one.
@@ -131,14 +155,23 @@ def create_capacity_job(
     interval = clamp_retry_interval(body.interval_sec or DEFAULT_RETRY_INTERVAL_SEC)
     max_attempts = clamp_max_attempts(body.max_attempts or DEFAULT_MAX_ATTEMPTS)
     now = datetime.now(timezone.utc)
+    # schemas.CapacityJobCreate 已经把这两个字段卡在列宽内了；这里再截一刀是因为
+    # 下面的 db.commit() 没有（也不该有）异常兜底：在 PostgreSQL 上一次
+    # DataError 就是一个没有任何信息的 500，而它发生在 enforce_launch_quota 已经
+    # 把租户枚举花出去之后。校验层将来被放宽时，这里仍然只会写出合法宽度。
+    name = (body.name or "容量重试").strip()[:MAX_CAPACITY_JOB_NAME] or "容量重试"
+    ads = [
+        str(a)[:MAX_AVAILABILITY_DOMAIN]
+        for a in (body.availability_domains or [])[:MAX_AVAILABILITY_DOMAINS]
+    ]
     row = CapacityJob(
         owner_id=user.id,
         tenant_id=body.tenant_id,
-        name=(body.name or "容量重试").strip(),
+        name=name,
         enabled=bool(body.enabled),
         status="idle" if body.enabled else "stopped",
         launch_payload=payload,
-        availability_domains=list(body.availability_domains or []),
+        availability_domains=ads,
         fallback_configs=fallback_configs,
         interval_sec=interval,
         max_attempts=max_attempts,
@@ -247,7 +280,26 @@ def resume_capacity_job(
         )
     row.enabled = True
     row.status = "idle"
-    row.next_run_at = datetime.now(timezone.utc)
+    # 「继续」不能把间隔下限清零。
+    #
+    # 这里原来是 next_run_at = now，无条件。worker 唯一的间隔判据就是候选条件里的
+    # next_run_at <= now，从来没有人拿 last_attempt_at 比过，所以下一次
+    # LaunchInstance 会在一个轮询周期（5s）内发出去。面板上 停止/继续 是同一个格
+    # 子里轮换的两个按钮，又没有「立即重试」，所以「停止→继续」就是用户表达「现
+    # 在就再试一次」的自然手势 —— 连点几下就是约 12 次/分钟，而
+    # app/scheduler.py::MIN_RETRY_INTERVAL_SEC 写死的合规下限是 1 次/60 秒，那个
+    # 模块存在的全部理由就是这条线。429 冷却一直是生效的，没有兜底的恰恰是普通
+    # 间隔。worker.tick_capacity 里有同样一道地板，这样绕过 API 也无效。
+    now = datetime.now(timezone.utc)
+    last_attempt = row.last_attempt_at
+    if last_attempt is not None and last_attempt.tzinfo is None:
+        # SQLite 存的是 naive，直接和 aware 比较会 TypeError。
+        last_attempt = last_attempt.replace(tzinfo=timezone.utc)
+    if last_attempt is None:
+        row.next_run_at = now
+    else:
+        earliest = last_attempt + timedelta(seconds=clamp_retry_interval(row.interval_sec))
+        row.next_run_at = max(now, earliest)
     row.last_error = ""
     db.commit()
     db.refresh(row)

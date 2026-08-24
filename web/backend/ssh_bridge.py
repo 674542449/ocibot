@@ -6,7 +6,6 @@ Target hosts are always resolved server-side from the instance's own IPs.
 
 from __future__ import annotations
 
-import asyncio
 import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -127,114 +126,14 @@ def _import_private_key(private_key_pem: str) -> Any:
         raise ValueError(f"SSH 私钥无法解析：{exc}") from exc
 
 
-async def ssh_exec(
-    host: str,
-    *,
-    port: int = 22,
-    username: str,
-    private_key_pem: Optional[str] = None,
-    password: Optional[str] = None,
-    command: str,
-    timeout: float = 120.0,
-    known_hosts: Any = None,
-) -> SshExecResult:
-    """Run a single command over SSH; never logs credentials."""
-    import asyncssh
-
-    user = validate_ssh_username(username)
-    connect_kwargs: dict[str, Any] = {
-        "host": host,
-        "port": int(port or 22),
-        "username": user,
-        "known_hosts": known_hosts,  # None disables host key check (OCI IPs rotate often)
-        "login_timeout": min(30.0, float(timeout)),
-    }
-    if private_key_pem:
-        connect_kwargs["client_keys"] = [_import_private_key(private_key_pem)]
-    elif password is not None:
-        connect_kwargs["password"] = str(password)
-    else:
-        return SshExecResult(ok=False, message="缺少 SSH 凭据", host=host)
-
-    try:
-        async with asyncssh.connect(**connect_kwargs) as conn:
-            result = await asyncio.wait_for(
-                conn.run(command, check=False),
-                timeout=float(timeout),
-            )
-            stdout = result.stdout if isinstance(result.stdout, str) else (
-                result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
-            )
-            stderr = result.stderr if isinstance(result.stderr, str) else (
-                result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
-            )
-            status = int(result.exit_status if result.exit_status is not None else -1)
-            ok = status == 0
-            return SshExecResult(
-                ok=ok,
-                exit_status=status,
-                stdout=stdout,
-                stderr=stderr,
-                message="命令成功" if ok else f"远程命令退出码 {status}",
-                host=host,
-            )
-    except asyncio.TimeoutError:
-        return SshExecResult(ok=False, message=f"SSH 执行超时（{timeout}s）", host=host)
-    except Exception as exc:  # noqa: BLE001
-        # Avoid leaking key material if it ever appears in exception text.
-        msg = str(exc)
-        for needle in ("BEGIN", "PRIVATE KEY", "password"):
-            if needle.lower() in msg.lower() and "PRIVATE" in msg.upper():
-                msg = "SSH 连接失败（详情已隐藏以防泄露凭据）"
-                break
-        return SshExecResult(ok=False, message=f"SSH 连接/执行失败：{msg}", host=host)
-
-
-def ssh_exec_sync(
-    host: str,
-    *,
-    port: int = 22,
-    username: str,
-    private_key_pem: Optional[str] = None,
-    password: Optional[str] = None,
-    command: str,
-    timeout: float = 120.0,
-) -> SshExecResult:
-    """Sync wrapper for FastAPI sync route handlers."""
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-    if loop and loop.is_running():
-        # Should not happen in default sync routers; fall back to a new loop in a thread.
-        import concurrent.futures
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            fut = pool.submit(
-                lambda: asyncio.run(
-                    ssh_exec(
-                        host,
-                        port=port,
-                        username=username,
-                        private_key_pem=private_key_pem,
-                        password=password,
-                        command=command,
-                        timeout=timeout,
-                    )
-                )
-            )
-            return fut.result(timeout=float(timeout) + 30)
-    return asyncio.run(
-        ssh_exec(
-            host,
-            port=port,
-            username=username,
-            private_key_pem=private_key_pem,
-            password=password,
-            command=command,
-            timeout=timeout,
-        )
-    )
+# ssh_exec() / ssh_exec_sync() lived here with `known_hosts=None` and a comment
+# reading "None disables host key check (OCI IPs rotate often)". They had no
+# callers left — every live SSH path (webssh.py, instance_ops.py) passes the key
+# verified by the KEX-only probe — but the comment stood as an endorsement of the
+# very default the host-key work was created to eliminate, and the next person
+# needing a one-off remote command would have reached for it. Deleted rather than
+# left as a loaded gun; ssh_hostkey.check_instance_host_key + known_hosts_for()
+# is the pattern to copy if a command runner is ever needed again.
 
 
 def grow_filesystem_over_ssh(
@@ -252,6 +151,14 @@ def grow_filesystem_over_ssh(
     """Upload-free: pipe grow script via bash -s over SSH, with short retries."""
     from app.fs_grow import build_grow_script
 
+    if known_hosts is None:
+        # Fail closed. asyncssh reads known_hosts=None as "trust anything", so a
+        # caller that simply forgot the argument would silently hand the user's
+        # private key to whatever answered on the address — the exact hole the
+        # TOFU work closed. The parameter keeps its None default only because
+        # making it required would break the signature; this check is the gate.
+        return SshExecResult(ok=False, message="缺少已验证的 SSH 主机密钥，已拒绝连接", host=host)
+
     script = build_grow_script()
     # Feed script on stdin so we never write a remote file that needs cleanup.
     command = "bash -s"
@@ -268,8 +175,10 @@ def grow_filesystem_over_ssh(
             "host": host,
             "port": int(port or 22),
             "username": user,
-            # Caller passes the verified host key; None only when verification is
-            # genuinely unavailable.
+            # The only caller (instance_ops boot-volume grow) always passes the key
+            # that check_instance_host_key() just verified, and refuses to call at
+            # all when the check did not pass — so this never legitimately runs
+            # with None. Do not "simplify" it back to a default of None.
             "known_hosts": known_hosts,
             "login_timeout": 30.0,
         }

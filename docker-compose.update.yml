@@ -1,0 +1,53 @@
+# 面板内一键更新 —— 可选叠加层，默认**不装载**。
+#
+# 用法（两者等价，install.sh 会自动带上这个文件）：
+#   ./scripts/install.sh update-on
+#   docker compose -f docker-compose.yml -f docker-compose.update.yml up -d
+#
+# 关掉：
+#   ./scripts/install.sh update-off
+#
+# ---------------------------------------------------------------- 这里换到了什么
+#
+# 装载它等于把 API 容器换成「以 root 运行、持有宿主机 docker.sock、可写整个仓库
+# 目录（含 web/.env 里的主密钥、JWT 密钥、数据库密码）」。执行更新时它还会用
+# `docker run --privileged --pid=host` + nsenter 进宿主机命名空间跑 install.sh。
+#
+# 也就是说：**任何一个管理员会话，或者 API 进程里任何一处代码执行，都等于宿主机
+# root。** web/AUDIT.md 里「管理员失陷 ≈ 宿主机失陷」说的就是这件事。
+#
+# 之所以拆成单独一个文件，是因为原来这些挂载是 docker-compose.yml 里无条件的列表
+# 项，而 OCIBOT_UPDATE_ENABLED 只管路由：一台特意关掉在线更新的面板，socket 和仓库
+# 照样挂着。开关和它守护的东西现在在同一个文件里，不会再分家。
+#
+# 多管理员、或者管理员账号不完全可信的安装：不要装载它。用 SSH 更新：
+#   cd ~/ocibot && bash scripts/install.sh update
+
+name: ocibot
+
+services:
+  api:
+    environment:
+      # 路由开关。和下面的挂载在同一个文件里，这是重点。
+      OCIBOT_UPDATE_ENABLED: "1"
+    # 回到 root：docker.sock 是 root:docker 0660，非 root 用户读不到；进宿主机
+    # 命名空间同样要 root。这不是「顺手放宽」，是这条路径本身的代价。
+    user: "0:0"
+    # 更新过程要在容器内落一些临时文件（辅助脚本、git 的中间态）。基础文件系统
+    # 保持只读会让这些写入以难以定位的方式失败。
+    read_only: false
+    # cap_drop: [ALL] 是从 docker-compose.yml 继承来的，compose 的列表不能在叠加层
+    # 里删项，只能加回来。root 之所以能改别人的文件靠的就是 DAC_OVERRIDE ——
+    # 装在非 root 用户家目录里的仓库（文件属主是 uid 1000），少了它 git reset 会
+    # 以 Permission denied 失败。CHOWN/FOWNER 同理，git 会改文件模式。
+    cap_add:
+      - DAC_OVERRIDE
+      - CHOWN
+      - FOWNER
+      - FSETID
+    volumes:
+      # 同一个 target 覆盖 docker-compose.yml 里的只读版本（compose 按容器内路径
+      # 合并挂载），换成可写：更新要在这里 git fetch / reset --hard 并回写 web/.env。
+      # 宿主机与辅助容器里必须是同一个绝对路径，否则 compose 的卷源解析不到。
+      - ${OCIBOT_HOST_REPO:-/root/ocibot}:/host/ocibot
+      - /var/run/docker.sock:/var/run/docker.sock

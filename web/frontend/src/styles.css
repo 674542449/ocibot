@@ -668,8 +668,13 @@ label.choice.muted,
   color: var(--muted);
   background: transparent;
   border-color: transparent;
-  padding-left: 0;
-  padding-right: 0;
+  /* 四个方向都写全，不能只写左右。下面那条给「空状态」用的 `.empty`
+     （`padding: 2.25rem 1rem`，本意是整格「暂无数据」的提示）是个裸类选择器，
+     同样会命中这里的 `.copyable.empty` —— 也就是「没有公网 IP」的那个「—」。
+     只声明 padding-left/right 的话，上下就留给它了：一个占位破折号被撑成
+     87px 高，把整行顶到两倍高。写成四值 shorthand，`.copyable.empty`
+     (0,2,0) 直接盖过 `.empty` (0,1,0)，四个方向都归自己管。 */
+  padding: 0.12rem 0;
   font-family: inherit;
   font-weight: 400;
 }

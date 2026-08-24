@@ -893,8 +893,21 @@ class TenantSession:
         except Exception as exc:  # noqa: BLE001
             return OperationResult(ok=False, message=str(exc))
 
-    def list_compartments(self, parent_id: Optional[str] = None, subtree: bool = True) -> list[dict[str, str]]:
-        """List accessible compartments under tenancy or a parent (including the parent/root)."""
+    def list_compartments(
+        self,
+        parent_id: Optional[str] = None,
+        subtree: bool = True,
+        *,
+        strict: bool = False,
+    ) -> list[dict[str, str]]:
+        """List accessible compartments under tenancy or a parent (including the parent/root).
+
+        ``strict=True`` raises instead of degrading to "just the root". Callers that
+        merely populate a picker want the degraded list — a broken enumeration still
+        leaves the root usable. Callers that COUNT resources must not: a failed
+        ListCompartments makes the subtree look like one compartment, and a count
+        taken over it is an undercount that carries no evidence of being one.
+        """
         tenancy = self.tenant.tenancy_ocid.strip()
         root = (parent_id or tenancy).strip()
         if root == tenancy:
@@ -919,8 +932,14 @@ class TenantSession:
                         "description": getattr(c, "description", "") or "",
                     }
                 )
-        except ServiceError:
-            pass
+        except ServiceError as exc:
+            # An IAM policy that grants `manage instance-family in compartment child`
+            # without `inspect compartments in tenancy` makes this a PERMANENT 404
+            # (NotAuthorizedOrNotFound), not a blip; sustained 429s produce the same
+            # thing transiently. Either way the quota readers below would report the
+            # root's usage as the whole tenancy's and call it complete.
+            if strict:
+                raise OCIClientError(_format_service_error(exc)) from exc
         # de-dupe by id
         seen: set[str] = set()
         unique: list[dict[str, str]] = []
@@ -1157,12 +1176,22 @@ class TenantSession:
     ) -> list[InstanceInfo]:
         """List instances in compartment and optionally its sub-compartments only."""
         root = (root_compartment_id or self.resolve_compartment()).strip()
+        # Kept apart from the per-compartment scan errors below: failing to enumerate
+        # is not "one compartment could not be read", it is "we never learned the
+        # subtree exists and scanned only the root". It still has to reach
+        # _last_tree_errors, because that is the only channel get_free_quota_usage
+        # reads — without it an undercount is reported as an authoritative zero and
+        # the fail-closed quota guard waves the launch through.
+        enum_error = ""
         if include_subcompartments:
             try:
                 # Only compartments under this root (not the entire tenancy when root is a child)
-                compartments = [c["id"] for c in self.list_compartments(parent_id=root, subtree=True)]
-            except Exception:
+                compartments = [
+                    c["id"] for c in self.list_compartments(parent_id=root, subtree=True, strict=True)
+                ]
+            except Exception as exc:  # noqa: BLE001
                 compartments = [root]
+                enum_error = f"子区间枚举失败：{exc}"
             if root not in compartments:
                 compartments.insert(0, root)
         else:
@@ -1201,7 +1230,11 @@ class TenantSession:
         # Record partial failures so quota accounting can tell "nothing there" apart
         # from "some compartments could not be read". Without this a throttled scan
         # produced an undercount that looked like plenty of free capacity.
-        self._last_tree_errors = list(errors)
+        self._last_tree_errors = ([enum_error] if enum_error else []) + list(errors)
+        # The raise stays keyed on SCAN errors only. A failed enumeration plus a
+        # genuinely empty root is still an empty list for the instances page; it is
+        # the quota snapshot, which reads _last_tree_errors, that must treat it as
+        # incomplete.
         if not all_items and errors and len(compartments) == 1:
             # Surface the only compartment's error instead of empty silent list
             raise OCIClientError(errors[0])
@@ -1743,17 +1776,26 @@ class TenantSession:
                         continue
                     seen_vcn.add(v["id"])
                     vcns.append(v)
+            # A VCN whose subnet list could not be read at all. Not the same as a VCN
+            # with no subnets, and the difference decides whether the create branch
+            # below runs — see the guard after the chosen-subnet block.
+            unreadable_vcns: list[str] = []
             for vcn in vcns:
                 found: list[dict] = []
+                read_errors: list[str] = []
                 for comp in (vcn.get("compartment_id"), *scan_comps):
                     if not comp:
                         continue
                     try:
                         found = self.list_subnets(compartment_id=comp, vcn_id=vcn["id"])
-                    except Exception:
+                    except Exception as exc:  # noqa: BLE001
+                        read_errors.append(str(exc))
                         found = []
                     if found:
                         break
+                if not found and read_errors:
+                    label = vcn.get("display_name") or vcn["id"][-8:]
+                    unreadable_vcns.append(f"{label}：{read_errors[0]}")
                 subnets_by_vcn[vcn["id"]] = found
 
             all_subnets = [s for subs in subnets_by_vcn.values() for s in subs]
@@ -1793,6 +1835,24 @@ class TenantSession:
                     },
                 )
 
+            # Reaching here means "no subnet was chosen". If that is because ListSubnets
+            # failed rather than because there is none, creating is the wrong move: the
+            # create branch builds a whole second public stack (subnet + IGW + route
+            # table + open security list) under the EXISTING VCN. On a non-overlapping
+            # CIDR it succeeds and the tenancy silently gains a public stack nobody
+            # asked for; on an overlapping one it fails with a CIDR message that hides
+            # the throttle underneath. Neither is undoable by the operator from here.
+            # Typical trigger: launching while a capacity-retry job hammers the same
+            # tenancy's rate limit.
+            if unreadable_vcns:
+                return OperationResult(
+                    ok=False,
+                    message="子网列表读取失败，无法确认现有网络（"
+                    + "；".join(unreadable_vcns[:2])
+                    + "），已中止自动创建，请稍后重试",
+                    data={"created": False, "vcns": vcns, "subnets_by_vcn": subnets_by_vcn},
+                )
+
             if not create_if_missing:
                 return OperationResult(
                     ok=False,
@@ -1807,6 +1867,29 @@ class TenantSession:
                 vcn_id = vcn_info["id"]
                 vcn_comp = vcn_info.get("compartment_id") or compartment
                 vcn_obj = self.network.get_vcn(vcn_id).data
+                # list_subnets keeps only AVAILABLE rows, so a subnet that is still
+                # PROVISIONING (or UPDATING) reads as "this VCN has no subnets" and
+                # lands us here seconds after someone else created one. Re-check
+                # without the state filter before adding a duplicate stack.
+                try:
+                    raw_subnets = oci.pagination.list_call_get_all_results(
+                        self.network.list_subnets, compartment_id=vcn_comp, vcn_id=vcn_id
+                    ).data or []
+                except ServiceError as exc:
+                    raise OCIClientError(_format_service_error(exc)) from exc
+                transient = [
+                    str(getattr(s, "lifecycle_state", "") or "")
+                    for s in raw_subnets
+                    if str(getattr(s, "lifecycle_state", "") or "")
+                    not in ("TERMINATED", "TERMINATING")
+                ]
+                if transient:
+                    return OperationResult(
+                        ok=False,
+                        message=f"现有 VCN 下已有子网正在创建中（状态 {transient[0]}），"
+                        "稍后重试即可使用，未重复创建网络",
+                        data={"created": False, "vcns": vcns, "subnets_by_vcn": subnets_by_vcn},
+                    )
             else:
                 vcn_comp = compartment
                 vcn_obj = self.network.create_vcn(
@@ -2646,13 +2729,18 @@ class TenantSession:
         """
         root = (compartment_id or self.resolve_compartment()).strip()
         comps: list[str] = [root]
+        # A failed enumeration silently shrinks the sweep to the root compartment.
+        # get_free_quota_usage reads data["errors"] to set read_incomplete, so this
+        # has to end up there or a storage undercount is reported as authoritative.
+        enum_error = ""
         if include_subcompartments:
             try:
-                comps = [c["id"] for c in self.list_compartments(parent_id=root, subtree=True)]
+                comps = [c["id"] for c in self.list_compartments(parent_id=root, subtree=True, strict=True)]
                 if root not in comps:
                     comps.insert(0, root)
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
                 comps = [root]
+                enum_error = f"子区间枚举失败：{exc}"
 
         # AD list needed by list_boot_volumes API
         try:
@@ -2787,6 +2875,11 @@ class TenantSession:
         msg = f"共 {len(volumes)} 个引导卷 · 合计 {total_gb} GB · 已挂载 {attached} · 未挂载 {orphaned}"
         if errors and not volumes:
             return OperationResult(ok=False, message="; ".join(errors[:3]), data={"volumes": [], "summary": {}})
+        # Folded in AFTER the "nothing was readable" branch on purpose: an unreadable
+        # compartment list must not turn a genuinely empty compartment into a hard
+        # failure on the volumes page, but it must still mark the read partial.
+        if enum_error:
+            errors.append(enum_error)
         if errors:
             msg += f"（部分 compartment 读取失败 {len(errors)} 处）"
         return OperationResult(
@@ -2835,7 +2928,12 @@ class TenantSession:
             instances = self.list_instances_tree(resolve_ips=False)
             if self._last_tree_errors:
                 read_incomplete = True
-                notes.append(f"部分区间实例读取失败（{len(self._last_tree_errors)} 处）")
+                # Name the first cause: a count alone cannot tell "one compartment
+                # was throttled" (retry) apart from "the subtree could not be
+                # enumerated at all" (an IAM policy the operator has to fix).
+                notes.append(
+                    f"部分区间实例读取失败（{len(self._last_tree_errors)} 处）：{self._last_tree_errors[0]}"
+                )
         except Exception as exc:  # noqa: BLE001
             instances = []
             read_incomplete = True
@@ -3418,14 +3516,22 @@ class TenantSession:
 
 
     def list_console_connections(self, instance_id: str, compartment_id: str) -> list[Any]:
+        """List the instance's live console connections.
+
+        Raises instead of returning ``[]`` on a failed read — same reasoning as
+        delete_console_connection below. An empty list is a factual claim ("this
+        instance has no console connection") that the UI renders and that
+        create_console_connection uses to decide nothing needs cleaning up; a
+        throttled or unauthorized read is neither.
+        """
         try:
             items = oci.pagination.list_call_get_all_results(
                 self.compute.list_instance_console_connections,
                 compartment_id,
                 instance_id=instance_id,
             ).data
-        except ServiceError:
-            return []
+        except ServiceError as exc:
+            raise OCIClientError(_format_service_error(exc)) from exc
         return [c for c in items if getattr(c, "lifecycle_state", "") not in ("DELETED", "DELETING")]
 
     def delete_console_connection(self, console_connection_id: str) -> OperationResult:
@@ -3450,7 +3556,17 @@ class TenantSession:
             return OperationResult(ok=False, message="需要有效的 SSH 公钥才能创建控制台连接")
         try:
             # A new connection must use our key; remove any stale ones first.
-            for existing in self.list_console_connections(instance_id, compartment_id):
+            # Oracle allows exactly one active console connection per instance, so
+            # skipping this cleanup because the read failed makes the create below
+            # fail with "already exists" — an error that says nothing about the
+            # throttle or missing permission that actually caused it.
+            try:
+                stale = self.list_console_connections(instance_id, compartment_id)
+            except OCIClientError as exc:
+                return OperationResult(
+                    ok=False, message=f"无法确认实例现有的控制台连接，已中止创建：{exc}"
+                )
+            for existing in stale:
                 self.delete_console_connection(existing.id)
             details = oci.core.models.CreateInstanceConsoleConnectionDetails(
                 instance_id=instance_id, public_key=key
@@ -5253,13 +5369,18 @@ class TenantSession:
         """List block (data) volumes under a compartment subtree."""
         root = (compartment_id or self.resolve_compartment()).strip()
         comps: list[str] = [root]
+        # Same reason as list_boot_volumes: block storage counts against the same
+        # 200GB free cap, so an enumeration failure that is not reported becomes
+        # headroom the guard believes in.
+        enum_error = ""
         if include_subcompartments:
             try:
-                comps = [c["id"] for c in self.list_compartments(parent_id=root, subtree=True)]
+                comps = [c["id"] for c in self.list_compartments(parent_id=root, subtree=True, strict=True)]
                 if root not in comps:
                     comps.insert(0, root)
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
                 comps = [root]
+                enum_error = f"子区间枚举失败：{exc}"
 
         try:
             ads = self.list_availability_domains()
@@ -5385,6 +5506,10 @@ class TenantSession:
         msg = f"共 {len(volumes)} 个块卷 · 合计 {total_gb} GB · 已挂载 {attached} · 未挂载 {orphaned}"
         if errors and not volumes:
             return OperationResult(ok=False, message="; ".join(errors[:3]), data={"volumes": [], "summary": {}})
+        # See list_boot_volumes: appended after the hard-failure branch so it flags a
+        # partial read without failing an empty-but-healthy compartment.
+        if enum_error:
+            errors.append(enum_error)
         if errors:
             msg += f"（部分 compartment 读取失败 {len(errors)} 处）"
         return OperationResult(

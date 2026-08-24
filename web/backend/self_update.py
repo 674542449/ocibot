@@ -18,9 +18,10 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 from sqlalchemy.orm import Session
@@ -38,6 +39,26 @@ DOCKER_CLI_IMAGE = (os.environ.get("OCIBOT_DOCKER_CLI_IMAGE") or "docker:27-cli"
 _lock = threading.Lock()
 _worker: Optional[threading.Thread] = None
 
+# The detached helper that actually builds and restarts the stack, and the
+# foreground compose container used by the recovery path. Both carry a fixed name
+# because a name is the only handle left once the CLI that started them is gone:
+# `_run_cmd`'s timeout kills the local `docker` process, not the container it
+# started, and an unnamed orphan then keeps rewriting the same compose project
+# while the operator is being told to SSH in and do it by hand.
+HELPER_CONTAINER = "ocibot-self-update-restart"
+RECOVERY_CONTAINER = "ocibot-self-update-compose"
+HELPER_LABEL = "ocibot.self-update=1"
+
+# Docker container states that mean "still doing the update". Anything else has
+# settled (or the container is gone).
+_LIVE_CONTAINER_STATES = {"created", "running", "restarting", "paused"}
+
+# The helper does `compose build --pull` + `up -d`; a cold build on a small OCI
+# instance is minutes, so the ceiling is generous. It only bounds the worker
+# thread — the container itself is never killed by us.
+_HELPER_POLL_SEC = 5
+_HELPER_WAIT_MAX_SEC = 40 * 60
+
 
 # Env vars whose VALUES must never reach a command line, a log line, or the
 # admin-visible update log. OCIBOT_MASTER_KEY is the one that matters most: it
@@ -49,6 +70,17 @@ SECRET_ENV_KEYS = (
     "OCIBOT_GITHUB_TOKEN",
     "GITHUB_TOKEN",
 )
+
+
+# Credentials embedded in a URL: `https://user:pass@host/…` or `https://ghp_x@…`.
+# Env-name matching alone is not enough here. A private-repo install commonly bakes
+# the PAT into the git remote itself, so the token lives in .git/config and NOT in
+# OCIBOT_GITHUB_TOKEN — and any network blip makes git print
+# `fatal: unable to access 'https://ghp_xxxx@github.com/owner/ocibot.git/'` verbatim
+# into output that is persisted in app_meta and returned by GET /api/admin/update.
+_URL_CREDENTIAL_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)([^\s/@]+)@")
+# Standalone GitHub tokens (also appear in `Authorization:` echoes and curl traces).
+_GH_TOKEN_RE = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,})")
 
 
 def _redact(text: str) -> str:
@@ -65,7 +97,8 @@ def _redact(text: str) -> str:
         value = (os.environ.get(key) or "").strip()
         if len(value) >= 8 and value in out:
             out = out.replace(value, f"***{key}***")
-    return out
+    out = _GH_TOKEN_RE.sub("***token***", out)
+    return _URL_CREDENTIAL_RE.sub(r"\1***@", out)
 
 
 def _utcnow() -> str:
@@ -211,8 +244,20 @@ def _read_status_raw(db: Session) -> dict[str, Any]:
         return {}
 
 
+# Every admin-visible string in the status row, not just the log. `log_tail` was
+# redacted at `_append_log` while `last_error` / `message` were written straight
+# from `git fetch` / `compose` stdout+stderr — so the *same* failure showed
+# ***OCIBOT_MASTER_KEY*** in one field and the value in the other. Redacting in the
+# single funnel that persists the row means a new save() call site cannot miss it.
+_REDACTED_STATUS_FIELDS = ("message", "last_error", "log_tail")
+
+
 def _write_status(db: Session, data: dict[str, Any]) -> dict[str, Any]:
     data = dict(data)
+    for field in _REDACTED_STATUS_FIELDS:
+        value = data.get(field)
+        if isinstance(value, str) and value:
+            data[field] = _redact(value)
     data["updated_at"] = _utcnow()
     set_meta(db, KEY_UPDATE_STATUS, json.dumps(data, ensure_ascii=False))
     try:
@@ -369,7 +414,10 @@ def check_for_update(db: Session) -> dict[str, Any]:
         st["message"] = f"检查更新失败：{exc}"
         st["checked_at"] = _utcnow()
         _write_status(db, st)
-        raise
+        # Re-raised redacted: the admin router turns this into the 502 `detail`,
+        # which is the one copy of the message that does not go through
+        # _write_status. An httpx/git error can carry a credentialed URL.
+        raise RuntimeError(_redact(str(exc))) from exc
     return get_status(db)
 
 
@@ -495,6 +543,16 @@ def _compose_via_cli_container(args: list[str], *, timeout: int = 1200) -> tuple
         "docker",
         "run",
         "--rm",
+        # Named even though this one runs in the foreground: _run_cmd's timeout
+        # kills the local docker CLI, never the container, and this container is
+        # running `compose up -d` (which builds when the image is missing — the
+        # exact state after a failed detach). Without a name the survivor is an
+        # invisible process rewriting the same compose project while the operator
+        # is told the update failed and to run install.sh by hand.
+        "--name",
+        RECOVERY_CONTAINER,
+        "--label",
+        HELPER_LABEL,
         "-v",
         "/var/run/docker.sock:/var/run/docker.sock",
         "-v",
@@ -592,7 +650,9 @@ def _detach_host_install_sh(host_repo: str, new_sha: str) -> tuple[int, str]:
         "run",
         "-d",
         "--name",
-        "ocibot-self-update-restart",
+        HELPER_CONTAINER,
+        "--label",
+        HELPER_LABEL,
         "--privileged",
         "--pid=host",
         # Small image; nsenter from util-linux. Pre-pull best-effort.
@@ -603,7 +663,10 @@ def _detach_host_install_sh(host_repo: str, new_sha: str) -> tuple[int, str]:
         "command -v nsenter >/dev/null 2>&1 || apk add --no-cache util-linux >/dev/null; "
         "nsenter -t 1 -m -u -i -n -- sh -c " + _sh_quote(remote_cmd),
     ]
-    _run_cmd(["docker", "rm", "-f", "ocibot-self-update-restart"], timeout=30)
+    # `rm -f` on a *live* helper SIGKILLs an update that is mid `compose up -d`.
+    # Only the leftover, already-exited record of the previous run may be removed.
+    _assert_no_live_helper()
+    _run_cmd(["docker", "rm", "-f", HELPER_CONTAINER], timeout=30)
     # Ensure alpine present (best-effort, non-fatal if pull fails and image exists)
     _run_cmd(["docker", "image", "inspect", "alpine:3.20", "--format", "{{.Id}}"], timeout=20)
     code, out = _run_cmd(["docker", "pull", "alpine:3.20"], timeout=180)
@@ -640,7 +703,9 @@ def _detach_stack_restart(host: Path, host_repo: str, project: str, new_sha: str
         "run",
         "-d",
         "--name",
-        "ocibot-self-update-restart",
+        HELPER_CONTAINER,
+        "--label",
+        HELPER_LABEL,
         "-v",
         "/var/run/docker.sock:/var/run/docker.sock",
         "-v",
@@ -653,7 +718,8 @@ def _detach_stack_restart(host: Path, host_repo: str, project: str, new_sha: str
         DOCKER_CLI_IMAGE,
         script_on_host,
     ]
-    _run_cmd(["docker", "rm", "-f", "ocibot-self-update-restart"], timeout=30)
+    _assert_no_live_helper()
+    _run_cmd(["docker", "rm", "-f", HELPER_CONTAINER], timeout=30)
     code2, out2 = _run_cmd(cmd, timeout=60)
     return code2, f"host install failed:\n{out}\ncompose fallback:\n{out2}"
 
@@ -678,6 +744,40 @@ def _humanize_build_error(out: str) -> str:
     return "；".join(tips)
 
 
+def _finish_after_helper(
+    save: Callable[..., None],
+    name: str,
+    *,
+    host_repo: str,
+    new_sha: str,
+    log_buf: str,
+) -> None:
+    """Hold the job open until ``name`` settles, then write the terminal state."""
+    settled = _wait_for_helper(
+        name, host_repo=host_repo, base={"applied_sha": new_sha, "log_tail": log_buf}
+    )
+    if settled is None:
+        # Still running after the ceiling. We never kill it — a SIGKILL between
+        # `compose up -d`'s db/api/worker steps is how the panel ends up with no
+        # API container at all. Say so instead of sending the operator into a
+        # concurrent install.sh.
+        save(
+            "error",
+            f"宿主机更新任务超过 {_HELPER_WAIT_MAX_SEC // 60} 分钟仍未结束，容器 {name} 还在运行。"
+            f" 请先 docker logs -f {name} 查看，不要在它结束前另外执行 install.sh update。",
+            last_error="helper_timeout",
+            log_tail=log_buf,
+        )
+        return
+    save(
+        settled.get("state") or "error",
+        settled.get("message") or "",
+        last_error=settled.get("last_error") or "",
+        log_tail=settled.get("log_tail") or log_buf,
+        applied_sha=new_sha,
+    )
+
+
 def _apply_job(username: str) -> None:
     from web.backend.db import SessionLocal
 
@@ -694,6 +794,9 @@ def _apply_job(username: str) -> None:
                 "last_error": "",
                 "triggered_by": username,
                 "log_tail": "",
+                # See start_update: a stale name here would be reconciled against
+                # the previous run's container.
+                "helper_container": "",
             }
         )
         _write_status(db, st)
@@ -828,8 +931,19 @@ def _apply_job(username: str) -> None:
         # Hand off to host: cd $HOST_REPO && bash scripts/install.sh update
         # (same command operators use over SSH). Building inside this API process
         # used to die mid-restart; install.sh / compose helper run detached.
+        #
+        # State stays "running" across the whole handoff. It used to be flipped to
+        # "success" HERE, before the helper had even been started: `docker run -d`
+        # returns in seconds, this thread then exited and cleared _worker, and the
+        # row no longer said "running" — so neither mutex (the in-process one nor
+        # the SELECT … FOR UPDATE re-check, both of which only reject the literal
+        # "running") excluded anything for the 1–5 minutes the host-side build was
+        # still going. The SPA re-enabled its button on the same signal. A second
+        # apply then `docker rm -f`d the live --privileged helper mid `compose up -d`
+        # and git-reset the build context underneath it, which can destroy the API
+        # container without recreating it — recovery by SSH only.
         save(
-            "success",
+            "running",
             f"代码已对齐 {new_sha[:7] or 'ok'}，正在宿主机执行 install.sh update（构建+重启）…约 1–5 分钟后强刷。",
             log_tail=log_buf,
             applied_sha=new_sha,
@@ -841,6 +955,24 @@ def _apply_job(username: str) -> None:
             # Last chance: at least try to bring whatever image exists back up.
             code2, out2 = _compose_via_cli_container(["up", "-d"], timeout=600)
             log_buf = _append_log(log_buf, f"$ compose up -d (recovery)\n{out2}\n")
+            if code2 == 124 and _container_is_live(RECOVERY_CONTAINER):
+                # The timeout reaped the local docker CLI, not the container: it is
+                # still building/starting the stack. Telling the operator to SSH in
+                # and run install.sh here would put two writers on the same compose
+                # project. Report what is actually happening and keep waiting.
+                save(
+                    "running",
+                    f"恢复任务仍在后台执行（容器 {RECOVERY_CONTAINER}）。"
+                    f"请勿同时 SSH 执行 install.sh update——两者会同时改动同一套 compose 项目。"
+                    f" 可用 docker logs -f {RECOVERY_CONTAINER} 观察进度。",
+                    log_tail=log_buf,
+                    applied_sha=new_sha,
+                    helper_container=RECOVERY_CONTAINER,
+                )
+                _finish_after_helper(
+                    save, RECOVERY_CONTAINER, host_repo=host_repo, new_sha=new_sha, log_buf=log_buf
+                )
+                return
             if code2 != 0:
                 save(
                     "error",
@@ -859,16 +991,20 @@ def _apply_job(username: str) -> None:
             )
             return
 
-        try:
-            save(
-                "success",
-                f"已在宿主机排队更新（{new_sha[:7] or 'ok'}）。执行：cd {host_repo} && bash scripts/install.sh update。"
-                f" 完成后约 1–5 分钟请 Ctrl+F5。",
-                log_tail=log_buf,
-                applied_sha=new_sha,
-            )
-        except Exception:
-            pass
+        # helper_container is what lets ANOTHER API process (or this one after the
+        # helper recreates our container mid-build) finish the job: get_status
+        # reconciles a "running" row against that container's real exit code.
+        save(
+            "running",
+            f"已在宿主机启动更新（{new_sha[:7] or 'ok'}）：cd {host_repo} && bash scripts/install.sh update。"
+            f" 构建+重启约 1–5 分钟，完成后请 Ctrl+F5。",
+            log_tail=log_buf,
+            applied_sha=new_sha,
+            helper_container=HELPER_CONTAINER,
+        )
+        _finish_after_helper(
+            save, HELPER_CONTAINER, host_repo=host_repo, new_sha=new_sha, log_buf=log_buf
+        )
     except Exception as exc:  # noqa: BLE001
         log.exception("self-update failed")
         save("error", f"更新异常：{exc}", last_error=str(exc), log_tail=log_buf)
@@ -924,32 +1060,142 @@ def _recover_stale_running(
     return st
 
 
-def _helper_container_outcome() -> tuple[str, int, str]:
-    """(status, exit_code, log_tail) of the detached update helper, if it still exists."""
+def _container_state(name: str) -> tuple[str, int]:
+    """(docker state, exit code) for ``name``.
+
+    "missing" and "unknown" are deliberately distinct. Only a daemon that answers
+    *and* says the object does not exist proves the helper is gone; a failed
+    inspect during the seconds when compose is recreating the stack must NOT be
+    read as "finished", or a perfectly healthy update gets reported as failed.
+    """
     code, out = _run_cmd(
-        [
-            "docker",
-            "inspect",
-            "-f",
-            "{{.State.Status}} {{.State.ExitCode}}",
-            "ocibot-self-update-restart",
-        ],
+        ["docker", "inspect", "-f", "{{.State.Status}} {{.State.ExitCode}}", name],
         timeout=20,
     )
     if code != 0:
-        return "", 0, ""
+        low = (out or "").lower()
+        if "no such object" in low or "no such container" in low:
+            return "missing", 0
+        return "unknown", 0
     parts = (out or "").strip().split()
-    status = parts[0] if parts else ""
+    status = parts[0] if parts else "unknown"
     try:
         exit_code = int(parts[1]) if len(parts) > 1 else 0
     except ValueError:
         exit_code = 0
+    return status, exit_code
+
+
+def _container_is_live(name: str) -> bool:
+    return _container_state(name)[0] in _LIVE_CONTAINER_STATES
+
+
+def _assert_no_live_helper() -> None:
+    """Refuse to start anything while a previous helper is still working.
+
+    `_detach_host_install_sh` opens with an unconditional `docker rm -f`, so a
+    second apply SIGKILLs the first one's `--privileged --pid=host` container in
+    the middle of `compose up -d` — which recreates db, then api, then worker, and
+    when killed between them can leave the API container destroyed and never
+    recreated. The status row is the primary mutex; this is the backstop for when
+    the row has been cleared (stale-running recovery, a wiped app_meta, a manual
+    edit) while the container is still very much alive.
+    """
+    for name in (HELPER_CONTAINER, RECOVERY_CONTAINER):
+        if _container_is_live(name):
+            raise RuntimeError(f"已有更新任务正在进行（容器 {name} 仍在运行）")
+
+
+def _helper_container_outcome(name: str = HELPER_CONTAINER) -> tuple[str, int, str]:
+    """(status, exit_code, log_tail) of the detached update helper, if it still exists."""
+    status, exit_code = _container_state(name)
     logs = ""
     if status == "exited" and exit_code != 0:
-        _, logs = _run_cmd(
-            ["docker", "logs", "--tail", "200", "ocibot-self-update-restart"], timeout=30
-        )
+        _, logs = _run_cmd(["docker", "logs", "--tail", "200", name], timeout=30)
     return status, exit_code, logs or ""
+
+
+def _settle_from_helper(
+    st: dict[str, Any], *, name: str, host_repo: str
+) -> Optional[dict[str, Any]]:
+    """Turn a finished helper container into a terminal status, or None if it is
+    still running.
+
+    Returning None is what keeps the mutex armed: the status row stays "running",
+    which both `start_update` checks reject, until the container that is actually
+    rewriting the stack has exited.
+    """
+    status, exit_code = _container_state(name)
+    if status in _LIVE_CONTAINER_STATES or status == "unknown":
+        return None
+
+    st = dict(st)
+    applied = str(st.get("applied_sha") or "")
+    short = applied[:7] or "ok"
+    if status == "exited" and exit_code == 0:
+        st["state"] = "success"
+        st["last_error"] = ""
+        st["message"] = f"更新完成（{short}）。若界面未变化请 Ctrl+F5 强制刷新。"
+    elif status == "exited":
+        _, _, logs = _helper_container_outcome(name)
+        st["state"] = "error"
+        st["last_error"] = f"更新容器退出码 {exit_code}"
+        st["message"] = (
+            f"宿主机更新任务失败（退出码 {exit_code}）。"
+            f"请 SSH 执行：cd {host_repo} && bash scripts/install.sh update"
+        )
+        if logs:
+            st["log_tail"] = _append_log(str(st.get("log_tail") or ""), "\n" + logs)
+    else:
+        # "missing": the recovery container runs with --rm, so a clean finish
+        # erases the exit code. The commit the API process reports is then the
+        # only evidence of whether the new code is actually running.
+        local_sha = (local_build_info().get("git_sha") or "").strip()
+        landed = bool(
+            applied
+            and local_sha
+            and local_sha not in {"unknown", "None"}
+            and (applied.startswith(local_sha) or local_sha.startswith(applied[:7]))
+        )
+        if landed:
+            st["state"] = "success"
+            st["last_error"] = ""
+            st["message"] = f"更新完成（{short}）。若界面未变化请 Ctrl+F5 强制刷新。"
+        else:
+            st["state"] = "error"
+            st["last_error"] = "helper_container_missing"
+            st["message"] = (
+                f"更新任务容器已结束但无法确认结果，当前运行版本仍是 {local_sha or '未知'}。"
+                f"请 SSH 执行：cd {host_repo} && bash scripts/install.sh update"
+            )
+    st["finished_at"] = _utcnow()
+    return st
+
+
+def _wait_for_helper(
+    name: str,
+    *,
+    host_repo: str,
+    base: dict[str, Any],
+    max_wait_sec: int = _HELPER_WAIT_MAX_SEC,
+    poll_sec: int = _HELPER_POLL_SEC,
+) -> Optional[dict[str, Any]]:
+    """Block the worker thread until the helper settles. None on timeout.
+
+    The wait IS the fix for the "second apply kills the first" race: while this
+    thread lives the in-process mutex holds, and the status row it left behind
+    still says "running" for the other API worker processes. If our own container
+    is recreated mid-wait (it usually is — the helper rebuilds api), this thread
+    simply dies with it and `get_status` finishes the reconciliation instead.
+    """
+    deadline = time.monotonic() + max_wait_sec
+    while True:
+        settled = _settle_from_helper(base, name=name, host_repo=host_repo)
+        if settled is not None:
+            return settled
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(poll_sec)
 
 
 def get_status(db: Session) -> dict[str, Any]:
@@ -977,7 +1223,35 @@ def get_status(db: Session) -> dict[str, Any]:
                     _write_status(db, st)
                 except Exception:  # noqa: BLE001
                     pass
-    recovered = _recover_stale_running(st)
+
+    # A "running" row that named a helper container is finished by whoever asks
+    # next. The worker thread that started it normally does NOT survive to write
+    # the terminal state — the update it launched recreates the api container it
+    # lives in — so without this the row would sit at "running" until the 45-minute
+    # stale sweep, blocking every further apply and never reporting the outcome.
+    helper_busy = False
+    if st.get("state") == "running" and st.get("helper_container"):
+        with _lock:
+            worker_alive = _worker_alive_unlocked()
+        if not worker_alive:
+            settled = _settle_from_helper(
+                st,
+                name=str(st.get("helper_container") or ""),
+                host_repo=str(caps.get("host_repo_on_host") or ""),
+            )
+            if settled is None:
+                helper_busy = True  # still building; keep the mutex armed
+            else:
+                st = settled
+                try:
+                    _write_status(db, st)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    # Stale-running recovery must not fire while the helper is demonstrably alive:
+    # a slow cold build on a small instance can outlast max_age_sec, and declaring
+    # it dead would re-open the apply button on top of a live update.
+    recovered = st if helper_busy else _recover_stale_running(st)
     if recovered.get("state") != st.get("state"):
         try:
             _write_status(db, recovered)
@@ -1034,10 +1308,28 @@ def start_update(db: Session, *, username: str) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         log.warning("pre-update check failed: %s", exc)
 
+    # Independent of any bookkeeping: if the previous update's container is still
+    # working, a second apply would `docker rm -f` it mid `compose up -d` and
+    # git-reset the build context it is reading. Checked before the row is touched
+    # so the stale-running sweep below cannot clear the marker of a live update.
+    _assert_no_live_helper()
+
     global _worker
     with _lock:
         st = _read_status_raw(db)
         alive = _worker_alive_unlocked()
+        # Same reconciliation get_status does, so an apply is not refused for the
+        # full stale window just because nobody polled the status after the helper
+        # finished (the worker thread rarely survives to write it itself).
+        if not alive and st.get("state") == "running" and st.get("helper_container"):
+            settled = _settle_from_helper(
+                st,
+                name=str(st.get("helper_container") or ""),
+                host_repo=str(caps.get("host_repo_on_host") or ""),
+            )
+            if settled is not None:
+                st = settled
+                _write_status(db, st)
         # Clear abandoned "running" markers (API was killed mid-update).
         recovered = _recover_stale_running(st, max_age_sec=20 * 60, worker_alive=alive)
         if recovered.get("state") != st.get("state"):
@@ -1087,6 +1379,11 @@ def start_update(db: Session, *, username: str) -> dict[str, Any]:
         st["triggered_by"] = username
         st["last_error"] = ""
         st["log_tail"] = ""
+        # Must be cleared: the previous run's container still exists (it is only
+        # removed when the next helper starts), so a leftover name would make
+        # get_status reconcile THIS run against the LAST run's exit code and call
+        # it finished before the new helper has even been launched.
+        st["helper_container"] = ""
         _write_status(db, st)
         t = threading.Thread(target=_apply_job, args=(username,), name="ocibot-self-update", daemon=True)
         _worker = t
