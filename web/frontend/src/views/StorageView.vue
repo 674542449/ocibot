@@ -71,6 +71,13 @@
         </label>
       </div>
 
+      <div v-if="bootPartial" class="card warn-box">
+        <strong>⚠ 这份引导卷列表可能不完整</strong>
+        <div class="muted" style="font-size: 12px; margin-top: 0.25rem">
+          {{ bootPartial }} —— 下面的「未挂载合计」是基于这份不完整的列表算的，请勿据此判断额度。
+        </div>
+      </div>
+
       <!-- 孤儿卷的账单提示。免费额度面板早就在数这个数字，但一直没有下手的地方；
            这里把「有 N 个孤儿」变成「这几个，共 X GB，可以删」。 -->
       <div v-if="orphanBoot.length" class="card" style="padding: 0.75rem 1rem">
@@ -167,6 +174,11 @@
 
     <!-- Block -->
     <div v-if="tab === 'block'" class="stack">
+      <div v-if="blockPartial" class="card warn-box">
+        <strong>⚠ 这份块卷列表可能不完整</strong>
+        <div class="muted" style="font-size: 12px; margin-top: 0.25rem">{{ blockPartial }}</div>
+      </div>
+
       <div class="card stack" style="padding: 0.85rem">
         <h3 style="margin: 0">创建块卷</h3>
         <div class="grid-2">
@@ -366,6 +378,20 @@ const quota = ref<any>(null)
 const includeSub = ref(true)
 
 const bootVolumes = ref<any[]>([])
+/** 部分读取失败的提示；空串表示这次读取是完整的。 */
+const bootPartial = ref('')
+const blockPartial = ref('')
+
+/** 从 ok=true 的响应里挑出「其实没读全」的证据。
+ *
+ *  后端把「全部失败」做成 ok=false、「部分失败」做成 ok=true + errors —— 只看
+ *  ok 的话，后者就完全消失了，而它恰恰是最危险的一种：列表看着正常，只是少了几条。 */
+function pickPartial(data: any): string {
+  const errs: string[] = data?.data?.errors || []
+  if (!errs.length) return ''
+  return `${errs.length} 处 compartment 读取失败：${errs[0]}`
+}
+
 const bootSearch = ref('')
 const orphanOnly = ref(false)
 /** 正在处理的引导卷 id，用来只禁用那一行的按钮而不是整张表。 */
@@ -486,6 +512,11 @@ async function loadBoot() {
     // Surface a tenant-level failure instead of rendering it as "no volumes".
     if (data.ok === false) error.value = data.message || '读取引导卷失败'
     bootVolumes.value = data.data?.volumes || []
+    // 后端在部分 compartment 读不到时返回 ok=true + 一个 errors 数组，
+    // 并在 message 末尾附上「（部分 compartment 读取失败 N 处）」。
+    // 这两样以前都没人读过 —— 于是一份被截断的列表看起来和完整列表一模一样，
+    // 而下面那张「未挂载合计 X GB，正在占用免费额度」的卡片正是基于它算的。
+    bootPartial.value = pickPartial(data)
   } catch (e: any) {
     // 自己接住异常，不能只指望 refreshAll 的 Promise.all：「含子 Compartment」
     // 复选框是直接调本函数的，抛出去就是没人接的 unhandled rejection ——
@@ -572,6 +603,7 @@ async function loadBlock() {
   if (guard.stale()) return
   if (data.ok === false) error.value = data.message || '读取块卷失败'
   blockVolumes.value = data.data?.volumes || []
+  blockPartial.value = pickPartial(data)
   // Pre-fill AD from first volume or boot
   if (!createForm.availability_domain) {
     const ad =

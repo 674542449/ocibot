@@ -171,6 +171,11 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        # 自定义响应头默认对跨源 JS 不可见（allow_headers 管的是**请求**头）。
+        # 实例列表用 X-Ocibot-Partial 告诉前端「这份列表是不完整的」，
+        # 不 expose 的话在跨源部署下前端读到的永远是 undefined，
+        # 于是一份被拒绝的读取又会被渲染成「你没有实例」。
+        expose_headers=["X-Ocibot-Partial", "X-Ocibot-Partial-Reason"],
     )
 
     app.include_router(auth.router, prefix="/api")

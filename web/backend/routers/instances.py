@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import logging
+from urllib.parse import quote
 import time
 from datetime import datetime, timezone
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -131,6 +132,7 @@ def list_instances(
     # Default False: IP resolution multiplies OCI calls; opt in from the UI.
     resolve_ips: bool = Query(False),
     include_terminated: bool = Query(False),
+    response: Response = None,  # type: ignore[assignment]
 ) -> list[InstanceOut]:
     row = _tenant_or_404(db, user.id, tenant_id)
     if not row.enabled:
@@ -143,6 +145,23 @@ def list_instances(
             infos = session.list_instances(resolve_ips=resolve_ips)
         if not include_terminated:
             infos = _visible_instances(infos)
+        # 「部分 compartment 读不到」必须传出去。
+        #
+        # list_instances_tree 只在「只剩一个 compartment、且没扫到任何实例」时才抛；
+        # 有两个以上 compartment 而**全部**被拒时，它安静地返回空列表，前端于是渲染
+        # 「暂无实例。请先在「租户」添加 API」—— 把一次权限拒绝说成了一个空账号，
+        # 还让人去做一件他早就做过的事。部分成功更糟：返回一个看着合理的子集，
+        # 没有任何标记说明它不完整。
+        #
+        # 用响应头而不是改返回结构：这个路由的 response_model 是纯数组，
+        # 换成对象会同时打破前端契约和 TS 类型。
+        tree_errors = list(getattr(session, "_last_tree_errors", []) or [])
+        if tree_errors and response is not None:
+            response.headers["X-Ocibot-Partial"] = "1"
+            # header 只能装 latin-1，错误里几乎一定有中文，所以百分号编码。
+            response.headers["X-Ocibot-Partial-Reason"] = quote(
+                f"{len(tree_errors)} 处 compartment 读取失败：{tree_errors[0]}"[:400]
+            )
         return [
             InstanceOut(**instance_to_dict(i, tenant_id=row.id, tenant_name=row.name))
             for i in infos
@@ -713,6 +732,24 @@ def launch_quota_check(
     # refuses outright in that case, so tell the UI rather than showing a total
     # that looks like plenty of headroom.
     out["read_incomplete"] = bool(usage.get("read_incomplete"))
+    # 预检的结论必须和真正创建时一致。
+    #
+    # enforce_launch_quota（创建路径）在读取不完整时会直接 503 拒绝，而
+    # check_launch_quota 不做这一步 —— 它只算 GuardResult。于是快照退化成
+    # {"read_incomplete": True} 时，校验器看到的用量是零，guard.ok 为真，
+    # 预检回 blocked=False，「下一步」正常打开确认框，用户点「确认并创建」
+    # 才被 503 挡下。本路由的 docstring 写着「面板的预检结论不会和服务端漂移」，
+    # 而这正是一处漂移。read_incomplete 虽然也传了出去，但它只渲染在额度预览
+    # 面板里，那个看起来更权威的「校验结论」框对此只字不提。
+    if out["read_incomplete"]:
+        reason = (
+            "无法完整读取 Always Free 用量（部分 compartment 读取失败），"
+            "因此无法判断额度是否够用。创建会被服务端拒绝 —— "
+            "请先到租户页点「测试连接」确认权限。"
+        )
+        out["ok"] = False
+        out["blocked"] = True
+        out["errors"] = [reason] + list(out.get("errors") or [])
     out["limits"] = usage.get("limits") or {}
     out["usage"] = usage.get("usage") or {}
     out["remaining"] = usage.get("remaining") or {}

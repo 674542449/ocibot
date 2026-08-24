@@ -237,15 +237,39 @@ def grow_filesystem_over_ssh(
 
             time.sleep(float(retry_delay_sec))
     assert last is not None
-    # Enrich hints in message for UI
+    return _enrich_hints(last)
+
+
+def _enrich_hints(last):
+    """Append a diagnosis to a failed SSH result.
+
+    抽成独立函数是为了能单独测：判断「连接失败」还是「命令失败」的规则曾经是反的，
+    而它内联在重试循环里时没有任何办法直接验证。
+    """
+    #
+    # 连接层的诊断只能看**连接层**的信息（last.message），不能看 last.stderr ——
+    # stderr 是**远端命令**的输出，能拿到它本身就证明 SSH 已经连上并认证成功了。
+    # 以前两者被拼在一起做子串匹配，于是最常见的一种真实失败被彻底诊断反了：
+    # fs_grow 的脚本执行 growpart / resize2fs / xfs_growfs 时**不带 sudo**，
+    # 而登录名默认是 ubuntu，非 root 跑这些工具会在 stderr 打出
+    # "Permission denied" —— 然后面板告诉你「请检查用户名与私钥是否匹配」。
+    # 同理，客体输出里只要出现 "timeout" / "refused" 字样（日志、报错都可能），
+    # 就会为一条明明连通了的连接给出网络诊断。
     hints = []
-    low = (last.message + last.stderr).lower()
+    low = last.message.lower()
+    guest = (last.stderr or "").lower()
     if "timed out" in low or "timeout" in low or "超时" in last.message:
         hints.append("连接超时：请确认实例已 RUNNING、22 端口 NSG/安全列表放行，且本机可访问该 IP")
     if "auth" in low or "permission denied" in low:
         hints.append("认证失败：请检查用户名与私钥/密码是否匹配（Ubuntu 常用 ubuntu，Oracle Linux 常用 opc）")
     if "refused" in low:
         hints.append("连接被拒绝：sshd 可能未启动，或防火墙未放行 22")
+    # 客体侧的权限失败是另一回事：连接是好的，是命令没有 root。
+    if not hints and ("permission denied" in guest or "operation not permitted" in guest or "not permitted" in guest):
+        hints.append(
+            "SSH 已连接成功，是命令本身没有权限：扩容需要 root，而当前登录用户不是。"
+            "请用 root 登录，或在实例内手动执行 sudo growpart / sudo resize2fs"
+        )
     if hints:
         last.message = last.message + "；" + "；".join(hints)
     return last

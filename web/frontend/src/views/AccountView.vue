@@ -267,8 +267,10 @@
         <h3 style="margin: 0">费用（最近 {{ days }} 天）</h3>
         <div class="muted" style="font-size: 13px">
           合计：
-          <strong>{{ usage?.total ?? '—' }}</strong>
-          {{ usage?.currency || '' }}
+          <!-- total 现在在读取失败时是 null（以前是 0）。?? 只挡 null/undefined，
+               0 会原样显示 —— 对账单数字来说「0」和「读不到」是相反的答案。 -->
+          <strong>{{ usage?.total ?? '未能读取' }}</strong>
+          {{ usage?.total == null ? '' : usage?.currency || '' }}
         </div>
       </div>
 
@@ -498,7 +500,9 @@ async function loadUsage() {
     }
   } catch (e: any) {
     if (guard.stale()) return
-    usage.value = { daily: [], by_service: [], total: 0 }
+    // total: null，不是 0。这条是网络/请求本身失败的分支 —— 我们对费用一无所知，
+    // 写 0 会让页面自信地显示「合计：0」，而那是个和真相相反的财务数字。
+    usage.value = { daily: [], by_service: [], total: null }
     usageMsg.value = e?.message || '读取账单失败'
   }
 }
@@ -557,7 +561,13 @@ async function loadInvoices() {
     invoices.value = res.data.data?.invoices || []
     invoiceMsg.value = res.data.message || ''
     // ok=false means Oracle refused the read; an empty list then proves nothing.
-    if (!res.data.ok) {
+    //
+    // unavailable=true 是同一件事的另一种形态：后端为了不让页面整块报红，把
+    // 「NotAuthorizedOrNotFound」这种读不到的情况返回成 ok=true + 空列表 +
+    // unavailable 标记。以前这里只看 ok，于是那面标记从未被读过，页面照样渲染
+    // 「该账号暂无账单记录」—— 对一个可能正在产生费用的账号来说，这是把
+    // 「读不到」说成了「没有」。
+    if (!res.data.ok || res.data.data?.unavailable) {
       invoiceError.value = res.data.message || '未知原因'
       invoices.value = []
     }

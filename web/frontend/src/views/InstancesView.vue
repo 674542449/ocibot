@@ -28,6 +28,12 @@
     </div>
 
     <div v-if="error" class="error-box">{{ error }}</div>
+    <!-- 列表不完整时必须说出来。返回一个看着合理的子集而不加任何标记，
+         比直接报错更危险：操作者会以为看到的就是全部。 -->
+    <div v-if="partialWarn" class="card warn-box">
+      <strong>⚠ 这份列表可能不完整</strong>
+      <div class="muted" style="font-size: 12px; margin-top: 0.25rem">{{ partialWarn }}</div>
+    </div>
     <div v-if="msg" class="success-box">{{ msg }}</div>
     <div v-if="!loading && !loadedOnce && tenantId" class="card muted" style="font-size: 13px">
       为减少 Oracle API 调用，进入本页<strong>不会自动拉取实例</strong>。选择租户后点击右上角「刷新」。
@@ -72,7 +78,12 @@
         <tbody>
           <tr v-if="!loading && filtered.length === 0">
             <td colspan="9" class="muted empty">
-              {{ instances.length ? '没有匹配搜索的实例' : '暂无实例。请先在「租户」添加 API，再「创建实例」。' }}
+              <template v-if="instances.length">没有匹配搜索的实例</template>
+              <template v-else-if="partialWarn">
+                没有读到任何实例，而且本次读取是不完整的 —— 这更可能是权限问题，
+                而不是「这个账号没有实例」。请到租户页点「测试连接」确认。
+              </template>
+              <template v-else>暂无实例。请先在「租户」添加 API，再「创建实例」。</template>
             </td>
           </tr>
           <tr v-for="ins in filtered" :key="ins.id + ins.tenant_id">
@@ -419,6 +430,8 @@ const resolveIps = ref(false)
 const search = ref('')
 const loading = ref(false)
 const loadedOnce = ref(false)
+/** 非空表示这份列表**不完整**（有 compartment 读不到）。 */
+const partialWarn = ref('')
 const acting = ref('')
 const error = ref('')
 const msg = ref('')
@@ -712,10 +725,20 @@ async function load() {
     if (superseded()) return
     instances.value = res.data
     loadedOnce.value = true
+    // 后端在「有 compartment 读不到」时会带上这两个头。没有它，一次被拒绝的
+    // 读取会返回空数组，页面照样渲染「暂无实例。请先在「租户」添加 API」——
+    // 把权限问题说成空账号，还让人去做一件早就做过的事。部分成功更隐蔽：
+    // 列表看着正常，只是少了几台。
+    const partial = res.headers?.['x-ocibot-partial']
+    partialWarn.value = partial
+      ? decodeURIComponent(String(res.headers?.['x-ocibot-partial-reason'] || '')) ||
+        '部分 compartment 读取失败'
+      : ''
   } catch (e: any) {
     if (superseded()) return
     error.value = e?.message || '加载失败'
     instances.value = []
+    partialWarn.value = ''
   } finally {
     // The spinner is owned by SEQUENCE only. Gating it on the tenant check too
     // meant that switching tenant mid-request left loading=true forever: no newer

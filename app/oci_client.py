@@ -3955,10 +3955,15 @@ class TenantSession:
                 # month_to_date is None, not 0: for a cost figure those two mean
                 # very different things, and a page that prints 0.00 for a read it
                 # never managed to perform is worse than one that prints nothing.
+                #
+                # `total` 同理，而它以前是 0 —— 这一段的注释写着这条原则，下一行却
+                # 违反了它。前端 `{{ usage?.total ?? '—' }}` 用的是 ??，0 不是
+                # nullish，于是「读不到费用」被渲染成「合计：0」。对账单数字来说，
+                # 「0」和「读不到」是相反的两个答案。
                 data={
                     "daily": [],
                     "by_service": [],
-                    "total": 0,
+                    "total": None,
                     "currency": "",
                     "days": days,
                     "month_to_date": None,
@@ -4063,10 +4068,15 @@ class TenantSession:
                 # month_to_date is None, not 0: for a cost figure those two mean
                 # very different things, and a page that prints 0.00 for a read it
                 # never managed to perform is worse than one that prints nothing.
+                #
+                # `total` 同理，而它以前是 0 —— 这一段的注释写着这条原则，下一行却
+                # 违反了它。前端 `{{ usage?.total ?? '—' }}` 用的是 ??，0 不是
+                # nullish，于是「读不到费用」被渲染成「合计：0」。对账单数字来说，
+                # 「0」和「读不到」是相反的两个答案。
                 data={
                     "daily": [],
                     "by_service": [],
-                    "total": 0,
+                    "total": None,
                     "currency": "",
                     "days": days,
                     "month_to_date": None,
@@ -4079,10 +4089,15 @@ class TenantSession:
                 # month_to_date is None, not 0: for a cost figure those two mean
                 # very different things, and a page that prints 0.00 for a read it
                 # never managed to perform is worse than one that prints nothing.
+                #
+                # `total` 同理，而它以前是 0 —— 这一段的注释写着这条原则，下一行却
+                # 违反了它。前端 `{{ usage?.total ?? '—' }}` 用的是 ??，0 不是
+                # nullish，于是「读不到费用」被渲染成「合计：0」。对账单数字来说，
+                # 「0」和「读不到」是相反的两个答案。
                 data={
                     "daily": [],
                     "by_service": [],
-                    "total": 0,
+                    "total": None,
                     "currency": "",
                     "days": days,
                     "month_to_date": None,
@@ -4140,12 +4155,19 @@ class TenantSession:
             # A tenancy with no subscription answers 404/NotAuthorizedOrNotFound.
             # For a free account that is the expected state, not an error to shout.
             if "NotAuthorizedOrNotFound" in text or "404" in text:
+                # 措辞不能替 Oracle 下结论。NotAuthorizedOrNotFound 同时意味着
+                # 「没权限」和「不存在」，把它说成「因此不会产生账单」是从一个
+                # 读不到的结果里推出了一个肯定的财务结论 —— 而如果真相是「没有
+                # 账单读取权限」，这句话会让一个正在产生费用的账号看起来是免费的。
                 return OperationResult(
                     ok=True,
                     message=(
-                        "未查询到账单。Always Free / 试用账号没有订阅，因此不会产生账单；"
-                        "若这是付费账号，请确认当前用户有账单读取权限"
-                        "（Allow group <你的组> to read invoices in tenancy）。"
+                        "无法读取账单：Oracle 返回「无权限或不存在」，这两种情况它用的是"
+                        "同一个错误码，因此无法区分。"
+                        "\n · 如果这是 Always Free / 试用账号，多半确实没有订阅，属于正常；"
+                        "\n · 如果这是付费账号，请确认当前用户有账单读取权限"
+                        "（Allow group <你的组> to read invoices in tenancy）—— "
+                        "在确认之前，请勿把这里的空白当作「没有产生费用」。"
                     ),
                     data={"invoices": [], "unavailable": True},
                 )
