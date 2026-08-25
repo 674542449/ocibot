@@ -1,5 +1,76 @@
 # Changelog
 
+## 0.4.90 — 2026-08-25
+
+### 修复
+
+- **「测试连接」把一个它无法知道的原因当成结论说了出来。** 一个满权限的账号,
+  点「测试连接」时**有时**通过、有时报「对 Compartment …k2wjnmitzo4po5wa 的读取
+  权限不足 / 这是 IAM 策略范围的问题」,于是操作员被反复推去改一条本来没问题的策略。
+  那句结论出自代码里一行注释:「Credentials are good past this point; anything below
+  is a policy/scope problem」—— 它是错的。`get_user` 成功之后,探针仍然可能因为
+  限流(429)、Oracle 5xx、网络超时、SDK 熔断器打开而失败,这些都不是策略问题。
+
+- **探针表本身也是坏的,「2 通过 1 失败」根本推不出「compartment 读不了」。**
+  旧表是 `{ListInstances, ListCompartments(ACCESSIBLE), ListAvailabilityDomains}`:
+  * 后两个需要的是**同一个**权限 `COMPARTMENT_INSPECT` —— 同一件事测了两遍;
+  * `ListCompartments` 传的 `access_level="ACCESSIBLE"` 是个**过滤器**(SDK 文档
+    明说它只返回你有 INSPECT 权限的那些),零权限时返回空页 + 200,**结构上不可能
+    因为缺权限而失败** —— 那一票是废票。
+  所以真实的探针集合是 `{INSTANCE_READ, COMPARTMENT_INSPECT, 废票}`。
+  而 **`ListInstances` 需要的是 `read` 不是 `inspect`** —— 一条只写了
+  `inspect instance-family` 的策略会**永久**产生一模一样的「1 挂 2 通」。
+
+- **新探针表把两条轴分开**,让形态本身能指认原因:
+  | 探针 | 服务 | 需要的权限 |
+  |---|---|---|
+  | 列出实例 | Compute | `read instance-family` |
+  | 列出规格 | Compute | `inspect instance-family` |
+  | 读取 Compartment | Identity | `inspect compartments` |
+  | 列出可用域 | Identity | `inspect compartments` |
+  「列出规格通过、列出实例失败」→ 直指 verb 写错(inspect 少了 read);
+  「两个 Compute 都挂、两个 Identity 都通」→ 差异在**服务端点**(Compute 走
+  `iaas.*`、Identity 走 `identity.*`),常见于副区刚订阅不久,与 Compartment 无关。
+
+- **对 404 自动重读一次,用来区分「瞬时」和「持续」。** 同一个调用 1.5 秒后就通了,
+  那次 404 按定义就是瞬时的 —— 面板会直接说出来,并**不再**建议去改策略。
+  只对 404 做(404 不是限流信号,SDK 本身也从不重试它);429/5xx 一律不重读,
+  SDK 刚退避重试过,再补一次纯粹是抢抢机重试循环的请求预算。
+
+- **记下诊断需要的事实,不再只留一个错误码。** 每个探针现在报出 HTTP 状态、
+  错误码、**opc-request-id**、operation、端点主机、耗时。opc-request-id 是开工单时
+  Oracle 唯一认的东西,而且只存在于那一次响应里 —— 以前被直接丢掉,故障过后再也
+  找不回来。`_format_service_error` 也一并附上它。
+  只取端点的**主机名**:`request_endpoint` 原文里带**完整 compartment OCID**,而
+  SDK 的 `redact_sensitive_string_for_logs` 只脱敏凭据头、不脱敏 `compartmentId`
+  (对 2.182.0 实测确认)。
+
+- **探针改用收敛的重试策略(2 次 / 20 秒)**,不再用 client 默认那套(8 次 / 600 秒)。
+  默认策略比前端超时和常见反代的 100 秒都长,所以一次真被限流的「测试连接」根本不会
+  返回文案 —— 它会在浏览器里超时,而后端还在继续烧预算。收敛之后 `[429]` 才有机会
+  被显示出来,而那正是本次要区分的东西之一。只改探针的单次调用策略,**不动
+  client 级默认策略**(worker 的抢机循环用的是同一批 client)。
+
+- **成败判定改为只看「列出实例」这一条。** 旧逻辑是「任一探针失败即报连接失败」,
+  而旧表里有一个探针结构上不可能失败、另外两个测的是同一件事 —— 那种判定既不敏感
+  也不特异。其余探针作为诊断上下文报出来。**这是一处有意的行为放宽**:原先会因
+  Identity 探针失败而显示「连接失败」的租户,现在会显示「连接成功 + 提示」。
+
+### 维护
+
+- 新增 `tests/test_connection_diagnosis.py`(15 条):不再出现那三句断言、重读成功后
+  不再提策略、inspect/read 与端点两种形态各自被指认、限流和熔断器不被讲成权限问题、
+  排查清单按命中项动态编号(旧写法会渲染出「2) … 2)」)、文案是纯文本不含 markdown
+  星号、以及**任何诊断文案和事实集合里都不出现完整 OCID**。
+- 全量 1006 passed。
+
+### 升级
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.90
+```
+
 ## 0.4.89 — 2026-08-24
 
 ### 修复

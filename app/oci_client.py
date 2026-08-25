@@ -41,6 +41,152 @@ CAPACITY_STATUS_MAP = {
 }
 
 
+def _format_probe_report(
+    user_name: str,
+    display_name: str,
+    region: str,
+    compartment: str,
+    results: list[dict[str, Any]],
+) -> str:
+    """把探针结果渲染成「事实 + 排序候选」,**不下结论**。
+
+    这一段以前是一句断言(「这是 IAM 策略范围的问题,不是密钥的问题」)。Oracle 用
+    同一个 404 `NotAuthorizedOrNotFound` 同时表示「没有权限」「资源不存在」和
+    「不在这个区域」,面板没有任何办法替它区分 —— 硬要下结论,就一定会有一部分
+    用户被指向一个本来没问题的地方。这里改成把观测到的事实原样摆出来,再按本次
+    证据给出排查**顺序**。
+    """
+    lines: list[str] = []
+    for r in results:
+        if r["ok"]:
+            lines.append(f"  ✓ {r['label']}（{r['service']}，{r['elapsed_ms']}ms）")
+            continue
+        head = f"  ✗ {r['label']}（{r['service']}"
+        if r.get("operation"):
+            head += f" · {r['operation']}"
+        head += "）"
+        tail = f"[{r.get('status') or r.get('type')}] {r.get('code') or ''}".strip()
+        bits = [f"{head}：{tail}", f"耗时 {r['elapsed_ms']}ms"]
+        if r.get("host"):
+            bits.append(f"端点 {r['host']}")
+        if r.get("request_id"):
+            bits.append(f"opc-request-id: {r['request_id']}")
+        if r.get("retried_ok") is True:
+            bits.append("★ 1.5 秒后重读同一个接口 —— 成功了")
+        elif r.get("retried_ok") is False:
+            bits.append("1.5 秒后重读同一个接口 —— 仍然失败")
+        lines.append("\n      ".join(bits))
+
+    by_label = {r["label"]: r for r in results}
+    blocking = [r for r in results if r["required"] and not r["ok"]]
+    head = (
+        f"凭据有效（用户 {user_name}，签名校验已通过）。"
+        f"区域 {region or '(未配置)'}，"
+        f"Compartment …{compartment[-16:] if compartment else '(未配置，按 Tenancy 根处理)'}"
+    )
+    if not blocking:
+        note = ""
+        if any(not r["ok"] for r in results):
+            note = "\n\n注：上面有非必需的探针没通过，不影响列实例等主要功能，但值得留意。"
+        return f"连接成功：{display_name}\n{head}\n\n" + "\n".join(lines) + note
+
+    # 按本次实际观测到的形态排候选,而不是给一句放之四海的建议。
+    #
+    # 全部用纯文本,**不要** markdown 星号 —— 这段会直接进面板的错误条,
+    # 星号会原样显示出来(同 _format_service_error 里那条既有的注释)。
+    transient = any(r.get("retried_ok") is True for r in results)
+    hints: list[str] = []
+    if transient:
+        hints.append(
+            "上面标了「重读成功」—— 那次 404 是瞬时的，与 IAM 策略无关。"
+            "隔几分钟再试即可；如果反复出现，把 opc-request-id 提给 Oracle 支持。"
+        )
+    shapes, instances = by_label.get("列出规格"), by_label.get("列出实例")
+    # 重读成功时不再提策略：既然同一个调用一秒半后就通了，策略解释已经出局，
+    # 再列出来只会让人去改一条本来没问题的策略 —— 那正是这次要修掉的毛病。
+    if not transient and shapes and instances and shapes["ok"] and not instances["ok"]:
+        hints.append(
+            "「列出规格」通过而「列出实例」失败 —— 两个调用走同一个服务、同一个 "
+            "Compartment，差别只在 verb。ListInstances 需要的是 read，不是 inspect："
+            "\n       Allow group <你的用户组> to read instance-family in compartment <名称>"
+            "\n     只写 inspect instance-family 是很常见的一个坑。"
+        )
+    compute_fail = [r for r in results if r["service"] == "Compute" and not r["ok"]]
+    identity_ok = [r for r in results if r["service"] == "Identity" and r["ok"]]
+    if not transient and len(compute_fail) == 2 and len(identity_ok) == 2:
+        hints.append(
+            "两个 Compute 探针都失败、两个 Identity 探针都通过 —— 差异落在服务端点上"
+            "（Compute 走 iaas.*，Identity 走 identity.*），不是落在 Compartment 上。"
+            "常见于副区刚订阅不久、或该区域的授权数据尚未就绪。"
+            "先确认这一行是不是副区、订阅多久了。"
+        )
+    if any(int(r.get("status") or 0) == 429 for r in results):
+        hints.append("出现 [429] —— 那是 Oracle 限流，不是权限问题。隔几分钟再点。")
+    if any(str(r.get("type") or "").startswith("CircuitBreaker") for r in results):
+        hints.append(
+            "出现熔断器错误 —— 这是 SDK 客户端侧的保护（连续失败后暂停发请求，约 30 秒自愈），"
+            "与权限无关。"
+        )
+    hints.append(
+        "本次只探了这一个 Compartment，没有向下展开子 Compartment。"
+        "如果资源其实在子 Compartment 里，把租户配置里的 Compartment OCID 改成它所在的那个。"
+    )
+
+    return (
+        f"{head}\n\n" + "\n".join(lines) + "\n\n"
+        "Oracle 用同一个 404「NotAuthorizedOrNotFound」同时表示「没有权限」「资源不存在」"
+        "和「不在这个区域」，面板无法替它区分。按本次观测到的证据，建议按这个顺序排查：\n"
+        + "\n".join(f"  {i}) {h}" for i, h in enumerate(hints, 1))
+    )
+
+
+_ENDPOINT_HOST_RE = re.compile(r"https?://([^/\s?]+)")
+
+
+def _endpoint_host(exc: Any) -> str:
+    """从 ServiceError 里只取**主机名**,绝不取原文。
+
+    `ServiceError.request_endpoint` 的实际内容长这样:
+
+        GET https://iaas.us-phoenix-1.oraclecloud.com/20160918/instances
+            ?compartmentId=ocid1.compartment.oc1..aaaa<完整 OCID>&limit=1
+
+    SDK 自己的 `redact_sensitive_string_for_logs` 只脱敏凭据头,**不脱敏
+    compartmentId**(对 2.182.0 实测过,OCID 原样输出)。原样打印等于把完整
+    compartment OCID 送进前端和日志 —— 而面板到处只显示 `compartment[-16:]`
+    正是为了防这件事。
+
+    只留 host 反而保住了诊断价值最高的那一段:`iaas.*` 是 Core 服务,
+    `identity.*` 是 Identity 服务。本次故障里「哪些通过、哪些失败」正好
+    沿着这条服务边界切开。
+    """
+    m = _ENDPOINT_HOST_RE.search(str(getattr(exc, "request_endpoint", "") or ""))
+    return m.group(1) if m else ""
+
+
+def _err_facts(exc: BaseException) -> dict[str, Any]:
+    """把一次失败压成一组**可以安全外发**的事实。绝不含 OCID / 密钥 / 签名头。
+
+    这些字段本来就在 ServiceError 上,以前全被丢掉了 —— 诊断代码只留了
+    `code or status`,于是「限流」「瞬时故障」「真的没权限」三种完全不同的情况
+    在面板上长得一模一样,只能靠一句写死的断言去填空。opc-request-id 更是找
+    Oracle 支持时**唯一**有用的东西。
+
+    注意不要改用 `oci.base_client.is_http_log_enabled` 去补这些信息:那个函数
+    整个函数体就是 `HTTPConnection.debuglevel = 1`,会把 OCI 请求签名的
+    Authorization 头打到 stdout。凭据永不落日志是本仓的常设约束。
+    """
+    return {
+        "type": type(exc).__name__,
+        "status": int(getattr(exc, "status", 0) or 0),
+        "code": str(getattr(exc, "code", "") or ""),
+        # opc-request-id
+        "request_id": str(getattr(exc, "request_id", "") or ""),
+        "operation": str(getattr(exc, "operation_name", "") or ""),
+        "host": _endpoint_host(exc),
+    }
+
+
 def _as_float_or_none(value: Any) -> Optional[float]:
     try:
         return None if value is None else float(value)
@@ -963,6 +1109,7 @@ class TenantSession:
         can go fix.
         """
         compartment = self.resolve_compartment()
+        region = self.tenant.region.strip()
         try:
             user = self.identity.get_user(self.tenant.user_ocid.strip()).data
         except ServiceError as exc:
@@ -970,42 +1117,117 @@ class TenantSession:
         except Exception as exc:  # noqa: BLE001
             return OperationResult(ok=False, message=str(exc))
 
-        # Credentials are good past this point; anything below is a policy/scope
-        # problem, and saying so is the whole value of this check.
-        probes: list[tuple[str, Callable[[], Any]]] = [
-            ("列出实例", lambda: self.compute.list_instances(compartment, limit=1)),
-            ("列出子 Compartment", lambda: self.identity.list_compartments(
-                compartment, compartment_id_in_subtree=True, access_level="ACCESSIBLE", limit=1
-            )),
-            ("列出可用域", lambda: self.identity.list_availability_domains(compartment)),
+        # 这里以前写着「Credentials are good past this point; anything below is a
+        # policy/scope problem」—— 那句话是错的,而且是本次故障的根源。
+        #
+        # get_user 成功之后,下面的探针仍然可能因为限流(429)、Oracle 服务端错误
+        # (5xx)、网络超时、DNS 抖动、熔断器打开而失败,这些全都不是策略问题。
+        # 旧代码把它们一律讲成「这是 IAM 策略范围的问题,不是密钥的问题」,并让操作员
+        # 去改一条本来没问题的策略。用户实际遇到的正是这个:满权限的账号,时好时坏,
+        # 每次都被告知去改 IAM。
+        #
+        # 探针表也重排过。旧表是 {ListInstances, ListCompartments, ListAvailabilityDomains},
+        # 看着像测三样东西,实际上:
+        #   * ListCompartments 传的是 access_level="ACCESSIBLE" —— 那是个**过滤器**,
+        #     SDK 文档明说它只返回你有 INSPECT 权限的那些,零权限时返回空页 + 200,
+        #     结构上**不可能**因为缺权限而失败。这一票是废票。
+        #   * 它和 ListAvailabilityDomains 需要的是**同一个**权限 COMPARTMENT_INSPECT。
+        # 于是真实的探针集合是 {INSTANCE_READ, COMPARTMENT_INSPECT, 废票},
+        # 「2 通过 1 失败」根本推不出「compartment 读不了」。
+        #
+        # 新表把两条轴分开:同一个服务的不同 verb、以及不同服务的同一件事。
+        #   ListInstances -> INSTANCE_READ      ListShapes -> INSTANCE_INSPECT
+        #   GetCompartment / ListAvailabilityDomains -> COMPARTMENT_INSPECT
+        # 「列出规格通过、列出实例失败」就直接指向「策略只给了 inspect 没给 read」——
+        # 这是个很常见的写法错误(ListInstances 要的是 read,不是 inspect)。
+        #
+        # 探针用**收敛**的重试策略,不用 client 默认那套(8 次 / 600 秒上限)。默认策略
+        # 比前端 axios 的超时和常见反代的 100 秒都长,所以一次真被限流的「测试连接」
+        # 根本不会返回文案 —— 它会在浏览器里超时,而后端还在继续烧请求预算。收敛之后
+        # [429] 才有机会被显示出来,而那正是本次要区分的东西之一。
+        probe_kw: dict[str, Any] = {}
+        try:
+            probe_kw["retry_strategy"] = (
+                oci.retry.RetryStrategyBuilder(
+                    max_attempts_check=True,
+                    max_attempts=2,
+                    total_elapsed_time_check=True,
+                    total_elapsed_time_seconds=20,
+                    retry_max_wait_between_calls_seconds=5,
+                    service_error_check=True,
+                    retry_on_service_error_codes=[429],
+                ).get_retry_strategy()
+            )
+        except Exception:  # noqa: BLE001
+            probe_kw = {}
+
+        probes: list[tuple[str, str, str, bool, Callable[[], Any]]] = [
+            ("列出实例", "Compute", "read instance-family", True,
+             lambda: self.compute.list_instances(compartment, limit=1, **probe_kw)),
+            ("列出规格", "Compute", "inspect instance-family", False,
+             lambda: self.compute.list_shapes(compartment, limit=1, **probe_kw)),
+            ("读取 Compartment", "Identity", "inspect compartments", False,
+             lambda: self.identity.get_compartment(compartment, **probe_kw)),
+            ("列出可用域", "Identity", "inspect compartments", False,
+             lambda: self.identity.list_availability_domains(compartment, **probe_kw)),
         ]
-        failures: list[str] = []
-        for label, call in probes:
+
+        results: list[dict[str, Any]] = []
+        for label, svc, verb, required, call in probes:
+            started = time.monotonic()
             try:
                 call()
-            except ServiceError as exc:
-                failures.append(f"{label}：{getattr(exc, 'code', '') or getattr(exc, 'status', '')}")
+                results.append(
+                    {
+                        "label": label, "service": svc, "verb": verb, "required": required,
+                        "ok": True, "elapsed_ms": int((time.monotonic() - started) * 1000),
+                    }
+                )
+                continue
             except Exception as exc:  # noqa: BLE001
-                failures.append(f"{label}：{exc}")
+                facts = _err_facts(exc)
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+
+            # 只对 404 复读一次,而且只在这条「用户主动点击的诊断」路径上。
+            #
+            # 这一位信息的价值极高:复读成功,那个 404 按定义就是**瞬时的**,
+            # 「策略问题」这个解释当场出局 —— 这正是用户「有时候好有时候坏」需要的答案。
+            #
+            # 为什么只对 404:404 不是限流信号,SDK 本身也从不重试它,补一读不可能给
+            # 限流火上浇油;而 429/5xx 一律不复读,SDK 刚刚已经替我们退避重试过,
+            # 再来一次纯粹是抢抢机重试循环的请求预算(CLAUDE.md 记的 0.4.21 回退
+            # 理由就是这条约束)。List/Get 是幂等的,不建资源、不消耗 retry token。
+            retried_ok: Optional[bool] = None
+            if facts["status"] == 404:
+                time.sleep(1.5)
+                try:
+                    call()
+                    retried_ok = True
+                except Exception:  # noqa: BLE001
+                    retried_ok = False
+            results.append(
+                {
+                    "label": label, "service": svc, "verb": verb, "required": required,
+                    "ok": False, "elapsed_ms": elapsed_ms, "retried_ok": retried_ok, **facts,
+                }
+            )
 
         name = getattr(user, "description", "") or user.name
-        if failures:
-            return OperationResult(
-                ok=False,
-                message=(
-                    f"凭据有效（用户 {user.name}），但对 Compartment "
-                    f"{compartment[-16:] or '(未配置)'} 的读取权限不足：\n  "
-                    + "\n  ".join(failures)
-                    + "\n\n这是 IAM 策略范围的问题，不是密钥的问题 —— 重新生成密钥不会有帮助。"
-                    "\n请在 Oracle 控制台给该用户所在的组添加对应 Compartment 的读取策略，"
-                    "或把租户配置里的 Compartment OCID 改成资源实际所在的那个。"
-                ),
-                data={"user": user.name, "compartment": compartment, "failures": failures},
-            )
+        # 成败只看**必需**的那一条(列出实例)。其余作为诊断上下文报出来。
+        # 旧逻辑是「任一探针失败即失败」,而其中一个探针结构上不可能失败、另一个和
+        # 第三个测的是同一件事 —— 那种判定既不敏感也不特异。
+        blocking = [r for r in results if r["required"] and not r["ok"]]
         return OperationResult(
-            ok=True,
-            message=f"连接成功：{name}（已验证可读取 Compartment {compartment[-16:]}）",
-            data={"user": user.name, "compartment": compartment},
+            ok=not blocking,
+            message=_format_probe_report(user.name, name, region, compartment, results),
+            data={
+                "user": user.name,
+                "compartment": compartment,
+                "region": region,
+                "probes": results,
+                # 兼容旧字段:曾经有调用方读它。
+                "failures": [f"{r['label']}：{r.get('code') or r.get('status')}" for r in results if not r["ok"]],
+            },
         )
 
     def list_compartments(
@@ -6896,6 +7118,12 @@ def _format_service_error(exc: ServiceError) -> str:
     message = getattr(exc, "message", "") or str(exc)
     parts = [p for p in [f"[{status}]", code, message] if p]
     text = " ".join(parts)
+    # opc-request-id 是开工单时 Oracle **唯一**认的东西,而且它只存在于这一次响应里 ——
+    # 丢掉之后就再也找不回来。附在错误尾巴上,代价一行,收益是这个错误从「无法追查」
+    # 变成「可以直接提给 Oracle」。
+    _rid = str(getattr(exc, "request_id", "") or "")
+    if _rid:
+        text += f" (opc-request-id: {_rid})"
     # Friendly hints
     #
     # 判断顺序很重要，而且以前是错的：`NotAuthorizedOrNotFound` 里含
@@ -6918,7 +7146,9 @@ def _format_service_error(exc: ServiceError) -> str:
             "\n  1) 该用户的 IAM 策略没有覆盖这个 Compartment（最常见）；"
             "\n  2) 租户里配置的 Compartment OCID 填错，或资源其实在别的 Compartment；"
             "\n  3) 资源在另一个区域。"
-            "\n可在租户页点「测试连接」，它会具体报出是哪一项读不到。"
+            "\n  4) Oracle 侧的瞬时故障 —— 这个码**不保证**是永久的，重读一次就好的情况确实存在。"
+            "\n可在租户页点「测试连接」：它会分别探 Compute 和 Identity、区分 read / inspect 两种 verb，"
+            "并对 404 自动重读一次，用来判断这次到底是瞬时还是持续。"
         )
     elif "not authenticated" in low or status == 401:
         # 401 才是真正的凭据问题：签名没通过。
