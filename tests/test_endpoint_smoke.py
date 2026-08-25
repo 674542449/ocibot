@@ -121,6 +121,11 @@ def make_session():
     # 容量雷达。桩在 TenantSession 这一层（而不是让 radar 直接碰 session.compute）：
     # 这个会话是 MagicMock，迭代 mock.data.shape_availabilities 会抛 TypeError，
     # 被路由的 except Exception -> 502 吞掉，测试当场变红而看不出原因。
+    # 雷达自己拿 AD 用的是这个(一次纯读),**不是** fetch_launch_meta ——
+    # 后者的冷调用会 ensure_default_network(create_if_missing=True),
+    # 在租户里真的建 VCN。0.4.88 首版误用了它,而这个文件当时正好把
+    # fetch_launch_meta 桩掉了,于是测试全绿、线上超时。
+    s.list_availability_domains.return_value = ["AD-1", "AD-2"]
     s.get_capacity_report.return_value = R(True, "", {
         "compartment_id": "ocid1.compartment.oc1..c1",
         "used_root_compartment": False,
@@ -343,8 +348,8 @@ def test_every_endpoint_is_wired() -> None:
 
         posts = [
             (f"/api/tenants/{tid}/test", {}),
-            # 容量雷达。AD 必须是 _stub_launch_meta 的 ads 里的值 —— 路由会拿
-            # fetch_launch_meta 的 ads 做白名单，不在里面的直接 400。
+            # 容量雷达。AD 必须在白名单里(peek 缓存命中就用它，否则用
+            # session.list_availability_domains 的返回)，不在里面的直接 400。
             (f"/api/tenants/{tid}/capacity-report",
              {"shape": "VM.Standard.A1.Flex", "ocpus": 4, "memory_in_gbs": 24,
               "availability_domain": "AD-1"}),

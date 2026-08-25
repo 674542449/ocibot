@@ -27,6 +27,7 @@ from web.backend.launch_service import (
     build_launch_request,
     fetch_launch_meta,
     launch_meta_state,
+    peek_launch_meta,
     prepare_launch_network,
     schedule_post_launch_adjustments,
     start_meta_refresh,
@@ -710,16 +711,34 @@ def capacity_report(
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    # AD 白名单。用 fetch_launch_meta 而不是直接把前端传来的字符串发给 Oracle:
-    # 命中缓存时它不发任何请求,而且和 launch 路由用的是同一个入口,所以雷达看到的
-    # AD 列表和创建时可选的那份天然一致。
+    # AD 列表:先看缓存,没有就单发一次 list_availability_domains。
+    #
+    # **绝对不能在这里调 fetch_launch_meta。** 它的冷调用是这个面板最贵的一次操作:
+    # 给每个 OS family 列一遍镜像,而且 —— 这才是致命的 ——
+    #     f_network = pool.submit(session.ensure_default_network,
+    #                             compartment_id=..., create_if_missing=True)
+    # 它会在租户里**创建 VCN、子网、网关和路由表**并等它们变可用,它自己的 docstring
+    # 写着「A minute or more is normal」。
+    #
+    # 0.4.88 首版就是这么写的,后果有两层:
+    #   1. 用户在雷达页(从没点过「加载配置」,缓存是冷的)点探测,请求要跑一分钟以上,
+    #      浏览器/反代先超时 —— 表现就是「探测没结果」;
+    #   2. 一个从页面副标题到 CHANGELOG 都写着「只读,绝不创建任何实例」的功能,
+    #      会**创建网络资源**。这不是慢,这是把承诺破坏掉了。
+    #
+    # 现在:peek 命中就白拿(零 Oracle 请求);没命中就单发一次
+    # list_availability_domains —— 一次纯读、没有任何写入,正好是我们要的那一样东西。
+    # 顺带雷达不再依赖「必须先去创建页点过加载配置」,自己就能用。
     known_ads: list[str] = []
     meta_error = ""
-    try:
-        meta = fetch_launch_meta(session, tenant_id=row.id, force=False)
-        known_ads = [str(a) for a in (meta.get("ads") or []) if a]
-    except Exception as exc:  # noqa: BLE001
-        meta_error = str(exc)
+    cached_meta = peek_launch_meta(session, row.id)
+    if cached_meta:
+        known_ads = [str(a) for a in (cached_meta.get("ads") or []) if a]
+    if not known_ads:
+        try:
+            known_ads = [str(a) for a in (session.list_availability_domains() or []) if a]
+        except Exception as exc:  # noqa: BLE001
+            meta_error = str(exc)
 
     wanted = (body.availability_domain or "").strip()
     if wanted:

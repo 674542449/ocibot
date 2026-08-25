@@ -72,9 +72,8 @@
         </div>
       </div>
       <p class="muted" style="font-size: 12px; margin: 0">
-        没有该租户的可用域列表时无法探测。若提示「请先加载配置」，去
-        <router-link :to="{ path: '/launch', query: tenantId ? { tenant: tenantId } : {} }">创建实例</router-link>
-        页点一次「加载配置」即可（那份列表会被缓存，雷达直接复用）。
+        不需要先去「创建实例」页加载配置 —— 雷达会自己读一次可用域列表（一次纯读，
+        不会创建任何东西）。若那份列表已经在缓存里，则直接复用、连这一次都省了。
       </p>
     </div>
 
@@ -102,7 +101,26 @@
         </div>
       </div>
 
-      <div v-if="result.message" class="card muted" style="font-size: 13px">{{ result.message }}</div>
+      <!-- 探测**没能进行**(比如读不到可用域列表)必须显眼。
+           以前这里一律是一行小灰字，而此刻上面那张「还没有探测」的解释卡因为
+           result 已存在被隐藏、下面的网格又是空的 —— 整页看起来就是「探测没结果」，
+           而真实情况是「压根没探成，原因写在那行灰字里」。 -->
+      <div v-if="!result.ok" class="card error-box">
+        <strong>没能进行探测</strong>
+        <div style="font-size: 13px; margin-top: 0.25rem">{{ result.message || '未知原因' }}</div>
+        <div class="muted" style="font-size: 12px; margin-top: 0.35rem">
+          这不代表没有容量 —— 是这次请求没走到 Oracle 那一步。创建实例不受影响。
+        </div>
+      </div>
+      <div v-else-if="result.message" class="card muted" style="font-size: 13px">{{ result.message }}</div>
+
+      <div v-if="result.ok && !result.results.length" class="card warn-box">
+        <strong>探测完成，但没有任何可用域返回结果</strong>
+        <div class="muted" style="font-size: 12px; margin-top: 0.25rem">
+          这不是「没有容量」。请到「创建实例」页点一次「加载配置」确认这个租户的可用域能读到，
+          再回来重试。
+        </div>
+      </div>
 
       <div class="radar-grid" role="status" aria-live="polite">
         <div

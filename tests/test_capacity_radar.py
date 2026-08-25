@@ -510,3 +510,50 @@ def test_a_missing_shape_config_echo_does_not_drop_the_row():
     rows = s.get_capacity_report("AD-1", RADAR_SHAPE, [(4.0, 24.0)]).data["rows"]
     assert len(rows) == 1
     assert rows[0]["ocpus"] is None
+
+
+# ------------------------------------------------- 路由层：雷达绝不能触发写操作
+
+def test_the_radar_route_never_calls_fetch_launch_meta():
+    """源码断言。fetch_launch_meta 的冷调用里有
+
+        f_network = pool.submit(session.ensure_default_network,
+                                compartment_id=..., create_if_missing=True)
+
+    它会在租户里**创建 VCN、子网、网关和路由表**并等它们变可用，自己的 docstring
+    写着「A minute or more is normal」。
+
+    0.4.88 首版为了拿一份可用域列表就调了它，后果有两层：
+      1. 用户在雷达页(从没点过「加载配置」，缓存是冷的)点探测，请求要跑一分钟以上，
+         浏览器/反代先超时 —— 表现就是「探测没结果」；
+      2. 一个从页面副标题到 CHANGELOG 都写着「只读，绝不创建任何实例」的功能，
+         会创建网络资源。
+
+    用源码断言而不是行为断言：真正的危险是**有人以后为了图省事又把它加回来**，
+    而那条路径在测试里是被桩掉的，行为断言看不见。
+    """
+    import inspect
+
+    from web.backend.routers import instances as inst
+
+    src = inspect.getsource(inst.capacity_report)
+
+    # 匹配**调用**(带左括号)而不是名字：路由里那段解释为什么不能用它的注释
+    # 本身就提到了这个名字，按名字匹配会被自己的注释绊倒。
+    assert "fetch_launch_meta(" not in src, (
+        "雷达路由不能调 fetch_launch_meta() —— 它的冷调用会 "
+        "ensure_default_network(create_if_missing=True)，在租户里真的建 VCN"
+    )
+    assert "peek_launch_meta(" in src, "应当先看缓存(零 Oracle 请求)"
+    assert "list_availability_domains(" in src, "缓存没命中时单发一次纯读调用"
+
+
+def test_the_radar_route_takes_no_launch_lock():
+    """雷达什么都不改，进 tenant_launch_lock 只会让探测把别人的创建堵住。
+    tests/test_launch_lock_scope.py 也钉着锁内的调用序列。"""
+    import inspect
+
+    from web.backend.routers import instances as inst
+
+    # 同上：按调用而不是按名字匹配。
+    assert "tenant_launch_lock(" not in inspect.getsource(inst.capacity_report)
