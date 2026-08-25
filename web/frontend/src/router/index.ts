@@ -87,6 +87,22 @@ const router = createRouter({
         },
       ],
     },
+    {
+      // 被删掉的路由留下的 URL 仍然活在书签、开着的标签页、以及登录跳转的
+      // redirect 参数里（0.4.92 删掉的 /radar 就是一例）。
+      //
+      // vue-router 4 对匹配不到的路径**既不抛错也不回退首页** —— 它照常完成一次
+      // matched 为空的导航，<router-view/> 于是渲染 null。实测结果是整页只剩一个
+      // 注释节点：连 AppLayout 都不挂载，没有导航栏、没有任何可点的东西，
+      // 用户只能手改地址栏。后端的 SPA 兜底对这些路径返回 200 + index.html，
+      // 所以也不会有 404 页面接住。
+      //
+      // 用字符串 '/' 而不是 { name: 'instances' }：后者会打一条
+      // "Discarded invalid param(s) pathMatch" 的开发期告警。
+      // 必须放在顶层数组，放进 '/' 的 children 会试图在 AppLayout 里渲染。
+      path: '/:pathMatch(.*)*',
+      redirect: '/',
+    },
   ],
 })
 

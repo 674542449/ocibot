@@ -2783,6 +2783,36 @@ class TenantSession:
         return specs
 
     @staticmethod
+    def _ssh_only_specs(include_ipv6: bool) -> list[FirewallRuleSpec]:
+        """不勾「允许外网直接访问」时的规则:只放 SSH 入站,出站不限。
+
+        为什么仍然建一个 NSG、而不是干脆不建:
+          * 不建的话实例只受子网 Security List 管,而那份规则不由面板掌控 ——
+            自建 VCN 和用户既有 VCN 的默认规则不一样,最坏情况是**连 22 都不通**,
+            用户创建完直接连不上机器。把人锁在外面比开得太宽更糟。
+          * 详情页的防火墙管理、以及创建失败时按 launch_token 回收 NSG,
+            都建立在「这台机器有一个自己的托管 NSG」之上。
+        """
+        specs = [
+            FirewallRuleSpec(
+                "INGRESS", "6", "0.0.0.0/0", port_min=22, port_max=22,
+                description="ocibot SSH 入站",
+            ),
+            FirewallRuleSpec("EGRESS", "all", "0.0.0.0/0", description="ocibot IPv4 出站"),
+        ]
+        if include_ipv6:
+            specs.extend(
+                [
+                    FirewallRuleSpec(
+                        "INGRESS", "6", "::/0", port_min=22, port_max=22,
+                        description="ocibot SSH 入站 (IPv6)",
+                    ),
+                    FirewallRuleSpec("EGRESS", "all", "::/0", description="ocibot IPv6 出站"),
+                ]
+            )
+        return specs
+
+    @staticmethod
     def _is_ocibot_managed_nsg(tags: Optional[dict] = None) -> bool:
         """Recognize NSGs created by this tool (legacy + current tag schemes)."""
         tags = tags or {}
@@ -2863,7 +2893,13 @@ class TenantSession:
         display_name: str,
         include_ipv6: bool = False,
         launch_token: str = "",
+        open_all: bool = True,
     ) -> OperationResult:
+        """open_all=False 时只放 SSH 入站。
+
+        默认仍是 True:这个方法还有别的调用方(详情页的「一键开放全部端口」),
+        它们的语义本来就是全开放。创建路径会显式传 open_all=表单上那个勾选。
+        """
         token = launch_token or uuid.uuid4().hex
         safe_name = (display_name or "instance").strip() or "instance"
         details = oci.core.models.CreateNetworkSecurityGroupDetails(
@@ -2878,7 +2914,8 @@ class TenantSession:
         )
         try:
             nsg = self.network.create_network_security_group(details).data
-            added = self.add_nsg_rules(nsg.id, self._open_all_specs(include_ipv6))
+            specs = self._open_all_specs(include_ipv6) if open_all else self._ssh_only_specs(include_ipv6)
+            added = self.add_nsg_rules(nsg.id, specs)
             if not added.ok:
                 try:
                     self.network.delete_network_security_group(nsg.id)
@@ -3465,13 +3502,18 @@ class TenantSession:
         object_usage: dict[str, Any] = {}
         try:
             est = self.estimate_object_storage_usage()
-            if isinstance(est.data, dict):
+            if est.ok and isinstance(est.data, dict):
                 object_usage = est.data
-                if est.message:
-                    notes.append(est.message)
-            if not est.ok and est.message:
+            else:
+                # 读不到就让 object_usage 留空 —— build_quota_snapshot 据此**省略**
+                # 这根仪表，而不是画一根「已用 0 / 20 GB，正常」的假仪表。
+                read_incomplete = True
+            if est.message:
+                # 以前这条在 not est.ok 时会被 append 两次（上面一次、下面一次），
+                # 于是同一句话在摘要里重复出现。
                 notes.append(est.message)
         except Exception as exc:  # noqa: BLE001
+            read_incomplete = True
             notes.append(f"对象存储读取失败：{exc}")
 
         egress_usage: dict[str, Any] = {}
@@ -5427,15 +5469,36 @@ class TenantSession:
         if cached:
             return cached
         region = self.tenant.region.strip()
+        # 记下这个值到底是**问出来的**还是**猜的**。
+        #
+        # 读失败时回退到租户自己填的 region 对预算/账单那几个调用方是合理的兜底,
+        # 但它同时让 quota_guard.region_pair 拿到 current == home ——「当前就是主区」。
+        # 而 region_pair 的 docstring 和 resolve_secondary 都建立在「读不出来就返回
+        # 空串、退回 DB 的 parent_tenant_id」之上。结果是:一个副区租户在区域订阅
+        # 读失败时被判成主区,免费额度检查照常跑,而副区的用量快照只统计那一个区域、
+        # 读起来是「一点没用」—— 于是一台**计费**机器被当成免费的放行。
+        # 副区闸门在最需要它的时候(读不到)恰好失效。
+        resolved = False
         try:
             subs = self.identity.list_region_subscriptions(self.tenant.tenancy_ocid.strip()).data
             home = next((s for s in subs if getattr(s, "is_home_region", False)), None)
             if home and getattr(home, "region_name", ""):
                 region = home.region_name
+                resolved = True
         except Exception:  # noqa: BLE001
             pass
         self._home_region_name = region
+        self._home_region_resolved = resolved
         return region
+
+    def home_region_confirmed(self) -> str:
+        """主区名,**只在真的问出来时**才返回;猜的一律返回 ""。
+
+        给依赖「读不到就别下结论」的调用方用(quota_guard.region_pair)。
+        需要兜底值的调用方继续用 home_region()。
+        """
+        value = self._home_region()
+        return value if getattr(self, "_home_region_resolved", False) else ""
 
     def _config_for_region(self, region: str) -> dict:
         cfg = dict(self._config)
@@ -6785,6 +6848,15 @@ class SessionManager:
                 tenant.fingerprint,
                 tenant.region,
                 tenant.compartment_ocid,
+                # account_tier 必须在键里。
+                #
+                # 会话把 self.tenant 冻结住,而 get_free_quota_usage 从那份冻结的
+                # 副本读 tier 并写进快照。tier 不在键里 = 改了等级不重建会话 =
+                # 快照里一直是旧等级。两个方向都会出事:
+                #   free -> paid:付费租户被当免费的硬拦,抢机任务被判成
+                #                enabled=False/failed(不是重试,是永久停止);
+                #   paid -> free:降级/试用到期后守卫**静默放行**超额创建。
+                tenant.account_tier or "",
                 hashlib_sha16(tenant.private_key_pem),
             ]
         )

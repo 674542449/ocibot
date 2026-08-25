@@ -804,12 +804,24 @@ def prepare_launch_network(
 
     if not payload.get("managed_nsg_id") and not payload.get("nsg_ids"):
         token = str(payload.get("launch_token") or uuid.uuid4().hex)
+        # open_all 必须跟着表单上那个勾选走。
+        #
+        # 以前这里无条件建一个 INGRESS all 0.0.0.0/0 的 NSG,而 open_guest_firewall
+        # 只被送去 build_root_cloud_init 决定要不要在**客体内**关掉 ufw/iptables ——
+        # 云端这一半从来没接过线。于是取消勾选之后,表单 hint 说「不放宽云端安全组」,
+        # 实际照样挂上一个全协议全网段入站的 NSG;而 NSG 与 Security List 在 OCI 是
+        # 并集,子网上原有的收紧规则会因此形同虚设。
         nsg = session.create_managed_nsg(
             vcn_id=vcn_id,
             compartment_id=network_compartment or compartment_id,
             display_name=str(payload.get("display_name") or "instance"),
             include_ipv6=bool(payload.get("assign_ipv6_ip")),
             launch_token=token,
+            # 缺省 True,和上游 build_launch_request(:692)的 `body.get(..., True)` 一致。
+            # 用 False 兜底会让**老抢机任务里存下的、还没有这个键的 payload**
+            # 被静默收窄成只放 SSH —— 用户的 web 服务某天重试成功后连不上,
+            # 而没有任何地方说过规则变了。
+            open_all=bool(payload.get("open_guest_firewall", True)),
         )
         if not nsg.ok:
             raise OCIClientError(nsg.message or "创建实例 NSG 失败")

@@ -508,6 +508,29 @@ async def webssh_endpoint(websocket: WebSocket, tenant_id: str, instance_id: str
                 if time.monotonic() - last_activity > _IDLE_TIMEOUT_SEC:
                     await _end_session("空闲超时，已断开 WebSSH", 4408)
                     return
+                # 顺带重验凭据。
+                #
+                # 握手时 _user_from_websocket 把 user 拷成一个 SimpleNamespace 快照,
+                # 之后主循环再没碰过数据库。于是「全设备退出」、改密码、管理员禁用
+                # 账号,统统关不掉一个**正在跑的 root 终端** —— 而唯一的时限是
+                # 30 分钟**空闲**超时,只要终端里有输出(top / tail -f / 一个
+                # keep-alive)就永远不空闲,会话时长没有上界。
+                # 只读一行 users 表,放在已有的看门狗协程里,不额外起 task。
+                try:
+                    with SessionLocal() as db:
+                        fresh = db.get(User, user.id)
+                        revoked = (
+                            fresh is None
+                            or not bool(fresh.is_active)
+                            or int(fresh.token_version or 1) != int(user.token_version)
+                        )
+                except Exception:  # noqa: BLE001
+                    # 数据库读不到不能成为踢人的理由 —— 那会让一次数据库抖动
+                    # 断开所有人的终端。下一轮再看。
+                    revoked = False
+                if revoked:
+                    await _end_session("登录状态已失效，终端已断开", 4401)
+                    return
 
         async def _write_stdin(payload: Any) -> bool:
             """Forward client input; False once the remote side is gone."""

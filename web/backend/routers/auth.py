@@ -276,7 +276,16 @@ def login(
         )
 
     ok_ip, retry_ip = login_ip_limiter.check(f"login-ip:{ip}")
-    ok_user, retry_user = login_user_limiter.check(f"login-user:{ip}:{username.lower()}")
+    # 限流键要用**归一化后**的用户名。
+    #
+    # 查找侧有 NFKC 回退（全角 ａdmin 也能命中 admin，见 normalize_username 的
+    # docstring），而这个键用的是原始串 —— 于是每换一种等价写法就是一个新桶，
+    # 攻击者靠切换全角/兼容字符就能把 10 次/5 分钟放大成任意次。
+    # 附带一个后果：NFKC 回退查找走的是全表扫描，所以每次这样的猜测还额外
+    # 花掉一次 users 全表扫。
+    ok_user, retry_user = login_user_limiter.check(
+        f"login-user:{ip}:{normalize_username(username).lower()}"
+    )
     if not ok_ip or not ok_user:
         retry = max(retry_ip, retry_user)
         # A burst tripping the limiter is the clearest single sign of an automated
@@ -437,6 +446,7 @@ def totp_setup(
 @router.post("/totp/enable")
 def totp_enable(
     body: TotpEnableRequest,
+    response: Response,
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> dict:
@@ -447,9 +457,19 @@ def totp_enable(
     if not _verify_totp(user, body.code):
         raise HTTPException(status_code=400, detail="验证码错误，请确认认证器时间与密钥正确")
     user.totp_enabled = True
+    # 开启 2FA 必须顶掉其它已有会话。
+    #
+    # 这个功能最常见的使用动机就是「有人已经进来了,我要把他赶走」——
+    # 而不 bump token_version 的话,2FA 只挡新的登录,挡不住已经握在对方手里的
+    # 那个 token,它会一直有效到自然过期。routers/audit.py 顶部的注释一直断言
+    # 「改密码和开关 2FA 都会 bump token_version 顶掉全部已有会话」,那句话在
+    # 这里为假 —— 注释和代码只能留一个,留代码。
+    user.token_version = int(user.token_version or 1) + 1
     db.commit()
     write_audit(db, owner_id=user.id, action="auth.totp_enabled", target=user.username)
-    return {"message": "两步验证已开启"}
+    # 换发本次会话的 token,否则刚开启 2FA 的人会把自己也踢下线(同 change_password)。
+    _issue(response, user)
+    return {"message": "两步验证已开启，其它设备需重新登录"}
 
 
 @router.post("/totp/disable")
@@ -466,6 +486,9 @@ def totp_disable(
         raise HTTPException(status_code=400, detail="两步验证码错误")
     user.totp_enabled = False
     user.totp_secret_encrypted = ""
+    # 关闭 2FA 同样顶掉全部会话(含本次)——账号的安全等级刚被调低,
+    # 此刻要求重新登录一次是应该的。
+    user.token_version = int(user.token_version or 1) + 1
     db.commit()
     write_audit(db, owner_id=user.id, action="auth.totp_disabled", target=user.username)
-    return {"message": "两步验证已关闭"}
+    return {"message": "两步验证已关闭，请重新登录"}

@@ -461,10 +461,17 @@ class Worker:
             log.warning("capacity prepare network job=%s: %s", job.id, exc)
 
         custom_user_data = ""
+        user_data_lost = False
         if job.user_data_encrypted:
             try:
                 custom_user_data = decrypt_text(job.user_data_encrypted)
             except Exception:  # noqa: BLE001
+                # 「这段数据还原不回来」不能降级成「用户没填」—— 两者在后面的代码里
+                # 完全不可区分，都表现为 custom_user_data == ""。于是抢机会开出一台
+                # **没跑过用户脚本**的机器，然后宣布成功：任务是绿的、尝试日志是 ok、
+                # 通知里只字不提，唯一的线索是 worker 容器日志里那一行。
+                # 和 0.4.87 修的「推送失败不留痕迹」是同一类问题，同一份代码里的另一处。
+                user_data_lost = True
                 log.exception("decrypt user_data failed job=%s (continuing without it)", job.id)
 
         # 从这里开始到 LaunchInstance 返回为止，整段要和浏览器端的创建互斥。
@@ -673,8 +680,11 @@ class Worker:
                         inst_id = part.strip(" ,.")
                         break
             job.success_instance_id = inst_id
+            attempt_note = result.message or "创建成功"
+            if user_data_lost:
+                attempt_note += "（自定义启动脚本无法解密，本次未应用）"
             self._log_attempt(
-                db, job, ok=True, message=result.message or "创建成功", ad=ad, config_label=cfg_label
+                db, job, ok=True, message=attempt_note, ad=ad, config_label=cfg_label
             )
             log.info("capacity SUCCESS job=%s instance=%s", job.id, inst_id or "?")
             # Apply Always-Free boot VPU (fire-and-forget so the worker isn't blocked
@@ -722,7 +732,13 @@ class Worker:
                     f"型号：{shape}" + (f"（{cfg_label}）" if cfg_label else "") + "\n"
                     f"可用域：{ad}\n"
                     f"OCID：{inst_id or '待查询'}\n"
-                    "公网 IP 请稍后在面板实例列表查看。"
+                    + (
+                        "⚠ 自定义启动脚本无法解密（主密钥可能已变更），本次未应用 —— "
+                        "这台机器没有跑过你的初始化脚本。\n"
+                        if user_data_lost
+                        else ""
+                    )
+                    + "公网 IP 请稍后在面板实例列表查看。"
                 ),
             )
             # 通知之后才写审计，不破坏上面那条「先落库、再做网络 I/O」的顺序：

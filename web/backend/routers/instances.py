@@ -46,6 +46,7 @@ from web.backend.quota_guard import (
     format_guard_warnings,
     free_only_for_tenant,
     region_pair,
+    resolve_secondary,
     tenant_is_secondary,
     tenant_launch_lock,
     usage_snapshot,
@@ -627,7 +628,13 @@ def free_quota(
         # A 副区 has no Always Free allowance of its own; the numbers below are a
         # per-region count and must not be read as free headroom.
         region, home_region = region_pair(session)
-        if (region and home_region and region != home_region) or tenant_is_secondary(row):
+        # 判定走 resolve_secondary,不要在这里再内联一份。
+        #
+        # 内联那份写的是 `(读到且不同) or DB hint`,`or` 让 DB hint 排在一次**成功**
+        # 的读取之后仍能翻盘 —— 于是一个 region 恰好等于主区的子行会被判成副区,
+        # 用户在自己的**主区**看不到任何额度数字,还被告知这里按量计费。
+        # 这正是 0.4.86 在 worker.py 里删掉的那个形态,当时漏了本文件这两处。
+        if resolve_secondary(session, row):
             data = {
                 **data,
                 "secondary_region": True,
@@ -667,7 +674,9 @@ def launch_quota_check(
         # Mirror the launch path's 副区 gate here so the panel's verdict matches
         # what submitting would actually do (see enforce_secondary_region).
         region, home_region = region_pair(session)
-        secondary = bool(region and home_region and region != home_region) or tenant_is_secondary(row)
+        # 同上:和创建路径的 enforce_secondary_region 用同一套判定,否则预检与
+        # 服务端会在同一次提交上给出相反结论(预检放行 → 确认框打开 → 提交 400)。
+        secondary = resolve_secondary(session, row)
         if secondary:
             region = region or (row.region or "")
             home_region = home_region or "主区"

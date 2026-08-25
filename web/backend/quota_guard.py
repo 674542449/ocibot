@@ -32,7 +32,13 @@ def region_pair(session: Any) -> tuple[str, str]:
     """
     try:
         current = str(getattr(getattr(session, "tenant", None), "region", "") or "").strip().lower()
-        home = str(session.home_region() or "").strip().lower()
+        # 优先要**确认过**的主区。home_region() 在区域订阅读失败时会回退到租户自己
+        # 填的 region,那样 current 和 home 必然相等 ——「读不到」被伪装成「当前就是
+        # 主区」,而本函数的 docstring 和 resolve_secondary 都建立在「读不到返回空串」
+        # 之上。副区闸门会因此在最需要它的时候失效。
+        # getattr 兜底:测试里的桩会话只有 home_region()。
+        probe = getattr(session, "home_region_confirmed", None) or session.home_region
+        home = str(probe() or "").strip().lower()
     except Exception:  # noqa: BLE001
         return "", ""
     if not _REGION_ID.match(current) or not _REGION_ID.match(home):
@@ -238,7 +244,9 @@ def check_launch_quota(
         free_only_mode = free_only_for_tier(tier)
     if usage is None:
         usage = _usage_snapshot(session, free_only_mode=bool(free_only_mode))
-    tier = str(usage.get("account_tier") or tier or "")
+    # 数据库行是权威,快照只是兜底 —— 顺序反过来会让**会话里冻结的旧等级**
+    # 压过调用方刚从数据库读到的新等级。
+    tier = str(tier or usage.get("account_tier") or "")
     return free_quota.validate_launch_against_quota(
         shape=shape,
         ocpus=ocpus,
@@ -346,7 +354,9 @@ def enforce_shape_resize_quota(
     blocked = _blocked_by_incomplete_read(usage, bool(free_only_mode), tier)
     if blocked:
         raise HTTPException(status_code=503, detail=blocked)
-    tier = str(usage.get("account_tier") or tier or "")
+    # 数据库行是权威,快照只是兜底 —— 顺序反过来会让**会话里冻结的旧等级**
+    # 压过调用方刚从数据库读到的新等级。
+    tier = str(tier or usage.get("account_tier") or "")
     guard = free_quota.validate_shape_resize_against_quota(
         shape=shape,
         current_ocpus=current_ocpus,

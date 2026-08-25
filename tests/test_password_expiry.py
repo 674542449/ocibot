@@ -60,13 +60,29 @@ def test_user_marked_cant_expire_wins_over_the_policy():
     assert "永不过期" in out["summary"]
 
 
-def test_real_date_is_computed_from_the_last_password_change():
+def test_real_date_is_computed_from_the_last_password_change(monkeypatch):
+    """把本地时区钉成「此刻正好是当地中午」，否则这条断言每天都会红一次。
+
+    0.4.87 起 summary 里的日期按**本地**日历日渲染，而这里的 expected 是拿
+    UTC 算的。两者在 UTC 时间跨过本地日界之后就差一天 —— 对 UTC+8 来说就是
+    每天 16:00 UTC 之后必红。tests/test_password_expiry_days.py 当时钉住了
+    这个时区，本文件漏了。
+
+    钉到中午而不是钉成 UTC：这里的算术是 now ± 100 天，只要当地时间离午夜够远，
+    任何 ±12 小时以内的偏移都不会跨日界。
+    """
+    now = datetime.now(timezone.utc)
+    tz = timezone(timedelta(hours=12 - now.hour))
+    monkeypatch.setattr(
+        TenantSession, "_to_local", staticmethod(lambda v: v.astimezone(tz))
+    )
+
     out = effective([_policy("p1", 120)], _user(last_set=_iso(20)))
     assert out["expires"] is True
     assert out["days"] == 120
     # 120 day policy, changed 20 days ago -> ~100 left.
     assert out["days_left"] in (99, 100)
-    expected = (datetime.now(timezone.utc) + timedelta(days=100)).strftime("%Y-%m-%d")
+    expected = (now + timedelta(days=100)).astimezone(tz).strftime("%Y-%m-%d")
     assert expected in out["summary"]
     assert out["expires_at"]
 
