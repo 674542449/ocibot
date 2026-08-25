@@ -25,21 +25,6 @@ ROOT_PASSWORD_TAG = "ocibot_root_password"
 # being a fact only this panel knows.
 TERMINATE_PROTECT_TAG = "ocibot_protected"
 
-# 容量报告的状态取值。Oracle 只定义了三个，SDK 把**任何**它不认识的值映射成字面量
-# 字符串 "UNKNOWN_ENUM_VALUE"（不是抛异常），而字段本身还可能是 None ——
-# 所以实际要处理五种输入，映射表兜不住的一律归 unknown。
-RADAR_AVAILABLE = "available"
-RADAR_OUT_OF_CAPACITY = "out_of_capacity"
-RADAR_NOT_SUPPORTED = "not_supported"
-RADAR_UNKNOWN = "unknown"
-
-CAPACITY_STATUS_MAP = {
-    "AVAILABLE": RADAR_AVAILABLE,
-    "OUT_OF_HOST_CAPACITY": RADAR_OUT_OF_CAPACITY,
-    "HARDWARE_NOT_SUPPORTED": RADAR_NOT_SUPPORTED,
-    "UNKNOWN_ENUM_VALUE": RADAR_UNKNOWN,
-}
-
 
 def _format_probe_report(
     user_name: str,
@@ -185,21 +170,6 @@ def _err_facts(exc: BaseException) -> dict[str, Any]:
         "operation": str(getattr(exc, "operation_name", "") or ""),
         "host": _endpoint_host(exc),
     }
-
-
-def _as_float_or_none(value: Any) -> Optional[float]:
-    try:
-        return None if value is None else float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _as_int_or_none(value: Any) -> Optional[int]:
-    """None 必须原样保留,不能折成 0 —— 见 get_capacity_report 里 available_count 的注释。"""
-    try:
-        return None if value is None else int(value)
-    except (TypeError, ValueError):
-        return None
 
 # Bounded parallelism for OCI network calls. The SDK clients wrap a
 # requests.Session, which tolerates concurrent GETs; keep pools small so a
@@ -1760,149 +1730,6 @@ class TenantSession:
             return [a.name for a in ads]
         except ServiceError as exc:
             raise OCIClientError(_format_service_error(exc)) from exc
-
-    def get_capacity_report(
-        self,
-        availability_domain: str,
-        shape: str,
-        configs: list[tuple[float, float]],
-        *,
-        compartment_id: Optional[str] = None,
-    ) -> OperationResult:
-        """CreateComputeCapacityReport —— 只读探测，**不创建任何实例或计费资源**。
-
-        接口名里带 Create，但它创建的是一份「报告」：响应模型
-        (oci.core.models.ComputeCapacityReport) 连 `id` 和 `lifecycle_state` 都没有，
-        ComputeClient 上也只有 create、没有 get/list/delete —— 没有东西可枚举，
-        也没有东西要清理。Oracle 自己的 SDK docstring 写的就是这个用途：
-        "Use the capacity report to determine whether sufficient capacity is
-        available for a shape **before you create an instance**"。
-
-        但它**不是免费的**：这是一次普通的 Core API POST
-        (POST /20160918/computeCapacityReports)，和 LaunchInstance 走同一个
-        per-tenancy 请求速率桶。别把它当成「零消耗」—— 它省下的是一次注定失败的
-        写入，不是省下一次请求。
-
-        retry_strategy 显式关掉，理由和 LaunchInstance 那处（见 launch_instance）
-        一样：SDK 的默认策略是 8 次尝试 / 总时长上限 600 秒、429 和任意 5xx 都重试。
-        不关的话，一次被限流的探测最多变成 8 个 HTTP 请求，并把调用线程占住十分钟 ——
-        而本项目所有路由都是同步 def，每个请求占一个 anyio 线程，卡住几十个就够让
-        整个面板看起来像死了。关掉之后「一次探测 = 每个 AD 恰好一个请求」，
-        429 立刻回到应用层，请求量可预测。
-
-        compartment 的取舍：SDK 的字段 docstring 写着 "This should always be the
-        root compartment"，但上面 list_availability_domains 那段注释记着一个真实的
-        坑 —— 一个 IAM 策略只覆盖子 compartment 的密钥，问根会拿到
-        NotAuthorizedOrNotFound。所以先问 resolve_compartment()，只在 404/403 上
-        回退一次根。**不在 429 上回退**：那会把一次限流变成两次请求。
-        """
-        comp = (compartment_id or self.resolve_compartment()).strip()
-        root = self.tenant.tenancy_ocid.strip()
-        attempts = [comp]
-        if root and root != comp:
-            attempts.append(root)
-
-        last_exc: Optional[ServiceError] = None
-        for idx, target in enumerate(attempts):
-            try:
-                rows = self._capacity_report_once(target, availability_domain, shape, configs)
-            except ServiceError as exc:
-                last_exc = exc
-                status = getattr(exc, "status", None)
-                # 只有「可能是 compartment 选错了」才值得再花一个请求。
-                # 429 绝不回退 —— 被限流时再发一次只会让情况更糟。
-                if idx + 1 < len(attempts) and status in (403, 404):
-                    continue
-                return OperationResult(
-                    ok=False,
-                    message=_format_service_error(exc),
-                    data={
-                        "status": status,
-                        "code": str(getattr(exc, "code", "") or ""),
-                        "compartment_id": target,
-                    },
-                )
-            except Exception as exc:  # noqa: BLE001
-                return OperationResult(
-                    ok=False,
-                    message=str(exc),
-                    data={"status": None, "code": "", "compartment_id": target},
-                )
-            return OperationResult(
-                ok=True,
-                message="",
-                data={
-                    "compartment_id": target,
-                    "used_root_compartment": bool(root and target == root and target != comp),
-                    "rows": rows,
-                },
-            )
-
-        # attempts 至少有一项，走不到这里；保底不让函数隐式返回 None。
-        return OperationResult(
-            ok=False,
-            message=_format_service_error(last_exc) if last_exc else "容量探测失败",
-            data={"status": None, "code": "", "compartment_id": comp},
-        )
-
-    def _capacity_report_once(
-        self,
-        compartment_id: str,
-        availability_domain: str,
-        shape: str,
-        configs: list[tuple[float, float]],
-    ) -> list[dict[str, Any]]:
-        """一次调用（一个 AD）。configs 里的每一组规格是请求里的一个 entry。
-
-        一次调用只覆盖一个 availability_domain，但 shape_availabilities 是个**列表** ——
-        所以「主配置 + 全部备用配置」是一次请求的事，成本 = AD 数，不是 AD 数 × 配置数。
-        """
-        entries = []
-        for ocpus, memory in configs:
-            # 只设 ocpus / memory_in_gbs。
-            #
-            # 绝不设 baseline_ocpu_utilization：A1 不是 burstable 机型，而这个字段
-            # 是枚举，给一个 SDK 不认识的值会被静默序列化成字符串
-            # "UNKNOWN_ENUM_VALUE" 发给 Oracle。nvmes 同理，A1.Flex 没有本地 NVMe。
-            cfg = oci.core.models.CapacityReportInstanceShapeConfig(
-                ocpus=float(ocpus), memory_in_gbs=float(memory)
-            )
-            entries.append(
-                # 不设 fault_domain：本项目创建实例时从不指定故障域
-                # （SAFE_LAUNCH_FIELDS 里没有这个字段），所以按 FD 提问会问出一个
-                # 系统给不了的选择。留空时 Oracle 自己决定按 FD 逐行返回还是只给
-                # 一行 AD 级汇总 —— 两种形状下面都能处理。
-                oci.core.models.CreateCapacityReportShapeAvailabilityDetails(
-                    instance_shape=shape, instance_shape_config=cfg
-                )
-            )
-        details = oci.core.models.CreateComputeCapacityReportDetails(
-            compartment_id=compartment_id,
-            availability_domain=availability_domain,
-            shape_availabilities=entries,
-        )
-        resp = self.compute.create_compute_capacity_report(
-            details, retry_strategy=sdk_no_retry_strategy()
-        )
-        out: list[dict[str, Any]] = []
-        for row in getattr(resp.data, "shape_availabilities", None) or []:
-            cfg = getattr(row, "instance_shape_config", None)
-            raw = str(getattr(row, "availability_status", "") or "")
-            out.append(
-                {
-                    # 可能是 None —— 那表示这一行是 AD 级汇总，不是某个具体 FD。
-                    "fault_domain": getattr(row, "fault_domain", None) or None,
-                    "ocpus": _as_float_or_none(getattr(cfg, "ocpus", None)),
-                    "memory_in_gbs": _as_float_or_none(getattr(cfg, "memory_in_gbs", None)),
-                    # 普通公有云租户这里**恒为 None**（只有 DRCC / 白名单租户拿得到
-                    # 数字）。绝不要在这里把 None 折成 0：那会渲染成「可开 0 台」，
-                    # 和「无货」长得一模一样，而它的真实含义是「有货，但 Oracle
-                    # 不告诉你还剩几台」。
-                    "available_count": _as_int_or_none(getattr(row, "available_count", None)),
-                    "status": CAPACITY_STATUS_MAP.get(raw, RADAR_UNKNOWN),
-                }
-            )
-        return out
 
     def list_images(
         self,

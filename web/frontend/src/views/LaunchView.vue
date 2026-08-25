@@ -84,37 +84,9 @@
           {{ quotaLoadError }}
         </p>
       </div>
-      <!-- 容量雷达。只出建议，不做拦截 —— 见 radarBlocking 上面那段注释。 -->
-      <div v-if="radar || radarError" class="card" style="padding: 0.65rem; font-size: 12px">
-        <div class="row" style="justify-content: space-between">
-          <strong>容量雷达</strong>
-          <span v-if="radar" class="badge" :class="radarBadge(radar.overall)">
-            {{ radarGlyph(radar.overall) }} {{ radarText(radar.overall) }}
-          </span>
-        </div>
-        <div v-if="radar" class="muted" style="margin-top: 0.25rem">
-          <div v-for="r in radar.results" :key="r.availability_domain" style="margin-top: 0.15rem">
-            <span class="badge" :class="radarBadge(r.status)" style="font-size: 11px">
-              {{ radarGlyph(r.status) }} {{ radarText(r.status) }}
-            </span>
-            <span class="mono" style="margin-left: 0.35rem">{{ shortAdName(r.availability_domain) }}</span>
-            <div v-if="r.reason" class="warn-text" style="white-space: pre-line; margin-top: 0.15rem">{{ r.reason }}</div>
-          </div>
-        </div>
-        <p v-if="radarError" class="muted warn-text" style="margin: 0.35rem 0 0">{{ radarError }}</p>
-        <p v-if="radarBlocking" class="warn-text" style="margin: 0.35rem 0 0">
-          Oracle 现在报告这个可用域没有 {{ form.shape }} 的容量。你仍然可以提交 ——
-          报告是瞬间快照，且已知在 A1.Flex 上出现过结论倒置的案例。若创建被拒，
-          建议勾选下方的「容量不足时自动重试」把它挂进抢机任务。
-        </p>
-      </div>
       <div class="row">
-        <button
-          :class="radarBlocking ? '' : 'primary'"
-          :disabled="submitting"
-          @click="doLaunch"
-        >
-          {{ submitting ? '创建中…' : (radarBlocking ? '仍然创建' : '确认并创建') }}
+        <button class="primary" :disabled="submitting" @click="doLaunch">
+          {{ submitting ? '创建中…' : '确认并创建' }}
         </button>
         <button type="button" :disabled="submitting" @click="confirmOpen = false">返回修改</button>
       </div>
@@ -558,42 +530,6 @@ const loadingMeta = ref(false)
 const submitting = ref(false)
 const confirmOpen = ref(false)
 
-// ---- 容量雷达（只支持 A1.Flex，见 probeCapacity） ----
-const RADAR_SHAPE = 'VM.Standard.A1.Flex'
-type RadarStatus = 'available' | 'out_of_capacity' | 'not_supported' | 'unknown'
-const radar = ref<any>(null)
-const radarError = ref('')
-
-/** 报告说「这个可用域没货」。仅用于把按钮降级 + 加一句说明，**不禁用任何东西**。 */
-const radarBlocking = computed(
-  () => radar.value?.overall === 'out_of_capacity' || radar.value?.overall === 'not_supported',
-)
-
-function radarText(s: RadarStatus) {
-  const m: Record<string, string> = {
-    available: '有货',
-    out_of_capacity: '暂无容量',
-    not_supported: '不提供此机型',
-  }
-  return m[s] || '读不到'
-}
-function radarGlyph(s: RadarStatus) {
-  const m: Record<string, string> = { available: '●', out_of_capacity: '○', not_supported: '⊘' }
-  return m[s] || '?'
-}
-/** 红色只给「读不到」——「没货」用琥珀，和任务中心保持一致。 */
-function radarBadge(s: RadarStatus) {
-  const m: Record<string, string> = {
-    available: 'running',
-    out_of_capacity: 'warn',
-    not_supported: 'stopped',
-  }
-  return m[s] || 'err'
-}
-function shortAdName(ad: string) {
-  const i = ad.indexOf(':')
-  return i >= 0 ? ad.slice(i + 1) : ad
-}
 const error = ref('')
 const msg = ref('')
 /** Held until the user acknowledges them. One entry per created instance.
@@ -1299,52 +1235,7 @@ async function openConfirm() {
     error.value = '当前配置会超出 Always Free 免费额度，已阻止提交（详见下方说明）'
     return
   }
-  // 额度放行之后才探容量：一个会被额度拦下的配置不值得花一次容量报告。
-  // 探测**从不阻断**确认框 —— 它只往框里加一段结论。
-  await probeCapacity(wanted)
-  if (tenantId.value !== wanted) return
   confirmOpen.value = true
-}
-
-/**
- * 容量雷达：创建之前先问 Oracle 这个可用域还有没有货。
- *
- * **只出建议，不做拦截。** 三条理由，每一条都足以否掉硬门：
- *   1. 容量报告是瞬时快照，和随后那次 LaunchInstance 之间必然有竞态；
- *   2. oracle/oci-cli issue #748 记录过 A1.Flex 上结论完全倒置的案例（报告说有货的
- *      可用域开不出来、说无货的反而开得出来），该 issue 至今未关闭；
- *   3. CreateComputeCapacityReport 需要一条和 LaunchInstance 完全不相交的 IAM 授权，
- *      「能创建但调不了报告」是常见配置。
- * 硬拦就是把 0.4.84/0.4.85 那个故事换一个权限重演一遍 —— 那次是预检比服务端严格，
- * 导致缺某项权限的租户从 UI 上**永久**无法创建实例。
- *
- * 并发写法照抄 checkQuotaForForm：序号 + 捕获租户，绝不写 `if (busy) return` 就完事。
- */
-let radarSeq = 0
-
-async function probeCapacity(wanted: string) {
-  const mine = ++radarSeq
-  radar.value = null
-  radarError.value = ''
-  if (!wanted || form.shape !== RADAR_SHAPE) {
-    // 雷达只支持 A1.Flex。别的机型不探，也不假装探过。
-    return
-  }
-  try {
-    const { data } = await api.post(`/tenants/${wanted}/capacity-report`, {
-      shape: form.shape,
-      ocpus: form.ocpus,
-      memory_in_gbs: form.memory_in_gbs,
-      availability_domain: form.availability_domain,
-    })
-    if (mine !== radarSeq || tenantId.value !== wanted) return
-    radar.value = data
-  } catch (e: any) {
-    if (mine !== radarSeq || tenantId.value !== wanted) return
-    // fail-open，理由同 checkQuotaForForm 的 catch 分支：预检自身失败不该
-    // 阻断一次服务端很可能会接受的创建。
-    radarError.value = `容量探测未完成（${e?.message || '未知错误'}），不影响创建。`
-  }
 }
 
 /**

@@ -30,14 +30,6 @@ withDefaults(
       <circle cx="12" cy="12" r="8.5" />
       <path d="M12 8v8M8 12h8" />
     </g>
-    <!-- radar：同心圆 + 扫描线 + 回波点。回波用 r=1 的**描边**圆而不是 fill，
-         整套图标没有任何 fill 图形，用实心点会让它成为唯一的例外。 -->
-    <g v-else-if="name === 'radar'" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-      <circle cx="12" cy="12" r="8.5" />
-      <circle cx="12" cy="12" r="4" />
-      <path d="M12 12 18.2 5.8" />
-      <circle cx="8.4" cy="15.4" r="1" />
-    </g>
     <!-- jobs -->
     <g v-else-if="name === 'jobs'" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
       <circle cx="12" cy="12" r="8.5" />

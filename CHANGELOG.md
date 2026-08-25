@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.4.92 — 2026-08-25
+
+### 移除
+
+- **容量雷达整个下线**（0.4.88 加入，0.4.89/0.4.90/0.4.91 三次修补）。
+
+  它在 0.4.91 之前会为了拿一份可用域列表而调用 `fetch_launch_meta()`，
+  那个函数的冷调用带 `ensure_default_network(create_if_missing=True)` ——
+  **一个宣称「只读，绝不创建任何实例」的功能，会在租户里创建 VCN、子网、网关和路由表。**
+  0.4.91 修好了这一点，但这个功能本身的价值经不起它带来的复杂度：
+
+  * Oracle 的容量报告对 A1.Flex **不可靠** —— oracle/oci-cli issue #748 记录了结论
+    完全倒置的案例（报告说有货的可用域开不出来、说无货的反而开得出来），至今未关闭；
+  * `available_count` 对普通公有云租户**恒为 null**，所以雷达能给的只有一个
+    三值状态，而那个状态还可能是错的；
+  * 它需要一条和创建实例完全不相交的 IAM 授权（`manage compute-capacity-reports`），
+    很多账号根本调不了，只能显示「读不到」；
+  * 它和抢机重试共用同一个 per-tenancy 请求速率桶。
+
+  一个不可靠、经常读不到、还要花请求预算的建议，不值得留在创建流程里。
+  抢机任务本来就会自己撞 `OutOfHostCapacity` 再退避 —— 那是**真实**的容量信号。
+
+  删除的内容：`/radar` 页面与导航项、`POST /api/tenants/{id}/capacity-report`、
+  `web/backend/capacity_radar.py`、`TenantSession.get_capacity_report()`、
+  创建页确认框里的容量提示、雷达图标、限流器与请求模型、`tests/test_capacity_radar.py`。
+
+  **没有数据库改动需要回滚** —— 这个功能自始至终没有加过任何表或列
+  （缓存是进程内的），所以不涉及 CLAUDE.md 那条「不要给已部署的数据库删列」的规则。
+
+  0.4.90 的「测试连接」诊断改进**不受影响**，那是独立的修复，保留。
+
+### 升级
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.92
+```
+
+升级后导航栏里的「容量雷达」会消失；若浏览器停在 `/radar`，刷新即可回到实例列表。
+
 ## 0.4.91 — 2026-08-25
 
 ### 修复
