@@ -125,7 +125,9 @@ def test_the_subtree_call_bounds_its_own_retry():
     """oci.pagination.list_call_get_all_results 自己**硬编码**又套了一层
     DEFAULT_RETRY_STRATEGY，和 client 层那个相乘：8 × 8 = 最坏 64 次真实调用、
     ~600 秒卡在一个 HTTP 请求里 —— 在跟抢机重试循环抢同一个 per-tenancy 限流额度。"""
-    code = _code_only(TenantSession.list_compartments)
+    # 0.4.95 起这段搬进了 _compartment_children（非根 compartment 要逐层 BFS，
+    # 每一层都走这个辅助函数）。
+    code = _code_only(TenantSession._compartment_children)
 
     assert "RetryStrategyBuilder" in code
     assert "max_attempts = 3" in code.replace("=", " = ").replace("  ", " ")
@@ -141,9 +143,9 @@ def test_access_level_stays_accessible():
     换成 ANY 等于要求调用方在整个请求范围上拿到授权，而权限受限的租户正是当前
     枚举会失败的那批人。那个改动只会把「有时候能枚举」变成「永远不能枚举」。
     """
-    src = inspect.getsource(TenantSession.list_compartments)
-    assert 'access_level="ACCESSIBLE"' in src
-    assert 'access_level="ANY"' not in src
+    src = inspect.getsource(TenantSession._compartment_children)
+    assert '"access_level": "ACCESSIBLE"' in src
+    assert '"ANY"' not in src
 
 
 # ---------------------------------------------------------------- 一次复读

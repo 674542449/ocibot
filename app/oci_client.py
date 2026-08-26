@@ -128,6 +128,22 @@ def _format_probe_report(
 _ENDPOINT_HOST_RE = re.compile(r"https?://([^/\s?]+)")
 
 
+def _vpus_or_default(raw: Any, default: int = 10) -> int:
+    """读 vpus_per_gb。**0 是合法值**（Lower Cost 档），不能被 `or` 吃掉。
+
+    原来四处都写成 `int(getattr(v, "vpus_per_gb", 10) or 10)` —— Python 里
+    `0 or 10` 等于 10，于是一块真正配成 0 VPUs/GB 的卷会被显示成 10 并标成
+    「平衡」。这是把一个**更便宜、更慢**的档次显示成标准档，方向和用户的实际
+    配置正好相反。只有 None（字段真的没返回）才该退回默认值。
+    """
+    if raw is None:
+        return int(default)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return int(default)
+
+
 def _endpoint_host(exc: Any) -> str:
     """从 ServiceError 里只取**主机名**,绝不取原文。
 
@@ -407,6 +423,9 @@ def sanitize_launch_payload(payload: dict, *, for_retry: bool = False) -> dict:
         if not 50 <= boot_size <= 32768:
             raise ValueError("Boot Volume 大小必须在 50–32768 GB 之间")
         clean["boot_volume_size_in_gbs"] = boot_size
+    # 创建路径刻意**不**开放 0（Lower Cost）：前端下拉里也没有这一档，而创建时
+    # 选错性能是要重建机器才能改回来的。已存在的卷读回 0 时不再被改写成 10
+    # （见 _vpus_or_default），调整路径也接受 0 —— 只有「新建」这一步保持保守。
     vpus = int(clean.get("boot_volume_vpus_per_gb") or 10)
     if vpus not in (10, 20) and not 30 <= vpus <= 120:
         raise ValueError("Boot Volume 性能必须为 10、20 或 30–120 VPUs/GB")
@@ -1239,6 +1258,113 @@ class TenantSession:
             },
         )
 
+    # Oracle: "Maximum nested compartment hierarchy levels: 6"
+    # （Content/Identity/compartments/Working_with_Compartments.htm 的 Limits 一节）
+    # root 自己可能已经在第 1~5 层，所以从 root 往下再走 6 层是严格的上界。
+    _MAX_COMPARTMENT_DEPTH = 6
+    # 请求预算硬闸。超了就当「没读全」上报，绝不当成读全了 —— 这正是本 bug 的教训。
+    _MAX_COMPARTMENT_CALLS = 64
+
+    def _compartment_children(self, cid: str, *, in_subtree: bool = False) -> list[Any]:
+        """列出一个 compartment 的子项。
+
+        `compartment_id_in_subtree` **只有在租户根上才有意义**，所以默认整个不传。
+        """
+        kwargs: dict[str, Any] = {
+            # ACCESSIBLE 是**结果过滤器**：只返回调用方有 INSPECT 权限的那些。
+            # 不要换成 ANY —— 文档里 "permissions are not checked" 说的是过滤器
+            # 不生效，不是「不需要权限」；换成 ANY 等于要求调用方在整个请求范围上
+            # 拿到授权，而权限受限的租户正是枚举会失败的那批人。
+            "access_level": "ACCESSIBLE",
+            # 分页层自己**硬编码**又套了一层 DEFAULT_RETRY_STRATEGY，和 client 层
+            # 那个相乘：最坏 8 × 8 = 64 次真实调用、~600 秒卡在一个 HTTP 请求里 ——
+            # 在跟抢机重试循环抢同一个 per-tenancy 限流额度（CLAUDE.md）。
+            # 收敛到 3 次 / 20 秒。service_error_retry_config 是**替换**语义，
+            # 429/409 必须自己抄回来；也**不含 404** —— Oracle 的错误表把
+            # 404 NotAuthorizedOrNotFound 的 Retry 列标成 "No."。
+            "retry_strategy": oci.retry.RetryStrategyBuilder(
+                max_attempts_check=True,
+                max_attempts=3,
+                total_elapsed_time_check=True,
+                total_elapsed_time_seconds=20,
+                retry_base_sleep_time_seconds=1,
+                retry_max_wait_between_calls_seconds=4,
+                service_error_check=True,
+                service_error_retry_on_any_5xx=True,
+                service_error_retry_config={
+                    409: ["IncorrectState", "LockConflict"],
+                    429: [],
+                },
+            ).get_retry_strategy(),
+        }
+        if in_subtree:
+            kwargs["compartment_id_in_subtree"] = True
+        resp = oci.pagination.list_call_get_all_results(
+            self.identity.list_compartments, cid, **kwargs
+        )
+        return list(resp.data or [])
+
+    def _walk_compartment_subtree(self, root: str) -> tuple[list[Any], bool]:
+        """逐层 BFS 出 root 的整棵子树。返回 (compartments, truncated)。
+
+        为什么不能一次问完：ListCompartments 的文档说得很死 ——
+
+            "With the exception of the tenancy (root compartment), the
+             ListCompartments operation returns only the first-level child
+             compartments in the parent compartment specified in compartmentId.
+             The list does not include any subcompartments of the child
+             compartments (grandchildren)."
+            ":param bool compartment_id_in_subtree: Default is false. Can only be
+             set to true when performing ListCompartments on the tenancy
+             (root compartment)."
+
+        对非根传 `compartment_id_in_subtree=True` 是**静默忽略**（调用成功、HTTP 200、
+        只回一层），不是报错。于是孙层里的实例/卷一个都不在列表里，而
+        `_last_tree_errors` 是空的、`read_incomplete` 是 False —— 配额守卫拿着一份
+        少算的用量，认为额度还有富余，放行一台**计费**机器。
+        这正是「读漏了却看起来像读全了」，比「读不到」危险得多。
+
+        为什么不改成「从租户根 + subtree=True 列全，再客户端筛」：那要
+        `inspect compartments in tenancy` 权限，而会把 compartment_ocid 指向子
+        compartment 的租户，恰恰是策略被限制在那一层的那批人 —— 对他们会 404，
+        等于把静默漏数换成更狠的静默漏数。
+
+        环：OCI 的 compartment 是树（每个只有一个父指针），但我没有找到一句官方
+        文档保证「不能移到自己的后代下」。所以不依赖无环 —— `seen` 集合加深度上限
+        让任何环结构都必然终止。
+        """
+        out: list[Any] = []
+        seen: set[str] = {root}
+        frontier = [root]
+        calls = 0
+        depth = 0
+        while frontier and depth < self._MAX_COMPARTMENT_DEPTH:
+            nxt: list[str] = []
+            for cid in frontier:
+                if calls >= self._MAX_COMPARTMENT_CALLS:
+                    return out, True
+                calls += 1
+                # 异常**不吞** —— 让它冒到 list_compartments 的 except，
+                # 那里会写 _last_enum_facts 并按 strict 决定要不要 raise。
+                for c in self._compartment_children(cid):
+                    state = str(getattr(c, "lifecycle_state", "") or "")
+                    # DELETING/DELETED 跳过且不下钻：文档要求 compartment 必须先清空
+                    # 所有资源（含子 compartment）才能删，所以它们里面没有可计数的
+                    # 东西；删除失败还会回到 ACTIVE，下次枚举自然重新收进来。
+                    # 注意 CREATING / INACTIVE **不能**跳过 —— 它们可以持有资源。
+                    if state in ("DELETED", "DELETING"):
+                        continue
+                    cid_child = getattr(c, "id", "") or ""
+                    if not cid_child or cid_child in seen:
+                        continue
+                    seen.add(cid_child)
+                    out.append(c)
+                    nxt.append(cid_child)
+            frontier = nxt
+            depth += 1
+        # frontier 非空 = 撞到深度上限，还有没走的层。
+        return out, bool(frontier)
+
     def list_compartments(
         self,
         parent_id: Optional[str] = None,
@@ -1260,39 +1386,17 @@ class TenantSession:
             items = [{"id": tenancy, "name": "(根) Tenancy", "description": "root"}]
         else:
             items = [{"id": root, "name": "(当前) Compartment", "description": "selected"}]
+        truncated = False
         try:
-            response = oci.pagination.list_call_get_all_results(
-                self.identity.list_compartments,
-                root,
-                compartment_id_in_subtree=bool(subtree),
-                # ACCESSIBLE 是**结果过滤器**：只返回调用方有 INSPECT 权限的那些。
-                # 不要换成 ANY —— 文档里 "permissions are not checked" 说的是过滤器
-                # 不生效，不是「不需要权限」；换成 ANY 等于要求调用方在整个请求范围上
-                # 拿到授权，而权限受限的租户正是当前枚举会失败的那批人，只会让
-                # 「有时候能枚举」变成「永远不能枚举」。
-                access_level="ACCESSIBLE",
-                # 分页层自己**硬编码**又套了一层 DEFAULT_RETRY_STRATEGY，和 client 层
-                # 那个相乘：8 × 8 = 最坏 64 次真实调用、~600 秒卡在一个 HTTP 请求里。
-                # 这是在跟抢机重试循环抢同一个 per-tenancy 限流额度（CLAUDE.md）。
-                # 收敛到 3 次 / 20 秒。注意 service_error_retry_config 是**替换**语义，
-                # 429/409 必须自己抄回来，漏写就把它们的重试一起丢掉；也**不含 404**
-                # —— Oracle 的错误表把 404 NotAuthorizedOrNotFound 的 Retry 列标成 "No."。
-                retry_strategy=oci.retry.RetryStrategyBuilder(
-                    max_attempts_check=True,
-                    max_attempts=3,
-                    total_elapsed_time_check=True,
-                    total_elapsed_time_seconds=20,
-                    retry_base_sleep_time_seconds=1,
-                    retry_max_wait_between_calls_seconds=4,
-                    service_error_check=True,
-                    service_error_retry_on_any_5xx=True,
-                    service_error_retry_config={
-                        409: ["IncorrectState", "LockConflict"],
-                        429: [],
-                    },
-                ).get_retry_strategy(),
-            )
-            for c in response.data:
+            if not subtree:
+                raw = self._compartment_children(root)
+            elif root == tenancy or root.startswith("ocid1.tenancy."):
+                # 只有在**租户根**上，compartment_id_in_subtree 才真正生效。
+                raw = self._compartment_children(root, in_subtree=True)
+            else:
+                # 非根：必须自己逐层走。见 _walk_compartment_subtree 的注释。
+                raw, truncated = self._walk_compartment_subtree(root)
+            for c in raw:
                 state = getattr(c, "lifecycle_state", "") or ""
                 if state in ("DELETED", "DELETING"):
                     continue
@@ -1303,6 +1407,25 @@ class TenantSession:
                         "description": getattr(c, "description", "") or "",
                     }
                 )
+            if truncated:
+                # 「走不完」必须和「读不到」走同一条通道 —— 本 bug 的教训就是
+                # 「读漏了但看起来像读全了」，绝不能再造一个同形的洞。
+                self._last_enum_facts = {
+                    "type": "SubtreeTruncated",
+                    "status": 0,
+                    "code": "SubtreeTruncated",
+                    "request_id": "",
+                    "operation": "list_compartments",
+                    "host": "",
+                }
+                if strict:
+                    raise OCIClientError(
+                        "子 Compartment 层级过深或数量过多，本次没有遍历完整。"
+                        "为避免把「没读全」当成「读全了」，这里主动报错 —— "
+                        "请把租户配置里的 Compartment OCID 指向更靠近资源的那一层。"
+                    )
+        except OCIClientError:
+            raise
         except Exception as exc:  # noqa: BLE001
             # 必须是 except Exception，不能只接 ServiceError。
             #
@@ -1403,7 +1526,7 @@ class TenantSession:
                     return
                 bv = self.blockstorage.get_boot_volume(bv_id).data
                 size = int(getattr(bv, "size_in_gbs", 0) or 0)
-                vpu = int(getattr(bv, "vpus_per_gb", 10) or 10)
+                vpu = _vpus_or_default(getattr(bv, "vpus_per_gb", None))
                 info.boot_volume_gb = size or None
                 info.boot_vpus_per_gb = vpu
             except Exception:
@@ -3324,7 +3447,7 @@ class TenantSession:
             if not bv_id:
                 return OperationResult(ok=False, message="未找到实例的引导卷")
             bv = self.blockstorage.get_boot_volume(bv_id).data
-            vpu = int(getattr(bv, "vpus_per_gb", 10) or 10)
+            vpu = _vpus_or_default(getattr(bv, "vpus_per_gb", None))
             if vpu <= 10:
                 perf_label = "平衡"
             elif vpu <= 20:
@@ -3434,7 +3557,7 @@ class TenantSession:
                         if state in {"TERMINATED", "TERMINATING"}:
                             continue
                         seen.add(vid)
-                        vpu = int(getattr(bv, "vpus_per_gb", 10) or 10)
+                        vpu = _vpus_or_default(getattr(bv, "vpus_per_gb", None))
                         is_hydrated = getattr(bv, "is_hydrated", None)
                         volumes.append(
                             {
@@ -3695,8 +3818,8 @@ class TenantSession:
         """
         if size_in_gbs is None and vpus_per_gb is None:
             return OperationResult(ok=False, message="未指定新的大小或性能")
-        if vpus_per_gb is not None and vpus_per_gb not in (10, 20) and not 30 <= int(vpus_per_gb) <= 120:
-            return OperationResult(ok=False, message="性能必须为 10、20 或 30–120 VPUs/GB")
+        if vpus_per_gb is not None and vpus_per_gb not in (0, 10, 20) and not 30 <= int(vpus_per_gb) <= 120:
+            return OperationResult(ok=False, message="性能必须为 0（低成本）、10、20 或 30–120 VPUs/GB")
         if size_in_gbs is not None and not 50 <= int(size_in_gbs) <= 32768:
             return OperationResult(ok=False, message="引导卷大小必须在 50–32768 GB 之间")
         try:
@@ -4410,12 +4533,16 @@ class TenantSession:
                 group_by=["service", "currency"],
             )
             resp = self._usage.request_summarized_usages(details)
-            items = list(getattr(resp, "data", None).items if getattr(resp, "data", None) else []) or list(
-                getattr(resp, "data", None) or []
-            )
-            # Some SDK versions return .data as SummarizedUsageCollection with .items
-            if hasattr(resp, "data") and hasattr(resp.data, "items"):
-                items = list(resp.data.items or [])
+            # 空结果是免费账号的**常态**，不是错误。
+            #
+            # 原来那行写成 `list(data.items ...) or list(data or [])`：items 为空时
+            # 第一段得到 []（假值），`or` 于是去求值第二段 —— 而 UsageAggregation
+            # 不可迭代，直接 TypeError「'UsageAggregation' object is not iterable」。
+            # 于是这个函数自己 docstring 里写着的那句
+            #   "Free accounts often have no usage data … returns ok with empty series"
+            # 那条分支**永远走不到**，免费账号看到的是一个报错而不是「暂无账单数据」。
+            usage_data = getattr(resp, "data", None)
+            items = list(getattr(usage_data, "items", None) or [])
             daily_map: dict[str, float] = {}
             service_map: dict[str, float] = {}
             currency = ""
@@ -4427,7 +4554,14 @@ class TenantSession:
                 if cost is None:
                     cost = getattr(it, "attributed_cost", None)
                 if cost is None:
-                    cost = getattr(it, "unit_price", None) or 0
+                    # 读不到费用就是 0，**不能拿单价顶上**。
+                    #
+                    # SDK 的字段说明写得很清楚：computed_amount 是 "The computed cost."，
+                    # 而 unit_price 是 "The price per unit." —— 两者差一个用量系数。
+                    # computedAmount 为 null 最典型的场景恰恰是「免费额度内的用量」，
+                    # 于是每一条这样的记录都会把**每单位价格**当成该行费用累加进
+                    # total / month_to_date / by_service，账单页凭空多出一笔钱。
+                    cost = 0
                 try:
                     amount = float(cost or 0)
                 except (TypeError, ValueError):
@@ -5431,6 +5565,11 @@ class TenantSession:
         for sub in subs:
             name = str(getattr(sub, "region_name", "") or "").strip().lower()
             is_home = bool(getattr(sub, "is_home_region", False))
+            # status 只有 READY 才是真的可用。文档给的取值是 READY / IN_PROGRESS ——
+            # 一个刚点过「开通副区」、还在 IN_PROGRESS 的区域，资源是建不出来的，
+            # 但面板以前只看这一行存不存在就当成「已开通」，于是用户会拿着一个
+            # 还没就绪的区域去创建，然后收到一个和区域订阅毫无关系的报错。
+            status = str(getattr(sub, "status", "") or "").strip().upper()
             if is_home and name:
                 home = name
             regions.append(
@@ -5441,7 +5580,9 @@ class TenantSession:
                     # non-existent entity — see subscribe_region.
                     "region_name": name,
                     "region_key": str(getattr(sub, "region_key", "") or "").strip(),
-                    "status": str(getattr(sub, "status", "") or ""),
+                    "status": status,
+                    # 给调用方一个不用自己解析枚举的判据。
+                    "ready": status == "READY",
                     "is_home_region": is_home,
                 }
             )
@@ -5512,13 +5653,25 @@ class TenantSession:
             )
         for item in (subscribed.data or {}).get("regions") or []:
             if _matches(item):
+                # 「订阅记录存在」不等于「可以用了」。status 为 IN_PROGRESS 时资源
+                # 还建不出来，把它当成已开通会让用户拿着一个未就绪的区域去创建，
+                # 然后收到一个和区域订阅毫无关系的报错。
+                ready = bool(item.get("ready"))
+                state = str(item.get("status") or "")
                 return OperationResult(
                     ok=True,
-                    message=f"该区域已开通：{item.get('region_name')}",
+                    message=(
+                        f"该区域已开通：{item.get('region_name')}"
+                        if ready
+                        else f"该区域正在开通中（{state or 'IN_PROGRESS'}），"
+                        f"尚不能创建资源：{item.get('region_name')}"
+                    ),
                     data={
                         "region_name": item.get("region_name") or "",
                         "region_key": item.get("region_key") or "",
                         "already": True,
+                        "ready": ready,
+                        "status": state,
                     },
                 )
 
@@ -5597,8 +5750,17 @@ class TenantSession:
                 resolved = True
         except Exception:  # noqa: BLE001
             pass
-        self._home_region_name = region
-        self._home_region_resolved = resolved
+        # 只在**真的问出来**时才写缓存。
+        #
+        # 0.4.93 加 resolved 标志时把它和 region 一起无条件缓存了，于是一次瞬时的
+        # 读取失败（限流、熔断、网络抖动）会被这个 session 永久记住 —— 只要进程还在、
+        # 租户配置没改，home_region_confirmed() 就一直返回 ""，副区闸门也就一直
+        # 退回 DB hint。既然是「读不到」，下一次就该重新读，而不是把失败也缓存起来。
+        if resolved:
+            self._home_region_name = region
+            self._home_region_resolved = True
+        else:
+            self._home_region_resolved = False
         return region
 
     def home_region_confirmed(self) -> str:
@@ -6252,7 +6414,7 @@ class TenantSession:
                         if state in {"TERMINATED", "TERMINATING"}:
                             continue
                         seen.add(vid)
-                        vpu = int(getattr(vol, "vpus_per_gb", 10) or 10)
+                        vpu = _vpus_or_default(getattr(vol, "vpus_per_gb", None))
                         volumes.append(
                             {
                                 "id": vid,
@@ -6382,7 +6544,7 @@ class TenantSession:
         if not 50 <= size_in_gbs <= 32768:
             return OperationResult(ok=False, message="块卷大小必须在 50–32768 GB 之间")
         if vpus_per_gb not in (10, 20) and not 30 <= vpus_per_gb <= 120:
-            return OperationResult(ok=False, message="性能必须为 10、20 或 30–120 VPUs/GB")
+            return OperationResult(ok=False, message="性能必须为 0（低成本）、10、20 或 30–120 VPUs/GB")
         ad = (availability_domain or "").strip()
         if not ad:
             return OperationResult(ok=False, message="必须指定可用域")
@@ -6460,8 +6622,8 @@ class TenantSession:
             return OperationResult(ok=False, message="缺少 volume_id")
         if size_in_gbs is None and vpus_per_gb is None:
             return OperationResult(ok=False, message="未指定新的大小或性能")
-        if vpus_per_gb is not None and vpus_per_gb not in (10, 20) and not 30 <= int(vpus_per_gb) <= 120:
-            return OperationResult(ok=False, message="性能必须为 10、20 或 30–120 VPUs/GB")
+        if vpus_per_gb is not None and vpus_per_gb not in (0, 10, 20) and not 30 <= int(vpus_per_gb) <= 120:
+            return OperationResult(ok=False, message="性能必须为 0（低成本）、10、20 或 30–120 VPUs/GB")
         if size_in_gbs is not None and not 50 <= int(size_in_gbs) <= 32768:
             return OperationResult(ok=False, message="块卷大小必须在 50–32768 GB 之间")
         try:
@@ -6625,7 +6787,17 @@ class TenantSession:
                         "namespace": namespace,
                         "compartment_id": getattr(b, "compartment_id", "") or cid,
                         "time_created": self._ts_iso(getattr(b, "time_created", None)),
-                        "public_access_type": str(getattr(b, "public_access_type", "") or ""),
+                        # None，不是 ""。
+                        #
+                        # ListBuckets 返回的是 BucketSummary，它**根本没有**
+                        # public_access_type 这个字段（实测 hasattr 为 False；
+                        # docstring 也写着 "A BucketSummary contains only summary
+                        # fields for the bucket"）。只有单个 GetBucket 才有。
+                        # 原来取到空串、前端再 `|| 'NoPublicAccess'` 兜底，于是
+                        # **每一个桶都被断言成「不公开」** —— 包括真正对公网开放读取
+                        # 的那些。断言的方向还恰好是让人放心的那一边。
+                        # 返回 None，让前端渲染成「未知」而不是替 Oracle 下结论。
+                        "public_access_type": None,
                     }
                 )
             items.sort(key=lambda x: str(x.get("name") or "").lower())

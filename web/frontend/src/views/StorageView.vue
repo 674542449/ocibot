@@ -302,7 +302,17 @@
                   </button>
                 </td>
                 <td class="muted" style="font-size: 12px">{{ formatTime(b.time_created) }}</td>
-                <td>{{ b.public_access_type || 'NoPublicAccess' }}</td>
+                <!-- ?? 而不是 ||：列表接口(ListBuckets)返回的 BucketSummary 里
+                     根本没有这个字段，用 || 会把「读不到」兜底成「不公开」——
+                     一个真正对公网开放的桶因此显示成私有的，方向恰好是让人放心那边。 -->
+                <td>
+                  <span v-if="b.public_access_type">{{ b.public_access_type }}</span>
+                  <span
+                    v-else
+                    class="muted"
+                    title="桶列表接口不返回访问权限。要确认某个桶是否对公网开放，请在 Oracle 控制台查看该桶详情。"
+                  >未知</span>
+                </td>
                 <td>
                   <button class="danger" :disabled="busy" @click="deleteBucket(b.name)">删除</button>
                 </td>

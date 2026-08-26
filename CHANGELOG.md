@@ -1,5 +1,93 @@
 # Changelog
 
+## 0.4.95 — 2026-08-27
+
+按 OCI CLI / SDK 官方文档逐参数校验了全部 120 个 OCI 调用点。六个 API 面并行审计，
+每条发现必须**引用文档原文**才算数，复核 agent 逐条回去核对原文是否一字不差
+（4 条因引文失实或定性错误被驳回）。**34 条提交、30 条确认**，本版修掉 8 条。
+
+### 修复
+
+- **【高】账单/用量页对「一条用量记录都没有」的租户直接抛 TypeError** —— 而这
+  正是免费账号的常态。原来那行写成 `list(data.items…) or list(data or [])`：
+  items 为空时第一段得到 `[]`（假值），`or` 于是去求值第二段，而
+  `UsageAggregation` 不可迭代。函数自己 docstring 里写着的
+  "Free accounts often have no usage data … returns ok with empty series"
+  那条分支**永远走不到**。
+
+- **【高】存储桶列表的「访问」列永远显示 NoPublicAccess —— 包括真正公开的桶。**
+  `ListBuckets` 返回的是 `BucketSummary`，它**根本没有** `public_access_type`
+  字段（docstring: "A BucketSummary contains only summary fields"；实测
+  `hasattr` 为 False）。取到空串、前端再 `|| 'NoPublicAccess'` 兜底，于是每个桶
+  都被断言成「不公开」，而且断言的方向恰好是让人放心那一边。现在后端返回
+  `None`、前端显示「未知」并说明要去控制台查。
+
+- **【高】孙层 compartment 里的资源被静默漏数，漏数直接喂给配额守卫。**
+  文档原文：*"Can only be set to true when performing ListCompartments on the
+  tenancy (root compartment)"*、*"With the exception of the tenancy … returns only
+  the first-level child compartments … does not include any subcompartments of
+  the child compartments (grandchildren)"*。而 `resolve_compartment()` 在租户配了
+  子 compartment 时返回的不是根 —— 那个参数被服务端**静默忽略**（调用成功、
+  HTTP 200、只回一层），于是孙层里的实例/卷全部计为 0，而 `read_incomplete`
+  是 False：配额守卫拿着一份少算的用量，认为额度有富余，放行一台**计费**机器。
+  这比「读不到」危险得多 —— 读不到会 fail-closed，读漏了不会。
+  现在非根时改成客户端逐层 BFS（深度上限 6，依据 Oracle 的
+  "Maximum nested compartment hierarchy levels: 6"；调用上限 64），
+  **走不完必须上报成「没读全」**，绝不当成读全了。
+  没有选「从租户根列全再客户端筛」那个方案：它要 `inspect compartments in tenancy`
+  权限，而会把 compartment 指向子级的租户恰恰是策略被限制在那一层的那批人，
+  对他们会 404 —— 等于把静默漏数换成更狠的静默漏数。
+
+- **【中】读不到费用时拿「单价」当「费用」加进合计。** SDK 字段说明：
+  `computed_amount` = "The computed cost."，`unit_price` = "The price per unit."
+  —— 两者差一个用量系数。`computedAmount` 为 null 最典型的场景恰恰是
+  「免费额度内的用量」，于是账单页凭空多出一笔钱。现在读不到就是 0。
+
+- **【中】块卷的 0 VPUs/GB（Lower Cost 档）被读成 10 并标成「平衡」。**
+  四处都写成 `int(getattr(v, "vpus_per_gb", 10) or 10)` —— Python 里 `0 or 10`
+  等于 10。这是把一个**更便宜、更慢**的档次显示成标准档。调整路径的校验
+  也一并放开 0（创建路径刻意保持保守，前端下拉本来就没有这一档）。
+
+- **【中】区域订阅 `status=IN_PROGRESS` 被当成「已开通」。** 正在开通中的区域
+  建不出资源，用户会拿着它去创建然后收到一个和区域订阅毫无关系的报错。
+  现在只有 `READY` 才算就绪，响应里多一个 `ready` 字段。
+
+- **【中】主区解析失败被 session 永久缓存。** 0.4.93 加 `resolved` 标志时把它和
+  region 一起无条件缓存了，于是一次瞬时读取失败（限流/熔断/抖动）会被永久记住，
+  副区闸门一直退回 DB hint。现在只在真的问出来时才写缓存。
+
+### 明确判为误报、不修的（复核驳回）
+
+- 「Usage API 的 groupBy 传了文档没有的 currency」—— **引文失实**：报告声称 CLI
+  参考页有一份「Accepted groupBy values」清单，抓下来核对后原文并无此清单。
+- 「路由表读改写把 deprecated 的 cidrBlock 与 destination 一起回传会被拒绝」——
+  机制描述是真的，但那个 bug 是假设出来的，实跑证据方向相反。
+- 「list_images 的 ubuntu_only 兜底查询在逻辑上永远返回空」—— 引文准确但核心
+  论证不成立。
+- 「list_shapes 读出了 ocpu/memory 上下界却不用」—— 事实全对，但那是缺功能不是
+  用错 API，不属于这一轮的范围。
+
+### 尚未修、已记录在案的 22 条
+
+网络那一块最多（保留公网 IP 读 deprecated 字段、attach/detach 不轮询状态、
+IPv6 只补路由不补安全规则、ICMP 规则显示成端口「全部」、subnet 没设 dns_label
+等），另有控制台连接超时报成功、串口公钥类型校验、对象列表只有第一页、
+`request_summarized_usages` 只读第一页、服务配额表把每 AD 一条压成一行等。
+下一版继续。
+
+### 维护
+
+- 新增 `tests/test_oci_api_conformance.py`（21 条），含 BFS 的孙层/环/深度上限、
+  Usage 空结果、BucketSummary 字段缺失、VPU 0、主区缓存、订阅就绪度。
+- 全量 1027 passed。
+
+### 升级
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.95
+```
+
 ## 0.4.94 — 2026-08-26
 
 修「刷新实例列表有时候 404，多点几次就好了」。按要求先查了甲骨文官方文档，
