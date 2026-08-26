@@ -77,15 +77,19 @@
           <thead>
             <tr>
               <th>名称</th>
+              <th>可用域</th>
               <th>值</th>
             </tr>
           </thead>
           <tbody>
             <tr v-if="!(data.limits || []).length">
-              <td colspan="2" class="muted empty">无配额数据或无权限</td>
+              <td colspan="3" class="muted empty">无配额数据或无权限</td>
             </tr>
-            <tr v-for="l in data.limits || []" :key="l.name">
+            <!-- key 要带上可用域：服务限额是按 AD 报的，同一个 name 在 3 个 AD 上
+                 有 3 条记录。只用 name 做 key 会让 Vue 认为它们是同一行。 -->
+            <tr v-for="l in data.limits || []" :key="`${l.name}@${l.ad || '-'}`">
               <td>{{ l.name }}</td>
+              <td class="muted" style="font-size: 12px">{{ shortAd(l.ad) || '全区域' }}</td>
               <td>{{ l.value }}</td>
             </tr>
           </tbody>
@@ -400,6 +404,13 @@ const barBaseY = svgH - 16
 function barY(amount: number) {
   const h = svgH - 24
   return 8 + h - (Number(amount || 0) / maxAmount.value) * h
+}
+
+/** "kIdk:AP-TOKYO-1-AD-1" -> "AP-TOKYO-1-AD-1"。空串表示该限额不分可用域。 */
+function shortAd(ad: string) {
+  if (!ad) return ''
+  const i = ad.indexOf(':')
+  return i >= 0 ? ad.slice(i + 1) : ad
 }
 
 function tierLabel(t: string) {

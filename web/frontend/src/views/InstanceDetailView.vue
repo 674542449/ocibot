@@ -239,7 +239,10 @@
     <div v-if="tab === 'console'" class="card stack">
       <h3 style="margin: 0">串口 / VNC 控制台</h3>
       <p class="muted" style="margin: 0; font-size: 13px">
-        创建控制台连接需要一条 SSH 公钥。创建后用返回的 SSH 命令连接串口或 VNC。
+        创建控制台连接需要一条 <strong>RSA</strong> 公钥 —— Oracle 的串口控制台只支持 RSA
+        （ed25519 / ECDSA 能把连接建出来，但 ssh 上去会被拒绝）。
+        没有的话用 <code>ssh-keygen -t rsa -b 2048</code> 另生成一把。
+        创建后用返回的 SSH 命令连接串口或 VNC。
         串口/VNC 控制台 ≠ 系统 SSH；浏览器内终端请用「WebSSH」页签。
       </p>
       <div class="field">

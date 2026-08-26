@@ -18,12 +18,21 @@ from __future__ import annotations
 
 import pytest
 
+import oci
+
 from app.oci_client import TenantSession
 
 
-class _Resp:
-    def __init__(self, data):
-        self.data = data
+def _Resp(data, next_page=None):
+    """返回一个**真的** oci.Response，不要自己捏一个。
+
+    分页助手 list_call_get_all_results 会依次读 next_page / has_next_page /
+    status / request / headers …… 自己捏的桩每给一处调用加分页就少一个属性，
+    只能不停地补 —— 而每一次「补属性」都是在猜 SDK 的形状。用真类，形状永远是对的。
+    """
+    resp = oci.Response(200, {}, data, None)
+    resp.next_page = next_page
+    return resp
 
 
 class _Vol:
@@ -63,7 +72,9 @@ class _Compute:
         self._att = attachments or []
         self._raises = raises
 
-    def list_boot_volume_attachments(self, ad, cid, boot_volume_id=None):
+    # **kwargs 是必须的：真实签名是 (availability_domain, compartment_id, **kwargs)，
+    # retry_strategy / limit / page 都从那里进。
+    def list_boot_volume_attachments(self, ad, cid, boot_volume_id=None, **kwargs):
         if self._raises:
             raise self._raises
         return _Resp(list(self._att))

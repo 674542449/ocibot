@@ -259,6 +259,40 @@ def sdk_default_retry_strategy() -> Any:
     return oci.retry.DEFAULT_RETRY_STRATEGY
 
 
+def sdk_bounded_paged_retry_strategy() -> Any:
+    """给 `oci.pagination.list_call_get_all_results` 用的**收敛**重试策略。
+
+    分页助手自己**硬编码**又套了一层 DEFAULT_RETRY_STRATEGY，和 client 层那个相乘：
+    最坏 8 x 8 = 64 次真实调用、~600 秒卡在一个 HTTP 请求里 —— 正在跟抢机重试循环
+    抢同一个 per-tenancy 限流额度（CLAUDE.md）。收敛到 3 次 / 20 秒。
+
+    两条不能改的：
+      * `service_error_retry_config` 是**替换**语义，不合并 —— 409/429 必须自己
+        抄回来，漏写就把它们的重试一起丢掉；
+      * **不含 404** —— Oracle 的 API 错误表把 404 NotAuthorizedOrNotFound 的
+        Retry 列标成 "No."。
+    另外绝不能用 `RetryStrategyBuilder.add_service_error_check()` 那个重载：
+    它会**原地改写模块级全局** RETRYABLE_STATUSES_AND_CODES，而那正是
+    DEFAULT_RETRY_STRATEGY 内部持有的同一个对象，会污染整个进程、所有租户。
+    """
+    if not OCI_AVAILABLE:
+        return None
+    return oci.retry.RetryStrategyBuilder(
+        max_attempts_check=True,
+        max_attempts=3,
+        total_elapsed_time_check=True,
+        total_elapsed_time_seconds=20,
+        retry_base_sleep_time_seconds=1,
+        retry_max_wait_between_calls_seconds=4,
+        service_error_check=True,
+        service_error_retry_on_any_5xx=True,
+        service_error_retry_config={
+            409: ["IncorrectState", "LockConflict"],
+            429: [],
+        },
+    ).get_retry_strategy()
+
+
 def sdk_no_retry_strategy() -> Any:
     """Disable SDK-level retries (single attempt). For LaunchInstance compliance path."""
     if not OCI_AVAILABLE:
@@ -1161,12 +1195,23 @@ class TenantSession:
         """
         compartment = self.resolve_compartment()
         region = self.tenant.region.strip()
+        # GetUser 失败**不等于**凭据不行。
+        #
+        # 策略参考里 GetUser 需要 USER_INSPECT，而这是一条和面板其余功能完全不相干的
+        # 权限 —— 一把只被授予了 compute/网络权限的密钥，其余功能全都正常，却会在
+        # 这里早退，整份诊断报告一个探针都没跑就结束了。
+        # 只有 401（NotAuthenticated：签名/指纹/私钥对不上）才是真的凭据问题。
+        user = None
+        user_error = ""
         try:
             user = self.identity.get_user(self.tenant.user_ocid.strip()).data
         except ServiceError as exc:
-            return OperationResult(ok=False, message=_format_service_error(exc))
+            status = int(getattr(exc, "status", 0) or 0)
+            if status == 401:
+                return OperationResult(ok=False, message=_format_service_error(exc))
+            user_error = _format_service_error(exc)
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            user_error = str(exc)
 
         # 这里以前写着「Credentials are good past this point; anything below is a
         # policy/scope problem」—— 那句话是错的,而且是本次故障的根源。
@@ -1222,6 +1267,9 @@ class TenantSession:
         except Exception:  # noqa: BLE001
             probe_kw = {}
 
+        # 把 GetUser 也列成一个**非必需**探针 —— 它读不到不影响面板任何功能，
+        # 但操作员该知道这件事，以及需要的话补 `inspect users in tenancy`。
+        # 绝不能设成 required=True：那会把这类租户从「假失败」变成「真失败」。
         probes: list[tuple[str, str, str, bool, Callable[[], Any]]] = [
             ("列出实例", "Compute", "read instance-family", True,
              lambda: self.compute.list_instances(compartment, limit=1, **probe_kw)),
@@ -1234,6 +1282,16 @@ class TenantSession:
         ]
 
         results: list[dict[str, Any]] = []
+        if user_error:
+            results.append(
+                {
+                    "label": "读取用户", "service": "Identity",
+                    "verb": "inspect users", "required": False,
+                    "ok": False, "elapsed_ms": 0, "retried_ok": None,
+                    "type": "ServiceError", "status": 0, "code": "",
+                    "request_id": "", "operation": "get_user", "host": "",
+                }
+            )
         for label, svc, verb, required, call in probes:
             started = time.monotonic()
             try:
@@ -1273,16 +1331,24 @@ class TenantSession:
                 }
             )
 
-        name = getattr(user, "description", "") or user.name
+        # 拿不到用户信息也要把报告出完 —— 用面板里配的租户名或 user OCID 尾段占位。
+        user_label = (
+            getattr(user, "name", "") if user is not None else ""
+        ) or (self.tenant.name or "").strip() or f"…{self.tenant.user_ocid.strip()[-12:]}"
+        name = (
+            (getattr(user, "description", "") or getattr(user, "name", ""))
+            if user is not None
+            else user_label
+        )
         # 成败只看**必需**的那一条(列出实例)。其余作为诊断上下文报出来。
         # 旧逻辑是「任一探针失败即失败」,而其中一个探针结构上不可能失败、另一个和
         # 第三个测的是同一件事 —— 那种判定既不敏感也不特异。
         blocking = [r for r in results if r["required"] and not r["ok"]]
         return OperationResult(
             ok=not blocking,
-            message=_format_probe_report(user.name, name, region, compartment, results),
+            message=_format_probe_report(user_label, name, region, compartment, results),
             data={
-                "user": user.name,
+                "user": user_label,
                 "compartment": compartment,
                 "region": region,
                 "probes": results,
@@ -1315,20 +1381,7 @@ class TenantSession:
             # 收敛到 3 次 / 20 秒。service_error_retry_config 是**替换**语义，
             # 429/409 必须自己抄回来；也**不含 404** —— Oracle 的错误表把
             # 404 NotAuthorizedOrNotFound 的 Retry 列标成 "No."。
-            "retry_strategy": oci.retry.RetryStrategyBuilder(
-                max_attempts_check=True,
-                max_attempts=3,
-                total_elapsed_time_check=True,
-                total_elapsed_time_seconds=20,
-                retry_base_sleep_time_seconds=1,
-                retry_max_wait_between_calls_seconds=4,
-                service_error_check=True,
-                service_error_retry_on_any_5xx=True,
-                service_error_retry_config={
-                    409: ["IncorrectState", "LockConflict"],
-                    429: [],
-                },
-            ).get_retry_strategy(),
+            "retry_strategy": sdk_bounded_paged_retry_strategy(),
         }
         if in_subtree:
             kwargs["compartment_id_in_subtree"] = True
@@ -1506,6 +1559,9 @@ class TenantSession:
         try:
             response = oci.pagination.list_call_get_all_results(
                 self.compute.list_instances,
+                # 分页层自己又套了一层 DEFAULT_RETRY_STRATEGY，和 client 层那个
+                # 相乘（最坏 8x8=64 次调用 / ~600 秒）。收敛，把预算还给抢机循环。
+                retry_strategy=sdk_bounded_paged_retry_strategy(),
                 **kwargs,
             )
         except ServiceError as exc:
@@ -1814,8 +1870,17 @@ class TenantSession:
                     message=f"抓取控制台输出超时（{timeout}s，状态 {state or '未知'}）。实例刚启动时可能还没有输出，稍后重试。",
                 )
 
+            # 一次把快照读全，然后在**本地**留尾部。
+            #
+            # 以前直接把 length_bytes(默认 256 KB)传给 Oracle，拿到的是快照的
+            # **开头** —— 而 CaptureConsoleHistory 抓的是「up to a megabyte」，
+            # 所以最坏情况是只看到前 25%。机器为什么起不来（panic、
+            # 停在 initramfs、磁盘挂不上）恰恰写在**最后**那几十行里，
+            # 也就是被丢掉的那部分。而且截断了也不给任何提示。
+            # 读满 1 MB 和读 256 KB 是同一次请求，不多花调用。
+            _WIRE_LEN = 1024 * 1024
             content = self.compute.get_console_history_content(
-                history_id, length=length_bytes
+                history_id, length=_WIRE_LEN
             ).data
             # `.data` 是 **bytes**：这个调用在 SDK 里声明的是
             # response_type="bytes"（oci/core/compute_client.py），base_client
@@ -1835,10 +1900,23 @@ class TenantSession:
             else:
                 # 兜底：旧 SDK 曾用带 .value 的对象包装。
                 text = str(getattr(content, "value", "") or "")
+            truncated = False
+            if length_bytes and len(text) > length_bytes:
+                # 留**末尾**：故障原因在最后。
+                text = text[-length_bytes:]
+                # 丢掉被切断的首行，避免开头是半行乱码。
+                newline = chr(10)
+                if newline in text:
+                    text = text.split(newline, 1)[1]
+                truncated = True
             return OperationResult(
                 ok=True,
-                message=f"已抓取控制台输出（{len(text)} 字符）",
-                data={"content": text, "history_id": history_id},
+                message=(
+                    f"已抓取控制台输出（{len(text)} 字符"
+                    + ("，已截断，只保留最后一段" if truncated else "")
+                    + "）"
+                ),
+                data={"content": text, "history_id": history_id, "truncated": truncated},
             )
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
@@ -2101,7 +2179,11 @@ class TenantSession:
         if image_id:
             kwargs["image_id"] = image_id
         try:
-            resp = oci.pagination.list_call_get_all_results(self.compute.list_shapes, **kwargs)
+            resp = oci.pagination.list_call_get_all_results(
+                self.compute.list_shapes,
+                retry_strategy=sdk_bounded_paged_retry_strategy(),
+                **kwargs,
+            )
         except ServiceError as exc:
             raise OCIClientError(_format_service_error(exc)) from exc
         items = []
@@ -2509,18 +2591,33 @@ class TenantSession:
         security_list_id: str,
         display_name: str = DEFAULT_SUBNET_NAME,
     ) -> Any:
-        subnet = self.network.create_subnet(
-            oci.core.models.CreateSubnetDetails(
-                compartment_id=compartment_id,
-                vcn_id=vcn_id,
-                cidr_block=cidr_block,
-                display_name=display_name,
-                route_table_id=route_table_id,
-                security_list_ids=[security_list_id],
-                prohibit_public_ip_on_vnic=False,
-                freeform_tags={"ocibot_managed": "true"},
-            )
-        ).data
+        # VCN 上设了 dns_label，子网上也要设，主机名解析才真的可用 —— 文档说
+        # VCN Resolver 需要**两者都有**。只设 VCN 那一半等于白设。
+        #
+        # 但这是个可选能力，不值得为它把整条建网路径变脆：dns_label 在同一个 VCN 内
+        # 必须唯一，撞名会 409。所以先带着试一次，失败就退回不带。
+        def _create(with_label: bool) -> Any:
+            kwargs: dict[str, Any] = {}
+            if with_label:
+                kwargs["dns_label"] = "publicsubnet"
+            return self.network.create_subnet(
+                oci.core.models.CreateSubnetDetails(
+                    compartment_id=compartment_id,
+                    vcn_id=vcn_id,
+                    cidr_block=cidr_block,
+                    display_name=display_name,
+                    route_table_id=route_table_id,
+                    security_list_ids=[security_list_id],
+                    prohibit_public_ip_on_vnic=False,
+                    freeform_tags={"ocibot_managed": "true"},
+                    **kwargs,
+                )
+            ).data
+
+        try:
+            subnet = _create(True)
+        except ServiceError:
+            subnet = _create(False)
         return self._wait_network_resource(self.network.get_subnet, subnet.id)
 
     def ensure_default_network(
@@ -2861,6 +2958,26 @@ class TenantSession:
             if auth_mode == "password" and (root_password or "").strip():
                 # OCI freeform tag values max 256 chars; our generator stays well under.
                 tags[ROOT_PASSWORD_TAG] = (root_password or "").strip()[:256]
+            # metadata 的上限是 **32,000 字节**（LaunchInstanceDetails.metadata 的
+            # 文档：总大小不超过 32,000 bytes），而上游那道闸门量的是**字符数**
+            # （16,000 字符的自定义启动脚本）—— 两者根本不是一个单位：
+            # 脚本先被 build_root_cloud_init 包成完整的 cloud-config，再 base64
+            # （+33%），中文一个字三字节。16,000 个中文字符能生成 80 KB 以上的
+            # metadata，Oracle 会直接 400，而那时网络/NSG 已经建好了。
+            # 在这里量一次可以同时覆盖向导和抢机 worker 两条路径。
+            meta_bytes = sum(
+                len(str(k).encode("utf-8")) + len(str(v).encode("utf-8"))
+                for k, v in (metadata or {}).items()
+            )
+            if meta_bytes > 32000:
+                return OperationResult(
+                    ok=False,
+                    message=(
+                        f"启动脚本经 cloud-init 组装并 base64 后为 {meta_bytes} 字节，"
+                        "超过 Oracle 对实例 metadata 的 32,000 字节上限。"
+                        "请缩短自定义启动脚本（注意中文一个字算三字节，base64 还会再涨约 1/3）。"
+                    ),
+                )
             details = oci.core.models.LaunchInstanceDetails(
                 display_name=display_name.strip() or None,
                 compartment_id=compartment_id,
@@ -2996,6 +3113,7 @@ class TenantSession:
             self.compute.list_vnic_attachments,
             compartment_id=compartment_id,
             instance_id=instance_id,
+            retry_strategy=sdk_bounded_paged_retry_strategy(),
         ).data
         attachments = sorted(
             attachments,
@@ -4267,13 +4385,44 @@ class TenantSession:
                     message=f"实例已有 IPv6：{address}{suffix}",
                     data={"ipv6": network.ipv6_addresses, "route_ok": route.ok, "enabled": enable.data},
                 )
-            details = oci.core.models.CreateIpv6Details(vnic_id=network.vnic_id)
+            # 子网上有**多个** IPv6 前缀时 ipv6_subnet_cidr 是必填的（文档：
+            # "Required if the subnet has multiple IPv6 prefixes"）。自带地址
+            # （BYOIPv6）或同时有 GUA + ULA 的子网就是这种情况，不传会直接失败。
+            # 只有一个前缀时不传 —— 别给单前缀子网引入一个新的失败面。
+            ipv6_kwargs: dict[str, Any] = {}
+            try:
+                subnet = self.network.get_subnet(network.subnet_id).data
+                blocks = self._subnet_ipv6_blocks(subnet)
+                if len(blocks) > 1:
+                    # 挑一个全球单播（GUA）前缀：ULA 是 fc00::/7，也就是首字节
+                    # 落在 fc/fd 的那些，它出不了公网。
+                    gua = [
+                        b
+                        for b in blocks
+                        if not str(b).lower().lstrip().startswith(("fc", "fd"))
+                    ]
+                    ipv6_kwargs["ipv6_subnet_cidr"] = (gua or blocks)[0]
+            except Exception:  # noqa: BLE001
+                # 读不到子网不该让分配直接失败 —— 退回不传，单前缀子网照样能过。
+                pass
+            details = oci.core.models.CreateIpv6Details(
+                vnic_id=network.vnic_id, **ipv6_kwargs
+            )
             ipv6 = self.network.create_ipv6(details).data
             address = getattr(ipv6, "ip_address", "") or ""
             route = self.ensure_ipv6_internet_access(network.subnet_id, compartment_id)
             suffix = f"；{route.message}" if route.ok else (
                 f"；⚠ 公网路由设置失败，可能仅内网可用：{route.message}"
             )
+            # 光有地址和路由还不通 —— 安全规则里只有 IPv4。
+            #
+            # 以前这里只补 ::/0 路由就报「已分配公网 IPv6」，而 NSG 里那两条规则
+            # 写的是 0.0.0.0/0。IPv6 流量在安全组这一层就被丢掉了，用户拿到一个
+            # ping 不通的地址，界面却是绿的。
+            # 只改**本工具托管**的 NSG；别人的 NSG 和子网安全列表不碰，但要说出来。
+            rules_note = self._ensure_ipv6_rules_on_managed_nsgs(network)
+            if rules_note:
+                suffix += f"；{rules_note}"
             if enable_note:
                 suffix = f"；{enable_note}" + suffix
             return OperationResult(
@@ -4285,6 +4434,56 @@ class TenantSession:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
             return OperationResult(ok=False, message=str(exc))
+
+    def _ensure_ipv6_rules_on_managed_nsgs(self, network: Any) -> str:
+        """给实例所在的**托管** NSG 补上 IPv6 版安全规则。返回一句给用户看的说明。
+
+        只动带 ocibot 标签的 NSG：别人手工建的 NSG 和子网 Security List 不该被这个
+        操作悄悄改写 —— 但要在返回文案里说清楚「没动的是哪些」，否则用户会以为
+        IPv6 已经全通了。
+        """
+        nsg_ids = [n for n in (getattr(network, "nsg_ids", None) or []) if n]
+        if not nsg_ids:
+            return "未检测到实例专属安全组，IPv6 规则需要自行在子网安全列表里添加"
+        touched, skipped = 0, 0
+        for nsg_id in nsg_ids:
+            try:
+                group = self.network.get_network_security_group(nsg_id).data
+                if not self._is_ocibot_managed_nsg(getattr(group, "freeform_tags", None)):
+                    skipped += 1
+                    continue
+                existing = oci.pagination.list_call_get_all_results(
+                    self.network.list_network_security_group_security_rules,
+                    nsg_id,
+                    retry_strategy=sdk_bounded_paged_retry_strategy(),
+                ).data or []
+                have = {
+                    (
+                        str(getattr(r, "direction", "") or "").upper(),
+                        str(getattr(r, "protocol", "") or ""),
+                        str(getattr(r, "source", None) or getattr(r, "destination", None) or ""),
+                    )
+                    for r in existing
+                }
+                wanted = [
+                    spec
+                    for spec in self._open_all_specs(include_ipv6=True)
+                    if ":" in spec.cidr
+                    and (spec.direction.upper(), spec.protocol, spec.cidr) not in have
+                ]
+                if wanted:
+                    self.add_nsg_rules(nsg_id, wanted)
+                    touched += len(wanted)
+            except Exception:  # noqa: BLE001
+                skipped += 1
+        parts = []
+        if touched:
+            parts.append(f"已补 {touched} 条 IPv6 安全规则")
+        if skipped:
+            parts.append(f"{skipped} 个非托管安全组未改动，如不通请自行添加 ::/0 规则")
+        if not parts:
+            parts.append("IPv6 安全规则已存在")
+        return "，".join(parts)
 
     def ensure_ipv6_internet_access(self, subnet_id: str, compartment_id: str) -> OperationResult:
         """Ensure a subnet can reach the public internet over IPv6.
@@ -4426,7 +4625,25 @@ class TenantSession:
     ) -> OperationResult:
         """Create a serial + VNC console connection, returning the SSH commands to run."""
         key = (ssh_public_key or "").strip()
-        if not re.match(r"^(ssh-(?:rsa|ed25519)|ecdsa-sha2-[^ ]+)\s+\S+", key):
+        # 校验必须在**删除已有连接之前**。
+        #
+        # Oracle 每个实例只允许一个活动的控制台连接，所以下面会先把现有的删掉。
+        # 而校验以前放在 try 里、删除之后 —— 一个 ed25519 公钥会先把操作员正在用的
+        # 那条连接删光，然后才发现建不出可用的新连接。
+        #
+        # 串口控制台**只支持 RSA**。文档原文（Connecting to the Serial Console）：
+        # "you must use an RSA key"。ed25519 / ECDSA 能把连接建出来，但 ssh 上去
+        # 会被拒 —— 所以放行它们等于给一条建得出来、用不了的连接。
+        if not re.match(r"^ssh-rsa\s+\S+", key):
+            if re.match(r"^(ssh-ed25519|ecdsa-sha2-[^ ]+)\s+\S+", key):
+                return OperationResult(
+                    ok=False,
+                    message=(
+                        "Oracle 串口控制台只支持 RSA 密钥（官方文档：you must use an RSA key）。"
+                        "ed25519 / ECDSA 能建出连接，但 ssh 上去会被拒绝。"
+                        "请另生成一把：ssh-keygen -t rsa -b 2048"
+                    ),
+                )
             return OperationResult(ok=False, message="需要有效的 SSH 公钥才能创建控制台连接")
         try:
             # A new connection must use our key; remove any stale ones first.
@@ -4447,14 +4664,26 @@ class TenantSession:
             )
             conn = self.compute.create_instance_console_connection(details).data
             deadline = time.monotonic() + 90
+            state = str(getattr(conn, "lifecycle_state", "") or "")
             while time.monotonic() < deadline:
                 conn = self.compute.get_instance_console_connection(conn.id).data
-                state = getattr(conn, "lifecycle_state", "")
+                state = str(getattr(conn, "lifecycle_state", "") or "")
                 if state == "ACTIVE":
                     break
                 if state in ("FAILED", "DELETED", "DELETING"):
                     return OperationResult(ok=False, message=f"控制台连接创建失败（状态 {state}）")
                 time.sleep(3)
+            # 循环**超时**退出时以前也走到下面的 ok=True：界面显示「控制台连接已就绪」，
+            # 而 connection_string 还是空的 —— 用户拿到一条空的 ssh 命令。
+            if state != "ACTIVE":
+                return OperationResult(
+                    ok=False,
+                    message=(
+                        f"控制台连接未在 90 秒内就绪（当前状态 {state or '未知'}）。"
+                        "连接已经创建出来了，可以稍后点「刷新」继续等，或删除后重建。"
+                    ),
+                    data={"id": getattr(conn, "id", "") or ""},
+                )
             return OperationResult(
                 ok=True,
                 message="控制台连接已就绪",
@@ -4925,7 +5154,14 @@ class TenantSession:
         # clamp anyway so a clock skew cannot produce a rejected query.
         if (end - start) > timedelta(days=32):
             start = end - timedelta(days=32)
-        compartment = self.resolve_compartment()
+        # 出网 10 TB 是**整租户**额度，所以要从租户根查。
+        #
+        # 以前传的是 resolve_compartment()，而 compartment_id_in_subtree=true 只在
+        # 租户根上有效（和 ListCompartments 是同一条规则）—— 配了子 compartment 的
+        # 租户因此永远读不到完整用量，那根 10 TB 仪表要么偏低要么空。
+        tenancy = self.tenant.tenancy_ocid.strip()
+        compartment = tenancy or self.resolve_compartment()
+        scope_note = ""
         try:
             details = oci.monitoring.models.SummarizeMetricsDataDetails(
                 namespace="oci_vcn",
@@ -4933,9 +5169,20 @@ class TenantSession:
                 start_time=start,
                 end_time=end,
             )
-            resp = self.monitoring.summarize_metrics_data(
-                compartment, details, compartment_id_in_subtree=True
-            ).data
+            try:
+                resp = self.monitoring.summarize_metrics_data(
+                    compartment, details, compartment_id_in_subtree=True
+                ).data
+            except ServiceError as exc:
+                # 租户级读取需要租户级权限。没有的话退化成只查配置的那个
+                # compartment —— 但必须**说出来**范围缩小了，而不是把读不全当成读全。
+                if int(getattr(exc, "status", 0) or 0) not in (400, 401, 403, 404):
+                    raise
+                compartment = self.resolve_compartment()
+                resp = self.monitoring.summarize_metrics_data(compartment, details).data
+                scope_note = (
+                    "（无租户级监控权限，只统计了配置的 Compartment，实际用量可能更高）"
+                )
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
@@ -4962,9 +5209,10 @@ class TenantSession:
         egress_gb = total_bytes / (1000**3)
         return OperationResult(
             ok=True,
-            message="",
+            message=scope_note,
             data={
                 "egress_gb": round(egress_gb, 3),
+                "scope_limited": bool(scope_note),
                 "region": self.tenant.region.strip(),
                 "since": start.isoformat(),
                 "until": end.isoformat(),
@@ -5011,21 +5259,34 @@ class TenantSession:
             values = oci.pagination.list_call_get_all_results(
                 self.limits.list_limit_values, tenancy_id, service_name="compute"
             ).data
-            shown = {}
+            # 保留可用域这一维。
+            #
+            # 服务限额是**按可用域**报的：同一个 name 在 3 个 AD 上有 3 条记录。
+            # 以前用 `shown[name] = numeric` 收进一个 dict —— 后写的覆盖先写的，
+            # 只剩最后一个 AD 的那条，而且界面上完全看不出它只代表一个 AD。
+            # 一个「AD-1 有配额、AD-2/3 没有」的租户，看到的可能正是没有的那个。
+            rows: list[dict[str, Any]] = []
             for v in values:
                 name = str(getattr(v, "name", "") or "")
+                if not name.endswith("count"):
+                    continue
+                if not any(tag in name for tag in FREE_TIER_LIMIT_TAGS):
+                    continue
                 value = getattr(v, "value", None)
                 try:
                     numeric = float(value) if value is not None else 0.0
                 except (TypeError, ValueError):
                     numeric = 0.0
-                if name.endswith("count"):
-                    shown[name] = numeric
-            info["limits"] = [
-                {"name": n, "value": val}
-                for n, val in sorted(shown.items(), key=lambda kv: kv[0])
-                if any(tag in n for tag in FREE_TIER_LIMIT_TAGS)
-            ][:12]
+                rows.append(
+                    {
+                        "name": name,
+                        # 空串 = 该限额是租户级/区域级的，不分 AD。
+                        "ad": str(getattr(v, "availability_domain", "") or ""),
+                        "scope": str(getattr(v, "scope_type", "") or ""),
+                        "value": numeric,
+                    }
+                )
+            info["limits"] = sorted(rows, key=lambda r: (r["name"], r["ad"]))[:12]
         except (ServiceError, Exception):  # noqa: BLE001
             info["limits"] = []
 
@@ -6122,6 +6383,14 @@ class TenantSession:
                     "size_in_mbs": getattr(img, "size_in_mbs", None),
                     "time_created": str(getattr(img, "time_created", "") or ""),
                     "is_custom": True,
+                    # 架构**未知**就明说未知。
+                    #
+                    # Image 模型里没有架构字段，自定义镜像的名字又是用户自己起的
+                    # （"my-backup" 之类）—— 前端以前按名字里有没有 arm/aarch64 猜，
+                    # 一台 A1 机器做出来的自定义镜像会被判成 x86，然后把 A1.Flex
+                    # 从规格下拉里过滤掉，用户根本选不到那个免费机型。
+                    # 空串 = 不知道，前端据此**不过滤**，而不是按猜测过滤。
+                    "architecture": "",
                     "label": f"自定义镜像 · {img.display_name or img.id}  [{img.id[-8:]}]",
                 }
             )
@@ -6380,8 +6649,15 @@ class TenantSession:
         guard would swallow, leaving "still attached?" silently answered "no".
         That exact mistake is recorded in delete_block_volume above.
         """
-        atts = self.compute.list_boot_volume_attachments(
-            availability_domain, compartment_id, boot_volume_id=volume_id
+        # 分页读：服务端会把 DETACHED 的历史附件一起返回，附件多的卷第一页装不下，
+        # 未分页时可能漏掉真正挂着的那条。位置参数顺序是
+        # list_boot_volume_attachments(availability_domain, compartment_id, ...)。
+        atts = oci.pagination.list_call_get_all_results(
+            self.compute.list_boot_volume_attachments,
+            availability_domain,
+            compartment_id,
+            boot_volume_id=volume_id,
+            retry_strategy=sdk_bounded_paged_retry_strategy(),
         ).data or []
         return [
             a
@@ -6724,8 +7000,15 @@ class TenantSession:
                     # AD is a keyword here (see list_volume_attachments signature);
                     # positionally it raised TypeError, so this "still attached"
                     # guard silently passed and delete was attempted regardless.
-                    atts = self.compute.list_volume_attachments(
-                        cid, availability_domain=ad, volume_id=volume_id
+                    # 分页读，理由同上。注意 list_volume_attachments 的
+                    # availability_domain 是**关键字**参数，位置参数只有 compartment_id
+                    # —— 这一点文件里已有注释警告过，别改坏。
+                    atts = oci.pagination.list_call_get_all_results(
+                        self.compute.list_volume_attachments,
+                        cid,
+                        availability_domain=ad,
+                        volume_id=volume_id,
+                        retry_strategy=sdk_bounded_paged_retry_strategy(),
                     ).data or []
                     live = [
                         a
@@ -6854,8 +7137,12 @@ class TenantSession:
             inst = self.compute.get_instance(instance_id).data
             ad = getattr(inst, "availability_domain", "") or ""
             cid = (compartment_id or getattr(inst, "compartment_id", "") or self.resolve_compartment()).strip()
-            atts = self.compute.list_volume_attachments(
-                cid, availability_domain=ad, instance_id=instance_id
+            atts = oci.pagination.list_call_get_all_results(
+                self.compute.list_volume_attachments,
+                cid,
+                availability_domain=ad,
+                instance_id=instance_id,
+                retry_strategy=sdk_bounded_paged_retry_strategy(),
             ).data or []
             items = []
             for a in atts:

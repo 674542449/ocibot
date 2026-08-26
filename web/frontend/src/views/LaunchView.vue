@@ -724,15 +724,33 @@ const vpuPresets = computed(
 )
 
 const selectedImage = computed(() => images.value.find((i) => i.id === form.image_id))
-const isArmImage = computed(() => {
-  const blob = `${selectedImage.value?.label || ''} ${selectedImage.value?.display_name || ''} ${selectedImage.value?.architecture || ''}`.toLowerCase()
-  return blob.includes('arm') || blob.includes('aarch64')
+/**
+ * 镜像架构：'arm' / 'x86' / '' （不知道）。
+ *
+ * 自定义镜像拿不到架构 —— Image 模型里没有这个字段，而名字是用户自己起的。
+ * 以前按名字猜，一台 A1 机器做出来的镜像会被判成 x86，然后把 A1.Flex 从规格
+ * 下拉里过滤掉，用户选不到那个免费机型。**不知道就返回空串，让下面不过滤。**
+ */
+const imageArch = computed<'arm' | 'x86' | ''>(() => {
+  const img = selectedImage.value
+  if (!img) return ''
+  const explicit = String((img as any).architecture || '').toLowerCase()
+  if (explicit.includes('arm') || explicit.includes('aarch64')) return 'arm'
+  if (explicit.includes('x86') || explicit.includes('amd64')) return 'x86'
+  // 自定义镜像的名字是用户起的，猜不得。
+  if ((img as any).is_custom) return ''
+  const blob = `${img.label || ''} ${img.display_name || ''}`.toLowerCase()
+  if (blob.includes('aarch64') || blob.includes('arm')) return 'arm'
+  return 'x86'
 })
 
 const compatibleShapes = computed(() => {
   const list = shapes.value
   if (!list.length) return []
-  const armImg = isArmImage.value
+  // 架构不确定时**不过滤** —— 宁可多列几个不兼容的（提交时 Oracle 会拒），
+  // 也不能把用户真正需要的那个免费机型悄悄藏起来。
+  if (!imageArch.value) return list
+  const armImg = imageArch.value === 'arm'
   const matched = list.filter((s) => {
     const blob = `${s.shape} ${s.processor_description || ''} ${s.label || ''}`.toLowerCase()
     const armShape = s.shape.includes('A1') || blob.includes('ampere') || blob.includes('arm')

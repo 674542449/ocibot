@@ -125,15 +125,34 @@ def test_the_subtree_call_bounds_its_own_retry():
     """oci.pagination.list_call_get_all_results 自己**硬编码**又套了一层
     DEFAULT_RETRY_STRATEGY，和 client 层那个相乘：8 × 8 = 最坏 64 次真实调用、
     ~600 秒卡在一个 HTTP 请求里 —— 在跟抢机重试循环抢同一个 per-tenancy 限流额度。"""
-    # 0.4.95 起这段搬进了 _compartment_children（非根 compartment 要逐层 BFS，
-    # 每一层都走这个辅助函数）。
-    code = _code_only(TenantSession._compartment_children)
+    # 0.4.96 起这段提成了模块级的 sdk_bounded_paged_retry_strategy()，
+    # 供 list_compartments / list_instances / list_shapes / list_vnic_attachments 共用。
+    from app.oci_client import sdk_bounded_paged_retry_strategy
 
+    code = _code_only(sdk_bounded_paged_retry_strategy)
     assert "RetryStrategyBuilder" in code
     assert "max_attempts = 3" in code.replace("=", " = ").replace("  ", " ")
     # 绝不能把 404 加进去 —— Oracle 的错误表把它的 Retry 列标成 "No."。
     cfg = code.split("service_error_retry_config")[1].split("}")[0]
     assert "404" not in cfg, cfg
+
+    # 行为断言（不只是源码）：建出来的 checker 里确实带上了那份 config。
+    st = sdk_bounded_paged_retry_strategy()
+    configs = [
+        vars(c).get("service_error_retry_config")
+        for c in st.checkers.checkers
+        if "service_error_retry_config" in vars(c)
+    ]
+    assert configs and 404 not in configs[0], configs
+
+    # 四条分页路径都要用上它。
+    for fn in (
+        TenantSession._compartment_children,
+        TenantSession.list_instances,
+        TenantSession.list_shapes,
+        TenantSession.resolve_primary_network,
+    ):
+        assert "sdk_bounded_paged_retry_strategy" in _code_only(fn), fn.__name__
 
 
 def test_access_level_stays_accessible():
@@ -246,8 +265,9 @@ def test_the_global_retry_config_is_not_mutated():
     所有 client 的重试行为都会被改掉。仓库里不能出现它。"""
     import pathlib
 
-    src = pathlib.Path("app/oci_client.py").read_text(encoding="utf-8")
-    assert "add_service_error_check(" not in src
+    # 去掉注释和文档字符串再匹配 —— 解释「不要用 X」的那段话本身就含 X。
+    src = _code_only(pathlib.Path("app/oci_client.py").read_text(encoding="utf-8"))
+    assert "add_service_error_check" not in src
 
     from oci.retry.retry_checkers import RETRYABLE_STATUSES_AND_CODES
 

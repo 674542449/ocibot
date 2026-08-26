@@ -478,3 +478,163 @@ def test_the_usage_client_is_not_built_eagerly():
 
     prop = inspect.getsource(TenantSession.usage.fget)
     assert "home_region_confirmed()" in prop
+
+
+# ---------------------------------------------------------------------------
+# 12. 剩余那批（0.4.97）
+# ---------------------------------------------------------------------------
+
+
+def test_the_console_key_must_be_rsa_and_is_checked_before_deleting():
+    """两件事：
+
+    1. 串口控制台**只支持 RSA**（文档："you must use an RSA key"）。ed25519 /
+       ECDSA 能把连接建出来，但 ssh 上去会被拒 —— 放行等于给一条用不了的连接。
+    2. 校验必须在**删除已有连接之前**。Oracle 每实例只允许一个活动连接，所以代码
+       会先删旧的；校验放在删除之后，意味着一个 ed25519 公钥会先把操作员正在用的
+       那条连接删光，然后才发现建不出可用的新连接。
+    """
+    import inspect
+
+    src = inspect.getsource(TenantSession.create_console_connection)
+    validate_at = src.index("ssh-rsa")
+    delete_at = src.index("delete_console_connection")
+
+    assert validate_at < delete_at, "校验必须早于删除已有连接"
+    assert "ed25519" in src, "要给 ed25519/ECDSA 一句解释，而不是笼统的「公钥无效」"
+
+
+def test_a_console_connection_timeout_is_not_reported_as_ready():
+    """循环超时退出时以前也走到 ok=True：界面显示「控制台连接已就绪」，
+    而 connection_string 还是空的 —— 用户拿到一条空的 ssh 命令。"""
+    import inspect
+
+    src = inspect.getsource(TenantSession.create_console_connection)
+    assert 'if state != "ACTIVE"' in src
+    assert "未在 90 秒内就绪" in src
+
+
+def test_the_boot_log_keeps_the_tail_not_the_head():
+    """CaptureConsoleHistory 抓的是「up to a megabyte」，以前只把前 256 KB 传给
+    Oracle —— 而机器为什么起不来（panic、停在 initramfs）写在**最后**那几十行里。
+    读满 1 MB 和读 256 KB 是同一次请求，不多花调用。"""
+    import inspect
+
+    src = inspect.getsource(TenantSession.capture_console_output)
+
+    assert "1024 * 1024" in src, "应当一次读满，然后在本地留尾部"
+    assert "text[-length_bytes:]" in src, "保留的必须是**末尾**"
+    assert "truncated" in src, "截断了要说出来"
+
+
+def test_get_user_failure_does_not_abort_the_whole_report():
+    """GetUser 需要 USER_INSPECT —— 一条和面板其余功能完全不相干的权限。
+    一把只被授予 compute/网络权限的密钥其余功能全都正常，却会在这里早退，
+    整份诊断报告一个探针都没跑就结束了。只有 401 才是真的凭据问题。"""
+    import inspect
+
+    src = inspect.getsource(TenantSession.test_connection)
+    head = src[: src.index("probes:")]
+
+    assert "status == 401" in head, "只有 401 才早退"
+    assert "user_error" in head
+
+
+def test_metadata_is_bounded_in_bytes_not_characters():
+    """上限是 32,000 **字节**，而上游那道闸门量的是 16,000 **字符** ——
+    两者不是一个单位：脚本先被包成 cloud-config 再 base64（+33%），
+    中文一个字三字节。16,000 个中文字符能生成 80 KB 以上的 metadata。"""
+    import inspect
+
+    src = inspect.getsource(TenantSession.launch_instance)
+
+    assert "32000" in src
+    assert 'encode("utf-8")' in src, "必须按字节量"
+
+
+def test_ipv6_allocation_passes_the_subnet_cidr_when_ambiguous():
+    """文档：ipv6_subnet_cidr "is required if more than one IPv6 prefix exists
+    on the subnet"。自带地址或 GUA+ULA 并存的子网就是这种情况。"""
+    import inspect
+
+    src = inspect.getsource(TenantSession.assign_public_ipv6)
+
+    assert "ipv6_subnet_cidr" in src
+    assert "len(blocks) > 1" in src, "只在多前缀时传，别给单前缀子网引入新失败面"
+    assert '("fc", "fd")' in src, "要挑 GUA，ULA(fc00::/7) 出不了公网"
+
+
+def test_ipv6_also_gets_security_rules():
+    """以前只补 ::/0 路由就报「已分配公网 IPv6」，而 NSG 里那两条规则写的是
+    0.0.0.0/0 —— IPv6 在安全组这一层就被丢掉，用户拿到一个 ping 不通的地址。"""
+    import inspect
+
+    src = inspect.getsource(TenantSession.assign_public_ipv6)
+    assert "_ensure_ipv6_rules_on_managed_nsgs" in src
+
+    helper = inspect.getsource(TenantSession._ensure_ipv6_rules_on_managed_nsgs)
+    # 只动托管的 NSG，别人的不碰 —— 但要说出来没动哪些。
+    assert "_is_ocibot_managed_nsg" in helper
+    assert "非托管" in helper
+
+
+def test_the_subnet_gets_a_dns_label_with_a_fallback():
+    """VCN 上设了 dns_label，子网上也要设，主机名解析才真的可用。
+    但 dns_label 在同一 VCN 内必须唯一，撞名会 409 —— 不值得为一个可选能力
+    把整条建网路径变脆，所以先带着试、失败退回不带。"""
+    import inspect
+
+    src = inspect.getsource(TenantSession._create_public_subnet)
+
+    assert 'dns_label' in src
+    assert "_create(False)" in src, "撞名要能退回不带 dns_label"
+
+
+def test_egress_is_queried_at_the_tenancy_root():
+    """出网 10 TB 是**整租户**额度，而 compartment_id_in_subtree 只在租户根上有效
+    —— 配了子 compartment 的租户以前永远读不到完整用量。"""
+    import inspect
+
+    src = inspect.getsource(TenantSession.get_network_egress_usage)
+
+    assert "tenancy_ocid" in src
+    assert "scope_limited" in src, "退化成小范围时必须说出来"
+
+
+def test_service_limits_keep_the_availability_domain():
+    """服务限额是**按可用域**报的：同一个 name 在 3 个 AD 上有 3 条记录。
+    以前收进一个 dict，后写的覆盖先写的，只剩最后一个 AD 那条，
+    而界面上完全看不出它只代表一个 AD。"""
+    import inspect
+    import io
+    import tokenize
+
+    raw = inspect.getsource(TenantSession.get_account_status)
+    # 只去掉**注释**，保留字符串 —— 解释「以前那样写不对」的注释本身就含那段代码，
+    # 但要断言的 "availability_domain" 又正是一个字符串字面量，两者都得顾上。
+    code = " ".join(
+        t.string
+        for t in tokenize.generate_tokens(io.StringIO(raw).readline)
+        if t.type != tokenize.COMMENT
+    )
+
+    assert "availability_domain" in code
+    assert "shown [ name ]" not in code, "别再用 name 做 key 覆盖掉其它 AD"
+
+
+def test_a_custom_image_reports_unknown_architecture():
+    """Image 模型里没有架构字段，自定义镜像的名字又是用户自己起的。
+    空串 = 不知道 —— 前端据此**不过滤**，而不是按猜测把 A1.Flex 藏起来。"""
+    import inspect
+
+    src = inspect.getsource(TenantSession.list_custom_images)
+    assert '"architecture": ""' in src
+
+
+def test_the_shape_filter_does_not_guess():
+    import pathlib
+
+    src = pathlib.Path("web/frontend/src/views/LaunchView.vue").read_text(encoding="utf-8")
+
+    assert "if (!imageArch.value) return list" in src, "架构不确定时不过滤"
+    assert "is_custom) return ''" in src, "自定义镜像的名字猜不得"
