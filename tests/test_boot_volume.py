@@ -13,7 +13,12 @@ class FakeCompute:
 
     def list_boot_volume_attachments(self, ad, compartment_id, instance_id=None):
         assert ad == self._ad
-        return SimpleNamespace(data=[SimpleNamespace(boot_volume_id=self._bv_id)])
+        # lifecycle_state 在 BootVolumeAttachment 上是 **[Required]**（SDK docstring），
+        # 真实 API 一定返回。桩里漏掉它，就是造了一个 SDK 产生不出来的形状 ——
+        # 而 _find_boot_volume_id 现在必须按状态筛掉 DETACHED 的旧盘附件。
+        return SimpleNamespace(
+            data=[SimpleNamespace(boot_volume_id=self._bv_id, lifecycle_state="ATTACHED")]
+        )
 
 
 class FakeBlockstorage:

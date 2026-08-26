@@ -396,11 +396,15 @@ def list_objects(
     db: Annotated[Session, Depends(get_db)],
     prefix: str = Query(""),
     limit: int = Query(200, ge=1, le=1000),
+    # ListObjects 用 start / nextStartWith 分页，不是标准的 opc-next-page。
+    # 后端一直算出了 next_start_with 却没有任何入口能把它传回来 ——
+    # 于是永远只有第一页。
+    start: str = Query("", max_length=1024),
 ) -> dict[str, Any]:
     row = _row(db, user.id, tenant_id)
     try:
         session = get_session_for_row(row)
-        result = session.list_objects(name, prefix=prefix, limit=limit)
+        result = session.list_objects(name, prefix=prefix, limit=limit, start=start)
         return {
             "ok": bool(result.ok),
             "message": result.message or "",

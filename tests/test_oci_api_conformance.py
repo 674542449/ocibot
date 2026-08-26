@@ -296,3 +296,185 @@ def test_a_ready_subscription_is_marked_ready():
 
     rows = (s.list_subscribed_regions().data or {}).get("regions") or []
     assert rows[0]["ready"] is True
+
+
+# ---------------------------------------------------------------------------
+# 7. 引导卷附件必须按状态筛 —— DETACHED 的旧盘不能被当成当前引导卷
+# ---------------------------------------------------------------------------
+#
+# SDK docstring：BootVolumeAttachment.lifecycle_state 是 **[Required]**，
+# 取值 "ATTACHING" / "ATTACHED" / "DETACHING" / "DETACHED"。
+
+
+def _attach(bv_id, state):
+    return SimpleNamespace(boot_volume_id=bv_id, lifecycle_state=state)
+
+
+def _fv_session(attachments):
+    s = TenantSession.__new__(TenantSession)
+    s.tenant = SimpleNamespace(region="r", tenancy_ocid="t", compartment_ocid="c", id="t1")
+    s._compute = SimpleNamespace(
+        list_boot_volume_attachments=lambda ad, cid, instance_id=None: SimpleNamespace(
+            data=attachments
+        )
+    )
+    return s
+
+
+def test_a_detached_old_boot_volume_is_never_picked():
+    """换过引导卷的实例有多条附件记录。取第一条有 boot_volume_id 的，
+    会让详情页显示的容量、以及「调整引导卷」实际操作的对象，都是那块**已拆下的旧盘**。"""
+    s = _fv_session([_attach("bv-OLD", "DETACHED"), _attach("bv-NEW", "ATTACHED")])
+
+    assert s._find_boot_volume_id("i", "c", "ad", wait=False) == "bv-NEW"
+
+
+def test_attaching_is_still_accepted():
+    """创建实例后 wait=True 轮询新盘时，状态正是 ATTACHING ——
+    只认 ATTACHED 会让「创建后调整 VPU」白等满 150 秒。"""
+    s = _fv_session([_attach("bv-NEW", "ATTACHING")])
+
+    assert s._find_boot_volume_id("i", "c", "ad", wait=False) == "bv-NEW"
+
+
+def test_attached_wins_over_attaching():
+    s = _fv_session([_attach("bv-A", "ATTACHING"), _attach("bv-B", "ATTACHED")])
+
+    assert s._find_boot_volume_id("i", "c", "ad", wait=False) == "bv-B"
+
+
+def test_only_detached_attachments_means_no_boot_volume():
+    s = _fv_session([_attach("bv-OLD", "DETACHED")])
+
+    assert s._find_boot_volume_id("i", "c", "ad", wait=False) == ""
+
+
+# ---------------------------------------------------------------------------
+# 8. 保留公网 IP 按 lifecycle_state 判断，不看 deprecated 的 private_ip_id
+# ---------------------------------------------------------------------------
+
+
+def test_an_assigning_public_ip_counts_as_busy():
+    """PublicIp.private_ip_id 在绑定进行中时也是 null（而且它已被标记 deprecated）。
+    只看它的话，一个 ASSIGNING 的保留 IP 会被读成「未绑定」：界面给出「删除」按钮、
+    服务端守卫也放行，delete_public_ip 就打在一个正在绑定的 IP 上。"""
+    from app.oci_client import _public_ip_busy
+
+    assigning = SimpleNamespace(lifecycle_state="ASSIGNING", private_ip_id=None,
+                                assigned_entity_id=None)
+    assert _public_ip_busy(assigning) is True
+
+
+def test_an_available_public_ip_is_not_busy():
+    from app.oci_client import _public_ip_busy
+
+    free = SimpleNamespace(lifecycle_state="AVAILABLE", private_ip_id=None,
+                           assigned_entity_id=None)
+    assert _public_ip_busy(free) is False
+
+
+def test_assigned_entity_id_also_counts():
+    """assigned_entity_id 是 private_ip_id 的替代字段，两者都要认。"""
+    from app.oci_client import _public_ip_busy
+
+    ip = SimpleNamespace(lifecycle_state="", private_ip_id=None,
+                         assigned_entity_id="ocid1.privateip.oc1..x")
+    assert _public_ip_busy(ip) is True
+
+
+# ---------------------------------------------------------------------------
+# 9. 公网路由表：目的地址和下一跳都要对上
+# ---------------------------------------------------------------------------
+
+
+def test_the_route_fallback_compares_the_next_hop_too():
+    """只比 destination 的话，一条已存在但指向 NAT 网关/服务网关的 0.0.0.0/0
+    会被当成「公网路由已就绪」，于是什么都不做 —— 实例拿到公网 IP、路由表看着
+    也有默认路由，但出网根本不通，而建网流程一路报成功。"""
+    import inspect
+
+    src = inspect.getsource(TenantSession._ensure_public_route_table)
+    tail = src[src.index("if target is None"):]
+
+    assert "existing_dests" not in tail, "兜底分支还在只比 destination"
+    assert "network_entity_id" in tail
+
+
+# ---------------------------------------------------------------------------
+# 10. ICMP 规则不能显示成「全部」端口
+# ---------------------------------------------------------------------------
+
+
+def test_icmp_type_and_code_are_shown():
+    """Oracle 默认安全列表里那条只放行 ICMPv4 type 3 code 4（Path MTU Discovery）
+    的规则，以前被读成「ICMP 全部放行」——让人以为网络比实际开放得多。"""
+    rule = SimpleNamespace(
+        protocol="1", source="0.0.0.0/0", destination=None, id="r1",
+        tcp_options=None, udp_options=None, is_stateless=False, description="",
+        icmp_options=SimpleNamespace(type=3, code=4),
+    )
+
+    out = TenantSession._normalize_firewall_rule(rule, "INGRESS")
+
+    assert out["port"] == "类型 3 代码 4"
+
+
+def test_icmp_without_options_stays_all():
+    rule = SimpleNamespace(
+        protocol="1", source="0.0.0.0/0", destination=None, id="r2",
+        tcp_options=None, udp_options=None, is_stateless=False, description="",
+        icmp_options=None,
+    )
+
+    assert TenantSession._normalize_firewall_rule(rule, "INGRESS")["port"] == "全部"
+
+
+def test_tcp_ports_are_unaffected():
+    rule = SimpleNamespace(
+        protocol="6", source="0.0.0.0/0", destination=None, id="r3",
+        udp_options=None, is_stateless=False, description="", icmp_options=None,
+        tcp_options=SimpleNamespace(
+            destination_port_range=SimpleNamespace(min=22, max=22)
+        ),
+    )
+
+    assert TenantSession._normalize_firewall_rule(rule, "INGRESS")["port"] == "22"
+
+
+# ---------------------------------------------------------------------------
+# 11. 对象列表分页 / 账单分页
+# ---------------------------------------------------------------------------
+
+
+def test_list_objects_accepts_a_start_cursor():
+    """ListObjects 用 start / nextStartWith，不是标准的 opc-next-page。
+    后端一直算出 next_start_with 却没有入口传回来 —— 永远只有第一页。"""
+    import inspect
+
+    src = inspect.getsource(TenantSession.list_objects)
+    assert "start: str" in src
+    assert 'kwargs["start"] = start' in src
+
+
+def test_usage_follows_next_page_and_reports_truncation():
+    import inspect
+
+    src = inspect.getsource(TenantSession.get_usage_summary)
+    assert "opc-next-page" in src
+    assert "truncated_pages" in src
+    # 截断必须说出来 —— 一个偏小但看起来权威的合计比读不到更糟。
+    assert "不完整" in src
+
+
+def test_the_usage_client_is_not_built_eagerly():
+    """_home_region() 是一次真实的 Identity 调用。放在 _build 里意味着每建一个
+    TenantSession 就多打一次，而构造是在进程级锁里做的 —— 那次网络调用会把同一个
+    worker 里所有租户的 OCI 请求一起堵住。"""
+    import inspect
+
+    build = inspect.getsource(TenantSession._build)
+    usage_part = build[build.index("UsageapiClient("):]
+    assert "_home_region()" not in usage_part.split("except")[0]
+
+    prop = inspect.getsource(TenantSession.usage.fget)
+    assert "home_region_confirmed()" in prop

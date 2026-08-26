@@ -128,6 +128,20 @@ def _format_probe_report(
 _ENDPOINT_HOST_RE = re.compile(r"https?://([^/\s?]+)")
 
 
+def _public_ip_busy(ip: Any) -> bool:
+    """这个公网 IP 是不是「已绑定 或 正在绑定」。
+
+    **不能只看 private_ip_id。** PublicIp 的文档写着这个字段在绑定进行中时也是
+    null（而且它本身已被标记 deprecated）。于是一个处于 ASSIGNING 的保留 IP 会被
+    读成「未绑定」：界面给出「删除」按钮、服务端守卫也放行，delete_public_ip 就打在
+    一个正在绑定的 IP 上。按 lifecycle_state 判断才是可靠的。
+    """
+    state = str(getattr(ip, "lifecycle_state", "") or "").upper()
+    if state in {"ASSIGNING", "ASSIGNED"}:
+        return True
+    return bool(getattr(ip, "assigned_entity_id", None) or getattr(ip, "private_ip_id", None))
+
+
 def _vpus_or_default(raw: Any, default: int = 10) -> int:
     """读 vpus_per_gb。**0 是合法值**（Lower Cost 档），不能被 `or` 吃掉。
 
@@ -1036,17 +1050,18 @@ class TenantSession:
                 self._instance_agent = None
             try:
                 # Usage API is often home-region only; prefer home region when known.
-                usage_cfg = dict(self._config)
-                home = ""
-                try:
-                    home = self._home_region()
-                except Exception:
-                    home = ""
-                if home:
-                    usage_cfg["region"] = home
-                self._usage = UsageapiClient(usage_cfg, **retry_kw)
+                # 先按租户自己的区域建，**不要**在这里解析主区。
+                #
+                # _home_region() 会真的发一次 list_region_subscriptions —— 放在
+                # _build 里意味着**每建一个 TenantSession 就多打一次 Identity 调用**，
+                # 而 SessionManager.get 是在一把进程级锁里构造 session 的，
+                # 那次网络调用会把同一个 worker 里所有租户的 OCI 请求一起堵住。
+                # 真正需要主区的只有账单接口，那时再按需重建（见 usage property）。
+                self._usage = UsageapiClient(dict(self._config), **retry_kw)
+                self._usage_region_pinned = False
             except Exception:
                 self._usage = None
+                self._usage_region_pinned = True
         except Exception:
             self.close()
             raise
@@ -1097,6 +1112,24 @@ class TenantSession:
 
     @property
     def usage(self) -> Any:
+        """账单/用量客户端。第一次被访问时才解析主区并按需换端点。
+
+        惰性化的理由见 _build：主区解析是一次真实的 Identity 调用，放在构造里
+        会让每个 session 的冷建都多一次网络往返，而构造是在进程级锁里做的。
+        """
+        if self._usage is not None and not getattr(self, "_usage_region_pinned", True):
+            self._usage_region_pinned = True
+            try:
+                home = self.home_region_confirmed()
+                if home and home != self.tenant.region.strip():
+                    self._usage = UsageapiClient(
+                        self._config_for_region(home),
+                        retry_strategy=sdk_default_retry_strategy(),
+                    )
+            except Exception:  # noqa: BLE001
+                # 换不成就用租户自己区域的那个 —— 账单接口是租户级的，
+                # 打错区域最多是拿不到数据，不该让整个 property 抛。
+                pass
         return self._usage
 
     @property
@@ -2402,12 +2435,30 @@ class TenantSession:
             ).data
 
         rules = list(getattr(target, "route_rules", None) or [])
-        existing_dests = {(getattr(r, "destination", "") or "").strip() for r in rules}
         changed = False
         for rule in desired:
-            if rule.destination not in existing_dests:
-                rules.append(rule)
-                changed = True
+            # 目的地址**和**下一跳都要对上 —— 上面那个 ::/0 分支已经是这么写的，
+            # 这条兜底路径当时漏了。
+            #
+            # 只比 destination 的话，一条已经存在但指向别处的 0.0.0.0/0
+            # （NAT 网关、服务网关、另一个 IGW）会被当成「公网路由已就绪」，
+            # 于是什么都不做：新建的公网子网里的实例拿到了公网 IP、路由表看着也有
+            # 默认路由，但**出网根本不通**，而建网流程一路报成功。
+            same_dest = [
+                r
+                for r in rules
+                if (getattr(r, "destination", "") or "").strip() == rule.destination
+            ]
+            if any(
+                (getattr(r, "network_entity_id", "") or "") == igw_id for r in same_dest
+            ):
+                continue
+            # 指错地方的要**换掉**而不是再加一条：同一个目的地址出现两条规则，
+            # Oracle 会拒绝整次 update。
+            if same_dest:
+                rules = [r for r in rules if r not in same_dest]
+            rules.append(rule)
+            changed = True
         if changed:
             self.network.update_route_table(
                 target.id, oci.core.models.UpdateRouteTableDetails(route_rules=rules)
@@ -3306,6 +3357,17 @@ class TenantSession:
         if port_range:
             start, end = getattr(port_range, "min", None), getattr(port_range, "max", None)
             port = str(start) if start == end else f"{start}-{end}"
+        else:
+            # ICMP 没有端口，但有 type/code —— 丢掉它们等于把一条**精确**的规则
+            # 显示成「全放行」。最典型的是 Oracle 默认安全列表里那条只放行
+            # ICMPv4 type 3 code 4（Path MTU Discovery）的规则：现在会被读成
+            # 「ICMP 全部放行」，让人以为网络比实际开放得多。
+            icmp = getattr(rule, "icmp_options", None)
+            if icmp is not None:
+                itype = getattr(icmp, "type", None)
+                icode = getattr(icmp, "code", None)
+                if itype is not None:
+                    port = f"类型 {itype}" + (f" 代码 {icode}" if icode is not None else "")
         # Security-list rules carry no `direction` attribute — it is implied by which
         # list (ingress_security_rules / egress_security_rules) they came from — so
         # the caller passes it in. NSG rules have it on the object.
@@ -3788,7 +3850,28 @@ class TenantSession:
                 ).data
             except ServiceError:
                 attachments = []
-            att = next((a for a in attachments if getattr(a, "boot_volume_id", "")), None)
+            # 必须看附件状态。
+            #
+            # ListBootVolumeAttachments 返回的是**历史全部**附件记录，换过引导卷的
+            # 实例会有多条：旧盘那条是 DETACHED、新盘那条才是 ATTACHED。原来直接
+            # next() 取第一条有 boot_volume_id 的，于是详情页显示的容量、以及
+            # 「调整引导卷」实际操作的对象，都可能是那块**已经拆下来的旧盘**。
+            #
+            # ATTACHING 必须留着：这个函数在创建实例后 wait=True 轮询新盘，
+            # 那时状态正是 ATTACHING —— 只认 ATTACHED 会让「创建后调整 VPU」
+            # 白等满 150 秒然后放弃。
+            usable = [
+                a
+                for a in attachments
+                if getattr(a, "boot_volume_id", "")
+                and str(getattr(a, "lifecycle_state", "") or "").upper()
+                in {"ATTACHED", "ATTACHING"}
+            ]
+            # ATTACHED 优先于 ATTACHING。
+            usable.sort(
+                key=lambda a: str(getattr(a, "lifecycle_state", "") or "").upper() != "ATTACHED"
+            )
+            att = usable[0] if usable else None
             if att:
                 return att.boot_volume_id
             if time.monotonic() >= deadline:
@@ -3830,13 +3913,32 @@ class TenantSession:
                 return OperationResult(ok=False, message="未找到实例的引导卷（可能仍在创建中，稍后在详情里重试）")
             # A volume must be AVAILABLE before it accepts an update.
             deadline = time.monotonic() + timeout
+            current = None
             while time.monotonic() < deadline:
-                state = getattr(self.blockstorage.get_boot_volume(bv_id).data, "lifecycle_state", "")
+                current = self.blockstorage.get_boot_volume(bv_id).data
+                state = getattr(current, "lifecycle_state", "")
                 if state == "AVAILABLE":
                     break
                 if state in ("FAULTY", "TERMINATED", "TERMINATING"):
                     return OperationResult(ok=False, message=f"引导卷状态为 {state}，无法调整")
                 time.sleep(3)
+            # 「只能扩大」必须在服务端拦。
+            #
+            # 前端那个输入框的 label 写着「≥ 当前且 ≥50，只能扩大」，但那只是文案 ——
+            # 服务端一直没查。同一个文件里的块卷路径是查了的，引导卷这条漏了。
+            # 绕过前端直接发一个更小的值，会拿到一个 Oracle 侧的原始报错；
+            # 更糟的是这个请求本身就是白花的一次写调用。
+            # 这次读取是复用上面等待循环里已经拿到的对象，不额外发请求。
+            if size_in_gbs is not None and current is not None:
+                cur_size = int(getattr(current, "size_in_gbs", 0) or 0)
+                if cur_size and int(size_in_gbs) < cur_size:
+                    return OperationResult(
+                        ok=False,
+                        message=(
+                            f"引导卷只能扩大，不能缩小：当前 {cur_size} GB，"
+                            f"目标 {int(size_in_gbs)} GB。"
+                        ),
+                    )
             hydration_deadline = time.monotonic() + hydration_timeout
             if vpus_per_gb is not None:
                 # Wait for hydration to finish before touching VPUs.
@@ -4532,17 +4634,30 @@ class TenantSession:
                 query_type="COST",
                 group_by=["service", "currency"],
             )
-            resp = self._usage.request_summarized_usages(details)
-            # 空结果是免费账号的**常态**，不是错误。
+            # 跟进 opc-next-page。
             #
-            # 原来那行写成 `list(data.items ...) or list(data or [])`：items 为空时
-            # 第一段得到 []（假值），`or` 于是去求值第二段 —— 而 UsageAggregation
-            # 不可迭代，直接 TypeError「'UsageAggregation' object is not iterable」。
-            # 于是这个函数自己 docstring 里写着的那句
-            #   "Free accounts often have no usage data … returns ok with empty series"
-            # 那条分支**永远走不到**，免费账号看到的是一个报错而不是「暂无账单数据」。
-            usage_data = getattr(resp, "data", None)
-            items = list(getattr(usage_data, "items", None) or [])
+            # 以前只读第一页：一个用量记录较多的租户，账单页显示的是**部分**合计，
+            # 而且没有任何地方说它被截断了 —— 一个权威的、偏小的数字。
+            # 硬上限 10 页，别让一个大租户把请求预算打光（CLAUDE.md）。
+            items: list[Any] = []
+            page: Optional[str] = None
+            pages_read = 0
+            truncated_pages = False
+            for _ in range(10):
+                kw = {"page": page} if page else {}
+                resp = self.usage.request_summarized_usages(details, **kw)
+                usage_data = getattr(resp, "data", None)
+                items.extend(list(getattr(usage_data, "items", None) or []))
+                pages_read += 1
+                page = getattr(resp, "next_page", None) or (
+                    (getattr(resp, "headers", None) or {}).get("opc-next-page")
+                    if hasattr(resp, "headers")
+                    else None
+                )
+                if not page:
+                    break
+            else:
+                truncated_pages = bool(page)
             daily_map: dict[str, float] = {}
             service_map: dict[str, float] = {}
             currency = ""
@@ -4595,9 +4710,22 @@ class TenantSession:
             ][:20]
             return OperationResult(
                 ok=True,
-                message="已获取用量/费用汇总" if daily else "暂无账单数据（免费账号或无 Usage 权限时常见）",
+                message=(
+                    (
+                        "已获取用量/费用汇总"
+                        if daily
+                        else "暂无账单数据（免费账号或无 Usage 权限时常见）"
+                    )
+                    # 截断必须说出来。一个偏小但看起来权威的合计，比读不到更糟。
+                    + (
+                        f"（注意：用量记录超过 {pages_read} 页，下面的合计**不完整**）"
+                        if truncated_pages
+                        else ""
+                    )
+                ),
                 data={
                     "daily": daily,
+                    "truncated": truncated_pages,
                     "by_service": by_service,
                     "total": round(total, 4),
                     "currency": currency or "USD",
@@ -6058,7 +6186,8 @@ class TenantSession:
                     "ip_address": getattr(ip, "ip_address", "") or "",
                     "display_name": getattr(ip, "display_name", "") or "",
                     "lifecycle_state": getattr(ip, "lifecycle_state", "") or "",
-                    "assigned": bool(getattr(ip, "private_ip_id", None)),
+                    # 按状态判断，不看 deprecated 的 private_ip_id —— 见 _public_ip_busy。
+                    "assigned": _public_ip_busy(ip),
                     "private_ip_id": getattr(ip, "private_ip_id", "") or "",
                     "time_created": str(getattr(ip, "time_created", "") or ""),
                 }
@@ -6091,7 +6220,12 @@ class TenantSession:
             ip = self.network.get_public_ip(public_ip_id).data
             if str(getattr(ip, "lifetime", "") or "").upper() != "RESERVED":
                 return OperationResult(ok=False, message="仅允许删除保留（RESERVED）公网 IP")
-            if getattr(ip, "private_ip_id", None):
+            if _public_ip_busy(ip):
+                state = str(getattr(ip, "lifecycle_state", "") or "").upper()
+                if state == "ASSIGNING":
+                    return OperationResult(
+                        ok=False, message="该保留 IP 正在绑定中，请稍候刷新后再操作"
+                    )
                 return OperationResult(ok=False, message="该保留 IP 仍绑定在实例上，请先解绑")
             self.network.delete_public_ip(public_ip_id)
             return OperationResult(ok=True, message=f"已删除保留 IP {getattr(ip, 'ip_address', '')}")
@@ -6113,7 +6247,7 @@ class TenantSession:
             target = self.network.get_public_ip(public_ip_id).data
             if str(getattr(target, "lifetime", "") or "").upper() != "RESERVED":
                 return OperationResult(ok=False, message="所选公网 IP 不是保留（RESERVED）类型")
-            if getattr(target, "private_ip_id", None):
+            if _public_ip_busy(target):
                 return OperationResult(ok=False, message="该保留 IP 已绑定其他实例，请先解绑")
 
             network = self.resolve_primary_network(
@@ -6157,7 +6291,7 @@ class TenantSession:
             ip = self.network.get_public_ip(public_ip_id).data
             if str(getattr(ip, "lifetime", "") or "").upper() != "RESERVED":
                 return OperationResult(ok=False, message="仅支持解绑保留（RESERVED）公网 IP")
-            if not getattr(ip, "private_ip_id", None):
+            if not _public_ip_busy(ip):
                 return OperationResult(ok=True, message="该保留 IP 未绑定任何实例")
             update = oci.core.models.UpdatePublicIpDetails(private_ip_id="")
             self.network.update_public_ip(public_ip_id, update)
@@ -6865,7 +6999,15 @@ class TenantSession:
         except ServiceError as exc:
             msg = _format_service_error(exc)
             if "BucketNotEmpty" in msg or "not empty" in msg.lower():
-                msg = f"存储桶非空，请先删除对象后再删桶（{msg}）"
+                # 别把原因咬定成「非空」。文档列出的删桶前置条件有三条：
+                # 桶内仍有对象、有未完成的分段上传（multipart upload）、
+                # 或存在预验证请求（PAR）。后两种删对象是解决不了的，
+                # 而祈使句「请先删除对象」会让人反复删一个已经空了的桶。
+                msg = (
+                    "存储桶无法删除。OCI 要求桶内没有对象、没有未完成的分段上传、"
+                    "也没有预验证请求（PAR）—— 三者任一存在都会被拒。"
+                    f"原始错误：{msg}"
+                )
             return OperationResult(ok=False, message=msg)
         except Exception as exc:  # noqa: BLE001
             return OperationResult(ok=False, message=str(exc))
@@ -6877,7 +7019,15 @@ class TenantSession:
         prefix: str = "",
         limit: int = 200,
         namespace: str = "",
+        start: str = "",
     ) -> OperationResult:
+        """列桶内对象。
+
+        ListObjects **不用**标准的 opc-next-page 分页，用的是 `start` /
+        `nextStartWith` 这一对。以前 next_start_with 被算出来并塞进返回值里，
+        但没有任何一处能把它传回来 —— 于是永远只看得到第一页，一个有几千个对象的
+        桶在界面上就是「只有这 200 个」，而且没有任何地方说它被截断了。
+        """
         if self.object_storage is None:
             return OperationResult(ok=False, message="Object Storage 客户端不可用")
         bucket = (bucket or "").strip()
@@ -6899,6 +7049,8 @@ class TenantSession:
             }
             if prefix:
                 kwargs["prefix"] = prefix
+            if start:
+                kwargs["start"] = start
             resp = self.object_storage.list_objects(namespace, bucket, **kwargs)
             data = resp.data
             objects = []

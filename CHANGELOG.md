@@ -1,5 +1,86 @@
 # Changelog
 
+## 0.4.96 — 2026-08-27
+
+接着 0.4.95 修 OCI 文档对比审计剩下的那批，本版再修 10 条。
+
+### 修复
+
+- **【高】换过引导卷的实例，详情页显示的容量和「调整引导卷」操作的对象，
+  可能是那块已经拆下来的旧盘。** `ListBootVolumeAttachments` 返回的是**历史全部**
+  附件记录，换过盘的实例有多条（旧盘 DETACHED、新盘 ATTACHED），而代码直接
+  `next()` 取第一条有 `boot_volume_id` 的。现在按 `lifecycle_state` 筛
+  （`lifecycle_state` 在 `BootVolumeAttachment` 上是 **[Required]**），
+  只收 ATTACHED / ATTACHING 且 ATTACHED 优先 —— ATTACHING 必须留着，
+  创建实例后轮询新盘时状态正是它。
+  顺带修了 `tests/test_boot_volume.py` 里那个漏掉必填字段的桩。
+
+- **【高】正在绑定中的保留公网 IP 被读成「未绑定」，界面给出「删除」按钮。**
+  四处判断都读 `PublicIp.private_ip_id`，而文档明说该字段在绑定进行中时也是 null
+  （它本身还被标记 deprecated）。于是一个 ASSIGNING 的保留 IP：界面显示未绑定、
+  服务端守卫放行、`delete_public_ip` 打在一个正在绑定的 IP 上。
+  统一改成按 `lifecycle_state` 判断（新增 `_public_ip_busy`），
+  ASSIGNING 的提示文案也和 ASSIGNED 区分开。
+
+- **【高】已有一条指向 NAT 网关的 0.0.0.0/0 时，公网路由被当成「已就绪」。**
+  `_ensure_public_route_table` 的兜底分支只比 `destination`，不比
+  `network_entity_id`。结果是新建的公网子网里的实例拿到了公网 IP、路由表看着也有
+  默认路由，但**出网根本不通**，而建网流程一路报成功。
+  同一个函数里的 `::/0` 分支早就是「目的地址和下一跳都要对上」了 —— 这条兜底路径
+  当时漏了。指错地方的规则要**换掉**而不是再加一条（同一目的地址两条规则，
+  Oracle 会拒绝整次 update）。
+
+- **【中】ICMP 规则一律显示成端口「全部」。** `_normalize_firewall_rule` 丢弃了
+  `icmp_options`。最典型的是 Oracle 默认安全列表里那条只放行 ICMPv4
+  type 3 code 4（Path MTU Discovery）的规则 —— 被读成「ICMP 全部放行」，
+  让人以为网络比实际开放得多。现在显示成「类型 3 代码 4」。
+
+- **【中】引导卷缩容没有服务端校验。** 前端 label 写着「只能扩大」，但那只是文案；
+  同一个文件里的块卷路径查了，引导卷这条没查。现在复用等待 AVAILABLE 时已经拿到的
+  卷对象做比较，**不额外发请求**。
+
+- **【中】桶内对象永远只显示第一页。** `ListObjects` 用的是 `start` /
+  `nextStartWith`，不是标准的 opc-next-page。后端一直算出 `next_start_with`
+  却没有任何入口能把它传回来 —— 一个几千对象的桶在界面上就是「只有这 200 个」，
+  而且没有任何地方说它被截断了。现在后端/路由/前端都接上了，并加了「加载更多」。
+
+- **【中】账单只读第一页，合计偏小且不说。** `request_summarized_usages` 从不跟进
+  `opc-next-page`。现在跟进（硬上限 10 页，别让大租户把请求预算打光），
+  **截断必须说出来** —— 一个偏小但看起来权威的合计比读不到更糟。
+
+- **【中】每建一个 TenantSession 就多打一次 Identity 调用。** `_build()` 里为了给
+  账单客户端选主区，直接调了 `_home_region()`（那是一次真实的
+  `list_region_subscriptions`）。而 `SessionManager.get` 是在**进程级锁**里构造
+  session 的 —— 那次网络往返会把同一个 worker 里所有租户的 OCI 请求一起堵住。
+  改成惰性：账单客户端第一次被真正访问时才解析主区并按需换端点。
+
+- **【低】删桶失败时把原因一口咬定成「非空」。** 文档列的前置条件有三条：桶内有
+  对象、有未完成的分段上传、或存在预验证请求（PAR）—— 后两种删对象解决不了，
+  而祈使句「请先删除对象」会让人反复删一个已经空了的桶。
+
+### 维护
+
+- `tests/test_oci_api_conformance.py` 补到 35 条。
+- vue-tsc 抓到一个本次改动引进的真 bug：`@click="loadObjects"` 会把 PointerEvent
+  当成 `more` 参数传进去（真值），于是点「刷新」变成「追加下一页」。已改成
+  `loadObjects()`，并在模板里留了注释。
+- 全量 1041 passed。
+
+### 还剩的（下一版）
+
+`assign_public_ipv6` 只补路由不补 IPv6 安全规则、`create_ipv6` 没传
+`ipv6_subnet_cidr`、subnet 没设 `dns_label`、控制台连接超时报成功、串口公钥类型
+校验、引导日志固定 256KB 不给截断提示、自定义镜像架构靠显示名猜、四处卷附件列表
+没分页、出网流量仪表对子 compartment 租户读不到、服务配额表把每 AD 一条压成一行、
+LaunchInstance metadata 上限量错单位、以及若干处双层重试。
+
+### 升级
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.96
+```
+
 ## 0.4.95 — 2026-08-27
 
 按 OCI CLI / SDK 官方文档逐参数校验了全部 120 个 OCI 调用点。六个 API 面并行审计，

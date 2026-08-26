@@ -330,7 +330,10 @@
         <div class="row">
           <input type="file" @change="onFile" />
           <button class="primary" :disabled="busy || !uploadFile" @click="uploadObject">上传（≤10MB）</button>
-          <button :disabled="busy" @click="loadObjects">刷新</button>
+          <!-- 必须写成 loadObjects()，不能写 @click="loadObjects" ——
+               后者会把 PointerEvent 当成 more 参数传进去（真值），
+               于是点「刷新」变成了「追加下一页」。 -->
+          <button :disabled="busy" @click="loadObjects()">刷新</button>
         </div>
         <div class="table-wrap">
           <table>
@@ -356,6 +359,16 @@
               </tr>
             </tbody>
           </table>
+          <!-- 有下一页游标就说出来。以前只显示第一页且不提示截断，一个几千对象的桶
+               在界面上看起来就是「只有这 200 个」。 -->
+          <div v-if="objectsNextStart" class="row" style="margin-top: 0.5rem; gap: 0.5rem">
+            <button :disabled="busy" @click="loadObjects(true)">
+              {{ busy ? '加载中…' : '加载更多' }}
+            </button>
+            <span class="muted" style="font-size: 12px">
+              还有更多对象未列出（已显示 {{ objects.length }} 个）
+            </span>
+          </div>
         </div>
       </div>
     </div>
@@ -411,6 +424,8 @@ const buckets = ref<any[]>([])
 const objectNs = ref('')
 const activeBucket = ref('')
 const objects = ref<any[]>([])
+// ListObjects 的下一页游标（nextStartWith）。空串 = 没有更多了。
+const objectsNextStart = ref('')
 const newBucket = ref('')
 const uploadFile = ref<File | null>(null)
 
@@ -811,19 +826,30 @@ async function openBucket(name: string) {
   await loadObjects()
 }
 
-async function loadObjects() {
+/**
+ * 列举对象。`more = true` 时接着上一页往下拉。
+ *
+ * ListObjects 用 start / nextStartWith 分页（不是标准的 opc-next-page）。以前后端
+ * 算出了 next_start_with 却没有任何入口能传回来 —— 于是一个有几千个对象的桶在界面
+ * 上就是「只有这 200 个」，而且没有任何地方说它被截断了。
+ */
+async function loadObjects(more = false) {
   if (!activeBucket.value) return
   busy.value = true
   // Guard on the bucket as well as the tenant: without it a slow listing could
   // render under a different bucket, and object deletes are addressed by name.
   const wantedBucket = activeBucket.value
   const guard = beginLoad('objects')
+  const from = more ? objectsNextStart.value : ''
   try {
     const { data } = await api.get(
       `/tenants/${tenantId.value}/object-storage/buckets/${encodeURIComponent(activeBucket.value)}/objects`,
+      { params: from ? { start: from } : {} },
     )
     if (guard.stale() || activeBucket.value !== wantedBucket) return
-    objects.value = data.data?.objects || []
+    const page = data.data?.objects || []
+    objects.value = more ? [...objects.value, ...page] : page
+    objectsNextStart.value = data.data?.next_start_with || ''
   } catch (e: any) {
     if (guard.stale() || activeBucket.value !== wantedBucket) return
     error.value = e?.message || '列举对象失败'
