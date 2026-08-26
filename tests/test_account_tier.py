@@ -176,7 +176,10 @@ def test_reference_quota_lists_only_always_free_shapes(monkeypatch):
     )
     s = _session("Pay as you go", monkeypatch=monkeypatch)
     s._limits = SimpleNamespace(
-        list_limit_values=lambda t, service_name=None: SimpleNamespace(
+        # `**_kw` 不能省：真实的 SDK 方法签名都是 (..., **kwargs)，面板会往里传
+        # retry_strategy。桩不收的话，一个本该无害的调用会变成 TypeError，
+        # 而这里 monkeypatch 掉的分页助手会把它原样透传进来。
+        list_limit_values=lambda t, service_name=None, **_kw: SimpleNamespace(
             data=[
                 SimpleNamespace(name="standard-a1-core-count", value=4),
                 SimpleNamespace(name="standard-a1-memory-count", value=24),

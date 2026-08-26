@@ -12,6 +12,14 @@
     </div>
 
     <div v-if="error" class="error-box">{{ error }}</div>
+    <!-- 首读被 Oracle 拒了、重读又成功。必须说出来：不然这次修复是隐形的，
+         用户只会觉得「有时候快有时候慢」，仍旧以为是自己权限配错了。 -->
+    <div v-if="rereadNote" class="card warn-box">
+      <strong>⚠ 本次读取重试后才成功</strong>
+      <div class="muted diag-msg" style="font-size: 12px; margin-top: 0.25rem">
+        {{ rereadNote }}
+      </div>
+    </div>
     <div v-if="msg" class="success-box">{{ msg }}</div>
 
     <div class="card stack" v-if="instance">
@@ -161,7 +169,7 @@
           启用「Compute Instance Monitoring」后,大约几分钟开始有数据。
         </div>
       </div>
-      <p class="muted" style="margin: 0; font-size: 12px">{{ metricsMsg }}</p>
+      <p class="muted diag-msg" style="margin: 0; font-size: 12px">{{ metricsMsg }}</p>
       <div class="metrics-grid">
         <div
           v-for="key in metricKeys"
@@ -291,7 +299,7 @@
           {{ bootlogBusy ? '抓取中…' : '抓取输出' }}
         </button>
       </div>
-      <div v-if="bootlogMsg" class="muted" style="font-size: 12px">{{ bootlogMsg }}</div>
+      <div v-if="bootlogMsg" class="muted diag-msg" style="font-size: 12px">{{ bootlogMsg }}</div>
       <pre v-if="bootlog" class="bootlog">{{ bootlog }}</pre>
       <p v-else-if="!bootlogBusy" class="muted empty" style="margin: 0">
         点「抓取输出」拉取。和本页其他部分一样，进入页面不会自动请求 Oracle。
@@ -306,7 +314,7 @@
           <button class="danger" :disabled="fwBusy" @click="openAllFirewall">放行全部端口</button>
         </div>
       </div>
-      <p class="muted" style="margin: 0; font-size: 12px">{{ fwMsg }}</p>
+      <p class="muted diag-msg" style="margin: 0; font-size: 12px">{{ fwMsg }}</p>
 
       <div v-if="fwLoading" class="card muted" style="padding: 0.75rem; font-size: 13px">
         正在读取防火墙规则…
@@ -771,6 +779,8 @@ const loading = ref(false)
 const acting = ref(false)
 const error = ref('')
 const msg = ref('')
+// 「首读 404、复读成功」的说明（X-Ocibot-Reread 响应头）。见 loadInstance。
+const rereadNote = ref('')
 const tab = ref<
   'metrics' | 'console' | 'bootlog' | 'webssh' | 'firewall' | 'network' | 'volume'
 >('metrics')
@@ -1087,12 +1097,22 @@ function formatTime(v: string) {
 
 async function loadInstance() {
   const guard = beginLoad('instance')
-  const { data } = await api.get<Instance>(
+  const res = await api.get<Instance>(
     `/tenants/${tenantId.value}/instances/${instanceId.value}`,
   )
+  const data = res.data
   // 这一份是上一台机器的答复（或者迟到的旧答复）：写进去就等于页面显示 A、
   // 按钮操作 B。整个页面的正确性都压在这一行上。
   if (guard.stale()) return
+  // 后端首读被 Oracle 拒了（404）、复读又成功时会带上这两个头。
+  //
+  // 不显示的话这个修复是**隐形**的：页面只是有时候慢一点，而「我账号是满权限的
+  // API，有时候点会出问题，有时候又好好的」这个困惑原封不动。显示出来，用户才知道
+  // 那次是 Oracle 侧的瞬时故障，不用再去翻自己的 IAM 策略。
+  rereadNote.value = res.headers?.['x-ocibot-reread']
+    ? decodeURIComponent(String(res.headers?.['x-ocibot-reread-reason'] || '')) ||
+      '首次读取失败、重读后成功 —— 本次是瞬时故障'
+    : ''
   instance.value = data
   if (data.ocpus != null) shapeForm.ocpus = data.ocpus
   if (data.memory_in_gbs != null) shapeForm.memory_in_gbs = data.memory_in_gbs
@@ -1951,6 +1971,7 @@ function resetInstanceState() {
   metricsMsg.value = ''
   // 引导日志尤其不能留:它是用来判断「这台机器为什么起不来」的,
   // 挂在另一台实例的页面上会直接导致误判。
+  rereadNote.value = ''
   bootlog.value = ''
   bootlogMsg.value = ''
   consoleList.value = []

@@ -541,7 +541,19 @@ html[data-theme='dark'] .badge.err {
    资源可能在别的 compartment），没有 pre-line 就会被压成一长串跑不断的句子，
    而那几条恰恰是操作者唯一能照着做的东西。
    pre-line 只保留换行、仍然折叠多余空格，所以对单行消息没有任何影响。
-   以前只有 LaunchView 自己加了内联样式，其余 12 处都会塌成一行。 */
+   以前只有 LaunchView 自己加了内联样式，其余 12 处都会塌成一行。
+
+   实例详情页的监控 / 引导日志 / 防火墙三块**局部**消息用的是裸 .muted，后端那段
+   带四条换行的 404 诊断（IAM 策略 / Compartment 填错 / 区域不对 / Oracle 瞬时
+   故障）在那里会被压成一条 12px 灰色的长句子。
+   给它们单独一个类，而**不是**直接给 .muted 加 pre-line：.muted 到处都在用，
+   其中不少是模板里换行写的多行文案，加上 pre-line 会让那些源码换行变成真的换行。 */
+.diag-msg {
+  white-space: pre-line;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
 .error-box {
   white-space: pre-line;
   background: var(--danger-soft);

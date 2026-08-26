@@ -86,19 +86,116 @@ def test_circuit_breaker_error_is_not_a_service_error():
     assert not issubclass(CircuitBreakerError, ServiceError)
 
 
-def test_identity_client_gets_a_per_tenant_circuit_breaker():
-    """每个租户一个独立 name → CircuitBreakerMonitor 不再复用同一个实例。
+def test_which_sdk_clients_actually_default_to_the_shared_breaker():
+    """钉住 0.4.96 的注释**说错了**的那件事。
 
-    保留熔断保护本身（A 租户被 Oracle 限流时仍然该退避），
-    只去掉「A 租户的限流把 B 租户也熔断掉」这个交叉污染。
+    那条注释断言「IdentityClient 是唯一会兜底装上 DEFAULT_CIRCUIT_BREAKER_STRATEGY
+    的 client」，于是修复只覆盖了 Identity。对 2.182.0 逐个读 __init__ 源码的实测
+    结果是：只有 Compute 例外，其余九个全都兜底 DEFAULT —— 也就是说它们跨租户
+    **并且跨服务**共用同一个熔断器。
+
+    这条测试直接查 SDK 源码，所以 SDK 升级后如果 Oracle 改了默认值，它会失败并
+    提醒我们重新判断，而不是让一条过时的断言继续指导代码。
     """
-    src = inspect.getsource(TenantSession._build)
+    import importlib
 
-    assert "circuit_breaker_strategy" in src, "Identity 没有自己的熔断器策略"
-    assert 'f"ocibot-identity-{self.tenant.id}"' in src, "熔断器 name 必须带租户 id"
-    # Compute 不该被顺手加上熔断器 —— 它本来就没有，加了会引入新的失败模式。
+    def _defaults_to_shared(mod: str, cls_name: str) -> bool:
+        cls = getattr(importlib.import_module(mod), cls_name)
+        src = inspect.getsource(cls.__init__)
+        return (
+            "base_client_init_kwargs['circuit_breaker_strategy'] = "
+            "circuit_breaker.DEFAULT_CIRCUIT_BREAKER_STRATEGY" in src
+        )
+
+    assert not _defaults_to_shared("oci.core", "ComputeClient"), (
+        "Compute 以前没有熔断器 —— 如果 SDK 改了，_build 里那条「不给 Compute 加」的"
+        "决定要重新评估"
+    )
+    for mod, cls_name in [
+        ("oci.core", "VirtualNetworkClient"),
+        ("oci.core", "BlockstorageClient"),
+        ("oci.identity", "IdentityClient"),
+        ("oci.monitoring", "MonitoringClient"),
+        ("oci.limits", "LimitsClient"),
+        ("oci.object_storage", "ObjectStorageClient"),
+    ]:
+        assert _defaults_to_shared(mod, cls_name), f"{cls_name} 不再兜底 DEFAULT？请复核"
+
+    # 而那个 DEFAULT 的 name 是固定的 —— 这才是「共用」的物理原因。
+    assert oci.circuit_breaker.DEFAULT_CIRCUIT_BREAKER_STRATEGY.name == (
+        oci.circuit_breaker.DEFAULT_CIRCUIT_BREAKER_STRATEGY.name
+    )
+
+
+def test_every_breaker_enabled_client_gets_a_per_tenant_per_service_name():
+    """每租户 × 每服务一个独立 name → CircuitBreakerMonitor 不再复用同一个实例。
+
+    保留熔断保护本身（A 租户被 Oracle 限流时仍然该退避），只去掉两种交叉污染：
+    「A 租户的限流把 B 租户也熔断掉」和「对象存储的故障把监控也熔断掉」。
+    """
+    from app.oci_client import cb_kwargs
+
+    src = inspect.getsource(TenantSession._build)
+    helper = inspect.getsource(cb_kwargs)
+
+    assert "circuit_breaker_strategy" in helper
+    # name 必须同时带服务名和租户 id，缺一个就还会串。
+    assert 'f"ocibot-{service}-{tenant_id}"' in helper
+
+    # 0.4.96 只覆盖了 Identity。这几个当时全漏了。
+    for service in ("network", "identity", "blockstorage", "monitoring", "limits"):
+        assert f'_cb_kw("{service}")' in src, f"{service} 仍在用共享熔断器"
+
+    # Compute 不该被顺手加上熔断器 —— 它本来就没有，加了会引入新的失败模式，
+    # 而实例列表和实例详情正好全压在它身上。
     compute_line = [ln for ln in src.splitlines() if "self._compute = " in ln]
     assert compute_line and "circuit_breaker" not in compute_line[0]
+    assert "_cb_kw" not in compute_line[0]
+
+
+def test_breaker_names_differ_across_tenants_and_services():
+    """行为断言，不是源码断言：两个租户拿到的 name 必须不同。"""
+    from app.oci_client import cb_kwargs
+
+    seen = set()
+    for tenant_id in ("t-aaa", "t-bbb"):
+        for service in ("identity", "monitoring"):
+            name = cb_kwargs(service, tenant_id)["circuit_breaker_strategy"].name
+            assert name not in seen, f"{name} 撞名了 —— 会复用同一个熔断器"
+            seen.add(name)
+    assert len(seen) == 4
+
+
+def test_no_client_is_left_on_the_shared_process_wide_breaker():
+    """0.4.96 只改了 _build 里的 Identity。_build **之外**还有五处按需重建 client
+    的地方（账单主区 Identity / InvoiceService / UsageApi / Subscription /
+    IdentityDomains），当时全漏了 —— 它们默认落回那个固定 uuid 的共享熔断器。
+
+    直接扫源码：任何 `XxxClient(` 构造要么带 circuit_breaker_strategy（经由
+    cb_kwargs / _cb_kw），要么是 Compute（本来就没有熔断器）。
+    """
+    import pathlib
+    import re
+
+    src = pathlib.Path("app/oci_client.py").read_text(encoding="utf-8")
+    # 取每一处 `SomethingClient(` 之后到匹配右括号为止的那段。
+    for m in re.finditer(r"\b([A-Z]\w*Client)\(", src):
+        name = m.group(1)
+        if name == "ComputeClient":
+            continue
+        depth, i = 0, m.end() - 1
+        while i < len(src):
+            if src[i] == "(":
+                depth += 1
+            elif src[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        call = src[m.start() : i + 1]
+        assert "cb_kw" in call or "circuit_breaker_strategy" in call, (
+            f"{name} 仍在用全进程共享的熔断器：{call[:160]}"
+        )
 
 
 # ---------------------------------------------------------------- 枚举失败
@@ -170,37 +267,97 @@ def test_access_level_stays_accessible():
 # ---------------------------------------------------------------- 一次复读
 
 
-def test_the_collapse_path_re_reads_once_before_raising():
+def test_the_collapse_path_re_reads_before_raising():
     """不是重试策略，是取一位证据：复读成功 → 这个 404 按定义就是瞬时的。
 
-    只在**注定要抛**的那一刻做，只做一次，且只对 404 做。
-    成功路径 0 增量；失败路径 +1 个幂等的 List —— 严格少于用户现在手动点三五次
+    只在**注定要抛**的那一刻做，次数有界，且只对 404 做。
+    成功路径 0 增量；失败路径 +N 个幂等的 List —— 严格少于用户现在手动点三五次
     刷新（每次 1+N 个请求）。
     """
-    src = inspect.getsource(TenantSession.list_instances_tree)
+    src = _code_only(TenantSession.list_instances_tree)
 
     assert "retried_ok" in src
-    assert "time.sleep(1.5)" in src
-    # 只对 404 复读。
-    assert '"[404]" in detail or "NotAuthorizedOrNotFound" in detail' in src
+    # 复读策略统一收在 read_with_404_evidence 里，list 和 detail 共用同一份。
+    assert "read_with_404_evidence" in src
+    assert "_is_ambiguous_404" in src
+
+
+def test_only_404_is_re_read():
+    """429 / 5xx / 401 都不该触发复读：限流有 SDK 自己的退避，401 是真的凭据问题。"""
+    from app.oci_client import _REREAD_DELAYS, read_with_404_evidence
+
+    calls = []
+
+    def _boom(status, code):
+        def _call():
+            calls.append(1)
+            exc = Exception("nope")
+            exc.status = status
+            exc.code = code
+            raise exc
+
+        return _call
+
+    for status, code in [(429, "TooManyRequests"), (500, "InternalError"), (401, "NotAuthenticated")]:
+        calls.clear()
+        ok, _v, _e, rereads = read_with_404_evidence(_boom(status, code))
+        assert not ok and rereads == 0, f"{status} 不该复读"
+        assert len(calls) == 1, f"{status} 只该调用一次，实际 {len(calls)}"
+
+    # 404 才复读，且次数有界。
+    calls.clear()
+    ok, _v, _e, rereads = read_with_404_evidence(_boom(404, "NotAuthorizedOrNotFound"))
+    assert not ok
+    assert rereads == len(_REREAD_DELAYS)
+    assert len(calls) == len(_REREAD_DELAYS) + 1
+
+
+def test_a_successful_first_read_costs_nothing_extra():
+    """成功路径必须零增量 —— 复读只能出现在失败路径上。"""
+    from app.oci_client import read_with_404_evidence
+
+    calls = []
+    ok, value, err, rereads = read_with_404_evidence(lambda: calls.append(1) or "fine")
+    assert ok and value == "fine" and err is None
+    assert rereads == 0 and len(calls) == 1
 
 
 def test_a_permanent_failure_says_it_was_re_read():
     """重试**不能**变成一次沉默的加时。
 
-    真的没权限的用户，加了复读之后拿到的是同一个 404、只是慢了 1.5 秒 ——
+    真的没权限的用户，加了复读之后拿到的是同一个 404、只是慢了几秒 ——
     如果不说出来，他只会觉得「变慢了、错误一模一样」。
     """
-    src = inspect.getsource(TenantSession.list_instances_tree)
-    assert "已自动重读 1 次，仍然失败" in src
+    from app.oci_client import persistent_404_note
+
+    assert "仍然失败" in persistent_404_note(2)
+    assert "2" in persistent_404_note(2)
+    # 从没复读过就不能声称复读过。
+    assert persistent_404_note(0) == ""
 
 
 def test_a_transient_failure_leaves_a_trace_instead_of_being_silent():
     """复读成功不该是一次「侥幸通过」—— _last_tree_errors 会被路由渲染成
     X-Ocibot-Partial 响应头，前端据此挂提示条。"""
-    src = inspect.getsource(TenantSession.list_instances_tree)
+    from app.oci_client import transient_404_note
+
+    src = _code_only(TenantSession.list_instances_tree)
     assert "_last_tree_errors" in src
-    assert "重读成功" in src
+    assert "transient_404_note" in src
+
+    note = transient_404_note("[404] NotAuthorizedOrNotFound", 1)
+    assert "瞬时" in note
+    # 而且必须明说「不用改配置」—— 用户的困惑正是「我权限是满的」。
+    assert "无关" in note
+
+
+def test_a_successful_but_empty_re_read_is_not_reported_as_a_permission_error():
+    """0.4.96 写的是 `if again:` —— 复读**成功但读到空列表**（这个 compartment
+    确实一台实例都没有）会被判成复读失败，于是照样抛那个 404，把「读得到、只是
+    空的」说成了「没有权限」。判据必须是调用成功与否，不是列表空不空。"""
+    src = _code_only(TenantSession.list_instances_tree)
+    assert "if again:" not in src, "又用列表真假当复读成功的判据了"
+    assert "ok_again" in src
 
 
 # ---------------------------------------------------------------- 探针策略

@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.oci_client import (
+    safe_error_text,
     OCIClientError,
     POWER_ACTIONS,
     TERMINATE_PROTECT_TAG,
@@ -113,7 +114,7 @@ def _tenant_or_404(db: Session, user_id: str, tenant_id: str) -> Tenant:
     try:
         return get_owned_tenant(db, user_id, tenant_id)
     except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=safe_error_text(exc)) from exc
 
 
 _HIDDEN_INSTANCE_STATES = frozenset({"TERMINATED"})
@@ -168,7 +169,7 @@ def list_instances(
             for i in infos
         ]
     except OCIClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"列出实例失败: {exc}") from exc
 
@@ -197,16 +198,30 @@ def get_instance(
     instance_id: str,
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
+    response: Response = None,  # type: ignore[assignment]
 ) -> InstanceOut:
     row = _tenant_or_404(db, user.id, tenant_id)
     try:
         session = get_session_for_row(row)
-        info = session.get_instance(instance_id, resolve_ips=True)
+        # 整个详情页只有这一次读的失败会进红框，所以复读只在这里开（见 get_instance）。
+        info = session.get_instance(instance_id, resolve_ips=True, reread_on_404=True)
+        # 「首读 404、复读成功」必须说出来。
+        #
+        # 不说的话这个修复是**隐形**的：页面就是有时候快有时候慢，用户原来的困惑
+        # （「我账号是满权限的 API，有时候点会出问题，有时候又好好的」）原封不动。
+        # 说出来，他才知道那次是 Oracle 侧的瞬时故障，不用再去翻自己的 IAM 策略。
+        # 用响应头而不是改 response_model：这个路由返回的是 InstanceOut 本身，
+        # 加字段会同时打破前端契约和 TS 类型（同 X-Ocibot-Partial 的理由）。
+        note = str(getattr(info, "read_note", "") or "")
+        if note and response is not None:
+            response.headers["X-Ocibot-Reread"] = "1"
+            # header 只能装 latin-1，中文必须百分号编码。
+            response.headers["X-Ocibot-Reread-Reason"] = quote(note[:400])
         return InstanceOut(**instance_to_dict(info, tenant_id=row.id, tenant_name=row.name))
     except OCIClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.post("/tenants/{tenant_id}/instances/{instance_id}/power", response_model=PowerActionResult)
@@ -243,9 +258,9 @@ def power_action(
         )
         return PowerActionResult(**op_result_dict(result))
     except OCIClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.post("/tenants/{tenant_id}/instances/{instance_id}/terminate", response_model=PowerActionResult)
@@ -294,9 +309,9 @@ def terminate_instance(
         # 终止保护返回的是 409，不能被下面的兜底改写成 502。
         raise
     except OCIClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.post("/tenants/{tenant_id}/instances/{instance_id}/rename", response_model=PowerActionResult)
@@ -313,9 +328,9 @@ def rename_instance(
         result = session.rename_instance(instance_id, body.display_name.strip())
         return PowerActionResult(**op_result_dict(result))
     except OCIClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.post(
@@ -357,9 +372,9 @@ def set_root_password_note(
         )
         return PowerActionResult(**op_result_dict(result))
     except OCIClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.post("/tenants/{tenant_id}/instances/{instance_id}/shape", response_model=PowerActionResult)
@@ -418,9 +433,9 @@ def update_shape(
     except HTTPException:
         raise
     except OCIClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.post(
@@ -440,9 +455,9 @@ def replace_public_ip(
         result = session.replace_ephemeral_public_ip(instance_id, info.compartment_id)
         return PowerActionResult(**op_result_dict(result))
     except OCIClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.post(
@@ -462,9 +477,9 @@ def assign_ipv6(
         result = session.assign_public_ipv6(instance_id, info.compartment_id)
         return PowerActionResult(**op_result_dict(result))
     except OCIClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.delete(
@@ -502,9 +517,9 @@ def remove_ipv6(
         )
         return PowerActionResult(**op_result_dict(result))
     except OCIClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.get("/tenants/{tenant_id}/instances/{instance_id}/metrics")
@@ -526,9 +541,9 @@ def instance_metrics(
             "data": result.data if isinstance(result.data, dict) else {"raw": result.data},
         }
     except OCIClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.get("/tenants/{tenant_id}/account")
@@ -549,9 +564,9 @@ def account_status(
             db.commit()
         return {"ok": bool(result.ok), "message": result.message or "", "data": data}
     except OCIClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.get("/tenants/{tenant_id}/invoices")
@@ -577,7 +592,7 @@ def account_invoices(
             "data": result.data if isinstance(result.data, dict) else {},
         }
     except OCIClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"读取账单失败: {exc}") from exc
 
@@ -600,9 +615,9 @@ def account_usage(
             "data": result.data if isinstance(result.data, dict) else {},
         }
     except OCIClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 @router.get("/tenants/{tenant_id}/free-quota")
 def free_quota(
@@ -647,7 +662,7 @@ def free_quota(
             "data": data,
         }
     except OCIClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"读取免费额度失败: {exc}") from exc
 
@@ -727,7 +742,7 @@ def launch_quota_check(
             count=max(1, int(body.count or 1)),
         )
     except OCIClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"校验免费额度失败: {exc}") from exc
 
@@ -797,7 +812,7 @@ def launch_meta(
         meta = fetch_launch_meta(session, tenant_id=row.id, force=force)
         return meta
     except OCIClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"加载创建元数据失败: {exc}") from exc
 
@@ -829,7 +844,7 @@ def launch_meta_refresh(
         session = get_session_for_row(row)
         return start_meta_refresh(session, row.id, force=force)
     except OCIClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"启动加载失败: {exc}") from exc
 
@@ -874,11 +889,11 @@ def launch_instance(
         built = build_launch_request(body.model_dump(), meta=meta)
         timer.mark("build")
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=safe_error_text(exc)) from exc
     except OCIClientError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
     payload = built["payload"]
     root_password = built["root_password"]
@@ -970,7 +985,7 @@ def launch_instance(
             built["payload"] = payload
             timer.mark("network")
         except (ValueError, OCIClientError) as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
+            raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=f"准备网络/NSG 失败: {exc}") from exc
 
@@ -1107,7 +1122,7 @@ def launch_instance(
                     except Exception:
                         pass
                 if not created:
-                    raise HTTPException(status_code=502, detail=str(exc)) from exc
+                    raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
                 failure_message = str(exc)
                 break
 

@@ -1,5 +1,145 @@
 # Changelog
 
+## 0.4.98 — 2026-08-27
+
+实例**详情页**刷新的间歇性 `404 NotAuthorizedOrNotFound`。
+
+### 先说结论：这次的 404 来自 Oracle，不是面板
+
+把范围收死之后只剩一个调用：详情页点「刷新」= `loadInstance()` + `loadCurrentTab()`，
+而后者的每一个分支（监控 / 控制台 / 防火墙 / 保留 IP / 引导卷）在前端**各自
+catch**、只写自己那一块的局部消息。唯一会冒泡到页面顶部那个红框的，是
+`loadInstance()` → `GET /tenants/{t}/instances/{i}` → `compute.get_instance(ocid)`。
+
+这条路径上**没有任何可疑之处**：OCID 来自 URL；region 绑在租户行上（副区是独立的
+租户行，不是 per-request 覆盖）；`resolve_compartment()` 不发网络请求、也没有
+「失败就退回 root」的分支；根本不涉及 compartment 枚举，所以 0.4.96 修的那条
+（共享熔断器把子 compartment 扫描打塌）**盖不到这里**。而错误里带着
+`opc-request-id`，说明那是一次真实 HTTP 往返拿回来的服务端 404 —— 本地熔断器异常
+没有 request id。
+
+满权限 + 间歇性，剩下能解释的只有 Oracle 侧的瞬时授权失败：Oracle 自己的文档说
+IAM 策略生效有「several minutes」的传播延迟，Go SDK 也把
+`{404, NotAuthorizedOrNotFound}` 登记为受最终一致性影响。
+
+**所以面板这边真正的 bug 是「说不清、查不到、不复读」**，下面这批修的就是这个。
+
+### 修复
+
+- **【高】错误不说是哪个调用失败的。** `operation_name` 和 `request_endpoint`
+  本来就在 `ServiceError` 上放着，一直被丢掉，只留了 `opc-request-id`。于是用户
+  贴出来的那条 404 里没有操作名、没有服务端点，连面板自己都只能靠反推调用链来猜。
+  现在错误尾巴上带 `(get_instance @ iaas.us-phoenix-1.oraclecloud.com,
+  opc-request-id: …)`。端点**只取主机名** —— 原文里带着未脱敏的完整 compartment
+  OCID，而主机名恰恰是诊断价值最高的一段（`iaas.*` 是 Compute、`identity.*` 是
+  Identity、`telemetry.*` 是监控）。
+
+- **【高】`app/oci_client.py` 一行日志都没有。** 120 多个 SDK 调用点，任何一次
+  失败只要没冒泡到界面就彻底消失 —— 用户报错时那条错误唯一存在的地方是他浏览器里
+  的红框，运维事后想查「昨晚是不是也炸过」查不到。现在每次失败在 `ocibot.oci` 留
+  一条事实记录（状态码 / 错误码 / 操作名 / 端点主机名 / opc-request-id，不含 OCID
+  和凭据）。限流和容量不足降到 INFO：抢机循环每 60 秒撞一次那是预期内的循环状态，
+  按 WARNING 记会把日志淹掉，而日志一旦变成噪音就又白搭了。
+
+- **【高】详情路径没有 404 复读。** 0.4.96 给列表路径加了「注定要抛之前复读一次取
+  证据」，同一个用户、同一种症状，详情路径没有。现在两边共用
+  `read_with_404_evidence`（间隔 1.2s + 3.0s，只对模糊 404，成功路径零增量）。
+  **默认关**，只有详情路由那一次「失败会直接进红框」的读打开 —— 同一次刷新里
+  `get_instance` 会被调好几遍（监控路由为了拿 `compartment_id` 又一次），全都复读的话
+  一次失败的刷新要打三倍请求、多等十几秒，而其中只有一次的错误是用户看得见的。
+
+- **【高】复读成功不能悄悄成功。** 页面就正常了，而「我账号是满权限的 API，有时候
+  点会出问题，有时候又好好的」这个困惑原封不动 —— 这次修复对用户就是隐形的。
+  现在走 `X-Ocibot-Reread` 响应头（同 `X-Ocibot-Partial` 的既有做法），详情页顶部
+  挂一条「本次读取重试后才成功…是 Oracle 侧的瞬时故障，与你的 IAM 策略无关」。
+  说明挂在**返回值**上而不是 session 上：`TenantSession` 是进程级缓存的，
+  写在 session 上会被同租户的并发请求互相覆盖。
+
+- **【高】熔断器异常被 SDK 自己判成「可重试」。** `TimeoutConnectionAndService
+  ErrorRetryChecker.should_retry` 里有一条 `elif isinstance(exception,
+  CircuitBreakerError): … return True`。于是熔断器一打开，调用方线程不会马上拿到
+  错误，而是按 1.4/2.9/4.1/8.3/16.9/30/30 秒退避重试**八次** —— 一次「本该立刻
+  失败」的调用把一个线程占住三十几秒。FastAPI 的同步路由跑在 anyio 那个默认 40
+  线程的池里，这类调用会把池坐满，面板整体像卡死，而熔断本来的意义恰恰是快速失败。
+  实测修复后：1 次调用 / 0.00 秒，而普通 429 照常退避重试。
+
+- **【高】熔断器异常把完整 compartment OCID 泄漏到前端。** `CircuitBreakerError`
+  不是 `ServiceError` 的子类，各处 `except ServiceError` 都接不住它，最后落到
+  `except Exception -> str(exc)`。而它的 `__str__` 末尾是 `(last_failure: %r)`，
+  那个 `%r` 是被熔断的 `ServiceError` 的 repr —— 里面带着 `request_endpoint` 整条，
+  含未脱敏的完整 OCID（对 2.182.0 实测确认）。面板到处只显示 `compartment[-16:]`
+  正是为了防这件事。新增 `safe_error_text()`：熔断器异常换成一句说人话的解释，
+  其余一律 `_scrub_ocids()`。94 处 `detail=str(exc)` 和 53 处 `message=str(exc)`
+  全部改走它。
+
+- **【高】0.4.96 那条「只有 Identity 兜底 DEFAULT 熔断器」的注释是错的。**
+  对 2.182.0 逐个读 `__init__` 源码实测：只有 **Compute** 例外（兜底 GLOBAL，
+  实测值为 `None`，即没有熔断器），VirtualNetwork / Blockstorage /
+  ComputeManagement / Identity / Monitoring / Limits / Quotas / ObjectStorage /
+  Usageapi / ComputeInstanceAgent **十个全都兜底 DEFAULT**。而 DEFAULT 的 name
+  是模块导入时生成的固定 uuid，`CircuitBreakerMonitor.get(name)` 按 name 取实例 ——
+  它们跨租户**并且跨服务**共用同一个熔断器。任一租户在任一服务上攒够 10 次
+  429/5xx，其余所有租户的网络、块存储、监控、对象存储调用一起熔断 30 秒。
+  现在每租户 × 每服务一个（`cb_kwargs`），`_build` 之外那五处按需重建的 client
+  （账单主区 Identity / InvoiceService / UsageApi / Subscription / IdentityDomains）
+  也一并覆盖。Compute 仍然**不加** —— 它本来就没有，加了等于凭空引入新的失败模式，
+  而实例列表和详情正好全压在它身上。
+
+- **【中】监控读取失败被说成「实例需启用计算代理 / 监控插件」。** 监控是详情页的
+  **默认**标签页。四条查询原来一律 `except: series[key] = []`，然后无条件
+  `ok=True`、消息写死。于是一次 404、一次限流、或者熔断器打开，给用户的结论都是
+  「去实例里装监控插件」—— 又一件把人指向一个本来没坏的东西的事（同 0.4.90 修掉的
+  「请检查 API Key」是同一类错误）。现在区分「读失败」和「确实没数据」。
+
+- **【中】列表路径的复读把「成功但为空」判成失败。** 原来写的是 `if again:` ——
+  复读成功、但这个 compartment 确实一台实例都没有时，会被判成复读失败，照样抛那个
+  404，把「读得到、只是空的」说成了「没有权限」。判据改成调用成功与否。
+
+- **【中】`list_subscribed_regions()` 让副区闸门静默失效。** 它顺手把主区写进
+  `_home_region_name` 缓存，但没有同时把 `_home_region_resolved` 置 True。而
+  `_home_region()` 开头是 `if cached: return cached`，于是永远走不到设置 resolved
+  的那几行 —— `home_region_confirmed()` 对这个 session 永远返回 ""，
+  `quota_guard.region_pair` 拿到 `("", "")`，`resolve_secondary` 退回 DB 的
+  `parent_tenant_id` hint，而手工添加的副区租户没有那个字段。**一台计费机器会被当成
+  免费的放行**，而闸门在最需要它的时候失效。少写一个字段把「问出来了」降级成了「猜的」。
+
+- **【中】27 处分页调用仍是双层重试。** `oci.pagination.list_call_get_all_results`
+  自己**硬编码**又套了一层 `DEFAULT_RETRY_STRATEGY`，和 client 层那个相乘：最坏
+  8×8=64 次真实调用、~600 秒卡在一个 HTTP 请求里，而且在跟抢机重试循环抢同一个
+  per-tenancy 限流额度。0.4.97 只收敛了 7 处，剩下 27 处（防火墙、保留 IP、块存储、
+  引导卷、镜像、桶……）全部补上，分页策略同样不再把熔断器异常当成可重试。
+
+- **【中】多行诊断在监控 / 引导日志 / 防火墙三处被压成一行。** 后端那段带四条换行的
+  404 诊断在裸 `.muted` 里会折成一条 12px 灰色长句子，而它恰恰是操作者唯一能照着做
+  的东西。给这三处单独一个 `.diag-msg` 类，**没有**直接给 `.muted` 加 `pre-line` ——
+  `.muted` 到处都在用，其中不少是模板里换行写的多行文案。
+
+- **【低】`sdk_default_retry_strategy()` 返回的是 SDK 的进程级单例。** SDK 每次调用前
+  都会往策略对象上写 `add_circuit_breaker_callback(...)`，返回单例等于让所有租户、
+  所有 client、所有线程往同一个可变对象上写。改成每次新建，参数照抄原默认值，
+  行为不变。
+
+### 维护
+
+- 修了两个**不忠实**的测试桩：`list_limit_values` 的桩补 `**_kw`（真实 SDK 方法都是
+  `(..., **kwargs)`，面板会往里传 `retry_strategy`）。
+- 熔断器那条测试原来用**关键字**调用单个 checker —— 而
+  `RetryCheckerContainer.should_retry` 是按**位置**传两个参数的
+  （`c.should_retry(exception, response, **kwargs)`）。关键字调用测不出签名不兼容，
+  这一轮真的靠它翻过一次车。现在按位置调用、并走端到端的 `make_retrying_call`。
+- 新增 `tests/test_detail_404.py`（20 条）。全量 1080 passed。
+
+### 升级
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.98
+```
+
+**如果详情页还报 404**：现在错误里会带上操作名和服务端点，请把那一整行连同
+`opc-request-id` 发出来 —— 那足以确定是哪个调用、打的哪个区域的哪个服务。
+服务端也会有记录：`journalctl -u ocibot -t ocibot.oci` 或容器日志里搜 `ocibot.oci`。
+
 ## 0.4.97 — 2026-08-27
 
 OCI 文档对比审计的**最后一批**，剩下的 12 条全部修完。三轮合计 30 条确认全部落地。

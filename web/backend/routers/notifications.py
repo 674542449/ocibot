@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from app.oci_client import safe_error_text
+
 from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -129,7 +131,7 @@ def create_channel(
     try:
         validate_channel_config(kind, body.config)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=safe_error_text(exc)) from exc
     row = NotificationChannel(
         owner_id=user.id,
         kind=kind,
@@ -162,7 +164,7 @@ def update_channel(
         try:
             validate_channel_config(row.kind, body.config)
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(status_code=400, detail=safe_error_text(exc)) from exc
         row.config_encrypted = encode_channel_config(body.config)
     db.commit()
     db.refresh(row)

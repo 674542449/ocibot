@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from app.oci_client import safe_error_text
+
 import io
 import json
 from datetime import datetime, timezone
@@ -329,7 +331,7 @@ def import_encrypted_zip(
     try:
         data = decode_backup_payload(raw, password)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=safe_error_text(exc)) from exc
 
     items = data.get("tenants", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
     if not isinstance(items, list):

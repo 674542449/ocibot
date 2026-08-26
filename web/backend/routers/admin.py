@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from app.oci_client import safe_error_text
+
 import secrets
 from typing import Annotated, Any, Optional
 
@@ -227,7 +229,7 @@ def check_update(
         return self_update.check_for_update(db)
     except Exception as exc:  # noqa: BLE001
         # check_for_update already persisted error state when possible
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.post("/update/apply")
@@ -238,9 +240,9 @@ def apply_update(
     try:
         result = self_update.start_update(db, username=admin.username)
     except RuntimeError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     write_audit(
         db,
         owner_id=admin.id,

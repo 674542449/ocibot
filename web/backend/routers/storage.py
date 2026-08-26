@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from app.oci_client import safe_error_text
+
 from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
@@ -26,7 +28,7 @@ def _row(db: Session, user_id: str, tenant_id: str):
     try:
         return get_owned_tenant(db, user_id, tenant_id)
     except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=safe_error_text(exc)) from exc
 
 
 def _guard_storage_delta(
@@ -114,7 +116,7 @@ def list_block_volumes(
             "data": result.data if isinstance(result.data, dict) else {},
         }
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.post("/tenants/{tenant_id}/block-volumes")
@@ -147,7 +149,7 @@ def create_block_volume(
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.delete("/tenants/{tenant_id}/block-volumes/{volume_id}")
@@ -170,7 +172,7 @@ def delete_block_volume(
         )
         return op_result_dict(result)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.post("/tenants/{tenant_id}/block-volumes/{volume_id}/update")
@@ -213,7 +215,7 @@ def update_block_volume(
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.post("/tenants/{tenant_id}/block-volumes/{volume_id}/attach")
@@ -242,7 +244,7 @@ def attach_block_volume(
         data = result.data if isinstance(result.data, dict) else {}
         return {**op_result_dict(result), "data": data}
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.post("/tenants/{tenant_id}/block-volumes/detach")
@@ -265,7 +267,7 @@ def detach_block_volume(
         )
         return op_result_dict(result)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.get("/tenants/{tenant_id}/instances/{instance_id}/volume-attachments")
@@ -285,7 +287,7 @@ def list_instance_volume_attachments(
             "data": result.data if isinstance(result.data, dict) else {},
         }
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +317,7 @@ def object_namespace(
             "data": result.data if isinstance(result.data, dict) else {},
         }
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.get("/tenants/{tenant_id}/object-storage/buckets")
@@ -334,7 +336,7 @@ def list_buckets(
             "data": result.data if isinstance(result.data, dict) else {},
         }
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.post("/tenants/{tenant_id}/object-storage/buckets")
@@ -362,7 +364,7 @@ def create_bucket(
         data = result.data if isinstance(result.data, dict) else {}
         return {**op_result_dict(result), "data": data}
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.delete("/tenants/{tenant_id}/object-storage/buckets/{name}")
@@ -385,7 +387,7 @@ def delete_bucket(
         )
         return op_result_dict(result)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.get("/tenants/{tenant_id}/object-storage/buckets/{name}/objects")
@@ -411,7 +413,7 @@ def list_objects(
             "data": result.data if isinstance(result.data, dict) else {},
         }
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.delete("/tenants/{tenant_id}/object-storage/buckets/{name}/objects/{object_name:path}")
@@ -435,7 +437,7 @@ def delete_object(
         )
         return op_result_dict(result)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.post("/tenants/{tenant_id}/object-storage/buckets/{name}/objects")
@@ -480,4 +482,4 @@ def put_object(
         data = result.data if isinstance(result.data, dict) else {}
         return {**op_result_dict(result), "data": data}
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc

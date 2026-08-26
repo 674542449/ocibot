@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.oci_client import sanitize_launch_payload
+from app.oci_client import safe_error_text, sanitize_launch_payload
 from app.scheduler import (
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_RETRY_INTERVAL_SEC,
@@ -90,12 +90,12 @@ def create_capacity_job(
     try:
         tenant = get_owned_tenant(db, user.id, body.tenant_id)
     except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=safe_error_text(exc)) from exc
 
     try:
         payload = sanitize_launch_payload(body.launch_payload, for_retry=True)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=safe_error_text(exc)) from exc
 
     # 行数上限放在 enforce_launch_quota **之前**：那一步是一整轮租户枚举，会实打
     # 实地花掉 Oracle 的速率预算（抢机循环和它抢的是同一个额度）。任何不需要
@@ -122,7 +122,7 @@ def create_capacity_job(
             as_retry=True,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=safe_error_text(exc)) from exc
 
     # Always Free guard — same rules as the launch wizard, including the 副区 gate
     # (free caps are home-region only, so there they are replaced not stacked).

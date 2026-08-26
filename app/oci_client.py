@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import ipaddress
+import logging
 import re
 import secrets
 import socket
@@ -14,6 +15,18 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+# 每一次 OCI 失败都在这里留一条服务端记录。
+#
+# 在此之前 app/oci_client.py **一行日志都没有** —— 120 多个 SDK 调用点,任何一次
+# 失败只要没冒泡到界面就彻底消失。用户报「刷新实例详情 404」时,那条错误唯一存在
+# 的地方是他浏览器里的红框,他只能手动复制粘贴给我;运维事后想查「昨晚 3 点是不是
+# 也炸过」——查不到。opc-request-id 是找 Oracle 开工单**唯一**认的东西,而它只存在
+# 于那一次响应里。
+#
+# 只记 _err_facts() 那组事实(状态码/错误码/操作名/端点主机名/request-id),不记
+# OCID、不记密钥、不记签名头 —— 理由见 _endpoint_host 的注释。
+_OCI_LOG = logging.getLogger("ocibot.oci")
 
 # Instance freeform-tag key used to remember the root password set at launch
 # (password mode only). Visible to anyone who can read the instance.
@@ -158,6 +171,51 @@ def _vpus_or_default(raw: Any, default: int = 10) -> int:
         return int(default)
 
 
+# OCID 长这样：ocid1.<类型>.<realm>.<区域可省>.<一长串>
+_OCID_RE = re.compile(r"\bocid1\.([a-z0-9]+)\.[a-z0-9-]*\.[a-z0-9-]*\.?([a-z0-9]{6,})", re.I)
+
+
+def _scrub_ocids(text: str) -> str:
+    """把任意文本里的完整 OCID 截成 `ocid1.<类型>…<末 8 位>`。
+
+    面板到处只显示 `compartment[-16:]` 是有意的（见 _endpoint_host）,但那条纪律
+    只覆盖了走 _format_service_error 的路径。裸 `str(exc)` 绕过它 —— 而 SDK 的
+    CircuitBreakerError.__str__ 正好是这种形状：
+
+        'Circuit "%s" OPEN until %s (%d failures, %d sec remaining) (last_failure: %r)'
+
+    那个 `%r` 是被熔断的 ServiceError 的 repr,而 ServiceError.__init__ 把
+    request_endpoint 整条塞进了 args —— 里面带着**未脱敏的完整 compartment OCID**
+    （对 2.182.0 实测确认）。它不是 ServiceError 的子类,所以各处 `except
+    ServiceError` 都接不住,最后落到 `except Exception -> str(exc)`,原样进前端。
+    """
+    if not text:
+        return text
+    return _OCID_RE.sub(lambda m: f"ocid1.{m.group(1)}…{m.group(2)[-8:]}", text)
+
+
+def safe_error_text(exc: BaseException) -> str:
+    """任何异常 → 可以安全显示给用户的一句话。
+
+    ``str(exc)`` 的最后一道闸门：熔断器异常换成一句说人话的解释，其余一律脱敏。
+    """
+    if _is_circuit_breaker_error(exc):
+        remaining = ""
+        try:
+            breaker = getattr(exc, "_circuit_breaker", None)
+            secs = int(round(float(getattr(breaker, "open_remaining", 0) or 0)))
+            if secs > 0:
+                remaining = f"约 {secs} 秒后自动恢复。"
+        except Exception:  # noqa: BLE001
+            remaining = ""
+        return (
+            "OCI SDK 客户端熔断器已打开：此前连续多次调用失败，SDK 暂停了对该服务的请求。"
+            f"{remaining or '约 30 秒后自动恢复。'}"
+            "这与 API Key、IAM 策略、Compartment 配置都无关，稍后重试即可。"
+        )
+    return _scrub_ocids(str(exc))
+
+
 def _endpoint_host(exc: Any) -> str:
     """从 ServiceError 里只取**主机名**,绝不取原文。
 
@@ -200,6 +258,86 @@ def _err_facts(exc: BaseException) -> dict[str, Any]:
         "operation": str(getattr(exc, "operation_name", "") or ""),
         "host": _endpoint_host(exc),
     }
+
+
+# 模糊 404 的复读间隔（秒）。两次,不是八次。
+#
+# Oracle 的 API 错误表把 404 NotAuthorizedOrNotFound 的 Retry 列明确标成 "No."，
+# 所以这里刻意**不**给 SDK 挂 404 重试策略 —— 那会让每一个真的没权限的调用都白白
+# 慢上八倍。但「按 OCID 直读一台实例」是幂等 GET,在注定要弹红框的那一刻多读一两次
+# 的性质完全不同:**复读成功,这个 404 按定义就是瞬时的**,「权限问题」这个解释当场
+# 出局;复读仍然失败,那就是持续问题,而且这一位证据本身就值得说给用户听。
+#
+# 一次(0.4.96 的做法)对用户报的现象不够:他描述的是「多点几次就好了」,手动点三五次
+# 跨度是好几秒。1.2 + 3.0 覆盖约 4.2 秒的窗口,而且**只在失败路径上**付这个代价 ——
+# 严格少于他现在手动点三次刷新的请求量。
+_REREAD_DELAYS: tuple[float, ...] = (1.2, 3.0)
+
+
+def _is_ambiguous_404(exc: BaseException) -> bool:
+    """这次失败是不是 Oracle 那个「没权限 **或** 不存在」的模糊 404。
+
+    同时认结构化字段和文本:上层有些地方拿到的已经是 _format_service_error()
+    拼过的字符串包在 OCIClientError 里,没有 status/code 属性了。
+    """
+    if int(getattr(exc, "status", 0) or 0) == 404:
+        return True
+    blob = f"{getattr(exc, 'code', '') or ''} {exc}".lower()
+    return "notauthorizedornotfound" in blob or "[404]" in blob
+
+
+def read_with_404_evidence(call: Callable[[], Any]) -> tuple[bool, Any, Optional[BaseException], int]:
+    """跑 ``call()``；**只在模糊 404 上**复读，最多 len(_REREAD_DELAYS) 次。
+
+    返回 ``(成功?, 值, 最后一次异常, 实际复读次数)``。
+
+    第一次就成功时复读次数为 0，一个额外请求都不发 —— 成功路径零增量。
+    任何**非** 404 的失败立刻返回,不复读:限流(429)有 SDK 自己的退避,
+    5xx 同理,401 是真的凭据问题,重读只是白等。
+    """
+    last: Optional[BaseException] = None
+    for attempt in range(len(_REREAD_DELAYS) + 1):
+        if attempt:
+            time.sleep(_REREAD_DELAYS[attempt - 1])
+        try:
+            return True, call(), None, attempt
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            if not _is_ambiguous_404(exc):
+                return False, None, exc, attempt
+    return False, None, last, len(_REREAD_DELAYS)
+
+
+def transient_404_note(first_error: str, rereads: int) -> str:
+    """首读失败、复读成功时说给用户听的那句话。
+
+    必须说出来,不能让它悄悄成功:用户当前的困惑正是「我权限是满的,为什么有时候
+    报错有时候不报」。默默修好等于让这个困惑一直挂着。
+    """
+    return (
+        f"首次读取失败、{rereads} 次重读后成功 —— 本次是 Oracle 侧的瞬时故障，"
+        f"与你的 IAM 策略、密钥、Compartment 配置都无关，无需改动任何配置。"
+        f"\n（首次错误：{first_error[:300]}）"
+    )
+
+
+def persistent_404_note(rereads: int) -> str:
+    """复读也没救回来时补的那句 —— 重试**不能**变成一次沉默的加时。
+
+    只陈述做过什么，**不下**「所以这是持续故障」的结论。Oracle 的授权最终一致性
+    窗口可以长达几分钟（Go SDK 把这个窗口设成 240 秒），而这里总共只等了几秒 ——
+    据此断言「这不是瞬时故障」就是又一次替 Oracle 下它没给我们依据的结论,
+    正是这一整轮要修掉的毛病。想等满 240 秒也不行:那要把一个 HTTP 请求挂四分钟。
+    """
+    if not rereads:
+        return ""
+    window = " + ".join(f"{d:g}s" for d in _REREAD_DELAYS[:rereads])
+    return (
+        f"（已自动重读 {rereads} 次、间隔 {window}，仍然失败。"
+        f"注意这不足以排除瞬时故障：Oracle 的授权最终一致性窗口可达数分钟，"
+        f"而这里只等了约 {sum(_REREAD_DELAYS[:rereads]):g} 秒。"
+        f"若隔几分钟重试即恢复，那就是 Oracle 侧的问题，不必改动任何配置。）"
+    )
 
 # Bounded parallelism for OCI network calls. The SDK clients wrap a
 # requests.Session, which tolerates concurrent GETs; keep pools small so a
@@ -253,10 +391,109 @@ def sdk_default_retry_strategy() -> Any:
 
     Used for list/get and ordinary management calls. Not used for LaunchInstance —
     capacity retry owns that loop at the application layer.
+
+    **每次新建一个**,不再返回 `oci.retry.DEFAULT_RETRY_STRATEGY` 那个模块级单例。
+    SDK 在每次调用前会往策略对象上写 `add_circuit_breaker_callback(...)`(实现就是
+    `self.circuit_breaker_callback = callback`)——返回单例等于让所有租户、所有
+    client、所有线程往同一个可变对象上写。当前写入值恒为 None,所以还观察不到症状,
+    但这正是本仓一直在清的那类跨租户共享可变状态。
+
+    参数照抄 DEFAULT_RETRY_STRATEGY 的实际取值(8 次 / 600 秒 / 429 + 任意 5xx),
+    行为不变。
     """
     if not OCI_AVAILABLE:
         return None
-    return oci.retry.DEFAULT_RETRY_STRATEGY
+    builder = oci.retry.RetryStrategyBuilder(
+        max_attempts_check=True,
+        max_attempts=8,
+        total_elapsed_time_check=True,
+        total_elapsed_time_seconds=600,
+        retry_max_wait_between_calls_seconds=30,
+        retry_base_sleep_time_seconds=1,
+        service_error_check=True,
+        # 传一份**全新的 dict**。RetryStrategyBuilder 的 add_service_error_check
+        # 重载会就地改写模块级全局 RETRYABLE_STATUSES_AND_CODES，那是 DEFAULT
+        # 策略内部持有的同一个对象（见 tests/test_instance_list_404.py 的那条测试）。
+        service_error_retry_config={429: [], 409: ["IncorrectState"]},
+        service_error_retry_on_any_5xx=True,
+        backoff_type=oci.retry.BACKOFF_FULL_JITTER_EQUAL_ON_THROTTLE_VALUE,
+    )
+    strategy = builder.get_retry_strategy()
+    _disarm_circuit_breaker_retry(strategy)
+    return strategy
+
+
+def _disarm_circuit_breaker_retry(strategy: Any) -> None:
+    """让熔断器异常**立刻**失败，而不是被当成「可重试」再退避八次。
+
+    SDK 自己的 TimeoutConnectionAndServiceErrorRetryChecker.should_retry 里有这么
+    一条：
+
+        elif isinstance(exception, CircuitBreakerError):
+            threading.Thread(target=kwargs['circuit_breaker_callback'], ...).start()
+            return True
+
+    也就是说熔断器一打开，调用方线程并不会马上拿到错误 —— 它会按 1.4/2.9/4.1/8.3/
+    16.9/30/30 秒退避重试**八次**，而熔断器的 recovery_timeout 是 30 秒。于是一次
+    「本该立刻失败」的调用把一个线程占住三十几秒到一分钟。FastAPI 的同步路由跑在
+    anyio 那个默认 40 个线程的池里,一个租户的 429 风暴打开共享熔断器之后,这些调用
+    会把线程池坐满,面板整体像卡死 —— 而熔断本来的意义恰恰是**快速失败**。
+    """
+    try:
+        checkers = getattr(getattr(strategy, "checkers", None), "checkers", None) or []
+        for checker in checkers:
+            inner = getattr(checker, "should_retry", None)
+            if inner is None:
+                continue
+
+            def _wrap(original: Callable) -> Callable:
+                # 签名照抄 SDK 的 should_retry(self, exception=None, response=None,
+                # **kwargs) —— `response` 必须原样透传，吞掉它会让基于响应体的重试
+                # 判断失效（SDK 目前是全关键字调用，但不要指望这一点不变）。
+                def _should_retry(
+                    exception: Any = None, response: Any = None, **kwargs: Any
+                ) -> bool:
+                    if _is_circuit_breaker_error(exception):
+                        return False
+                    return bool(original(exception=exception, response=response, **kwargs))
+
+                return _should_retry
+
+            checker.should_retry = _wrap(inner)
+    except Exception:  # noqa: BLE001
+        # 装不上就算了 —— 退回 SDK 原行为，绝不能因为这个优化让 client 建不出来。
+        pass
+
+
+def cb_kwargs(service: str, tenant_id: str) -> dict:
+    """每租户 × 每服务一个熔断器的 client kwargs（理由见 TenantSession._build）。
+
+    是模块级函数而不是方法：它只需要一个租户 id，不需要整个会话。`_build` 之外还有
+    四处按需重建 client 的地方（账单走主区的 Identity / InvoiceService / UsageApi /
+    Subscription / IdentityDomains），它们同样不能落回那个全进程共用的 DEFAULT 熔断器。
+    """
+    kw: dict = {"retry_strategy": sdk_default_retry_strategy()}
+    if not OCI_AVAILABLE:
+        return kw
+    try:
+        kw["circuit_breaker_strategy"] = oci.circuit_breaker.CircuitBreakerStrategy(
+            failure_threshold=10,
+            recovery_timeout=30,
+            name=f"ocibot-{service}-{tenant_id}",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    return kw
+
+
+def _is_circuit_breaker_error(exc: Any) -> bool:
+    """CircuitBreakerError **不是** ServiceError 的子类，所以到处都接不住它。"""
+    try:
+        from circuitbreaker import CircuitBreakerError
+
+        return isinstance(exc, CircuitBreakerError)
+    except Exception:  # noqa: BLE001
+        return type(exc).__name__ == "CircuitBreakerError"
 
 
 def sdk_bounded_paged_retry_strategy() -> Any:
@@ -277,7 +514,7 @@ def sdk_bounded_paged_retry_strategy() -> Any:
     """
     if not OCI_AVAILABLE:
         return None
-    return oci.retry.RetryStrategyBuilder(
+    strategy = oci.retry.RetryStrategyBuilder(
         max_attempts_check=True,
         max_attempts=3,
         total_elapsed_time_check=True,
@@ -291,6 +528,9 @@ def sdk_bounded_paged_retry_strategy() -> Any:
             429: [],
         },
     ).get_retry_strategy()
+    # 分页路径同样不能把熔断器异常当成「可重试」再退避（见 _disarm_circuit_breaker_retry）。
+    _disarm_circuit_breaker_retry(strategy)
+    return strategy
 
 
 def sdk_no_retry_strategy() -> Any:
@@ -829,6 +1069,14 @@ class InstanceInfo:
     # GetInstance 响应里（Instance.agent_config），不需要多调一次 API。
     # None = 该实例没有返回 agent_config（老实例/老镜像），此时不做任何断言。
     monitoring_disabled: Optional[bool] = None
+    # 「首读被拒(404)、复读成功」时填这一句，路由渲染成 X-Ocibot-Reread 响应头。
+    #
+    # 挂在**这里**而不是 TenantSession 上是有意的：TenantSession 是进程级缓存的
+    # （web/backend/oci_bridge.py 的 SessionManager），同一个租户的并发请求拿到的
+    # 是同一个对象。写在 session 上，A 请求的「本次是瞬时故障」会被 B 请求覆盖，
+    # 或者更糟 —— B 把 A 的提示挂在一个根本没出错的页面上。
+    # _last_tree_errors 就是这么写的，那是一个已知的旧坑，不要照抄。
+    read_note: str = ""
     raw: Any = None
 
     @property
@@ -1019,6 +1267,10 @@ class TenantSession:
         self._last_tree_errors: list[str] = []
         self._build()
 
+    def _cb_kwargs(self, service: str) -> dict:
+        """本会话的 client kwargs —— 见模块级 cb_kwargs()。"""
+        return cb_kwargs(service, str(getattr(self.tenant, "id", "") or ""))
+
     def _build(self) -> None:
         # Keep the decrypted key in memory only. It used to be written to a temp
         # file, which left plaintext OCI API keys in the system temp directory for
@@ -1039,47 +1291,49 @@ class TenantSession:
             # LaunchInstance overrides this with NoneRetryStrategy so capacity
             # retry + application 429 cooldown stay the single control plane.
             retry_kw = {"retry_strategy": sdk_default_retry_strategy()}
-            self._compute = ComputeClient(self._config, **retry_kw)
-            self._network = VirtualNetworkClient(self._config, **retry_kw)
-            # Identity 需要一个**每租户独立**的熔断器。
+
+            # 熔断器必须**每租户 × 每服务**一个。
             #
-            # IdentityClient 是唯一会自己兜底装上 DEFAULT_CIRCUIT_BREAKER_STRATEGY 的
-            # client（ComputeClient 的 docstring 明说「will not have circuit breakers
-            # enabled by default」）。而 BaseClient 是这样取熔断器的：
+            # BaseClient 是这样取熔断器的：
             #     circuit_breaker = CircuitBreakerMonitor.get(strategy.name)
-            # DEFAULT 策略的 name 是**导入时生成的一个固定 uuid**，于是全进程、
-            # 所有租户的 IdentityClient 拿到的是**同一个**熔断器实例。
+            # 而 DEFAULT_CIRCUIT_BREAKER_STRATEGY.name 是**模块导入时生成的一个固定
+            # uuid**。于是所有兜底用 DEFAULT 的 client，无论属于哪个租户、哪个服务，
+            # 按 name 查出来的都是**同一个**熔断器实例。
             #
-            # 后果就是用户报的那个「刷新实例列表有时候 404，多点几次就好了」：
-            #   1. 任何一个租户攒够 10 次 429/5xx，这个共享熔断器打开 30 秒；
-            #   2. 期间**所有**租户的 list_compartments 直接抛 CircuitBreakerError，
-            #      而它不是 ServiceError（实测 issubclass 为 False），穿透了
-            #      list_compartments 的 `except ServiceError`；
-            #   3. 枚举失败 → list_instances_tree 的扫描范围塌缩成只有根；
-            #   4. Compute 没有熔断器，list_instances(根) 照常打通、照常返回那个
-            #      **永久**的 404（实例其实在子 compartment 里）；
-            #   5. 于是塌缩 + 根 404 → 抛错。等 30 秒熔断器恢复，枚举又成功，
-            #      列表就出来了 —— 「多点几次就好了」等的正是那 30 秒。
-            # 保留熔断保护本身，只去掉跨租户的交叉污染。
-            identity_kw = dict(retry_kw)
+            # 0.4.96 只给 Identity 换了独立熔断器，依据是一句「IdentityClient 是唯一
+            # 会兜底装上 DEFAULT 的 client」—— 那句话是错的。对 2.182.0 逐个读
+            # __init__ 源码实测的结果是：
+            #     ComputeClient                → GLOBAL（实测值为 None，即没有熔断器）
+            #     VirtualNetwork / Blockstorage / ComputeManagement / Identity /
+            #     Monitoring / Limits / Quotas / ObjectStorage / Usageapi /
+            #     ComputeInstanceAgent          → 全部兜底 DEFAULT
+            # 也就是说：除 Compute 之外的九个 client，跨租户**并且跨服务**共用一个
+            # 熔断器。任意租户在任意一个服务上攒够 10 次 429/5xx，其余所有租户的
+            # 网络、块存储、监控、对象存储调用会一起被熔断 30 秒。
+            #
+            # 而 CircuitBreakerError **不是** ServiceError 的子类（实测 issubclass
+            # 为 False），所以它会穿透各处 `except ServiceError`；在 IP 解析、引导卷
+            # 读取这类 `except Exception: pass` 的地方则被静默吞掉，表现为字段莫名其妙
+            # 变空。保留熔断保护本身，只去掉这个交叉污染。
+            #
+            # Compute **不要**加：它本来就没有熔断器，加上等于凭空引入一个新的失败
+            # 模式，而实例列表和实例详情正好全压在它身上。
+            _cb_kw = self._cb_kwargs
+
+            self._compute = ComputeClient(self._config, **retry_kw)
+            self._network = VirtualNetworkClient(self._config, **_cb_kw("network"))
+            self._identity = IdentityClient(self._config, **_cb_kw("identity"))
+            self._blockstorage = BlockstorageClient(self._config, **_cb_kw("blockstorage"))
+            self._limits = LimitsClient(self._config, **_cb_kw("limits"))
+            self._monitoring = MonitoringClient(self._config, **_cb_kw("monitoring"))
             try:
-                identity_kw["circuit_breaker_strategy"] = oci.circuit_breaker.CircuitBreakerStrategy(
-                    failure_threshold=10,
-                    recovery_timeout=30,
-                    name=f"ocibot-identity-{self.tenant.id}",
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            self._identity = IdentityClient(self._config, **identity_kw)
-            self._blockstorage = BlockstorageClient(self._config, **retry_kw)
-            self._limits = LimitsClient(self._config, **retry_kw)
-            self._monitoring = MonitoringClient(self._config, **retry_kw)
-            try:
-                self._object_storage = ObjectStorageClient(self._config, **retry_kw)
+                self._object_storage = ObjectStorageClient(self._config, **_cb_kw("objectstorage"))
             except Exception:
                 self._object_storage = None
             try:
-                self._instance_agent = ComputeInstanceAgentClient(self._config, **retry_kw)
+                self._instance_agent = ComputeInstanceAgentClient(
+                    self._config, **_cb_kw("instanceagent")
+                )
             except Exception:
                 self._instance_agent = None
             try:
@@ -1091,7 +1345,7 @@ class TenantSession:
                 # 而 SessionManager.get 是在一把进程级锁里构造 session 的，
                 # 那次网络调用会把同一个 worker 里所有租户的 OCI 请求一起堵住。
                 # 真正需要主区的只有账单接口，那时再按需重建（见 usage property）。
-                self._usage = UsageapiClient(dict(self._config), **retry_kw)
+                self._usage = UsageapiClient(dict(self._config), **_cb_kw("usage"))
                 self._usage_region_pinned = False
             except Exception:
                 self._usage = None
@@ -1158,7 +1412,7 @@ class TenantSession:
                 if home and home != self.tenant.region.strip():
                     self._usage = UsageapiClient(
                         self._config_for_region(home),
-                        retry_strategy=sdk_default_retry_strategy(),
+                        **cb_kwargs("usage", str(getattr(self.tenant, "id", "") or "")),
                     )
             except Exception:  # noqa: BLE001
                 # 换不成就用租户自己区域的那个 —— 账单接口是租户级的，
@@ -1647,12 +1901,46 @@ class TenantSession:
         self._enrich_instances_parallel([info], compartment)
         return info
 
-    def get_instance(self, instance_id: str, resolve_ips: bool = True) -> InstanceInfo:
-        try:
-            inst = self.compute.get_instance(instance_id).data
-        except ServiceError as exc:
-            raise OCIClientError(_format_service_error(exc)) from exc
+    def get_instance(
+        self,
+        instance_id: str,
+        resolve_ips: bool = True,
+        reread_on_404: bool = False,
+    ) -> InstanceInfo:
+        """按 OCID 直读一台实例。
+
+        实例详情页那个「刷新」按钮**唯一**能弹出红色错误框的调用就是这个 —— 页内
+        其它 loader(监控/控制台/防火墙/保留 IP/引导卷)在前端各自 catch,只写自己那
+        一块的提示。所以用户报的「详情页点刷新报 404」一定出自这里,而这里以前既不
+        复读、也不说明是哪个调用失败的。
+
+        ``reread_on_404`` **默认关**,只有那一次「失败会直接进红框」的读才打开。
+        因为同一次刷新里这个方法会被调好几遍(详情路由一次,监控路由为了拿
+        compartment_id 又一次,引导卷页还有更多),全都复读的话一次失败的刷新要打
+        三倍请求、多等十几秒 —— 而其中只有一次的错误是用户看得见的,其余几次的
+        异常在前端就被各自的 catch 吃掉了。给看不见的失败付重试代价没有意义。
+        """
+        reader = lambda: self.compute.get_instance(instance_id).data  # noqa: E731
+        if reread_on_404:
+            ok, inst, exc, rereads = read_with_404_evidence(reader)
+        else:
+            rereads = 0
+            try:
+                ok, inst, exc = True, reader(), None
+            except Exception as _exc:  # noqa: BLE001
+                ok, inst, exc = False, None, _exc
+        if not ok:
+            detail = (
+                _format_service_error(exc)
+                if isinstance(exc, ServiceError)
+                else str(exc or "读取实例失败")
+            )
+            note = persistent_404_note(rereads)
+            raise OCIClientError(f"{detail}\n{note}" if note else detail) from exc
         info = self._to_instance_info(inst)
+        if rereads:
+            # 记在返回值上,不是记在 session 上 —— 见 InstanceInfo.read_note 的注释。
+            info.read_note = transient_404_note("按 OCID 读取实例被拒（404）", rereads)
         if resolve_ips:
             self._enrich_instances_parallel([info], info.compartment_id)
         return info
@@ -1684,7 +1972,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def terminate_instance(
         self,
@@ -1708,7 +1996,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def set_root_password_note(self, instance_id: str, password: str) -> OperationResult:
         """Update (or clear) the remembered root password on an existing instance.
@@ -1751,7 +2039,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def set_instance_protected(self, instance_id: str, protected: bool) -> OperationResult:
         """Mark/unmark an instance as protected from termination.
@@ -1784,7 +2072,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def capture_console_output(
         self,
@@ -1827,6 +2115,7 @@ class TenantSession:
                     self.compute.list_console_histories,
                     compartment_id,
                     instance_id=instance_id,
+                    retry_strategy=sdk_bounded_paged_retry_strategy(),
                 ).data or []
                 for h in old:
                     state = str(getattr(h, "lifecycle_state", "") or "")
@@ -1921,7 +2210,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def rename_instance(self, instance_id: str, display_name: str) -> OperationResult:
         display_name = (display_name or "").strip()
@@ -1934,7 +2223,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def list_instances_tree(
         self,
@@ -2026,24 +2315,26 @@ class TenantSession:
             # 这里只补 1 个幂等的 List，请求量严格更少。
             # 同形先例：test_connection 的探针（见那里的注释），理由逐字适用。
             retried_ok = False
-            if "[404]" in detail or "NotAuthorizedOrNotFound" in detail:
-                time.sleep(1.5)
-                try:
-                    again = _scan(compartments[0])
-                except Exception:  # noqa: BLE001
-                    again = []
-                if again:
-                    # 复读读到了 —— 这次是瞬时故障，不该报错。
-                    # 但必须留痕：_last_tree_errors 会被路由渲染成
-                    # X-Ocibot-Partial 头，前端据此挂「这份列表可能不完整」的提示。
+            rereads = 0
+            if _is_ambiguous_404(Exception(detail)):
+                # 走和 get_instance 同一个复读策略（见 _REREAD_DELAYS）。
+                #
+                # 顺带修掉一个真 bug：这里以前写的是 `if again:` —— 复读**成功但读到
+                # 空列表**（这个 compartment 确实一台实例都没有）会被判成复读失败，
+                # 于是照样抛出那个 404，把「读得到、只是空的」说成了「没有权限」。
+                # 判据必须是「调用成功了没有」，不是「返回的列表空不空」。
+                ok_again, again, _exc, rereads = read_with_404_evidence(
+                    lambda: _scan(compartments[0])
+                )
+                if ok_again:
                     retried_ok = True
-                    all_items = again
-                    self._last_tree_errors = [
-                        f"首次读取失败、1.5 秒后重读成功 —— 本次是瞬时故障，不是权限问题。"
-                        f"（首次错误：{detail[:200]}）"
-                    ]
+                    all_items = list(again or [])
+                    # 必须留痕：_last_tree_errors 会被路由渲染成 X-Ocibot-Partial 头。
+                    self._last_tree_errors = [transient_404_note(detail, rereads)]
             if not retried_ok:
-                probe = "（已自动重读 1 次，仍然失败 —— 这不是瞬时故障）"
+                # 不是 404 时 rereads 为 0、这里为空串 —— 不能对一个从没复读过的
+                # 失败（比如 429、5xx）声称「已自动重读」。
+                probe = persistent_404_note(rereads)
                 if enum_error:
                     raise OCIClientError(
                         f"{detail}\n{probe}\n\n注意：本次未能枚举子 Compartment（{enum_error}），"
@@ -2052,7 +2343,7 @@ class TenantSession:
                         "而枚举成功的那几次则一切正常，表现为「时好时坏」。"
                         "\n请到租户页点「测试连接」确认具体是哪一项读不到。"
                     )
-                raise OCIClientError(f"{detail}\n{probe}")
+                raise OCIClientError(f"{detail}\n{probe}" if probe else detail)
         if resolve_ips:
             targets = [i for i in all_items if i.lifecycle_state not in ("TERMINATED", "TERMINATING")]
             self._enrich_instances_parallel(targets, root)
@@ -2094,7 +2385,9 @@ class TenantSession:
         elif operating_system:
             kwargs["operating_system"] = operating_system
         try:
-            resp = oci.pagination.list_call_get_all_results(self.compute.list_images, **kwargs)
+            resp = oci.pagination.list_call_get_all_results(self.compute.list_images, **kwargs,
+                retry_strategy=sdk_bounded_paged_retry_strategy(),
+            )
         except ServiceError as exc:
             raise OCIClientError(_format_service_error(exc)) from exc
 
@@ -2138,7 +2431,9 @@ class TenantSession:
         if len(items) < 5 and compartment != self.tenant.tenancy_ocid.strip():
             try:
                 kwargs["compartment_id"] = self.tenant.tenancy_ocid.strip()
-                resp2 = oci.pagination.list_call_get_all_results(self.compute.list_images, **kwargs)
+                resp2 = oci.pagination.list_call_get_all_results(self.compute.list_images, **kwargs,
+                    retry_strategy=sdk_bounded_paged_retry_strategy(),
+                )
                 seen = {i["id"] for i in items}
                 for img in resp2.data:
                     if img.id in seen:
@@ -2154,7 +2449,9 @@ class TenantSession:
                 try:
                     kwargs.pop("operating_system", None)
                     kwargs["compartment_id"] = self.tenant.tenancy_ocid.strip()
-                    resp3 = oci.pagination.list_call_get_all_results(self.compute.list_images, **kwargs)
+                    resp3 = oci.pagination.list_call_get_all_results(self.compute.list_images, **kwargs,
+                        retry_strategy=sdk_bounded_paged_retry_strategy(),
+                    )
                     filtered = [_img_item(img) for img in resp3.data if _is_ubuntu(img)]
                 except Exception:
                     pass
@@ -2230,6 +2527,7 @@ class TenantSession:
             resp = oci.pagination.list_call_get_all_results(
                 self.network.list_vcns,
                 compartment_id=compartment,
+                retry_strategy=sdk_bounded_paged_retry_strategy(),
             )
         except ServiceError as exc:
             raise OCIClientError(_format_service_error(exc)) from exc
@@ -2252,7 +2550,9 @@ class TenantSession:
         if vcn_id:
             kwargs["vcn_id"] = vcn_id
         try:
-            resp = oci.pagination.list_call_get_all_results(self.network.list_subnets, **kwargs)
+            resp = oci.pagination.list_call_get_all_results(self.network.list_subnets, **kwargs,
+                retry_strategy=sdk_bounded_paged_retry_strategy(),
+            )
         except ServiceError as exc:
             raise OCIClientError(_format_service_error(exc)) from exc
         return [
@@ -2394,7 +2694,8 @@ class TenantSession:
 
     def _ensure_internet_gateway(self, vcn_id: str, compartment_id: str) -> Any:
         gateways = oci.pagination.list_call_get_all_results(
-            self.network.list_internet_gateways, compartment_id, vcn_id=vcn_id
+            self.network.list_internet_gateways, compartment_id, vcn_id=vcn_id,
+            retry_strategy=sdk_bounded_paged_retry_strategy(),
         ).data
         igw = next(
             (g for g in gateways if getattr(g, "lifecycle_state", "") not in ("TERMINATED", "TERMINATING")),
@@ -2427,7 +2728,8 @@ class TenantSession:
         include_ipv6: bool = False,
     ) -> Any:
         tables = oci.pagination.list_call_get_all_results(
-            self.network.list_route_tables, compartment_id, vcn_id=vcn_id
+            self.network.list_route_tables, compartment_id, vcn_id=vcn_id,
+            retry_strategy=sdk_bounded_paged_retry_strategy(),
         ).data
         # Prefer an existing table that already has 0.0.0.0/0 -> IGW.
         # Do NOT require ::/0 here — IPv4-only VCNs cannot carry that rule.
@@ -2556,7 +2858,8 @@ class TenantSession:
         include_ipv6: bool = False,
     ) -> Any:
         lists = oci.pagination.list_call_get_all_results(
-            self.network.list_security_lists, compartment_id, vcn_id=vcn_id
+            self.network.list_security_lists, compartment_id, vcn_id=vcn_id,
+            retry_strategy=sdk_bounded_paged_retry_strategy(),
         ).data
         managed = next(
             (
@@ -2750,7 +3053,8 @@ class TenantSession:
                 # without the state filter before adding a duplicate stack.
                 try:
                     raw_subnets = oci.pagination.list_call_get_all_results(
-                        self.network.list_subnets, compartment_id=vcn_comp, vcn_id=vcn_id
+                        self.network.list_subnets, compartment_id=vcn_comp, vcn_id=vcn_id,
+                        retry_strategy=sdk_bounded_paged_retry_strategy(),
                     ).data or []
                 except ServiceError as exc:
                     raise OCIClientError(_format_service_error(exc)) from exc
@@ -2855,9 +3159,9 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except OCIClientError as exc:
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def launch_instance(
         self,
@@ -3024,7 +3328,7 @@ class TenantSession:
                 },
             )
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def launch_from_payload(
         self,
@@ -3144,6 +3448,7 @@ class TenantSession:
         private_ips = oci.pagination.list_call_get_all_results(
             self.network.list_private_ips,
             vnic_id=info.vnic_id,
+            retry_strategy=sdk_bounded_paged_retry_strategy(),
         ).data
         private_ip = next(
             (item for item in private_ips if bool(getattr(item, "is_primary", False))),
@@ -3285,7 +3590,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def create_managed_nsg(
         self,
@@ -3332,7 +3637,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def delete_managed_nsg(self, nsg_id: str) -> OperationResult:
         try:
@@ -3382,7 +3687,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def get_instance_firewall(self, instance_id: str, compartment_id: str) -> OperationResult:
         try:
@@ -3393,6 +3698,7 @@ class TenantSession:
                 rules = oci.pagination.list_call_get_all_results(
                     self.network.list_network_security_group_security_rules,
                     nsg_id,
+                    retry_strategy=sdk_bounded_paged_retry_strategy(),
                 ).data
                 tags = getattr(nsg, "freeform_tags", None) or {}
                 groups.append(
@@ -3437,7 +3743,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def _subnet_security_lists(self, subnet_id: str) -> list[dict]:
         """Security-list rules for a subnet, normalized like NSG rules (read-only)."""
@@ -3522,7 +3828,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def replace_instance_firewall_with_open_all(
         self,
@@ -3660,7 +3966,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def list_boot_volumes(
         self,
@@ -3728,6 +4034,7 @@ class TenantSession:
                     resp = oci.pagination.list_call_get_all_results(
                         self.blockstorage.list_boot_volumes,
                         **kwargs,
+                        retry_strategy=sdk_bounded_paged_retry_strategy(),
                     )
                     for bv in resp.data or []:
                         vid = getattr(bv, "id", "") or ""
@@ -3778,6 +4085,7 @@ class TenantSession:
                         self.compute.list_boot_volume_attachments,
                         ad,
                         cid,
+                        retry_strategy=sdk_bounded_paged_retry_strategy(),
                     ).data
                 except Exception:
                     atts = []
@@ -4102,7 +4410,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def update_instance_shape(self, instance_id: str, ocpus: float, memory_in_gbs: float) -> OperationResult:
         """Change OCPU / memory of a running Flex-shape instance."""
@@ -4128,7 +4436,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     @staticmethod
     def _subnet_ipv6_blocks(subnet: Any) -> list[str]:
@@ -4193,6 +4501,7 @@ class TenantSession:
                 self.network.list_subnets,
                 compartment_id=compartment_id,
                 vcn_id=getattr(vcn, "id", "") or "",
+                retry_strategy=sdk_bounded_paged_retry_strategy(),
             ).data
         except Exception:
             siblings = []
@@ -4292,9 +4601,9 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except OCIClientError as exc:
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def remove_public_ipv6(self, instance_id: str, compartment_id: str) -> OperationResult:
         """Delete the IPv6 address(es) on the instance's primary VNIC.
@@ -4314,7 +4623,8 @@ class TenantSession:
             if not network.vnic_id:
                 return OperationResult(ok=False, message="找不到实例的主 VNIC")
             existing = oci.pagination.list_call_get_all_results(
-                self.network.list_ipv6s, vnic_id=network.vnic_id
+                self.network.list_ipv6s, vnic_id=network.vnic_id,
+                retry_strategy=sdk_bounded_paged_retry_strategy(),
             ).data or []
             if not existing:
                 return OperationResult(
@@ -4352,7 +4662,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def assign_public_ipv6(self, instance_id: str, compartment_id: str) -> OperationResult:
         """Assign a public IPv6 to the primary VNIC and open internet routing.
@@ -4433,7 +4743,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def _ensure_ipv6_rules_on_managed_nsgs(self, network: Any) -> str:
         """给实例所在的**托管** NSG 补上 IPv6 版安全规则。返回一句给用户看的说明。
@@ -4504,7 +4814,8 @@ class TenantSession:
 
             # 1) Ensure an enabled Internet Gateway on the VCN.
             gateways = oci.pagination.list_call_get_all_results(
-                self.network.list_internet_gateways, vcn_compartment, vcn_id=vcn_id
+                self.network.list_internet_gateways, vcn_compartment, vcn_id=vcn_id,
+                retry_strategy=sdk_bounded_paged_retry_strategy(),
             ).data
             igw = next(
                 (g for g in gateways if getattr(g, "lifecycle_state", "") not in ("TERMINATED", "TERMINATING")),
@@ -4585,7 +4896,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
 
     def list_console_connections(self, instance_id: str, compartment_id: str) -> list[Any]:
@@ -4602,6 +4913,7 @@ class TenantSession:
                 self.compute.list_instance_console_connections,
                 compartment_id,
                 instance_id=instance_id,
+                retry_strategy=sdk_bounded_paged_retry_strategy(),
             ).data
         except ServiceError as exc:
             raise OCIClientError(_format_service_error(exc)) from exc
@@ -4696,7 +5008,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def get_instance_metrics(self, instance_id: str, compartment_id: str, hours: int = 3) -> OperationResult:
         """Fetch CPU / memory / network time series from the Monitoring service.
@@ -4720,6 +5032,15 @@ class TenantSession:
         }
         series: dict[str, list] = {}
         any_data = False
+        # 读取失败不能再被说成「没有数据」。
+        #
+        # 这四条查询以前都是 `except ServiceError: series[key] = []`，
+        # 然后无论如何都返回 ok=True、消息写死成「暂无监控数据
+        # （实例需启用计算代理 / 监控插件）」。于是一次 404、一次限流、
+        # 或者熝断器打开，给用户的结论都是「去实例里装监控插件」——
+        # 又一件把人指向一个本来没坏的东西的事，和 0.4.90 修掉的
+        # 「请检查 API Key」是同一类错误。监控又正好是详情页的**默认**标签页。
+        read_errors: list[str] = []
         for key, query in queries.items():
             try:
                 details = oci.monitoring.models.SummarizeMetricsDataDetails(
@@ -4755,13 +5076,26 @@ class TenantSession:
                     points.sort(key=lambda p: (p[0] is None, p[0]))
                 series[key] = points
                 any_data = any_data or bool(points)
-            except ServiceError:
+            except ServiceError as exc:
                 series[key] = []
-            except Exception:  # noqa: BLE001
+                read_errors.append(_format_service_error(exc).splitlines()[0])
+            except Exception as exc:  # noqa: BLE001
                 series[key] = []
+                read_errors.append(str(exc).splitlines()[0] if str(exc) else type(exc).__name__)
+        if any_data:
+            message = "已获取监控数据"
+        elif read_errors:
+            # 读失败了就说读失败了，并把 Oracle 原话交出去。
+            message = (
+                f"监控数据读取失败（{len(read_errors)}/{len(queries)} 条查询出错）：{read_errors[0]}"
+                + chr(10)
+                + "这不等于实例没开监控插件 —— 先看上面这条错误。"
+            )
+        else:
+            message = "暂无监控数据（实例需启用计算代理 / 监控插件）"
         return OperationResult(
-            ok=True,
-            message="已获取监控数据" if any_data else "暂无监控数据（实例需启用计算代理 / 监控插件）",
+            ok=not read_errors or any_data,
+            message=message,
             data={
                 "series": series,
                 "hours": hours,
@@ -4991,7 +5325,7 @@ class TenantSession:
         except Exception as exc:  # noqa: BLE001
             return OperationResult(
                 ok=False,
-                message=str(exc),
+                message=safe_error_text(exc),
                 # month_to_date is None, not 0: for a cost figure those two mean
                 # very different things, and a page that prints 0.00 for a read it
                 # never managed to perform is worse than one that prints nothing.
@@ -5044,7 +5378,7 @@ class TenantSession:
         if home:
             cfg["region"] = home
         try:
-            client = InvoiceServiceClient(cfg, retry_strategy=sdk_default_retry_strategy())
+            client = InvoiceServiceClient(cfg, **cb_kwargs("invoice", str(getattr(self.tenant, "id", "") or "")))
             # "INVOICE_DATE" is the billing period this table is ordered by, and it
             # is one of the values the service accepts — the enum is small and
             # closed, so it is asserted rather than assumed. Sending anything else
@@ -5186,7 +5520,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
         total_bytes = 0.0
         for metric in resp or []:
@@ -5257,7 +5591,8 @@ class TenantSession:
         # Service limits — informational only (dashboard). Not used for tier.
         try:
             values = oci.pagination.list_call_get_all_results(
-                self.limits.list_limit_values, tenancy_id, service_name="compute"
+                self.limits.list_limit_values, tenancy_id, service_name="compute",
+                retry_strategy=sdk_bounded_paged_retry_strategy(),
             ).data
             # 保留可用域这一维。
             #
@@ -5328,7 +5663,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
         if not domains:
             return OperationResult(
@@ -5792,7 +6127,7 @@ class TenantSession:
         home = self._home_region()
         if home and home != self.tenant.region.strip():
             try:
-                identity = IdentityClient(self._config_for_region(home), retry_strategy=sdk_default_retry_strategy())
+                identity = IdentityClient(self._config_for_region(home), **cb_kwargs("identity", str(getattr(self.tenant, "id", "") or "")))
             except Exception:  # noqa: BLE001
                 identity = self.identity
 
@@ -5800,6 +6135,7 @@ class TenantSession:
             identity.list_domains,
             compartment_id=tenancy,
             lifecycle_state="ACTIVE",
+            retry_strategy=sdk_bounded_paged_retry_strategy(),
         )
         items: list[dict[str, str]] = []
         for d in response.data or []:
@@ -5839,7 +6175,7 @@ class TenantSession:
         return IdentityDomainsClient(
             cfg,
             service_endpoint=endpoint,
-            retry_strategy=sdk_default_retry_strategy(),
+            **cb_kwargs("identitydomains", str(getattr(self.tenant, "id", "") or "")),
         )
 
     def _list_domain_password_policies(self, client: Any) -> list[dict[str, Any]]:
@@ -5947,7 +6283,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
         home = ""
         regions: list[dict[str, Any]] = []
@@ -5978,7 +6314,17 @@ class TenantSession:
         regions.sort(key=lambda r: (not r["is_home_region"], r["region_name"]))
         if home:
             # Same answer _home_region() would compute; seed its cache for free.
+            #
+            # 两个字段必须**一起**写。只写 _home_region_name 的话，_home_region()
+            # 下次会在 `if cached: return cached` 那里提前 return，永远走不到设置
+            # _home_region_resolved 的那几行 —— 于是 home_region_confirmed() 对这个
+            # session 永远返回 ""，quota_guard.region_pair 拿到 ("", "")，副区闸门
+            # 退回 DB 的 parent_tenant_id hint。手工添加的副区租户没有那个字段，
+            # 闸门就此静默失效，一台**计费**机器会被当成免费的放行。
+            # 而这里的 home 恰恰是**真的问出来的**（就是上面那次 Oracle 读的结果），
+            # resolved 理应为 True —— 少写一个字段把「问出来了」降级成了「猜的」。
             self._home_region_name = home
+            self._home_region_resolved = True
         return OperationResult(
             ok=True,
             message="",
@@ -5992,7 +6338,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
         regions = [
             {
                 # Names are genuinely lowercase (ap-osaka-1); keys are uppercase and
@@ -6083,7 +6429,7 @@ class TenantSession:
         try:
             identity = IdentityClient(
                 self._config_for_region(self._home_region()),
-                retry_strategy=sdk_default_retry_strategy(),
+                **cb_kwargs("identity", str(getattr(self.tenant, "id", "") or "")),
             )
             identity.create_region_subscription(
                 oci.identity.models.CreateRegionSubscriptionDetails(region_key=match["region_key"]),
@@ -6225,7 +6571,7 @@ class TenantSession:
             try:
                 client = SubscriptionClient(
                     self._config_for_region(region),
-                    retry_strategy=sdk_default_retry_strategy(),
+                    **cb_kwargs("subscription", str(getattr(self.tenant, "id", "") or "")),
                 )
                 resp = client.list_subscriptions(compartment_id=tenancy, entity_version="V1")
                 items = list(getattr(resp.data, "items", None) or [])
@@ -6350,7 +6696,7 @@ class TenantSession:
                 data={"stage": "replace", "recovery_possible": True},
             )
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc), data={"recovery_possible": True})
+            return OperationResult(ok=False, message=safe_error_text(exc), data={"recovery_possible": True})
 
     # ------------------------------------------------------------------
     # Custom images
@@ -6364,6 +6710,7 @@ class TenantSession:
                 compartment_id=compartment,
                 sort_by="TIMECREATED",
                 sort_order="DESC",
+                retry_strategy=sdk_bounded_paged_retry_strategy(),
             )
         except ServiceError as exc:
             raise OCIClientError(_format_service_error(exc)) from exc
@@ -6418,7 +6765,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def delete_custom_image(self, image_id: str) -> OperationResult:
         try:
@@ -6430,7 +6777,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     # ------------------------------------------------------------------
     # Reserved public IPs
@@ -6444,6 +6791,7 @@ class TenantSession:
                 scope="REGION",
                 compartment_id=compartment,
                 lifetime="RESERVED",
+                retry_strategy=sdk_bounded_paged_retry_strategy(),
             )
         except ServiceError as exc:
             raise OCIClientError(_format_service_error(exc)) from exc
@@ -6482,7 +6830,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def delete_reserved_public_ip(self, public_ip_id: str) -> OperationResult:
         try:
@@ -6501,7 +6849,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def attach_reserved_public_ip(
         self, instance_id: str, compartment_id: str, public_ip_id: str
@@ -6552,7 +6900,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def detach_reserved_public_ip(self, public_ip_id: str) -> OperationResult:
         """Unassign a reserved public IP (the address stays reserved for reuse)."""
@@ -6571,7 +6919,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     # ------------------------------------------------------------------
     # Boot volume backups
@@ -6587,7 +6935,8 @@ class TenantSession:
             kwargs["boot_volume_id"] = boot_volume_id
         try:
             resp = oci.pagination.list_call_get_all_results(
-                self.blockstorage.list_boot_volume_backups, **kwargs
+                self.blockstorage.list_boot_volume_backups, **kwargs,
+                retry_strategy=sdk_bounded_paged_retry_strategy(),
             )
         except ServiceError as exc:
             raise OCIClientError(_format_service_error(exc)) from exc
@@ -6628,7 +6977,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def delete_boot_volume_backup(self, backup_id: str) -> OperationResult:
         try:
@@ -6637,7 +6986,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def _boot_volume_attachments(self, volume_id: str, availability_domain: str, compartment_id: str) -> list:
         """Live (non-detached) attachments for a boot volume.
@@ -6719,7 +7068,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def rename_boot_volume(self, volume_id: str, display_name: str) -> OperationResult:
         """Set a boot volume's display name.
@@ -6747,7 +7096,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     # ------------------------------------------------------------------
     # Block (data) volumes
@@ -6815,6 +7164,7 @@ class TenantSession:
                     resp = oci.pagination.list_call_get_all_results(
                         self.blockstorage.list_volumes,
                         **kwargs,
+                        retry_strategy=sdk_bounded_paged_retry_strategy(),
                     )
                     for vol in resp.data or []:
                         vid = getattr(vol, "id", "") or ""
@@ -6870,6 +7220,7 @@ class TenantSession:
                         self.compute.list_volume_attachments,
                         cid,
                         availability_domain=ad,
+                        retry_strategy=sdk_bounded_paged_retry_strategy(),
                     ).data
                 except Exception:
                     atts = []
@@ -6981,7 +7332,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def delete_block_volume(self, volume_id: str) -> OperationResult:
         volume_id = (volume_id or "").strip()
@@ -7025,7 +7376,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def update_block_volume(
         self,
@@ -7067,7 +7418,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def attach_volume(
         self,
@@ -7115,7 +7466,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def detach_volume(self, attachment_id: str) -> OperationResult:
         attachment_id = (attachment_id or "").strip()
@@ -7127,7 +7478,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def list_volume_attachments(self, instance_id: str, compartment_id: str = "") -> OperationResult:
         instance_id = (instance_id or "").strip()
@@ -7166,7 +7517,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     # ------------------------------------------------------------------
     # Object Storage
@@ -7184,7 +7535,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def list_buckets(self, compartment_id: str = "") -> OperationResult:
         if self.object_storage is None:
@@ -7199,6 +7550,7 @@ class TenantSession:
                 self.object_storage.list_buckets,
                 namespace,
                 cid,
+                retry_strategy=sdk_bounded_paged_retry_strategy(),
             )
             items = []
             for b in resp.data or []:
@@ -7230,7 +7582,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def create_bucket(
         self,
@@ -7267,7 +7619,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def delete_bucket(self, name: str, namespace: str = "") -> OperationResult:
         if self.object_storage is None:
@@ -7297,7 +7649,7 @@ class TenantSession:
                 )
             return OperationResult(ok=False, message=msg)
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def list_objects(
         self,
@@ -7370,7 +7722,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def delete_object(self, bucket: str, object_name: str, namespace: str = "") -> OperationResult:
         if self.object_storage is None:
@@ -7390,7 +7742,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def put_object(
         self,
@@ -7432,7 +7784,7 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=str(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc))
 
     def estimate_object_storage_usage(
         self,
@@ -7547,7 +7899,7 @@ class TenantSession:
         except Exception as exc:  # noqa: BLE001
             return OperationResult(
                 ok=False,
-                message=str(exc),
+                message=safe_error_text(exc),
                 data={"object_storage_gb_used": 0.0, "object_buckets": [], "bucket_count": 0},
             )
 
@@ -7738,12 +8090,40 @@ def _format_service_error(exc: ServiceError) -> str:
     message = getattr(exc, "message", "") or str(exc)
     parts = [p for p in [f"[{status}]", code, message] if p]
     text = " ".join(parts)
+    # 把「是哪一次调用失败的」写进错误本身。
+    #
+    # 这条以前只带 opc-request-id。用户报「实例详情页点刷新报 404」时,那串文本里
+    # 没有操作名、没有服务端点,面板自己也不知道是 GetInstance 挂了还是监控挂了 ——
+    # 只能靠人去反推调用链。而 operation_name / request_endpoint 本来就在
+    # ServiceError 上放着,一直被丢掉。
+    #
+    # 端点只取主机名,绝不取原文:request_endpoint 里带着未脱敏的完整 compartment
+    # OCID(见 _endpoint_host)。主机名本身恰恰是诊断价值最高的一段 ——
+    # iaas.* 是 Compute,identity.* 是 Identity,telemetry.* 是监控,
+    # 一眼就能把问题切到某个服务上。
+    #
     # opc-request-id 是开工单时 Oracle **唯一**认的东西,而且它只存在于这一次响应里 ——
-    # 丢掉之后就再也找不回来。附在错误尾巴上,代价一行,收益是这个错误从「无法追查」
-    # 变成「可以直接提给 Oracle」。
+    # 丢掉之后就再也找不回来。
     _rid = str(getattr(exc, "request_id", "") or "")
-    if _rid:
-        text += f" (opc-request-id: {_rid})"
+    _op = str(getattr(exc, "operation_name", "") or "")
+    _host = _endpoint_host(exc)
+    _tail = [b for b in (_op, f"@ {_host}" if _host else "", f"opc-request-id: {_rid}" if _rid else "") if b]
+    if _tail:
+        text += " (" + ", ".join(_tail) + ")"
+    # 服务端留痕。异常永远不能因为记日志而变形,所以整段吞掉自身的错误。
+    #
+    # 限流和容量不足降到 INFO:抢机重试循环每 60 秒就会撞一次「容量不足」,那是**预期
+    # 内**的循环状态,不是故障。按 WARNING 记会把日志淹掉,而日志一旦变成噪音,
+    # 真正要查的那条 404 就又找不到了 —— 正是这次要修的毛病。
+    try:
+        _expected = is_rate_limit_error(exc) or is_capacity_error(exc)
+        _OCI_LOG.log(
+            logging.INFO if _expected else logging.WARNING,
+            "OCI 调用失败 %s",
+            _err_facts(exc),
+        )
+    except Exception:  # noqa: BLE001
+        pass
     # Friendly hints
     #
     # 判断顺序很重要，而且以前是错的：`NotAuthorizedOrNotFound` 里含

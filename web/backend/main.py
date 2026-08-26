@@ -175,7 +175,14 @@ def create_app() -> FastAPI:
         # 实例列表用 X-Ocibot-Partial 告诉前端「这份列表是不完整的」，
         # 不 expose 的话在跨源部署下前端读到的永远是 undefined，
         # 于是一份被拒绝的读取又会被渲染成「你没有实例」。
-        expose_headers=["X-Ocibot-Partial", "X-Ocibot-Partial-Reason"],
+        # X-Ocibot-Reread 同理：实例详情「首读 404、复读成功」的说明走这一对头，
+        # 不 expose 的话跨源部署下这条解释永远到不了用户眼前。
+        expose_headers=[
+            "X-Ocibot-Partial",
+            "X-Ocibot-Partial-Reason",
+            "X-Ocibot-Reread",
+            "X-Ocibot-Reread-Reason",
+        ],
     )
 
     app.include_router(auth.router, prefix="/api")

@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.oci_client import FirewallRuleSpec
+from app.oci_client import safe_error_text, FirewallRuleSpec
 from web.backend import quota_guard
 from web.backend.audit import iso_utc, write_audit
 from web.backend.auth import get_current_user
@@ -60,7 +60,7 @@ def _row(db: Session, user_id: str, tenant_id: str):
     try:
         return get_owned_tenant(db, user_id, tenant_id)
     except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=safe_error_text(exc)) from exc
 
 
 def _unpack_console_list(result: Any) -> tuple[list[Any], str]:
@@ -147,7 +147,7 @@ def create_console(
             "data": data,
         }
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.delete("/tenants/{tenant_id}/instances/{instance_id}/console/{connection_id}")
@@ -163,7 +163,7 @@ def delete_console(
         session = get_session_for_row(row)
         result = session.delete_console_connection(connection_id)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     if not result.ok:
         raise HTTPException(status_code=502, detail=result.message or "删除控制台连接失败")
     return {"message": result.message or "已删除控制台连接"}
@@ -187,7 +187,7 @@ def get_firewall(
             "data": result.data if isinstance(result.data, dict) else {},
         }
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.post("/tenants/{tenant_id}/instances/{instance_id}/firewall/rules")
@@ -224,13 +224,13 @@ def add_firewall_rule(
         try:
             spec.validate()
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(status_code=400, detail=safe_error_text(exc)) from exc
         result = session.add_instance_firewall_rule(body.nsg_id, spec)
         return PowerActionResult(**op_result_dict(result))
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.post("/tenants/{tenant_id}/instances/{instance_id}/firewall/delete-rules")
@@ -248,7 +248,7 @@ def delete_firewall_rules(
         result = session.delete_nsg_rules(body.nsg_id, body.rule_ids)
         return PowerActionResult(**op_result_dict(result))
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.post("/tenants/{tenant_id}/instances/{instance_id}/firewall/open-all")
@@ -272,7 +272,7 @@ def firewall_open_all(
         )
         return PowerActionResult(**op_result_dict(result))
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.get("/tenants/{tenant_id}/boot-volumes")
@@ -297,7 +297,7 @@ def list_boot_volumes(
             "data": result.data if isinstance(result.data, dict) else {},
         }
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.get("/tenants/{tenant_id}/instances/{instance_id}/boot-volume")
@@ -318,7 +318,7 @@ def boot_volume_info(
             "data": result.data if isinstance(result.data, dict) else {},
         }
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.post("/tenants/{tenant_id}/instances/{instance_id}/boot-volume")
@@ -399,7 +399,7 @@ def boot_volume_update(
                     port=int(body.ssh_port or 22),
                 )
             except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
+                raise HTTPException(status_code=400, detail=safe_error_text(exc)) from exc
 
         result = session.resize_boot_volume(
             instance_id,
@@ -509,7 +509,7 @@ def boot_volume_update(
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -601,7 +601,7 @@ def list_reserved_ips(
         items = session.list_reserved_public_ips()
         return {"ok": True, "items": items}
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.post("/tenants/{tenant_id}/reserved-ips")
@@ -624,7 +624,7 @@ def create_reserved_ip(
         )
         return PowerActionResult(**op_result_dict(result))
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.delete("/tenants/{tenant_id}/reserved-ips/{public_ip_id}")
@@ -647,7 +647,7 @@ def delete_reserved_ip(
         )
         return PowerActionResult(**op_result_dict(result))
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.post("/tenants/{tenant_id}/instances/{instance_id}/reserved-ip/attach")
@@ -672,7 +672,7 @@ def attach_reserved_ip(
         )
         return PowerActionResult(**op_result_dict(result))
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.post("/tenants/{tenant_id}/reserved-ips/{public_ip_id}/detach")
@@ -695,7 +695,7 @@ def detach_reserved_ip(
         )
         return PowerActionResult(**op_result_dict(result))
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -726,7 +726,7 @@ def list_boot_volume_backups(
         items = session.list_boot_volume_backups(boot_volume_id=boot_volume_id or None)
         return {"ok": True, "items": items}
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.post("/tenants/{tenant_id}/boot-volume-backups")
@@ -754,7 +754,7 @@ def create_boot_volume_backup(
         )
         return PowerActionResult(**op_result_dict(result))
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.delete("/tenants/{tenant_id}/boot-volume-backups/{backup_id}")
@@ -777,7 +777,7 @@ def delete_boot_volume_backup(
         )
         return PowerActionResult(**op_result_dict(result))
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 class ProtectRequest(BaseModel):
@@ -825,7 +825,7 @@ def capture_console_output(
             "content": data.get("content", ""),
         }
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.post("/tenants/{tenant_id}/instances/{instance_id}/protect")
@@ -854,7 +854,7 @@ def set_instance_protected(
         )
         return PowerActionResult(**op_result_dict(result))
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 class BootVolumeRename(BaseModel):
@@ -899,7 +899,7 @@ def delete_boot_volume(
         )
         return PowerActionResult(**op_result_dict(result))
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.post("/tenants/{tenant_id}/boot-volumes/{volume_id}/rename")
@@ -925,7 +925,7 @@ def rename_boot_volume(
         )
         return PowerActionResult(**op_result_dict(result))
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.post("/tenants/{tenant_id}/instances/{instance_id}/create-image")
@@ -956,7 +956,7 @@ def list_custom_images(
         items = session.list_custom_images()
         return {"ok": True, "items": items}
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.delete("/tenants/{tenant_id}/custom-images/{image_id}")
@@ -979,4 +979,4 @@ def delete_custom_image(
         )
         return PowerActionResult(**op_result_dict(result))
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc

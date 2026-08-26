@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from app.oci_client import safe_error_text
+
 import logging
 
 from datetime import datetime, timezone
@@ -259,7 +261,7 @@ def get_tenant(
     try:
         row = get_owned_tenant(db, user.id, tenant_id)
     except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=safe_error_text(exc)) from exc
     return _to_out(row)
 
 
@@ -273,7 +275,7 @@ def update_tenant(
     try:
         row = get_owned_tenant(db, user.id, tenant_id)
     except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=safe_error_text(exc)) from exc
 
     data = body.model_dump(exclude_unset=True)
     new_pem = data.pop("private_key_pem", None)
@@ -390,7 +392,7 @@ def list_tenant_regions(
     try:
         row = get_owned_tenant(db, user.id, tenant_id)
     except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=safe_error_text(exc)) from exc
 
     try:
         session = get_session_for_row(row)
@@ -479,7 +481,7 @@ def subscribe_tenant_region(
     try:
         row = get_owned_tenant(db, user.id, tenant_id)
     except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=safe_error_text(exc)) from exc
     if not body.confirm:
         raise HTTPException(status_code=400, detail="请先确认：副区一经开通无法取消，且副区资源不属于免费额度")
 
@@ -622,7 +624,7 @@ def get_oci_password_policy(
     try:
         row = get_owned_tenant(db, user.id, tenant_id)
     except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=safe_error_text(exc)) from exc
     try:
         session = get_session_for_row(row)
         # Richer than the raw policy list: also resolves the user's own
@@ -648,7 +650,7 @@ def disable_oci_password_expiry(
     try:
         row = get_owned_tenant(db, user.id, tenant_id)
     except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=safe_error_text(exc)) from exc
     try:
         session = get_session_for_row(row)
         result = session.disable_console_password_expiry()
@@ -671,7 +673,7 @@ def delete_tenant(
     try:
         row = get_owned_tenant(db, user.id, tenant_id)
     except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=safe_error_text(exc)) from exc
     # 副区 rows share this row's credentials and would be left pointing at a tenant
     # the user can no longer edit, so they go with it.
     children = list(
@@ -711,7 +713,7 @@ def test_tenant(
     try:
         row = get_owned_tenant(db, user.id, tenant_id)
     except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=safe_error_text(exc)) from exc
     try:
         session = get_session_for_row(row)
         result = session.test_connection()
