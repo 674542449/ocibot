@@ -1,5 +1,93 @@
 # Changelog
 
+## 0.4.94 — 2026-08-26
+
+修「刷新实例列表有时候 404，多点几次就好了」。按要求先查了甲骨文官方文档，
+结论和直觉相反，所以**没有**给 SDK 加 404 重试。
+
+### 甲骨文文档怎么说
+
+- 官方 API 错误表（docs.oracle.com/en-us/iaas/Content/API/References/apierrors.htm）
+  有一列 **Retry**：`404 NotAuthorizedOrNotFound` 标的是 **"No."**，
+  而 429 和 5xx 标的是 "Yes, with backoff."。
+- Terraform 排障页同样把 404 列进「重试也不会成功」那一组。
+- Oracle 自己的 CLI 原样使用 `DEFAULT_RETRY_STRATEGY`，对 404 无任何特殊处理。
+- 唯一相反的先例是 Go SDK：它确实把 `{404, "NotAuthorizedOrNotFound"}` 登记为
+  「受最终一致性影响」并重试 —— 但门控在一个**只由同进程先前成功的 Identity
+  写操作**打开的 240 秒窗口上。刷新实例列表是纯读、没有前置写，按 Oracle 自己的
+  规则也不该重试。Python SDK 2.182.0 完全没有这套机制。
+
+**所以「给 404 加重试」这个方向是错的，本版没有这么做。**
+
+### 那「多点几次就好了」到底是什么（实测确认的机制）
+
+1. `IdentityClient` 是唯一会兜底装上 `DEFAULT_CIRCUIT_BREAKER_STRATEGY` 的 client
+   （`ComputeClient` 的 docstring 明说 "will not have circuit breakers enabled
+   by default"）。
+2. 那个策略的 `name` 是**导入时生成的一个固定 uuid**，而 `BaseClient` 用
+   `CircuitBreakerMonitor.get(strategy.name)` 取熔断器 —— 于是**全进程、所有租户的
+   `IdentityClient` 共用同一个熔断器实例**。
+3. 任一租户攒够 10 次 429/5xx，这个共享熔断器打开 **30 秒**。
+4. 期间所有租户的 `list_compartments` 抛 `CircuitBreakerError`，而它**不是**
+   `ServiceError`（实测 `issubclass` 为 False），穿透了原来的 `except ServiceError`。
+5. 枚举失败 → `list_instances_tree` 的扫描范围塌缩成只有根。
+6. Compute 没有熔断器，`list_instances(根)` 照常打通、照常返回那个**永久**的 404
+   （实例其实在子 compartment 里）。
+7. 塌缩 + 根 404 → 抛错。等 30 秒熔断器恢复 → 枚举成功 → 列表出来。
+
+**「多点几次」等的正是那 30 秒。**
+
+### 修复
+
+- **给每个租户一个独立的 Identity 熔断器**（`name=f"ocibot-identity-{tenant.id}"`）。
+  保留熔断保护本身，去掉「A 租户被限流把 B 租户也熔断掉」这个跨租户污染。
+  **这一项很可能就是全部病因。**
+- **`list_compartments` 的 `except ServiceError` 改成 `except Exception`。**
+  熔断器异常和连接超时原本会直接穿透，连 `strict=False` 那条「退化成只有根」的
+  docstring 承诺都保不住。失败时同时留下结构化事实（status / code /
+  opc-request-id / operation / host）。
+- **掐掉分页层的双层重试。** `oci.pagination.list_call_get_all_results` 自己
+  **硬编码**又套了一层 `DEFAULT_RETRY_STRATEGY`，和 client 层那个相乘：
+  最坏 8 × 8 = 64 次真实调用、~600 秒卡在一个 HTTP 请求里 —— 正好在跟抢机重试
+  循环抢同一个 per-tenancy 限流额度。收敛到 3 次 / 20 秒。
+- **抛错前做且只做一次显式复读，并把结果如实说出来。** 这不是重试策略，是取一位
+  证据：复读成功 → 这个 404 按定义就是瞬时的，界面直接列出实例并在「列表可能
+  不完整」的提示条里说明；复读仍然失败 → 错误里明写「已自动重读 1 次，仍然失败
+  —— 这不是瞬时故障」。只在注定要抛的那一刻做、只做一次、只对 404 做。
+  成功路径 0 增量；失败路径 +1 个幂等的 List，严格**少于**手动点三五次刷新
+  （每次 1+N 个请求）。
+
+### 维护
+
+- **修掉 0.4.90 我自己写错的一个参数名。** `test_connection` 的探针策略写的是
+  `retry_on_service_error_codes=[429]` —— 那不是 `RetryStrategyBuilder` 的参数，
+  被 `kwargs.get` 静默吞掉，于是当时那句「只对 429 重试」的注释是假的（实际生效的
+  是默认配置外加 `retry_any_5xx`）。收敛的部分（2 次 / 20 秒）当时是生效的，所以
+  行为影响不大，但照着抄的人会得到一个和注释不符的策略。正确参数名是
+  `service_error_retry_config`（**替换**语义，不合并）。
+- 新增 `tests/test_instance_list_404.py`（14 条），含一条钉住
+  `add_service_error_check()` 不得出现的断言 —— 那个重载会**原地改写模块级全局**
+  `RETRYABLE_STATUSES_AND_CODES`，而那正是 `DEFAULT_RETRY_STRATEGY` 内部持有的
+  同一个对象，会污染整个进程、所有租户、所有 client。
+- 全量 1006 passed。
+
+### 已确认但**本版不修**的一条（单独议题）
+
+`compartment_id_in_subtree=True` 只在**租户根**上有效 —— SDK docstring 原文：
+"Can only be set to true when performing ListCompartments on the tenancy
+(root compartment)"。而 `resolve_compartment()` 在租户配了子 compartment 时返回的
+不是根。文档措辞是 "applies only when"（只在…时生效）而非「拒绝」，所以实际行为
+大概率是**参数被静默忽略、只返回一级子 compartment**：孙子层 compartment 里的实例
+被漏数，而这份漏数会喂给配额守卫。它产生的是**恒定的漏数**，不是间歇的 404，
+和本次故障是两件事，混在一起改只会让两边都说不清。
+
+### 升级
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.94
+```
+
 ## 0.4.93 — 2026-08-26
 
 第四轮全功能审计：六个功能区并行，每条发现交给一个专门找茬的复核 agent 复验

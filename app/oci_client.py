@@ -974,7 +974,36 @@ class TenantSession:
             retry_kw = {"retry_strategy": sdk_default_retry_strategy()}
             self._compute = ComputeClient(self._config, **retry_kw)
             self._network = VirtualNetworkClient(self._config, **retry_kw)
-            self._identity = IdentityClient(self._config, **retry_kw)
+            # Identity 需要一个**每租户独立**的熔断器。
+            #
+            # IdentityClient 是唯一会自己兜底装上 DEFAULT_CIRCUIT_BREAKER_STRATEGY 的
+            # client（ComputeClient 的 docstring 明说「will not have circuit breakers
+            # enabled by default」）。而 BaseClient 是这样取熔断器的：
+            #     circuit_breaker = CircuitBreakerMonitor.get(strategy.name)
+            # DEFAULT 策略的 name 是**导入时生成的一个固定 uuid**，于是全进程、
+            # 所有租户的 IdentityClient 拿到的是**同一个**熔断器实例。
+            #
+            # 后果就是用户报的那个「刷新实例列表有时候 404，多点几次就好了」：
+            #   1. 任何一个租户攒够 10 次 429/5xx，这个共享熔断器打开 30 秒；
+            #   2. 期间**所有**租户的 list_compartments 直接抛 CircuitBreakerError，
+            #      而它不是 ServiceError（实测 issubclass 为 False），穿透了
+            #      list_compartments 的 `except ServiceError`；
+            #   3. 枚举失败 → list_instances_tree 的扫描范围塌缩成只有根；
+            #   4. Compute 没有熔断器，list_instances(根) 照常打通、照常返回那个
+            #      **永久**的 404（实例其实在子 compartment 里）；
+            #   5. 于是塌缩 + 根 404 → 抛错。等 30 秒熔断器恢复，枚举又成功，
+            #      列表就出来了 —— 「多点几次就好了」等的正是那 30 秒。
+            # 保留熔断保护本身，只去掉跨租户的交叉污染。
+            identity_kw = dict(retry_kw)
+            try:
+                identity_kw["circuit_breaker_strategy"] = oci.circuit_breaker.CircuitBreakerStrategy(
+                    failure_threshold=10,
+                    recovery_timeout=30,
+                    name=f"ocibot-identity-{self.tenant.id}",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            self._identity = IdentityClient(self._config, **identity_kw)
             self._blockstorage = BlockstorageClient(self._config, **retry_kw)
             self._limits = LimitsClient(self._config, **retry_kw)
             self._monitoring = MonitoringClient(self._config, **retry_kw)
@@ -1125,7 +1154,17 @@ class TenantSession:
                     total_elapsed_time_seconds=20,
                     retry_max_wait_between_calls_seconds=5,
                     service_error_check=True,
-                    retry_on_service_error_codes=[429],
+                    # 参数名必须是 service_error_retry_config。
+                    #
+                    # 0.4.90 这里写的是 `retry_on_service_error_codes=[429]` ——
+                    # 那不是 RetryStrategyBuilder 的参数，被 kwargs.get 静默吞掉，
+                    # 于是当时那句「只对 429 重试」的注释是假的：实际生效的是默认的
+                    # {-1: [], 409: [...], 429: []} 外加 retry_any_5xx=True。
+                    # 收敛的部分（2 次 / 20 秒）当时是生效的，所以行为影响不大，
+                    # 但照着那个形状抄的人会得到一个和注释不符的策略。
+                    # 这个 dict 是**替换**语义，不合并 —— 要保留的项必须自己写全。
+                    service_error_retry_config={429: []},
+                    service_error_retry_on_any_5xx=True,
                 ).get_retry_strategy()
             )
         except Exception:  # noqa: BLE001
@@ -1226,7 +1265,32 @@ class TenantSession:
                 self.identity.list_compartments,
                 root,
                 compartment_id_in_subtree=bool(subtree),
+                # ACCESSIBLE 是**结果过滤器**：只返回调用方有 INSPECT 权限的那些。
+                # 不要换成 ANY —— 文档里 "permissions are not checked" 说的是过滤器
+                # 不生效，不是「不需要权限」；换成 ANY 等于要求调用方在整个请求范围上
+                # 拿到授权，而权限受限的租户正是当前枚举会失败的那批人，只会让
+                # 「有时候能枚举」变成「永远不能枚举」。
                 access_level="ACCESSIBLE",
+                # 分页层自己**硬编码**又套了一层 DEFAULT_RETRY_STRATEGY，和 client 层
+                # 那个相乘：8 × 8 = 最坏 64 次真实调用、~600 秒卡在一个 HTTP 请求里。
+                # 这是在跟抢机重试循环抢同一个 per-tenancy 限流额度（CLAUDE.md）。
+                # 收敛到 3 次 / 20 秒。注意 service_error_retry_config 是**替换**语义，
+                # 429/409 必须自己抄回来，漏写就把它们的重试一起丢掉；也**不含 404**
+                # —— Oracle 的错误表把 404 NotAuthorizedOrNotFound 的 Retry 列标成 "No."。
+                retry_strategy=oci.retry.RetryStrategyBuilder(
+                    max_attempts_check=True,
+                    max_attempts=3,
+                    total_elapsed_time_check=True,
+                    total_elapsed_time_seconds=20,
+                    retry_base_sleep_time_seconds=1,
+                    retry_max_wait_between_calls_seconds=4,
+                    service_error_check=True,
+                    service_error_retry_on_any_5xx=True,
+                    service_error_retry_config={
+                        409: ["IncorrectState", "LockConflict"],
+                        429: [],
+                    },
+                ).get_retry_strategy(),
             )
             for c in response.data:
                 state = getattr(c, "lifecycle_state", "") or ""
@@ -1239,14 +1303,29 @@ class TenantSession:
                         "description": getattr(c, "description", "") or "",
                     }
                 )
-        except ServiceError as exc:
-            # An IAM policy that grants `manage instance-family in compartment child`
-            # without `inspect compartments in tenancy` makes this a PERMANENT 404
-            # (NotAuthorizedOrNotFound), not a blip; sustained 429s produce the same
-            # thing transiently. Either way the quota readers below would report the
-            # root's usage as the whole tenancy's and call it complete.
+        except Exception as exc:  # noqa: BLE001
+            # 必须是 except Exception，不能只接 ServiceError。
+            #
+            # IdentityClient 默认带熔断器，而它抛的 CircuitBreakerError **不是**
+            # ServiceError（实测 issubclass 为 False）。只接 ServiceError 的话，
+            # 熔断打开时这个异常会直接穿透出去 —— 连 strict=False 那条
+            # 「退化成只有根」的承诺都保不住。连接超时同理。
+            #
+            # 至于 404 本身：一条只给了 `manage instance-family in compartment child`
+            # 而没给 `inspect compartments in tenancy` 的策略会让这里**永久** 404；
+            # 持续 429 也会短暂产生同样的结果。两种情况下，下面的配额读取都会把根的
+            # 用量当成整个租户的、并且认为读全了。
+            #
+            # 把结构化事实留下来，让上层能说清楚到底是哪一种（_err_facts 已经声明
+            # 这些字段可安全外发、不含 OCID）。
+            self._last_enum_facts = _err_facts(exc)
             if strict:
-                raise OCIClientError(_format_service_error(exc)) from exc
+                detail = (
+                    _format_service_error(exc)
+                    if isinstance(exc, ServiceError)
+                    else f"{type(exc).__name__}: {exc}"
+                )
+                raise OCIClientError(detail) from exc
         # de-dupe by id
         seen: set[str] = set()
         unique: list[dict[str, str]] = []
@@ -1700,15 +1779,46 @@ class TenantSession:
             # 只抛 errors[0] 的话，操作者拿到的是一句光秃秃的 Oracle 404，
             # 完全看不出扫描范围已经塌缩成一个 compartment 了。
             detail = errors[0]
-            if enum_error:
-                raise OCIClientError(
-                    f"{detail}\n\n注意：本次未能枚举子 Compartment（{enum_error}），"
-                    f"因此只扫描了 {root[-16:]} 这一个 Compartment。"
-                    "如果实例其实在子 Compartment 里，这里就会既列不出实例、又报无权限 —— "
-                    "而枚举成功的那几次则一切正常，表现为「时好时坏」。"
-                    "\n请到租户页点「测试连接」确认具体是哪一项读不到。"
-                )
-            raise OCIClientError(detail)
+            # 抛之前做且**只做一次**显式复读，并把结果如实说出来。
+            #
+            # 这不是「重试策略」，是取一位证据。Oracle 的 API 错误表把
+            # 404 NotAuthorizedOrNotFound 的 Retry 列明确标成 "No."，Terraform 的
+            # 排障页也把 404 列进「重试也不会成功」那组 —— 所以这里刻意不给 SDK 挂
+            # 404 重试策略（那会让每一个真的没权限的调用都白白慢 8 倍）。
+            #
+            # 但复读一次的价值不同：**复读成功，这个 404 按定义就是瞬时的**，
+            # 「权限问题」这个解释当场出局；复读仍然失败，那就是持续问题。
+            # 用户现在的变通办法正是手动点三五次刷新，每次都是 1+N 个请求；
+            # 这里只补 1 个幂等的 List，请求量严格更少。
+            # 同形先例：test_connection 的探针（见那里的注释），理由逐字适用。
+            retried_ok = False
+            if "[404]" in detail or "NotAuthorizedOrNotFound" in detail:
+                time.sleep(1.5)
+                try:
+                    again = _scan(compartments[0])
+                except Exception:  # noqa: BLE001
+                    again = []
+                if again:
+                    # 复读读到了 —— 这次是瞬时故障，不该报错。
+                    # 但必须留痕：_last_tree_errors 会被路由渲染成
+                    # X-Ocibot-Partial 头，前端据此挂「这份列表可能不完整」的提示。
+                    retried_ok = True
+                    all_items = again
+                    self._last_tree_errors = [
+                        f"首次读取失败、1.5 秒后重读成功 —— 本次是瞬时故障，不是权限问题。"
+                        f"（首次错误：{detail[:200]}）"
+                    ]
+            if not retried_ok:
+                probe = "（已自动重读 1 次，仍然失败 —— 这不是瞬时故障）"
+                if enum_error:
+                    raise OCIClientError(
+                        f"{detail}\n{probe}\n\n注意：本次未能枚举子 Compartment（{enum_error}），"
+                        f"因此只扫描了 {root[-16:]} 这一个 Compartment。"
+                        "如果实例其实在子 Compartment 里，这里就会既列不出实例、又报无权限 —— "
+                        "而枚举成功的那几次则一切正常，表现为「时好时坏」。"
+                        "\n请到租户页点「测试连接」确认具体是哪一项读不到。"
+                    )
+                raise OCIClientError(f"{detail}\n{probe}")
         if resolve_ips:
             targets = [i for i in all_items if i.lifecycle_state not in ("TERMINATED", "TERMINATING")]
             self._enrich_instances_parallel(targets, root)
