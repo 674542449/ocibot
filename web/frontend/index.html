@@ -6,10 +6,13 @@
       name="viewport"
       content="width=device-width, initial-scale=1.0, viewport-fit=cover"
     />
-    <meta name="theme-color" content="#3370ff" />
+    <meta name="theme-color" content="#5b51d8" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="description" content="OCIBot — Oracle Cloud 多租户实例管理面板" />
+    <!-- SVG 优先（清晰、跟随系统配色），.ico 兜底：Safari 老版本和一些抓取
+         网站图标的工具只认 /favicon.ico，没有它那边就是一个空白方块。 -->
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" sizes="16x16 32x32 48x48 64x64" href="/favicon.ico" />
     <link rel="apple-touch-icon" href="/logo.svg" />
     <title>OCIBot</title>
     <script>

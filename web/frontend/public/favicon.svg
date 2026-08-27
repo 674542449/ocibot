@@ -1,11 +1,23 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
-  <defs>
-    <linearGradient id="g" x1="2" y1="2" x2="30" y2="30" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#3370ff"/>
-      <stop offset="1" stop-color="#6b4eff"/>
-    </linearGradient>
-  </defs>
-  <rect width="32" height="32" rx="8" fill="url(#g)"/>
-  <circle cx="16" cy="16" r="8.2" fill="none" stroke="#fff" stroke-width="2"/>
-  <path d="M16 9.2v6.6l4.3 2.6" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="OCIBot">
+  <!-- 标记的含义：环 = 一直在转的容量循环，缺口 = 放出来的那个空位，
+       方块 = 抢到并落位的实例。这是本工具唯一在做的事，不是又一个通用云图标。
+
+       浏览器标签页里需要一个实心的轮廓才好找，所以 favicon 带底板；
+       侧边栏那个是透明字形（见 AppLayout.vue），两者是有意分开的。 -->
+  <style>
+    .tile { fill: #5b51d8 }
+    /* 标签栏用的是浏览器自己的配色，跟应用内的 data-theme 无关，
+       所以这里只能按系统配色微调，让底板在深色标签栏上不发闷。 */
+    @media (prefers-color-scheme: dark) {
+      .tile { fill: #7b73e8 }
+    }
+  </style>
+  <rect class="tile" width="32" height="32" rx="7"/>
+  <!-- 带底板时字形收到 88%：贴着圆角边缘的图标在标签栏里显得又挤又糊。
+       16 - 16*0.88 = 1.92,所以平移 1.92 就能保持居中。
+       侧边栏那个裸字形**不收** —— 没有底板,本来就该填满自己的盒子。 -->
+  <g transform="translate(1.92 1.92) scale(0.88)">
+    <path d="M25.56 15.16A9.6 9.6 0 1 1 16.84 6.44" fill="none" stroke="#fff" stroke-width="4.6"/>
+    <rect x="18.79" y="5.21" width="8" height="8" rx="2.2" fill="#fff"/>
+  </g>
 </svg>

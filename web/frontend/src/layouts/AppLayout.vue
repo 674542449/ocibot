@@ -23,13 +23,27 @@
 
     <aside class="sidebar">
       <div class="brand">
-        <img class="logo-img" src="/logo.svg" width="30" height="30" alt="OCIBot" />
-        <div class="brand-text">
-          <div class="title">OCIBot</div>
-          <div class="muted small truncate">
-            {{ auth.username }}<span v-if="auth.isAdmin"> · 管理员</span>
-          </div>
-        </div>
+        <!-- 内联而不是 <img src="/logo.svg">：img 里的 currentColor 拿不到外部
+             CSS，标记就只能写死一个颜色。内联之后它跟着 --accent 走，
+             亮/暗主题各自都是对的。public/logo.svg 是同一套路径的写死颜色版，
+             给 apple-touch-icon 那类没有 CSS 上下文的地方用 —— 改一个要改两个。
+
+             标记的含义：环 = 一直在转的容量循环，缺口 = 放出来的那个空位，
+             方块 = 抢到并落位的实例。 -->
+        <svg
+          class="brand-mark"
+          viewBox="0 0 32 32"
+          role="img"
+          aria-label="OCIBot"
+        >
+          <path
+            d="M25.56 15.16A9.6 9.6 0 1 1 16.84 6.44"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="4.6"
+          />
+          <rect x="18.79" y="5.21" width="8" height="8" rx="2.2" fill="currentColor" />
+        </svg>
         <button
           type="button"
           class="icon-btn sidebar-close"
@@ -102,6 +116,12 @@
       </nav>
 
       <div class="sidebar-foot">
+        <!-- 「我登录的是哪个账号」原来挂在标题下面，标题去掉之后全应用就没有
+             第二处显示它了。这是个多租户管理面板，用错账号做的操作是不可逆的，
+             所以这行必须留着 —— 只是挪到脚部，那才是账号信息该待的地方。 -->
+        <div class="muted small account-line rail-label" :title="accountFull">
+          {{ auth.username }}<span v-if="auth.isAdmin"> · 管理员</span>
+        </div>
         <div v-if="buildLabel" class="muted small build-label rail-label" :title="buildFull">
           v{{ appVersion }} · {{ buildLabel }}
         </div>
@@ -211,6 +231,11 @@ const workerChecked = ref(false)
 const heartbeatText = ref('从未收到心跳')
 const buildLabel = ref('')
 const buildFull = ref('')
+// 侧边栏收窄成图标栏时 .rail-label 会被隐藏，账号那行也跟着看不见 ——
+// title 是那种状态下唯一还能确认「我是谁」的途径。
+const accountFull = computed(
+  () => `已登录：${auth.username}${auth.isAdmin ? '（管理员）' : ''}`,
+)
 const appVersion = ref('')
 let timer: number | undefined
 
@@ -403,34 +428,31 @@ onBeforeUnmount(() => {
   color: var(--text);
 }
 
-.brand-text {
-  min-width: 0;
-  flex: 1;
-}
-
-.logo-img {
-  width: 36px;
-  height: 36px;
-  border-radius: 10px;
-  flex-shrink: 0;
+/* 标记本身就是品牌，旁边不再有文字，所以它得自己撑住这块区域。
+   跟着 --accent 走：亮色主题是深靛，暗色是淡紫，两边都是 AA 以上对比度。
+   不加投影 —— 这是个透明字形不是贴纸，投影只会让它显得像贴上去的。 */
+.brand-mark {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
   display: block;
-  box-shadow: 0 4px 12px rgba(51, 112, 255, 0.35);
-  background: transparent;
+  color: var(--accent);
+  transition: color 160ms ease;
+}
+.brand:hover .brand-mark {
+  color: var(--accent-hover);
+}
+@media (prefers-reduced-motion: reduce) {
+  .brand-mark {
+    transition: none;
+  }
 }
 
-.logo {
-  width: 36px;
-  height: 36px;
-  border-radius: 10px;
-  display: grid;
-  place-items: center;
-  font-weight: 700;
-  font-size: 16px;
-  color: #fff;
-  background: linear-gradient(135deg, #3370ff 0%, #6b4eff 100%);
-  flex-shrink: 0;
-  box-shadow: 0 4px 12px rgba(51, 112, 255, 0.35);
+.account-line {
+  font-size: 11px;
+  padding: 0 0.15rem 0.15rem;
 }
+
 
 .title {
   font-weight: 650;
@@ -574,6 +596,9 @@ onBeforeUnmount(() => {
 
 .sidebar-close {
   display: none;
+  /* 标题文字去掉之后 .brand 里只剩标记和这个关闭按钮，没有东西再把它推到右边，
+     它会紧贴着标记。原来那个 flex:1 的 .brand-text 一直在做这件事。 */
+  margin-left: auto;
 }
 
 .icon-btn {
