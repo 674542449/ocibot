@@ -486,58 +486,6 @@ def cb_kwargs(service: str, tenant_id: str) -> dict:
     return kw
 
 
-# IPv6 地址块（CreateIpv6 的 cidrPrefixLength，2025-08-22 上线）的取值边界。
-#
-# 官方文档原话是 "Custom mask values between 80 and 128 are supported" 和
-# "The mask value must be divisible by 4 without any remainder"。
-# 一个 /112 是 65536 个地址，一个 /80 是 2^48 —— 而不论多大都只占 VNIC 那 32 个
-# 「地址对象」配额里的 1 个。这才是在 OCI 上拿到大量出口 IPv6 的正路：
-# 逐个 CreateIpv6 建几千个既慢又会在第 32 个上撞墙。
-_IPV6_MASK_MIN = 80
-_IPV6_MASK_MAX = 128
-# 服务限额页：Secondary Private IPv6 addresses / VNIC / 32。
-# （IPv4 那条是 64，别记串。）
-_IPV6_OBJECTS_PER_VNIC = 32
-
-
-def validate_ipv6_prefix_length(value: Any) -> str:
-    """合法返回 ""，不合法返回**给用户看的**一句话。
-
-    单独拎出来是因为这几个边界很容易记错，而记错的代价是一条 Oracle 那边回的、
-    看不出所以然的 400。前端和后端共用同一份判断。
-    """
-    if value in (None, "", 0):
-        return ""
-    try:
-        n = int(value)
-    except (TypeError, ValueError):
-        return f"IPv6 前缀长度必须是整数（收到 {value!r}）"
-    if n == 64:
-        # 单独接住 /64：这是最容易想当然的一个值，而它错得有理由 ——
-        # 别家 VPS 给的就是「路由一个 /64 给你」，用户会直接照搬那个心智模型。
-        return (
-            "OCI 不能把整个 /64 划给一张网卡。/64 是**子网本身**的大小，不是能分给 "
-            "VNIC 的块；Oracle 只接受 80–128 的掩码。"
-            f"能拿到的最大一块是 /{_IPV6_MASK_MIN}，那已经是 2^48 个地址。"
-        )
-    if not (_IPV6_MASK_MIN <= n <= _IPV6_MASK_MAX):
-        return (
-            f"IPv6 前缀长度必须在 /{_IPV6_MASK_MIN} 到 /{_IPV6_MASK_MAX} 之间"
-            f"（收到 /{n}）"
-        )
-    if n % 4:
-        return f"IPv6 前缀长度必须能被 4 整除（收到 /{n}，最近的是 /{n - n % 4}）"
-    return ""
-
-
-def ipv6_prefix_choices() -> list[dict[str, Any]]:
-    """给界面用的块大小候选。/128 就是「一个地址」，也就是原来的行为。"""
-    out: list[dict[str, Any]] = []
-    for n in range(_IPV6_MASK_MAX, _IPV6_MASK_MIN - 1, -4):
-        out.append({"prefix_length": n, "count": 1 << (128 - n)})
-    return out
-
-
 def _is_circuit_breaker_error(exc: Any) -> bool:
     """CircuitBreakerError **不是** ServiceError 的子类，所以到处都接不住它。"""
     try:
@@ -4716,27 +4664,13 @@ class TenantSession:
         except Exception as exc:  # noqa: BLE001
             return OperationResult(ok=False, message=safe_error_text(exc))
 
-    def assign_public_ipv6(
-        self,
-        instance_id: str,
-        compartment_id: str,
-        cidr_prefix_length: Optional[int] = None,
-    ) -> OperationResult:
+    def assign_public_ipv6(self, instance_id: str, compartment_id: str) -> OperationResult:
         """Assign a public IPv6 to the primary VNIC and open internet routing.
 
         If the subnet/VCN has no IPv6 prefix yet, automatically enables an
         Oracle-assigned GUA on the VCN and a /64 on the subnet, then ensures
         Internet Gateway + ``::/0`` so the address is publicly reachable.
-
-        ``cidr_prefix_length`` 给的是**一整块**而不是一个地址（OCI 2025-08-22 起的
-        `cidrPrefixLength`）。一个 /112 就是 65536 个地址,而且只占 VNIC 那 32 个
-        地址对象配额里的 1 个 —— 这是在 OCI 上拿到成百上千个出口 IPv6 的正路。
-        取值必须落在 80–128 且能被 4 整除,详见 validate_ipv6_prefix_length。
         """
-        prefix_error = validate_ipv6_prefix_length(cidr_prefix_length)
-        if prefix_error:
-            return OperationResult(ok=False, message=prefix_error)
-        prefix_len = int(cidr_prefix_length) if cidr_prefix_length else 0
         try:
             network = self.resolve_primary_network(instance_id, compartment_id)
             enable = self.ensure_subnet_ipv6(network.subnet_id, compartment_id)
@@ -4750,12 +4684,7 @@ class TenantSession:
 
             # Re-read VNIC addresses after possible network changes.
             network = self.resolve_primary_network(instance_id, compartment_id)
-            # 请求一整块时**不能**在这里早退。
-            #
-            # 「已经有地址了」对单地址来说是终点(再加一个没意义),但对「我要一块
-            # /112 做出口池」来说恰恰相反 —— 文档说地址掩码必须作为**辅助** IP
-            # 分配,也就是 VNIC 上本来就该先有一个常规 IPv6。早退等于永远分不出块。
-            if network.ipv6_addresses and not prefix_len:
+            if network.ipv6_addresses:
                 address = ", ".join(network.ipv6_addresses)
                 route = self.ensure_ipv6_internet_access(network.subnet_id, compartment_id)
                 suffix = f"；{route.message}" if route.ok else f"；⚠ 公网路由设置失败：{route.message}"
@@ -4786,39 +4715,11 @@ class TenantSession:
             except Exception:  # noqa: BLE001
                 # 读不到子网不该让分配直接失败 —— 退回不传，单前缀子网照样能过。
                 pass
-            seeded = ""
-            if prefix_len:
-                # 配额闸门：每 VNIC 32 个 IPv6 **地址对象**（服务限额页
-                # "Secondary Private IPv6 addresses / VNIC / 32"）。一个块也算
-                # 一个对象。撞上限时 Oracle 给的是一条看不出所以然的 400，
-                # 不如在这里说清楚还剩几个。
-                used = self._count_vnic_ipv6_objects(network.vnic_id)
-                if used >= 0 and used >= _IPV6_OBJECTS_PER_VNIC:
-                    return OperationResult(
-                        ok=False,
-                        message=(
-                            f"这张网卡已经有 {used} 个 IPv6 地址对象，达到每 VNIC "
-                            f"{_IPV6_OBJECTS_PER_VNIC} 个的上限。先删掉一些，"
-                            "或者把新块挂到另一张 VNIC 上。"
-                        ),
-                    )
-                if not network.ipv6_addresses:
-                    # 文档：地址掩码**必须作为辅助 IP 分配**，所以 VNIC 上得先有
-                    # 一个常规 IPv6。空网卡直接要块会被 Oracle 拒掉，而那个错误
-                    # 完全看不出少的是这一步。
-                    base = oci.core.models.CreateIpv6Details(
-                        vnic_id=network.vnic_id, **ipv6_kwargs
-                    )
-                    seed = self.network.create_ipv6(base).data
-                    seeded = getattr(seed, "ip_address", "") or ""
-                ipv6_kwargs["cidr_prefix_length"] = prefix_len
             details = oci.core.models.CreateIpv6Details(
                 vnic_id=network.vnic_id, **ipv6_kwargs
             )
             ipv6 = self.network.create_ipv6(details).data
             address = getattr(ipv6, "ip_address", "") or ""
-            if prefix_len:
-                address = f"{address}/{prefix_len}"
             route = self.ensure_ipv6_internet_access(network.subnet_id, compartment_id)
             suffix = f"；{route.message}" if route.ok else (
                 f"；⚠ 公网路由设置失败，可能仅内网可用：{route.message}"
@@ -4834,67 +4735,15 @@ class TenantSession:
                 suffix += f"；{rules_note}"
             if enable_note:
                 suffix = f"；{enable_note}" + suffix
-            if prefix_len:
-                total = 1 << (128 - prefix_len)
-                head = f"已分配公网 IPv6 地址块：{address}（{total:,} 个地址）"
-                if seeded:
-                    head += f"；已先补一个常规地址 {seeded}（掩码块必须作为辅助 IP）"
-                # 主机侧怎么用这一块，Oracle 文档没写 —— 不要替它编步骤。
-                head += (
-                    "\n注意：块已经分给网卡，但**实例内部还要自己配**才能真的用上里面的地址；"
-                    "Oracle 文档只写了单地址的配置方法，没有给地址块的官方步骤。"
-                    "先在机器上验证一个地址能出站，再铺开。"
-                )
-                return OperationResult(
-                    ok=True,
-                    message=f"{head}{suffix}",
-                    data={
-                        "ipv6": address,
-                        "cidr_prefix_length": prefix_len,
-                        "address_count": total,
-                        "seeded": seeded,
-                        "route_ok": route.ok,
-                        "enabled": enable.data,
-                    },
-                )
             return OperationResult(
                 ok=True,
                 message=f"已分配公网 IPv6：{address}{suffix}",
                 data={"ipv6": address, "route_ok": route.ok, "enabled": enable.data},
             )
         except ServiceError as exc:
-            # 这个字段是 2025-08-22 才上线的。区域没铺到时 Oracle 回的是一条
-            # 看不出所以然的 400，不说破的话用户会以为是自己参数写错了。
-            if prefix_len and int(getattr(exc, "status", 0) or 0) == 400:
-                return OperationResult(
-                    ok=False,
-                    message=(
-                        f"{_format_service_error(exc)}\n"
-                        f"提示：IPv6 地址块（cidrPrefixLength）是 2025-08-22 上线的较新能力。"
-                        "这条 400 有两种可能：该区域还没有这个特性，"
-                        "或者所选块和子网里已有的地址撞了 —— 子网前缀的**首尾各一个 /80** "
-                        "是保留给临时地址的，不能用作掩码块。可以换一个更长的前缀再试。"
-                    ),
-                )
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
             return OperationResult(ok=False, message=safe_error_text(exc))
-
-    def _count_vnic_ipv6_objects(self, vnic_id: str) -> int:
-        """这张网卡上已有几个 IPv6 地址对象。读不到返回 -1（调用方据此跳过闸门）。
-
-        读不到就**不拦**：这只是一道提前说明白的闸门，不是安全边界。让一次列举
-        失败把「分配 IPv6」整个挡掉，比撞上限拿到一条含糊的 400 更糟。
-        """
-        try:
-            resp = oci.pagination.list_call_get_all_results(
-                self.network.list_ipv6s,
-                vnic_id=vnic_id,
-                retry_strategy=sdk_bounded_paged_retry_strategy(),
-            )
-            return len(list(resp.data or []))
-        except Exception:  # noqa: BLE001
-            return -1
 
     def _ensure_ipv6_rules_on_managed_nsgs(self, network: Any) -> str:
         """给实例所在的**托管** NSG 补上 IPv6 版安全规则。返回一句给用户看的说明。
