@@ -284,6 +284,19 @@ class RenameRequest(BaseModel):
     display_name: str = Field(min_length=1, max_length=255)
 
 
+class AssignIpv6Request(BaseModel):
+    """可选：要一整块 IPv6 而不是单个地址。
+
+    留空 = 老行为（一个 /128）。范围校验故意**不**写在这里而是交给
+    app.oci_client.validate_ipv6_prefix_length —— 那边给的是能直接显示给用户的
+    中文说明（尤其 /64 那条：别家 VPS 给的就是路由一个 /64，用户会照搬那个
+    心智模型），Pydantic 的 ge/le 只会吐一句 "Input should be less than or
+    equal to 128"，把最需要解释的那个错误解释没了。
+    """
+
+    cidr_prefix_length: Optional[int] = None
+
+
 class RootPasswordNoteRequest(BaseModel):
     """New value for the remembered root password (empty clears it).
 

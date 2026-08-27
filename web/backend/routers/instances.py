@@ -53,6 +53,7 @@ from web.backend.quota_guard import (
     usage_snapshot,
 )
 from web.backend.schemas import (
+    AssignIpv6Request,
     InstanceOut,
     LaunchInstanceRequest,
     LaunchInstanceResult,
@@ -469,12 +470,32 @@ def assign_ipv6(
     instance_id: str,
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
+    # 请求体可省 —— 老前端不带 body 时仍然是「分配一个地址」。
+    payload: AssignIpv6Request | None = None,
 ) -> PowerActionResult:
     row = _tenant_or_404(db, user.id, tenant_id)
+    prefix_len = payload.cidr_prefix_length if payload else None
     try:
         session = get_session_for_row(row)
         info = session.get_instance(instance_id, resolve_ips=False)
-        result = session.assign_public_ipv6(instance_id, info.compartment_id)
+        result = session.assign_public_ipv6(
+            instance_id, info.compartment_id, cidr_prefix_length=prefix_len
+        )
+        # 分配地址块是**增量且可观测**的写操作，和「取消 IPv6」一样值得留档：
+        # 一块 /96 在账单和安全审查里都不是小事，事后要能回答「谁什么时候开的」。
+        if prefix_len:
+            write_audit(
+                db,
+                owner_id=user.id,
+                action="instance.ipv6.assign_block",
+                target=instance_id,
+                detail={
+                    "tenant_id": tenant_id,
+                    "cidr_prefix_length": prefix_len,
+                    "ok": result.ok,
+                    "message": result.message,
+                },
+            )
         return PowerActionResult(**op_result_dict(result))
     except OCIClientError as exc:
         raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc

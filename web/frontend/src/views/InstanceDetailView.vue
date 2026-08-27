@@ -87,7 +87,17 @@
         <button :disabled="acting" @click="power('SOFTRESET')">重启</button>
         <button :disabled="acting" @click="doRename">重命名</button>
         <button :disabled="acting" @click="doReplaceIp">换公网IP</button>
-        <button :disabled="acting" @click="doIpv6">分配 IPv6</button>
+        <!-- 块大小和按钮放在一起：分开会让人以为选完还要再点别的。
+             默认「单个地址」= 老行为，不给只想要一个 IPv6 的人加负担。 -->
+        <select v-model.number="ipv6Prefix" :disabled="acting" style="width: auto">
+          <option :value="0">单个地址</option>
+          <option v-for="c in ipv6Choices" :key="c.n" :value="c.n">
+            /{{ c.n }} 块（{{ c.label }} 个）
+          </option>
+        </select>
+        <button :disabled="acting" @click="doIpv6">
+          {{ ipv6Prefix ? `分配 /${ipv6Prefix} 块` : '分配 IPv6' }}
+        </button>
         <!-- Only offered when there is something to remove: a button that always
              answers "该实例没有 IPv6" is noise on every instance that never had one. -->
         <button
@@ -1733,12 +1743,29 @@ async function doReplaceIp() {
     acting.value = false
   }
 }
+// OCI 只接受 80–128 且能被 4 整除的掩码（CreateIpv6 的 cidrPrefixLength，
+// 2025-08-22 上线）。**没有 /64** —— 那是子网本身的大小，不是能分给网卡的块；
+// 别家 VPS 给的正是「路由一个 /64 给你」，所以这里刻意不列它，免得照着点。
+// 一个块只占 VNIC 那 32 个地址对象配额里的 1 个。
+const ipv6Prefix = ref(0)
+const ipv6Choices = [
+  { n: 120, label: '256' },
+  { n: 116, label: '4,096' },
+  { n: 112, label: '65,536' },
+  { n: 104, label: '1,677 万' },
+  { n: 96, label: '42.9 亿' },
+  { n: 80, label: '2^48' },
+]
+
 async function doIpv6() {
   // 分配地址是增量操作，不删不断，不加确认。
   const act = beginAction()
   acting.value = true
   try {
-    const { data } = await api.post(`/tenants/${act.tenant}/instances/${act.target}/ipv6`)
+    const { data } = await api.post(
+      `/tenants/${act.tenant}/instances/${act.target}/ipv6`,
+      ipv6Prefix.value ? { cidr_prefix_length: ipv6Prefix.value } : {},
+    )
     if (act.moved()) return
     if (data.ok) msg.value = data.message
     else error.value = data.message
