@@ -1,21 +1,26 @@
-"""Always Free 的 ARM 额度按账号类型分，而且 2026-06-15 被 Oracle 砍过半。
+"""Always Free 的 ARM 额度按账号类型分，而且被 Oracle 砍过半。
 
 ## 故障
 
 用户开了两台 2 OCPU / 12 GB / 100 GB 的 A1，过几天**被销毁一台，硬盘还在**。
 
 面板当时把免费额度写死成 `FREE_A1_OCPU = 4.0` / `FREE_A1_MEMORY_GB = 24.0`，
-于是两台合计 4 / 24 正好"顶满"，校验放行。但 Oracle 已经在 2026-06-15 把
-Always Free 的 Ampere A1 从 4 OCPU / 24 GB **砍半**到 2 OCPU / 12 GB —— 没有公告、
-没有邮件，只改了文档：
+于是两台合计 4 / 24 正好"顶满"，校验放行。但 Oracle 现行文档写的是：
 
     "All tenancies get the first 1,500 OCPU hours and 9,000 GB hours per month
      for free for VM instances using the VM.Standard.A1.Flex shape...
      For Always Free tenancies, this is equivalent to 2 OCPUs and 12 GB of memory."
     "you can create one or two OCI Ampere A1 Compute instances, 2 OCPUs total"
 
-整改期限是 2026-08-18，逾期 Oracle 自动终止超限实例 —— 终止时**保留引导卷**，
-这正是「机器没了、硬盘还在」的形态。
+免费号的上限是 2 / 12 —— 只装得下那两台里的一台。这个算术是唯一能精确解释
+「不是两台都掉、也不是都留、恰好剩下合规的一台」的东西。
+
+**关于 Oracle 具体做了什么，本文件刻意不下结论**：这次下调的生效日和整改期限
+只见于第三方报道（InfoQ / heise / Linuxiac），Oracle 从未公告；官方对超额 A1 的
+唯一表述是「现有实例被禁用、30 天后删除」，不是「终止超出那台并保留引导卷」；
+另有闲置回收（7 天内 CPU/网络/内存 95 分位均 <20%，内存仅 A1）同样能解释
+「两台只掉一台」。见 test_the_block_message_explains_the_change_without_over_claiming。
+（「硬盘还在」本身有据：OCI 终止实例时**默认保留**引导卷。）
 
 ## 两件必须分开的事
 
@@ -135,6 +140,38 @@ def test_the_block_message_explains_the_change_without_over_claiming():
 
 
 # ------------------------------------------------------------------ 一键预设
+
+
+def test_presets_follow_the_account_tier():
+    """预设也得按账号类型走 —— 一张静态表必然对其中一边是错的。
+
+    写 4C24G:免费号照着点会开出超一倍的配置然后被收走一台；
+    写 2C12G:升级号被无端砍掉一半，而那本来就是他的额度。
+    """
+    from app.oci_client import launch_quick_presets
+
+    for tier in ("free", "paid"):
+        cap_cpu, cap_mem = a1_caps(tier)
+        a1 = [x for x in launch_quick_presets(tier) if free_quota.is_a1_shape(x["shape"])]
+        assert a1, tier
+        # 至少有一个「用满额度」的档，也至少有一个「对半分、可开两台」的档。
+        assert any(x["ocpus"] == cap_cpu and x["memory_in_gbs"] == cap_mem for x in a1), tier
+        assert any(x["ocpus"] * 2 <= cap_cpu for x in a1), tier
+        for x in a1:
+            assert x["ocpus"] <= cap_cpu and x["memory_in_gbs"] <= cap_mem, (tier, x["label"])
+
+
+def test_the_meta_cache_is_keyed_on_the_account_tier():
+    """预设按 tier 生成之后，tier 就必须进缓存键。
+
+    否则一个刚升级完的租户会继续拿到缓存里那份免费号的预设 —— 界面少给他一半额度，
+    而且没有任何东西会让它失效。
+    """
+    import inspect
+
+    from web.backend.launch_service import meta_cache_key
+
+    assert "account_tier" in inspect.getsource(meta_cache_key)
 
 
 def test_every_free_preset_fits_inside_the_free_allowance():

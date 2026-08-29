@@ -588,64 +588,83 @@ BOOT_VPU_PRESETS = [
     (120, "超高性能 (120 VPUs/GB) — 可能额外计费"),
 ]
 
-# One-click free-tier launch presets (shape + boot). Network uses the account default.
-LAUNCH_QUICK_PRESETS: list[dict] = [
-    {
-        "id": "e2_micro_50",
-        "label": "免费 AMD · 50G",
-        "hint": "VM.Standard.E2.1.Micro · 硬盘 50GB",
-        "shape": "VM.Standard.E2.1.Micro",
-        "arch": "x86",
-        "ocpus": None,
-        "memory_in_gbs": None,
-        "boot_volume_size_in_gbs": 50,
-        "boot_volume_vpus_per_gb": 10,
-    },
-    # 这三个预设**必须**落在免费号的额度内（2 OCPU / 12 GB，见 free_quota.a1_caps）。
-    #
-    # 原来这里是 4C24G —— 那是 2026-06-15 之前的额度。Oracle 砍半之后没有公告，
-    # 于是面板一直在一键推荐一个**整整超一倍**的配置；照着点的免费号会在整改期
-    # （2026-08-18）之后被自动终止，引导卷留下。这正是用户报的「开两台 2C12G，
-    # 被销毁一台，硬盘还在」。
-    #
-    # VPU 也从 120 降回 10（平衡档）。同一个文件里 BOOT_VPU_PRESETS 把 >20 标成
-    # 「可能额外计费」，free_quota 也会为 vpu>10 挂告警 —— 一个标着「免费」的预设
-    # 却默认选一个自己都在警告的档位，是自相矛盾。想要更高性能仍可在向导里手动选。
-    {
-        "id": "a1_2c12g_100",
-        "label": "免费 ARM 2C12G · 100G",
-        "hint": "VM.Standard.A1.Flex · 2 OCPU / 12GB · 硬盘 100GB（用满免费额度）",
-        "shape": "VM.Standard.A1.Flex",
-        "arch": "arm",
-        "ocpus": 2,
-        "memory_in_gbs": 12,
-        "boot_volume_size_in_gbs": 100,
-        "boot_volume_vpus_per_gb": 10,
-    },
-    {
-        "id": "a1_2c12g_200",
-        "label": "免费 ARM 2C12G · 200G",
-        "hint": "VM.Standard.A1.Flex · 2 OCPU / 12GB · 硬盘 200GB（用满免费额度）",
-        "shape": "VM.Standard.A1.Flex",
-        "arch": "arm",
-        "ocpus": 2,
-        "memory_in_gbs": 12,
-        "boot_volume_size_in_gbs": 200,
-        "boot_volume_vpus_per_gb": 10,
-    },
-    # 想要两台机器就得对半分 —— 免费额度只够 2 OCPU / 12 GB 合计。
-    {
-        "id": "a1_1c6g_100",
-        "label": "免费 ARM 1C6G · 100G（可开两台）",
-        "hint": "VM.Standard.A1.Flex · 1 OCPU / 6GB · 硬盘 100GB · 开两台正好用满额度",
-        "shape": "VM.Standard.A1.Flex",
-        "arch": "arm",
-        "ocpus": 1,
-        "memory_in_gbs": 6,
-        "boot_volume_size_in_gbs": 100,
-        "boot_volume_vpus_per_gb": 10,
-    },
-]
+# One-click launch presets (shape + boot). Network uses the account default.
+#
+# **按账号类型生成，不是一张写死的表。** 免费号的 A1 额度是 2 OCPU / 12 GB，
+# 升级（PAYG）号是 4 / 24（见 free_quota.a1_caps）—— 一张静态表必然对其中一边是错的：
+#   * 写 4C24G：免费号照着点会开出超一倍的配置，然后被 Oracle 收走一台
+#     （这就是 0.4.102 修的那个故障）；
+#   * 写 2C12G：升级号被无端砍掉一半，而那本来就是他的额度。
+#
+# VPU 一律 10（平衡档）。同一个文件里 BOOT_VPU_PRESETS 把 >20 标成「可能额外计费」，
+# free_quota 也会为 vpu>10 挂告警 —— 一个标着「免费」的预设却默认选一个自己都在
+# 警告的档位，是自相矛盾。想要更高性能仍可在向导里手动选。
+def launch_quick_presets(account_tier: str = "") -> list[dict]:
+    """这个账号该看到的一键预设。"""
+    from app.free_quota import a1_caps
+
+    cap_cpu, cap_mem = a1_caps(account_tier)
+    cpu = int(cap_cpu)
+    mem = int(cap_mem)
+    half_cpu = max(1, cpu // 2)
+    half_mem = max(1, mem // 2)
+    # 免费号那 2/12 是硬上限；升级号的 4/24 是免费额度，超出按量计费，
+    # 所以文案上不把升级号那档说成「免费」——「额度内」才是准确的。
+    tag = "免费" if cap_cpu <= 2 else "额度内"
+    return [
+        {
+            "id": "e2_micro_50",
+            "label": "免费 AMD · 50G",
+            "hint": "VM.Standard.E2.1.Micro · 硬盘 50GB",
+            "shape": "VM.Standard.E2.1.Micro",
+            "arch": "x86",
+            "ocpus": None,
+            "memory_in_gbs": None,
+            "boot_volume_size_in_gbs": 50,
+            "boot_volume_vpus_per_gb": 10,
+        },
+        {
+            "id": f"a1_{cpu}c{mem}g_100",
+            "label": f"{tag} ARM {cpu}C{mem}G · 100G",
+            "hint": f"VM.Standard.A1.Flex · {cpu} OCPU / {mem}GB · 硬盘 100GB（用满额度）",
+            "shape": "VM.Standard.A1.Flex",
+            "arch": "arm",
+            "ocpus": cpu,
+            "memory_in_gbs": mem,
+            "boot_volume_size_in_gbs": 100,
+            "boot_volume_vpus_per_gb": 10,
+        },
+        {
+            "id": f"a1_{cpu}c{mem}g_200",
+            "label": f"{tag} ARM {cpu}C{mem}G · 200G",
+            "hint": f"VM.Standard.A1.Flex · {cpu} OCPU / {mem}GB · 硬盘 200GB（用满额度）",
+            "shape": "VM.Standard.A1.Flex",
+            "arch": "arm",
+            "ocpus": cpu,
+            "memory_in_gbs": mem,
+            "boot_volume_size_in_gbs": 200,
+            "boot_volume_vpus_per_gb": 10,
+        },
+        # 想要两台机器就得对半分 —— A1 额度是**合计**的。
+        {
+            "id": f"a1_{half_cpu}c{half_mem}g_100",
+            "label": f"{tag} ARM {half_cpu}C{half_mem}G · 100G（可开两台）",
+            "hint": (
+                f"VM.Standard.A1.Flex · {half_cpu} OCPU / {half_mem}GB · 硬盘 100GB · "
+                "开两台正好用满额度"
+            ),
+            "shape": "VM.Standard.A1.Flex",
+            "arch": "arm",
+            "ocpus": half_cpu,
+            "memory_in_gbs": half_mem,
+            "boot_volume_size_in_gbs": 100,
+            "boot_volume_vpus_per_gb": 10,
+        },
+    ]
+
+
+# 兼容旧引用：不带 tier 就是免费号那份（最保守的一份）。
+LAUNCH_QUICK_PRESETS: list[dict] = launch_quick_presets("")
 
 # Platform image OS families offered in the launch wizard. Values are the
 # official `operating_system` filter names used by list_images.

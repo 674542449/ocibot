@@ -16,7 +16,7 @@ from app.oci_client import (
     BOOT_VPU_PRESETS,
     FREE_TIER_SHAPES,
     LAUNCH_OS_FAMILIES,
-    LAUNCH_QUICK_PRESETS,
+    launch_quick_presets,
     OCIClientError,
     TenantSession,
     free_tier_tag,
@@ -275,7 +275,14 @@ _REFRESHING: set[str] = set()
 
 def meta_cache_key(session: TenantSession, tenant_id: str) -> str:
     tenant = session.tenant
-    return f"{tenant_id}|{tenant.region}|{tenant.compartment_ocid or tenant.tenancy_ocid}"
+    # account_tier 必须进键：quick_presets 现在按账号类型生成（免费号 2C12G /
+    # 升级号 4C24G）。不带它的话，一个刚升级完的租户会继续拿到缓存里那份免费号的
+    # 预设 —— 界面少给他一半额度，而且没有任何东西会失效。
+    tier = str(getattr(tenant, "account_tier", "") or "")
+    return (
+        f"{tenant_id}|{tenant.region}|"
+        f"{tenant.compartment_ocid or tenant.tenancy_ocid}|{tier}"
+    )
 
 
 def _read_status(cache_key: str) -> dict[str, Any]:
@@ -547,7 +554,11 @@ def fetch_launch_meta(
         "network_created": bool(net_data.get("created")),
         "preferred_vcn_id": (net_data.get("vcn") or {}).get("id", ""),
         "preferred_subnet_id": (net_data.get("subnet") or {}).get("id", ""),
-        "quick_presets": LAUNCH_QUICK_PRESETS,
+        # 按账号类型给 —— 免费号 2C12G，升级号 4C24G。一张静态表必然对其中
+        # 一边是错的（见 oci_client.launch_quick_presets 的说明）。
+        "quick_presets": launch_quick_presets(
+            str(getattr(session.tenant, "account_tier", "") or "")
+        ),
         "boot_vpu_presets": [{"value": v, "label": lab} for v, lab in BOOT_VPU_PRESETS],
         "free_tier_shapes": dict(FREE_TIER_SHAPES),
         "defaults": {

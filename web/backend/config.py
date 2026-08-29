@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     # /api/health 正是操作员确认"更新有没有装上"的唯一手段（README 排障表第一行），
     # test_version_bump.py 也看不见这种偏差。ClassVar 不参与 pydantic 解析，任何环境
     # 变量都改不动它。
-    app_version: ClassVar[str] = "0.4.102"
+    app_version: ClassVar[str] = "0.4.103"
 
     debug: bool = Field(default=False, alias="OCIBOT_DEBUG")
 
