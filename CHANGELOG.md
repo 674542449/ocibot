@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.4.106 — 2026-08-30
+
+修 0.4.105「清空所有规则」的三处判断缺陷 —— 其中一处会给出**虚假的安心**。
+
+### 修复
+
+- **【高】清空后的 SSH 判定从头到尾没读源 CIDR。** 一条「入站 TCP 22 源
+  `10.0.0.0/16`」会被算成幸存者，面板打出「SSH 不受影响」，而公网 SSH 其实已经
+  断了。这是整个功能**唯一**朝「虚假安心」失效的方向 —— 误报警告只是烦人，
+  误报安全会让人真的被关在机器外面。
+
+  判定改成三态：`""`（不放行）/ `"public"`（`0.0.0.0/0` 或 `::/0`）/ 具体网段。
+  只对特定网段放行时给的是警告加实情：「只对 `10.0.0.0/16` 放行，你当前的出口 IP
+  未必在里面」。非 CIDR 的源（service OCID、另一个 NSG 的 OCID）**绝不**算公网可达。
+
+- **【高】读不到子网安全列表时，被当成「没有任何东西放行 22」。**
+  `_subnet_security_lists` 静默把读失败吞成空列表，而空列表是一个**事实陈述**。
+  于是一次限流或权限不足会被讲成「清空后 SSH 将连不上」，把一台其实连得上的机器
+  报成即将失联。现在读不全就说「说不准」，不下否定断言。
+  （`list_console_connections` 的 docstring 早就为这类问题定过调子：
+  空列表是断言，读失败不是。）
+
+- **【中】IPv6 没有单独判定。** IPv4 的存活规则不能替 IPv6 背书。本面板的典型形态
+  正是「`::/0` 的放行写在 NSG 里」，一清就没了。实例有 IPv6 时现在分两族各给一条结论。
+
+- **【中】删到一半失败时报「已删除 0 条」。** `delete_nsg_rules` 按 25 条分批，
+  失败分支的 `data` 里没有 `count`，调用方拿不到已删数 —— 一个删了 50 条才失败的
+  操作会报成 0，用户据此以为规则都还在，而安全组已经被削掉一半。
+  失败分支现在还**必须**带上 SSH 结论：那恰恰是最需要知道的时刻，而用户看到的
+  只是一句「失败」，最容易以为「那就是什么都没发生」。
+
+- **【低】作用域说实话。** `resolve_primary_network` 命中 `is_primary` 就 break，
+  所以清的只是**主网卡**关联的安全组。文案改成「已清空主网卡关联的 N 个安全组」。
+
+### 我引错了文档
+
+0.4.105 的代码注释、测试和 CHANGELOG 都引了 networksecuritygroups.htm 里
+「A packet in question is allowed if any rule in any of the VNIC's NSGs allows
+the traffic」这句来支持「安全列表和 NSG 是并集」。
+
+**那句讲的是多个 NSG 之间如何合并，管不着 NSG 和安全列表的关系。** 结论是对的，
+但引文不支持它 —— 这本身就是这一整轮反复在修的那个毛病：替 Oracle 下它没说过的
+结论。三处都换成 securityrules.htm 里真正对应的那句：
+
+> "If you use **both** security lists and network security groups, the set of
+> rules that applies to a particular VNIC is the **union** of these items: The
+> security rules in the security lists associated with the VNIC's subnet / The
+> security rules in all NSGs that the VNIC is in"
+
+### 维护
+
+- `tests/test_firewall_clear.py` 补到 27 条，新增的都对着上面每一条：私网段不算
+  公网可达、非 CIDR 源不算放行、两个地址族互不背书、读失败不下否定断言、
+  失败分支带已删条数和 SSH 结论。全量 1145 passed。
+
+### 升级
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.106
+```
+
 ## 0.4.105 — 2026-08-30
 
 防火墙新增「清空所有规则」，就在「放行全部端口」旁边。

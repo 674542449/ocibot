@@ -3757,7 +3757,9 @@ class TenantSession:
             # only nsg_ids therefore showed an empty firewall panel for any instance
             # not launched with this panel's managed NSG. Security lists are reported
             # read-only: the add/delete endpoints operate on NSGs.
-            security_lists = self._subnet_security_lists(network.subnet_id)
+            security_lists, sl_complete = self._subnet_security_lists_checked(
+                network.subnet_id
+            )
 
             parts = []
             if groups:
@@ -3775,6 +3777,9 @@ class TenantSession:
                 data={
                     "groups": groups,
                     "security_lists": security_lists,
+                    # 读全了没有。清空防火墙那条路径靠它区分「确实没有放行 22」和
+                    # 「这次没读到」—— 后者不能被讲成前者。
+                    "security_lists_complete": sl_complete,
                     "subnet_id": network.subnet_id,
                     "has_ipv6": bool(network.ipv6_addresses),
                     "vnic_id": network.vnic_id,
@@ -3790,17 +3795,30 @@ class TenantSession:
 
     def _subnet_security_lists(self, subnet_id: str) -> list[dict]:
         """Security-list rules for a subnet, normalized like NSG rules (read-only)."""
+        return self._subnet_security_lists_checked(subnet_id)[0]
+
+    def _subnet_security_lists_checked(self, subnet_id: str) -> tuple[list[dict], bool]:
+        """同上，另外返回「这次读全了没有」。
+
+        读失败以前是静默返回空列表 —— 而空列表是一个**事实陈述**：「这个子网没有
+        放行任何东西」。清空防火墙那个功能正是拿它来判断「清完之后 SSH 还通不通」，
+        于是一次限流或权限不足会被讲成「没有任何东西放行 22」，把一台其实连得上的
+        机器报成即将失联。同一个道理在 list_console_connections 的 docstring 里已经
+        写过：空列表是断言，读失败不是。
+        """
         if not subnet_id:
-            return []
+            return [], False
         out: list[dict] = []
+        complete = True
         try:
             subnet = self.network.get_subnet(subnet_id).data
         except Exception:  # noqa: BLE001 - best effort; NSGs are still returned
-            return out
+            return out, False
         for sl_id in list(getattr(subnet, "security_list_ids", None) or []):
             try:
                 sl = self.network.get_security_list(sl_id).data
             except Exception:  # noqa: BLE001
+                complete = False
                 continue
             rules: list[dict] = []
             for rule in list(getattr(sl, "ingress_security_rules", None) or []):
@@ -3814,7 +3832,7 @@ class TenantSession:
                     "rules": rules,
                 }
             )
-        return out
+        return out, complete
 
     @staticmethod
     def _normalize_firewall_rule(rule: Any, direction: str = "") -> dict:
@@ -4020,47 +4038,88 @@ class TenantSession:
 
     def delete_nsg_rules(self, nsg_id: str, rule_ids: list[str]) -> OperationResult:
         ids = [value for value in rule_ids if value]
+        # 分批删,所以失败时**前面几批已经删掉了**。以前失败分支的 data 里没有
+        # count,调用方拿不到已删数,于是一个删了 50 条才失败的操作会报「已删除 0 条」
+        # —— 用户据此以为规则都还在,而实际上安全组已经被削掉一半。
+        done = 0
         try:
             for offset in range(0, len(ids), 25):
+                batch = ids[offset : offset + 25]
                 details = oci.core.models.RemoveNetworkSecurityGroupSecurityRulesDetails(
-                    security_rule_ids=ids[offset : offset + 25]
+                    security_rule_ids=batch
                 )
                 self.network.remove_network_security_group_security_rules(nsg_id, details)
+                done += len(batch)
             return OperationResult(
                 ok=True,
                 message=f"已删除 {len(ids)} 条防火墙规则",
                 data={"count": len(ids)},
             )
         except ServiceError as exc:
-            return OperationResult(ok=False, message=_format_service_error(exc))
+            return OperationResult(
+                ok=False, message=_format_service_error(exc), data={"count": done}
+            )
         except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=safe_error_text(exc))
+            return OperationResult(ok=False, message=safe_error_text(exc), data={"count": done})
+
+    # 「全网可达」的两个源。其余任何值（含私网段、service OCID、NSG OCID）
+    # 都**不算**公网放行。
+    _PUBLIC_SOURCES = frozenset({"0.0.0.0/0", "::/0"})
 
     @staticmethod
-    def _rule_allows_ingress_tcp(rule: dict, port: int) -> bool:
-        """归一化后的规则是否放行入站 TCP ``port``。
+    def _ingress_tcp_scope(rule: dict, port: int, *, family: str = "v4") -> str:
+        """入站 TCP ``port`` 的放行范围。
 
-        解析的是 _normalize_firewall_rule 自己产出的 port 文案 —— 只有四种形态：
-        ``"全部"`` / ``"22"`` / ``"80-443"`` / ``"类型 3 代码 4"``（ICMP，没有端口）。
-        是本仓自己的格式,不是从 Oracle 那边猜的。
+        返回 ``""``（不放行）/ ``"public"``（全网）/ 具体 CIDR 字符串（仅该网段）。
+
+        **必须看 cidr。** 第一版只看方向/协议/端口就返回 True —— 于是一条
+        「TCP 22 源 10.0.0.0/16」会被算成幸存者，面板打出「SSH 不受影响」，
+        而公网 SSH 其实已经断了。这是整个功能**唯一**朝「虚假安心」失效的方向：
+        误报警告只是烦人，误报安全会让人真的被关在机器外面。
+
+        ``family`` 决定看哪一族：IPv4 的存活规则不能替 IPv6 背书，反之亦然。
+
+        端口文案解析的是 _normalize_firewall_rule 自己产出的四种形态：
+        ``"全部"`` / ``"22"`` / ``"80-443"`` / ``"类型 3 代码 4"``（ICMP，无端口）。
         """
         if str(rule.get("direction", "") or "").upper() != "INGRESS":
-            return False
+            return ""
         # "all" 覆盖 TCP；ICMP(1/58)、UDP(17) 都不算。
         if str(rule.get("protocol", "") or "") not in ("6", "all"):
-            return False
+            return ""
+
         text = str(rule.get("port", "") or "").strip()
-        if text in ("", "全部"):
-            return True
         if text.startswith("类型"):
-            return False
+            return ""
+        if text not in ("", "全部"):
+            try:
+                if "-" in text:
+                    lo, hi = text.split("-", 1)
+                    if not (int(lo) <= port <= int(hi)):
+                        return ""
+                elif int(text) != port:
+                    return ""
+            except ValueError:
+                return ""
+
+        source = str(rule.get("cidr", "") or "").strip()
+        if not source:
+            return ""
+        if source in TenantSession._PUBLIC_SOURCES:
+            # ::/0 只对 IPv6 算数,0.0.0.0/0 只对 IPv4 算数。
+            want_v6 = family == "v6"
+            if (source == "::/0") is want_v6:
+                return "public"
+            return ""
         try:
-            if "-" in text:
-                lo, hi = text.split("-", 1)
-                return int(lo) <= port <= int(hi)
-            return int(text) == port
+            net = ipaddress.ip_network(source, strict=False)
         except ValueError:
-            return False
+            # 不是 CIDR:NSG 规则的源可以是 service OCID 或另一个 NSG 的 OCID。
+            # 它可能确实放行了某些流量,但**绝不能**当成「公网能进」。
+            return ""
+        if (net.version == 6) is not (family == "v6"):
+            return ""
+        return str(net)
 
     def clear_instance_firewall_rules(
         self,
@@ -4071,10 +4130,19 @@ class TenantSession:
 
         和「放行全部端口」只差后半截：那个是清空后写入全开放，这个清空就结束。
 
-        危险程度取决于子网安全列表 —— OCI 文档原话：「A packet in question is
-        allowed if **any** rule in any of the VNIC's NSGs allows the traffic」，
+        危险程度取决于子网安全列表。OCI 文档（securityrules.htm）原话：
+
+            "If you use both security lists and network security groups, the set
+             of rules that applies to a particular VNIC is the union of these
+             items: The security rules in the security lists associated with the
+             VNIC's subnet / The security rules in all NSGs that the VNIC is in"
+
         安全列表和 NSG 是**并集**，不是交集。所以清空 NSG 不必然锁死：只要子网
-        安全列表里还有一条放行 22，SSH 照样进得去。
+        安全列表里还有一条对全网放行 22，SSH 照样进得去。
+
+        （第一版引的是 networksecuritygroups.htm 里「any rule in any of the VNIC's
+        NSGs」那句 —— 那讲的是**多个 NSG 之间**如何合并，管不着 NSG 和安全列表
+        的关系。结论没错，但引文不支持它，等于又一次替 Oracle 下它没说过的结论。）
 
         面板本来就读得到那些安全列表，所以这里**具体算一遍** 22 端口清完之后还通
         不通，而不是甩一句泛泛的「可能连不上」。说得准，用户才会认真看。
@@ -4085,37 +4153,64 @@ class TenantSession:
         data = state.data or {}
         groups = list(data.get("groups") or [])
         security_lists = list(data.get("security_lists") or [])
+        sl_complete = bool(data.get("security_lists_complete", True))
+        has_ipv6 = bool(data.get("has_ipv6"))
 
-        # 清空之后还有谁在放行 22 —— 只能是子网安全列表（NSG 马上就空了）。
-        ssh_survivors = [
-            sl["display_name"]
-            for sl in security_lists
-            if any(
-                self._rule_allows_ingress_tcp(rule, 22) for rule in (sl.get("rules") or [])
+        def _verdict(family: str) -> str:
+            """清空后这一族的 22 端口还通不通，说成人话。"""
+            label = "IPv6" if family == "v6" else "IPv4"
+            if not sl_complete:
+                return f"这次没读全子网安全列表，{label} 的 22 端口通不通说不准。"
+            public: list[str] = []
+            narrow: list[tuple[str, str]] = []
+            for sl in security_lists:
+                for rule in sl.get("rules") or []:
+                    scope = self._ingress_tcp_scope(rule, 22, family=family)
+                    if scope == "public":
+                        public.append(sl["display_name"])
+                        break
+                    if scope:
+                        narrow.append((sl["display_name"], scope))
+            if public:
+                return (
+                    f"清空后 {label} 的 22 端口仍由子网安全列表（"
+                    + "、".join(sorted(set(public)))
+                    + "）对全网放行，SSH 不受影响。"
+                )
+            if narrow:
+                where = "、".join(f"{name} 放行 {cidr}" for name, cidr in narrow[:3])
+                return (
+                    f"⚠ 清空后 {label} 的 22 端口只对特定网段放行（{where}），"
+                    "你当前的出口 IP 未必在里面。"
+                )
+            return (
+                f"⚠ 清空后没有任何子网安全列表放行 {label} 的 22 端口 —— "
+                "SSH 与面板的 WebSSH 都将连不上。"
             )
-        ]
-        if ssh_survivors:
-            after = (
-                "清空后 22 端口仍由子网安全列表放行（"
-                + "、".join(ssh_survivors)
-                + "），SSH 不受影响。"
-            )
-        else:
-            after = (
-                "⚠ 清空后**没有任何**子网安全列表放行 22 端口 —— SSH 与 WebSSH 将连不上。"
-                "恢复办法：本页「放行全部端口」或「添加规则」都是通过 Oracle API 改的，"
+
+        verdicts = [_verdict("v4")] + ([_verdict("v6")] if has_ipv6 else [])
+        after = chr(10).join(verdicts)
+        if any(v.startswith("⚠") for v in verdicts):
+            after += (
+                chr(10)
+                + "恢复办法：本页「放行全部端口」或「添加规则」都是通过 Oracle API 改的，"
                 "不需要先连上机器，随时可以点。"
             )
 
         if not groups:
             return OperationResult(
                 ok=True,
-                message="该实例没有关联的网络安全组（NSG），无规则可清空。"
+                message="该实例的主网卡没有关联网络安全组（NSG），无规则可清空。"
                 + chr(10)
                 + "子网安全列表是独立的，本操作不会碰它。"
                 + chr(10)
                 + after,
-                data={"removed": 0, "groups": 0, "ssh_after": bool(ssh_survivors)},
+                data={
+                    "removed": 0,
+                    "groups": 0,
+                    "ssh_after": not any(v.startswith("⚠") for v in verdicts),
+                    "security_lists_complete": sl_complete,
+                },
             )
 
         results: list[dict] = []
@@ -4127,8 +4222,8 @@ class TenantSession:
                 results.append({"nsg_id": group["id"], "removed": 0, "ok": True})
                 continue
             removed = self.delete_nsg_rules(group["id"], ids)
-            if removed.ok:
-                total_removed += int((removed.data or {}).get("count") or len(ids))
+            # 不论成败都累计 —— 失败也可能已经删掉了前面几批（见 delete_nsg_rules）。
+            total_removed += int((removed.data or {}).get("count") or 0)
             all_ok = all_ok and removed.ok
             results.append(
                 {
@@ -4147,14 +4242,27 @@ class TenantSession:
             )
             return OperationResult(
                 ok=False,
-                message=f"清空部分失败，请刷新后重试。已删除 {total_removed} 条。{detail}",
-                data={"results": results, "removed": total_removed},
+                # 失败分支**同样**要给出 SSH 结论：这恰恰是最需要知道的时刻 ——
+                # 规则已经删掉一部分，机器可能比操作前更连不上，而用户看到的只是
+                # 一句「失败」，最容易以为「那就是什么都没发生」。
+                message=(
+                    f"清空部分失败，请刷新后重试。已删除 {total_removed} 条（无法回滚）。"
+                    f"{detail}"
+                    + chr(10)
+                    + after
+                ),
+                data={
+                    "results": results,
+                    "removed": total_removed,
+                    "ssh_after": not any(v.startswith("⚠") for v in verdicts),
+                    "security_lists_complete": sl_complete,
+                },
             )
 
         return OperationResult(
             ok=True,
             message=(
-                f"已清空 {len(groups)} 个安全组的全部规则（共 {total_removed} 条）。"
+                f"已清空主网卡关联的 {len(groups)} 个安全组的全部规则（共 {total_removed} 条）。"
                 + chr(10)
                 + "子网安全列表未受影响 —— OCI 里它和 NSG 是并集关系，任一放行即放行。"
                 + chr(10)
@@ -4164,8 +4272,10 @@ class TenantSession:
                 "results": results,
                 "removed": total_removed,
                 "groups": len(groups),
-                "ssh_after": bool(ssh_survivors),
-                "ssh_survivors": ssh_survivors,
+                # 「⚠ 一个都没有」才算不通；读不全时同样是 ⚠（说不准也不能说通）。
+                "ssh_after": not any(v.startswith("⚠") for v in verdicts),
+                "security_lists_complete": sl_complete,
+                "verdicts": verdicts,
             },
         )
 
