@@ -567,9 +567,11 @@ FREE_TIER_LIMIT_TAGS = ("a1", "e2-micro")
 
 # Oracle Always Free resource caps (tenancy-wide reference; not region-scoped).
 # Source: Oracle Cloud Always Free resources documentation.
+# Always Free（不能计费的租户）的上限。升级号的 A1 额度不同 ——
+# 权威判断在 app/free_quota.py 的 a1_caps()，那里按账号类型分；这份镜像只作展示用。
 ALWAYS_FREE_LIMITS = {
-    "a1_ocpu": 4.0,
-    "a1_memory_gb": 24.0,
+    "a1_ocpu": 2.0,
+    "a1_memory_gb": 12.0,
     "e2_micro_count": 2,
     "block_storage_gb": 200.0,
     "object_storage_gb": 20.0,
@@ -591,35 +593,57 @@ LAUNCH_QUICK_PRESETS: list[dict] = [
     {
         "id": "e2_micro_50",
         "label": "免费 AMD · 50G",
-        "hint": "VM.Standard.E2.1.Micro · 硬盘 50GB · 性能 120",
+        "hint": "VM.Standard.E2.1.Micro · 硬盘 50GB",
         "shape": "VM.Standard.E2.1.Micro",
         "arch": "x86",
         "ocpus": None,
         "memory_in_gbs": None,
         "boot_volume_size_in_gbs": 50,
-        "boot_volume_vpus_per_gb": 120,
+        "boot_volume_vpus_per_gb": 10,
     },
+    # 这三个预设**必须**落在免费号的额度内（2 OCPU / 12 GB，见 free_quota.a1_caps）。
+    #
+    # 原来这里是 4C24G —— 那是 2026-06-15 之前的额度。Oracle 砍半之后没有公告，
+    # 于是面板一直在一键推荐一个**整整超一倍**的配置；照着点的免费号会在整改期
+    # （2026-08-18）之后被自动终止，引导卷留下。这正是用户报的「开两台 2C12G，
+    # 被销毁一台，硬盘还在」。
+    #
+    # VPU 也从 120 降回 10（平衡档）。同一个文件里 BOOT_VPU_PRESETS 把 >20 标成
+    # 「可能额外计费」，free_quota 也会为 vpu>10 挂告警 —— 一个标着「免费」的预设
+    # 却默认选一个自己都在警告的档位，是自相矛盾。想要更高性能仍可在向导里手动选。
     {
-        "id": "a1_4c24g_100",
-        "label": "免费 ARM 4C24G · 100G",
-        "hint": "VM.Standard.A1.Flex · 4 OCPU / 24GB · 硬盘 100GB · 性能 120",
+        "id": "a1_2c12g_100",
+        "label": "免费 ARM 2C12G · 100G",
+        "hint": "VM.Standard.A1.Flex · 2 OCPU / 12GB · 硬盘 100GB（用满免费额度）",
         "shape": "VM.Standard.A1.Flex",
         "arch": "arm",
-        "ocpus": 4,
-        "memory_in_gbs": 24,
+        "ocpus": 2,
+        "memory_in_gbs": 12,
         "boot_volume_size_in_gbs": 100,
-        "boot_volume_vpus_per_gb": 120,
+        "boot_volume_vpus_per_gb": 10,
     },
     {
-        "id": "a1_4c24g_200",
-        "label": "免费 ARM 4C24G · 200G",
-        "hint": "VM.Standard.A1.Flex · 4 OCPU / 24GB · 硬盘 200GB · 性能 120",
+        "id": "a1_2c12g_200",
+        "label": "免费 ARM 2C12G · 200G",
+        "hint": "VM.Standard.A1.Flex · 2 OCPU / 12GB · 硬盘 200GB（用满免费额度）",
         "shape": "VM.Standard.A1.Flex",
         "arch": "arm",
-        "ocpus": 4,
-        "memory_in_gbs": 24,
+        "ocpus": 2,
+        "memory_in_gbs": 12,
         "boot_volume_size_in_gbs": 200,
-        "boot_volume_vpus_per_gb": 120,
+        "boot_volume_vpus_per_gb": 10,
+    },
+    # 想要两台机器就得对半分 —— 免费额度只够 2 OCPU / 12 GB 合计。
+    {
+        "id": "a1_1c6g_100",
+        "label": "免费 ARM 1C6G · 100G（可开两台）",
+        "hint": "VM.Standard.A1.Flex · 1 OCPU / 6GB · 硬盘 100GB · 开两台正好用满额度",
+        "shape": "VM.Standard.A1.Flex",
+        "arch": "arm",
+        "ocpus": 1,
+        "memory_in_gbs": 6,
+        "boot_volume_size_in_gbs": 100,
+        "boot_volume_vpus_per_gb": 10,
     },
 ]
 

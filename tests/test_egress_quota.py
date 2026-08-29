@@ -15,6 +15,8 @@ from types import SimpleNamespace
 from app import free_quota
 from app.oci_client import TenantSession
 
+_FREE_CPU, _FREE_MEM = free_quota.a1_caps("free")
+
 
 def _dp(value):
     return SimpleNamespace(timestamp=datetime.now(timezone.utc), value=value)
@@ -140,8 +142,9 @@ def test_launch_validation_ignores_egress_entirely():
     """Egress is not knowable at create time; the guard must not read it."""
     guard = free_quota.validate_launch_against_quota(
         shape="VM.Standard.A1.Flex",
-        ocpus=4,
-        memory_in_gbs=24,
+        # 用当前免费额度，不写死 —— Oracle 2026-06-15 把 ARM 从 4/24 砍到 2/12。
+        ocpus=_FREE_CPU,
+        memory_in_gbs=_FREE_MEM,
         boot_volume_size_in_gbs=50,
         free_only_mode=True,
         usage=_snapshot({"egress_gb": free_quota.FREE_EGRESS_GB * 5}),

@@ -30,6 +30,10 @@ from typing import Any
 
 import pytest
 
+from app.free_quota import a1_caps
+
+_FREE_CPU, _FREE_MEM = a1_caps("free")
+
 _TMP = tempfile.mkdtemp(prefix="ocibot_lockscope_")
 os.environ.setdefault("DATABASE_URL", f"sqlite+pysqlite:///{Path(_TMP, 'lockscope.db').as_posix()}")
 os.environ.setdefault("OCIBOT_MASTER_KEY", "lockscope-master-key-0123456789abcdef")
@@ -340,17 +344,20 @@ def test_object_storage_enumeration_scales_with_bucket_count(client, monkeypatch
 
 
 def test_batch_creates_take_one_snapshot_for_the_whole_batch(client, monkeypatch):
-    """count=3 只取一次快照、发三次 LaunchInstance。
+    """批量创建只取一次快照、发 N 次 LaunchInstance。
 
     额度是租户级总量，所以判决必须一次算完整批（tests/test_launch_count.py 管那条
     算术）；这里管的是**代价**：每台机器重取一次快照，就是把锁内最贵的那段乘以 N。
     """
-    resp, session = _launch(client, monkeypatch, count=3)
+    # 台数按当前免费额度算：1 OCPU 一台，开满为止（原来写死 3，
+    # 而免费额度砍半之后 3 台已经超限，测试挂在了一个和它无关的断言上）。
+    n = int(_FREE_CPU)
+    resp, session = _launch(client, monkeypatch, count=n)
     assert resp.status_code == 200, resp.text
     inside = _inside(session)
     assert inside.count("list_instances_tree") == 1
     assert inside.count("list_buckets") == 1
-    assert inside.count("launch_from_payload") == 3
+    assert inside.count("launch_from_payload") == n
 
 
 # ---------------------------------------------------------------------------

@@ -10,8 +10,37 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 # Mirror Oracle Always Free caps (tenancy-wide). Keep in sync with oci_client.ALWAYS_FREE_LIMITS.
-FREE_A1_OCPU = 4.0
-FREE_A1_MEMORY_GB = 24.0
+#
+# A1 的上限**按账号类型分**，不是一个常量 —— 见 a1_caps()。
+#
+# Oracle 把 Always Free 的 Ampere A1 从 4 OCPU / 24 GB **砍半**到 2 OCPU / 12 GB。
+# 没有公告、没有邮件，只是把文档改了。官方原话（这是**唯一**的一手依据）：
+#
+#   "All tenancies get the first 1,500 OCPU hours and 9,000 GB hours per month
+#    for free for VM instances using the VM.Standard.A1.Flex shape...
+#    For Always Free tenancies, this is equivalent to 2 OCPUs and 12 GB of memory."
+#   "you can create one or two OCI Ampere A1 Compute instances, 2 OCPUs total"
+#
+# 关键在于那句 **For Always Free tenancies**：1,500 OCPU 小时是给**所有**租户的
+# 免费额度，对**可计费**账号那是一个免费额度而不是天花板（超出按量计费，仍然能跑
+# 4 OCPU / 24 GB）；只有不能计费的 Always Free 账号，它才等价于一个 2/12 的硬上限。
+# 把两者混成一个数字，要么让免费号开出必被回收的机器，要么把升级号无端拦掉一半。
+#
+# 面板原来写死 4.0 / 24.0，于是免费号被放行开出**双倍**配置，随后一台被 Oracle
+# 收走 —— 表现为「开两台 2C12G，过几天被销毁一台，硬盘还留着」。
+#
+# 关于「Oracle 具体做了什么」要克制：生效日期和整改期限只见于第三方报道
+# （InfoQ / heise / Linuxiac），Oracle 从未公告；而官方对超额 A1 的唯一表述是
+# 「现有实例被禁用，30 天后删除」，不是「终止超出的那台」。另有一条同样能解释
+# 「两台只掉一台」的官方机制：闲置回收 —— 7 天内 CPU / 网络 / 内存的 95 分位
+# 同时低于 20%（内存那条只对 A1 生效）即可能被回收。两者都解释不了「终止且保留
+# 引导卷」这个确切形态，所以代码里不对回收动作下结论，只把额度算对。
+# （「硬盘还在」本身倒是有据：OCI 终止实例时**默认保留**引导卷。）
+FREE_A1_OCPU = 2.0
+FREE_A1_MEMORY_GB = 12.0
+# 升级（PAYG）账号仍按 4 / 24 计免费额度。
+PAID_A1_OCPU = 4.0
+PAID_A1_MEMORY_GB = 24.0
 FREE_E2_MICRO_COUNT = 2
 FREE_BLOCK_STORAGE_GB = 200.0
 FREE_OBJECT_STORAGE_GB = 20.0
@@ -51,6 +80,26 @@ def is_a1_shape(shape: str) -> bool:
 def is_e2_micro_shape(shape: str) -> bool:
     s = (shape or "").strip().lower()
     return s == E2_MICRO_SHAPE.lower() or s.endswith(".e2.1.micro") or "e2.1.micro" in s
+
+
+def a1_caps(account_tier: str = "") -> tuple[float, float]:
+    """这个账号的 A1 免费额度 (OCPU, 内存GB)。
+
+    **只看账号类型，不看 free_only。** 这两件事必须分开：
+
+      * 额度**多大** —— 由账号类型决定。不能计费的 Always Free 租户是 2 / 12，
+        升级过的（PAYG）仍是 4 / 24。
+      * 额度是否**硬拦** —— 由 hard_free_caps() 决定（free_only 开关 + 账号类型）。
+
+    一开始我把两者并成了一个判断，结果是「付费账号打开『仅使用免费额度』」会被压到
+    2 / 12 —— 而 4 / 24 本来就是他的免费额度，凭空少一半。
+
+    **也不要把它退化成一个常量。** 写死 4/24 会让免费号开出双倍配置、被 Oracle
+    回收（就是这次修的故障）；写死 2/12 会把升级号无端拦掉一半。
+    """
+    if (account_tier or "").strip().lower() == "paid":
+        return PAID_A1_OCPU, PAID_A1_MEMORY_GB
+    return FREE_A1_OCPU, FREE_A1_MEMORY_GB
 
 
 def hard_free_caps(free_only_mode: bool, account_tier: str = "") -> bool:
@@ -292,9 +341,11 @@ def build_quota_snapshot(
             "soft": bool(soft),
         }
 
+    # 上限按账号类型取，别再直接引常量（见 a1_caps 的说明）。
+    cap_ocpu, cap_mem = a1_caps(account_tier)
     buckets = {
-        "a1_ocpu": _bucket(a1_ocpu_used, FREE_A1_OCPU),
-        "a1_memory_gb": _bucket(a1_mem_used, FREE_A1_MEMORY_GB),
+        "a1_ocpu": _bucket(a1_ocpu_used, cap_ocpu),
+        "a1_memory_gb": _bucket(a1_mem_used, cap_mem),
         "e2_micro_count": _bucket(float(e2_used), float(FREE_E2_MICRO_COUNT)),
         "block_storage_gb": _bucket(disk_used, FREE_BLOCK_STORAGE_GB),
         "object_storage_gb": _bucket(object_used, FREE_OBJECT_STORAGE_GB),
@@ -323,8 +374,8 @@ def build_quota_snapshot(
             overall = "warn"
 
     lines = [
-        f"A1 {buckets['a1_ocpu']['remaining']:g}/{FREE_A1_OCPU:g} OCPU 剩余",
-        f"A1 内存 {buckets['a1_memory_gb']['remaining']:g}/{FREE_A1_MEMORY_GB:g} GB 剩余",
+        f"A1 {buckets['a1_ocpu']['remaining']:g}/{cap_ocpu:g} OCPU 剩余",
+        f"A1 内存 {buckets['a1_memory_gb']['remaining']:g}/{cap_mem:g} GB 剩余",
         f"E2.Micro {int(buckets['e2_micro_count']['remaining'])}/{FREE_E2_MICRO_COUNT} 台剩余",
         f"块存储 {buckets['block_storage_gb']['remaining']:g}/{FREE_BLOCK_STORAGE_GB:g} GB 剩余",
         f"对象存储 {buckets['object_storage_gb']['remaining']:g}/{FREE_OBJECT_STORAGE_GB:g} GB 剩余",
@@ -335,8 +386,8 @@ def build_quota_snapshot(
             f"出网流量 本月约 {egress_used:g}/{FREE_EGRESS_GB:g} GB（估算上限）"
         )
     limits = {
-        "a1_ocpu": FREE_A1_OCPU,
-        "a1_memory_gb": FREE_A1_MEMORY_GB,
+        "a1_ocpu": cap_ocpu,
+        "a1_memory_gb": cap_mem,
         "e2_micro_count": FREE_E2_MICRO_COUNT,
         "block_storage_gb": FREE_BLOCK_STORAGE_GB,
         "object_storage_gb": FREE_OBJECT_STORAGE_GB,
@@ -459,8 +510,9 @@ def validate_launch_against_quota(
     e2_used = _as_int(used.get("e2_micro_count"), 0)
     disk_used = _as_float(used.get("block_storage_gb"), 0.0)
 
-    a1_rem = _as_float(rem.get("a1_ocpu"), max(0.0, FREE_A1_OCPU - a1_used))
-    a1_mem_rem = _as_float(rem.get("a1_memory_gb"), max(0.0, FREE_A1_MEMORY_GB - a1_mem_used))
+    cap_ocpu, cap_mem = a1_caps(account_tier)
+    a1_rem = _as_float(rem.get("a1_ocpu"), max(0.0, cap_ocpu - a1_used))
+    a1_mem_rem = _as_float(rem.get("a1_memory_gb"), max(0.0, cap_mem - a1_mem_used))
     e2_rem = _as_int(rem.get("e2_micro_count"), max(0, FREE_E2_MICRO_COUNT - e2_used))
 
     free_only = bool(free_only_mode)
@@ -503,14 +555,29 @@ def validate_launch_against_quota(
             issues.append(
                 GuardIssue(
                     "a1_spec_required",
-                    "A1.Flex 必须指定 OCPU 与内存（免费上限 4 OCPU / 24 GB）。",
+                    f"A1.Flex 必须指定 OCPU 与内存（免费上限 {cap_ocpu:g} OCPU / {cap_mem:g} GB）。",
                 )
             )
-        if need_cpu > FREE_A1_OCPU or need_mem > FREE_A1_MEMORY_GB:
+        if need_cpu > cap_ocpu or need_mem > cap_mem:
             msg = (
                 f"A1 规格 {need_cpu:g} OCPU / {need_mem:g} GB 已超过免费上限 "
-                f"{FREE_A1_OCPU:g} / {FREE_A1_MEMORY_GB:g}。"
+                f"{cap_ocpu:g} / {cap_mem:g}。"
             )
+            # 免费号踩到这条最常见的原因是照着旧攻略开 4C24G —— 那是 Oracle 下调
+            # 之前的额度。不说破的话，用户只会觉得面板算错了。
+            #
+            # 措辞刻意保守：Oracle **没有**公告过这次下调，生效日和整改期限只见于
+            # 第三方报道，不能当成官方口径写进面板。而对「A1 开超了会怎样」，官方
+            # 唯一的正面表述是「现有 A1 实例会被禁用，30 天后删除」—— 不是「终止
+            # 超出的那一台并保留引导卷」。所以这里只陈述**文档写了的**那条上限，
+            # 后果部分说「可能被停用或回收」，不替 Oracle 编它没说过的动作。
+            if hard and (need_cpu > FREE_A1_OCPU or need_mem > FREE_A1_MEMORY_GB):
+                msg += (
+                    f"（Oracle 现行文档写的 Always Free ARM 上限是 "
+                    f"{FREE_A1_OCPU:g} OCPU / {FREE_A1_MEMORY_GB:g} GB —— 比早年的 4 / 24 少一半，"
+                    "且这次下调没有公告。超出的实例可能被停用或回收。"
+                    "升级为付费账号后不受此上限约束。）"
+                )
             if hard:
                 issues.append(GuardIssue("a1_over_free_cap", msg))
             else:
@@ -552,9 +619,21 @@ def validate_launch_against_quota(
         assumed = "（未填 Boot 时按约 47GB 估算）" if boot_assumed else ""
         each = f"{n} × {boot_gb:g} GB = " if n > 1 else ""
         msg = (
-            f"块存储将超过免费 200GB：当前已用 {disk_used:g} GB，"
+            f"块存储将超过免费 {FREE_BLOCK_STORAGE_GB:g}GB：当前已用 {disk_used:g} GB，"
             f"本次 Boot {each}{batch_boot:g} GB{assumed}，合计 {projected_disk:g} GB。"
         )
+        # 「已用」里可能有一部分是**没挂在任何实例上**的引导卷。
+        #
+        # 实例被终止（不论是用户点的还是 Oracle 回收的）时引导卷默认保留，于是它
+        # 继续占着 200GB，而实例列表里什么都看不到 —— 用户只会觉得「我明明删了机器，
+        # 怎么还说存储不够」。快照里本来就数好了这个值，说出来只是一行的事。
+        orphans = _as_int((usage or {}).get("orphan_boot_count"), 0)
+        if orphans > 0:
+            msg += (
+                chr(10)
+                + f"其中有 {orphans} 个引导卷没有挂在任何实例上（实例已终止、卷被保留），"
+                "仍然占用额度。在「存储」页确认后删除即可释放。"
+            )
         if enforce_storage_cap:
             issues.append(GuardIssue("storage_over_free_cap", msg))
         else:
@@ -583,8 +662,8 @@ def validate_launch_against_quota(
         "units": units,
         "units_per_instance": per_unit,
         "remaining_after": {
-            "a1_ocpu": round(max(0.0, FREE_A1_OCPU - (a1_used + units["a1_ocpu"])), 4),
-            "a1_memory_gb": round(max(0.0, FREE_A1_MEMORY_GB - (a1_mem_used + units["a1_memory_gb"])), 4),
+            "a1_ocpu": round(max(0.0, cap_ocpu - (a1_used + units["a1_ocpu"])), 4),
+            "a1_memory_gb": round(max(0.0, cap_mem - (a1_mem_used + units["a1_memory_gb"])), 4),
             "e2_micro_count": max(0, FREE_E2_MICRO_COUNT - (e2_used + int(units["e2_micro_count"]))),
             "block_storage_gb": round(max(0.0, FREE_BLOCK_STORAGE_GB - projected_disk), 4),
         },
@@ -611,6 +690,7 @@ def validate_shape_resize_against_quota(
     a1_mem_used = _as_float(used.get("a1_memory_gb"), 0.0)
     free_only = bool(free_only_mode)
     hard = hard_free_caps(free_only, account_tier)
+    cap_ocpu, cap_mem = a1_caps(account_tier)
 
     issues: list[GuardIssue] = []
     warnings: list[GuardIssue] = []
@@ -629,10 +709,15 @@ def validate_shape_resize_against_quota(
     after_cpu = others_cpu + new_cpu
     after_mem = others_mem + new_mem
 
-    if new_cpu > FREE_A1_OCPU or new_mem > FREE_A1_MEMORY_GB or after_cpu > FREE_A1_OCPU + 1e-9 or after_mem > FREE_A1_MEMORY_GB + 1e-9:
+    if (
+        new_cpu > cap_ocpu
+        or new_mem > cap_mem
+        or after_cpu > cap_ocpu + 1e-9
+        or after_mem > cap_mem + 1e-9
+    ):
         msg = (
             f"调整后 A1 将为合计 {after_cpu:g} OCPU / {after_mem:g} GB，"
-            f"超过免费上限 {FREE_A1_OCPU:g} / {FREE_A1_MEMORY_GB:g}。"
+            f"超过免费上限 {cap_ocpu:g} / {cap_mem:g}。"
         )
         if hard:
             issues.append(GuardIssue("a1_resize_over", msg))

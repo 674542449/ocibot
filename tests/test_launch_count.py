@@ -43,7 +43,10 @@ _PEM = TEST_PEM
 # Guard arithmetic (pure)
 # ---------------------------------------------------------------------------
 
-# Nothing used yet: the whole 4 OCPU / 24 GB / 200 GB allowance is free.
+# Nothing used yet: the whole allowance is free.
+# 额度大小**不写死** —— Oracle 2026-06-15 把 Always Free 的 ARM 从 4/24 砍到 2/12，
+# 而这些测试当时把 4/24 抄成了字面量，于是它们钉住的是一个已经不存在的额度。
+# 引用常量之后，下次 Oracle 再改只需要改 free_quota 一处。
 _EMPTY = {"usage": {"a1_ocpu": 0.0, "a1_memory_gb": 0.0, "e2_micro_count": 0, "block_storage_gb": 0.0}}
 
 
@@ -62,8 +65,11 @@ def _guard(count: int, *, ocpus=1, memory=6, boot=50, usage=None):
 
 
 def test_a_batch_that_exactly_fills_the_allowance_is_allowed():
-    """4 × (1 OCPU / 6 GB / 50 GB) = 4 / 24 / 200 — the whole free tier."""
-    assert _guard(4).ok is True
+    """N × (1 OCPU / 6 GB) 正好等于整个免费额度时必须放行。"""
+    n = int(free_quota.FREE_A1_OCPU)          # 1 OCPU 一台，开满为止
+    mem_each = free_quota.FREE_A1_MEMORY_GB / n
+    boot_each = int(free_quota.FREE_BLOCK_STORAGE_GB // n)
+    assert _guard(n, ocpus=1, memory=mem_each, boot=boot_each).ok is True
 
 
 def test_one_instance_too_many_is_blocked():
@@ -89,17 +95,18 @@ def test_boot_volume_is_summed_across_the_batch():
 
 
 def test_count_one_matches_the_old_single_instance_behaviour():
+    cpu, mem = free_quota.a1_caps("free")
     single = free_quota.validate_launch_against_quota(
         shape="VM.Standard.A1.Flex",
-        ocpus=4,
-        memory_in_gbs=24,
+        ocpus=cpu,
+        memory_in_gbs=mem,
         boot_volume_size_in_gbs=100,
         boot_volume_vpus_per_gb=10,
         free_only_mode=True,
         account_tier="free",
         usage=_EMPTY,
     )
-    assert single.ok is _guard(1, ocpus=4, memory=24, boot=100).ok is True
+    assert single.ok is _guard(1, ocpus=cpu, memory=mem, boot=100).ok is True
 
 
 def test_projection_reports_the_batch():

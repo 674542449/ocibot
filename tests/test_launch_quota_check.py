@@ -25,6 +25,7 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
 import web.backend.routers.instances as instances_router  # noqa: E402
+from app.free_quota import a1_caps  # noqa: E402
 from web.backend.auth import hash_password  # noqa: E402
 from web.backend.crypto_util import encrypt_text  # noqa: E402
 from web.backend.db import SessionLocal, init_db  # noqa: E402
@@ -56,14 +57,24 @@ def _bucket(used: float, limit: float) -> dict:
     }
 
 
-def _snapshot(a1_ocpu=2.0, a1_mem=12.0, e2=1, disk=100.0, tier="free", incomplete=False) -> dict:
+# 额度**从常量推导**，不写死。Oracle 2026-06-15 把 Always Free 的 ARM 从 4/24
+# 砍到 2/12，而这个夹具当时把 4/24 抄成了字面量：额度一变，
+# 「上限内但剩余不够」的用例就先撞上了「超过上限」，测的已经不是原来那件事。
+# 默认用掉**一半**额度，这样「请求 = 满额度」既在上限内、又超出剩余。
+_CAP_CPU, _CAP_MEM = a1_caps("free")
+
+
+def _snapshot(a1_ocpu=None, a1_mem=None, e2=1, disk=100.0, tier="free", incomplete=False) -> dict:
+    cap_cpu, cap_mem = a1_caps(tier)
+    a1_ocpu = cap_cpu / 2 if a1_ocpu is None else a1_ocpu
+    a1_mem = cap_mem / 2 if a1_mem is None else a1_mem
     return {
         "account_tier": tier,
         "free_only_mode": tier != "paid",
         "read_incomplete": incomplete,
         "limits": {
-            "a1_ocpu": 4,
-            "a1_memory_gb": 24,
+            "a1_ocpu": cap_cpu,
+            "a1_memory_gb": cap_mem,
             "e2_micro_count": 2,
             "block_storage_gb": 200,
             "object_storage_gb": 20,
@@ -76,14 +87,14 @@ def _snapshot(a1_ocpu=2.0, a1_mem=12.0, e2=1, disk=100.0, tier="free", incomplet
             "block_storage_gb": disk,
         },
         "remaining": {
-            "a1_ocpu": 4 - a1_ocpu,
-            "a1_memory_gb": 24 - a1_mem,
+            "a1_ocpu": cap_cpu - a1_ocpu,
+            "a1_memory_gb": cap_mem - a1_mem,
             "e2_micro_count": 2 - e2,
             "block_storage_gb": 200 - disk,
         },
         "buckets": {
-            "a1_ocpu": _bucket(a1_ocpu, 4),
-            "a1_memory_gb": _bucket(a1_mem, 24),
+            "a1_ocpu": _bucket(a1_ocpu, cap_cpu),
+            "a1_memory_gb": _bucket(a1_mem, cap_mem),
             "e2_micro_count": _bucket(e2, 2),
             "block_storage_gb": _bucket(disk, 200),
         },
@@ -140,8 +151,8 @@ def _body(**over) -> dict:
     body = {
         "shape": "VM.Standard.A1.Flex",
         "image_id": "ocid1.image.oc1..i",
-        "ocpus": 2,
-        "memory_in_gbs": 12,
+        "ocpus": _CAP_CPU / 2,
+        "memory_in_gbs": _CAP_MEM / 2,
         "boot_volume_size_in_gbs": 50,
         "boot_volume_vpus_per_gb": 10,
     }
@@ -164,10 +175,10 @@ def test_response_carries_the_usage_the_panel_shows(client, monkeypatch):
     c, tid = client
     _stub_usage(monkeypatch, _snapshot())
     d = c.post(f"/api/tenants/{tid}/launch-quota-check", json=_body()).json()
-    assert d["usage"]["a1_ocpu"] == 2.0
+    assert d["usage"]["a1_ocpu"] == _CAP_CPU / 2
     assert d["usage"]["block_storage_gb"] == 100.0
-    assert d["limits"]["a1_ocpu"] == 4
-    assert d["remaining"]["a1_memory_gb"] == 12.0
+    assert d["limits"]["a1_ocpu"] == _CAP_CPU
+    assert d["remaining"]["a1_memory_gb"] == _CAP_MEM / 2
     assert d["buckets"]["block_storage_gb"]["limit"] == 200.0
     assert d["account_tier"] == "free"
 
@@ -175,8 +186,9 @@ def test_response_carries_the_usage_the_panel_shows(client, monkeypatch):
 @pytest.mark.parametrize(
     "over,needle",
     [
-        ({"ocpus": 3}, "A1 额度不足"),
-        ({"memory_in_gbs": 20}, "A1 额度不足"),
+        # 恰好等于上限：不触发「超过免费上限」，但超过剩余 → 「额度不足」。
+        ({"ocpus": _CAP_CPU}, "A1 额度不足"),
+        ({"memory_in_gbs": _CAP_MEM}, "A1 额度不足"),
         ({"boot_volume_size_in_gbs": 150}, "块存储"),
         ({"shape": "VM.Standard.E4.Flex"}, "付费 Shape"),
     ],

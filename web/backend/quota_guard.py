@@ -107,7 +107,7 @@ def enforce_secondary_region(
     bills everything created in a subscribed secondary region, whatever the shape
     is called. The per-region usage snapshot cannot see that: read from a fresh
     副区 it reports zero A1 usage and would happily wave through a second
-    "free" 4 OCPU / 24 GB machine on top of the home region's.
+    "free" full-allowance machine on top of the home region's.
 
     So the tenant's explicit ``free_only_mode`` flag decides, exactly as it does
     for oversized configurations: on = refuse, off = allow with a billing warning.

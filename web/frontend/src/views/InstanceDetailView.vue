@@ -707,7 +707,7 @@
         <h4 style="margin: 0 0 0.5rem">修改 OCPU / 内存</h4>
         <template v-if="isFlexShape">
           <p class="muted" style="margin: 0 0 0.5rem; font-size: 12px">
-            调整 A1.Flex 时，服务端会按 Always Free 剩余额度校验（免费/未知账号硬拦 4 OCPU / 24 GB 合计上限）。
+            调整 A1.Flex 时，服务端会按 Always Free 剩余额度校验（免费/未知账号硬拦 2 OCPU / 12 GB 合计上限；升级账号仍按 4 / 24）。
           </p>
           <div class="grid-2">
             <div class="field">

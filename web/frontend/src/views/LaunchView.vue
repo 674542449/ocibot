@@ -689,8 +689,11 @@ const form = reactive({
   auth_mode: 'key' as 'key' | 'password',
   ssh_public_key: '',
   root_password: '',
-  ocpus: 4 as number | null,
-  memory_in_gbs: 24 as number | null,
+  // 默认值必须落在**免费号**的额度内（2 OCPU / 12 GB）。
+  // 原来是 4 / 24 —— 那是 Oracle 下调之前的额度，于是免费号一进创建页，
+  // 表单里躺着的就是一个服务端必然 400 的配置，而用户什么都还没改。
+  ocpus: 2 as number | null,
+  memory_in_gbs: 12 as number | null,
   boot_volume_size_in_gbs: '' as number | string,
   boot_volume_vpus_per_gb: 10,
   count: 1,
@@ -1002,8 +1005,9 @@ function onShapeChange() {
     form.memory_in_gbs =
       s.memory_in_gbs != null ? Number(s.memory_in_gbs) : /e2\.1\.micro/i.test(form.shape) ? 1 : null
   } else if (form.ocpus == null) {
-    form.ocpus = 4
-    form.memory_in_gbs = 24
+    // 同上：换 shape 后回填的也得是免费额度内的值。
+    form.ocpus = 2
+    form.memory_in_gbs = 12
   }
 }
 

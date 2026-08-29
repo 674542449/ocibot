@@ -41,6 +41,9 @@ from web.backend.quota_guard import (  # noqa: E402
     launch_lock_held,
     tenant_launch_lock,
 )
+from app.free_quota import a1_caps  # noqa: E402
+
+_CAP_CPU, _CAP_MEM = a1_caps("free")
 
 _ROOT = Path(__file__).resolve().parents[1]
 _TENANTS = (
@@ -67,8 +70,11 @@ def _clean_lock_files():
 A1 = "VM.Standard.A1.Flex"
 FULL_A1 = dict(
     shape=A1,
-    ocpus=4,
-    memory_in_gbs=24,
+    # 两个并发请求各要一整份免费额度 —— 只能有一个通过。
+    # 数字从常量来：额度砍半后写死的 4/24 会先被「超过上限」挡掉，
+    # 于是两个都失败，这条测试就测不到它要测的那个竞态了。
+    ocpus=_CAP_CPU,
+    memory_in_gbs=_CAP_MEM,
     boot_volume_size_in_gbs=47,
     boot_volume_vpus_per_gb=10,
 )
@@ -103,8 +109,8 @@ class _Tenancy:
                     "block_storage_gb": 0.0,
                 },
                 "remaining": {
-                    "a1_ocpu": max(0.0, 4.0 - cpu),
-                    "a1_memory_gb": max(0.0, 24.0 - mem),
+                    "a1_ocpu": max(0.0, _CAP_CPU - cpu),
+                    "a1_memory_gb": max(0.0, _CAP_MEM - mem),
                     "e2_micro_count": 2,
                     "block_storage_gb": 200.0,
                 },
