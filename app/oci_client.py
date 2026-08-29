@@ -4036,6 +4036,139 @@ class TenantSession:
         except Exception as exc:  # noqa: BLE001
             return OperationResult(ok=False, message=safe_error_text(exc))
 
+    @staticmethod
+    def _rule_allows_ingress_tcp(rule: dict, port: int) -> bool:
+        """归一化后的规则是否放行入站 TCP ``port``。
+
+        解析的是 _normalize_firewall_rule 自己产出的 port 文案 —— 只有四种形态：
+        ``"全部"`` / ``"22"`` / ``"80-443"`` / ``"类型 3 代码 4"``（ICMP，没有端口）。
+        是本仓自己的格式,不是从 Oracle 那边猜的。
+        """
+        if str(rule.get("direction", "") or "").upper() != "INGRESS":
+            return False
+        # "all" 覆盖 TCP；ICMP(1/58)、UDP(17) 都不算。
+        if str(rule.get("protocol", "") or "") not in ("6", "all"):
+            return False
+        text = str(rule.get("port", "") or "").strip()
+        if text in ("", "全部"):
+            return True
+        if text.startswith("类型"):
+            return False
+        try:
+            if "-" in text:
+                lo, hi = text.split("-", 1)
+                return int(lo) <= port <= int(hi)
+            return int(text) == port
+        except ValueError:
+            return False
+
+    def clear_instance_firewall_rules(
+        self,
+        instance_id: str,
+        compartment_id: str,
+    ) -> OperationResult:
+        """删光实例所有 NSG 的规则，**不写回任何东西**。
+
+        和「放行全部端口」只差后半截：那个是清空后写入全开放，这个清空就结束。
+
+        危险程度取决于子网安全列表 —— OCI 文档原话：「A packet in question is
+        allowed if **any** rule in any of the VNIC's NSGs allows the traffic」，
+        安全列表和 NSG 是**并集**，不是交集。所以清空 NSG 不必然锁死：只要子网
+        安全列表里还有一条放行 22，SSH 照样进得去。
+
+        面板本来就读得到那些安全列表，所以这里**具体算一遍** 22 端口清完之后还通
+        不通，而不是甩一句泛泛的「可能连不上」。说得准，用户才会认真看。
+        """
+        state = self.get_instance_firewall(instance_id, compartment_id)
+        if not state.ok:
+            return state
+        data = state.data or {}
+        groups = list(data.get("groups") or [])
+        security_lists = list(data.get("security_lists") or [])
+
+        # 清空之后还有谁在放行 22 —— 只能是子网安全列表（NSG 马上就空了）。
+        ssh_survivors = [
+            sl["display_name"]
+            for sl in security_lists
+            if any(
+                self._rule_allows_ingress_tcp(rule, 22) for rule in (sl.get("rules") or [])
+            )
+        ]
+        if ssh_survivors:
+            after = (
+                "清空后 22 端口仍由子网安全列表放行（"
+                + "、".join(ssh_survivors)
+                + "），SSH 不受影响。"
+            )
+        else:
+            after = (
+                "⚠ 清空后**没有任何**子网安全列表放行 22 端口 —— SSH 与 WebSSH 将连不上。"
+                "恢复办法：本页「放行全部端口」或「添加规则」都是通过 Oracle API 改的，"
+                "不需要先连上机器，随时可以点。"
+            )
+
+        if not groups:
+            return OperationResult(
+                ok=True,
+                message="该实例没有关联的网络安全组（NSG），无规则可清空。"
+                + chr(10)
+                + "子网安全列表是独立的，本操作不会碰它。"
+                + chr(10)
+                + after,
+                data={"removed": 0, "groups": 0, "ssh_after": bool(ssh_survivors)},
+            )
+
+        results: list[dict] = []
+        all_ok = True
+        total_removed = 0
+        for group in groups:
+            ids = [rule["id"] for rule in group["rules"] if rule.get("id")]
+            if not ids:
+                results.append({"nsg_id": group["id"], "removed": 0, "ok": True})
+                continue
+            removed = self.delete_nsg_rules(group["id"], ids)
+            if removed.ok:
+                total_removed += int((removed.data or {}).get("count") or len(ids))
+            all_ok = all_ok and removed.ok
+            results.append(
+                {
+                    "nsg_id": group["id"],
+                    "removed": int((removed.data or {}).get("count") or 0),
+                    "ok": removed.ok,
+                    "message": removed.message,
+                }
+            )
+
+        if not all_ok:
+            detail = "；".join(
+                f"…{item['nsg_id'][-8:]}={item.get('message', '失败')}"
+                for item in results
+                if not item["ok"]
+            )
+            return OperationResult(
+                ok=False,
+                message=f"清空部分失败，请刷新后重试。已删除 {total_removed} 条。{detail}",
+                data={"results": results, "removed": total_removed},
+            )
+
+        return OperationResult(
+            ok=True,
+            message=(
+                f"已清空 {len(groups)} 个安全组的全部规则（共 {total_removed} 条）。"
+                + chr(10)
+                + "子网安全列表未受影响 —— OCI 里它和 NSG 是并集关系，任一放行即放行。"
+                + chr(10)
+                + after
+            ),
+            data={
+                "results": results,
+                "removed": total_removed,
+                "groups": len(groups),
+                "ssh_after": bool(ssh_survivors),
+                "ssh_survivors": ssh_survivors,
+            },
+        )
+
     def replace_instance_firewall_with_open_all(
         self,
         instance_id: str,

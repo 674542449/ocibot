@@ -312,6 +312,7 @@
         <div class="row">
           <button :disabled="fwLoading" @click="loadFirewall">刷新</button>
           <button class="danger" :disabled="fwBusy" @click="openAllFirewall">放行全部端口</button>
+          <button class="danger" :disabled="fwBusy" @click="clearFirewall">清空所有规则</button>
         </div>
       </div>
       <p class="muted diag-msg" style="margin: 0; font-size: 12px">{{ fwMsg }}</p>
@@ -1496,6 +1497,55 @@ async function addCloudflare(nsgId: string) {
     error.value = e?.message || '操作失败'
   } finally {
     cfBusy.value = false
+  }
+}
+
+async function clearFirewall() {
+  const act = beginAction()
+  // 确认框里报出**具体条数和安全组数**，不是一句「确定要清空吗」——
+  // 数字就在手边（fwGroups 已经加载过了），说出来用户才知道自己在删掉什么。
+  // 同 doRemoveIpv6：只有 instance 确实是目标机器时才敢报这些数,
+  // 否则会拿 A 的规则数去描述对 B 的操作。
+  const onTarget = instance.value && instance.value.id === act.target
+  const groups = onTarget ? fwGroups.value.length : 0
+  const rules = onTarget
+    ? fwGroups.value.reduce((n: number, g: any) => n + (g.rules?.length || 0), 0)
+    : 0
+  const scope = onTarget
+    ? `${groups} 个安全组、共 ${rules} 条规则`
+    : '该实例所有安全组的全部规则'
+  if (
+    !confirm(
+      [
+        `将清空实例 ${targetLabel(act.target)} 的 ${scope}，且不写回任何规则。`,
+        '',
+        '子网安全列表不受影响 —— OCI 里它和 NSG 是并集关系，任一放行即放行。',
+        '所以是否会连不上，取决于子网安全列表还放行了什么；清空后页面会告诉你 22 端口的实际情况。',
+        '',
+        '可恢复：本页「放行全部端口」和「添加规则」都是通过 Oracle API 改的，不需要先连上机器。',
+        '',
+        '确认清空？',
+      ].join('\n'),
+    )
+  )
+    return
+  fwBusy.value = true
+  error.value = ''
+  try {
+    const { data } = await api.post(
+      `/tenants/${act.tenant}/instances/${act.target}/firewall/clear`,
+    )
+    if (act.moved()) return
+    // 清空之后 SSH 不通是**成功但要紧**的结果 —— 走红框，别混在绿色的「已清空」里。
+    const warned = String(data.message || '').includes('⚠')
+    if (data.ok && !warned) msg.value = data.message
+    else error.value = data.message
+    await loadFirewall()
+  } catch (e: any) {
+    if (act.moved()) return
+    error.value = e?.message || '操作失败'
+  } finally {
+    fwBusy.value = false
   }
 }
 

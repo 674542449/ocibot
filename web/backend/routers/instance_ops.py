@@ -288,6 +288,41 @@ def firewall_open_all(
         raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
+@router.post("/tenants/{tenant_id}/instances/{instance_id}/firewall/clear")
+def firewall_clear(
+    tenant_id: str,
+    instance_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> PowerActionResult:
+    """清空实例所有 NSG 的规则（不写回任何东西）。
+
+    破坏性动作，和 open_all 同级 —— 一样写审计。
+    """
+    row = _row(db, user.id, tenant_id)
+    try:
+        session = get_session_for_row(row)
+        info = session.get_instance(instance_id, resolve_ips=False)
+        result = session.clear_instance_firewall_rules(instance_id, info.compartment_id)
+        write_audit(
+            db,
+            owner_id=user.id,
+            action="firewall.clear",
+            target=instance_id,
+            detail={
+                "tenant_id": tenant_id,
+                "ok": result.ok,
+                "message": result.message,
+                "removed": (result.data or {}).get("removed") if isinstance(result.data, dict) else None,
+                # 事后要能回答「清空之后 SSH 还通不通」——这是这次操作最要紧的一位信息。
+                "ssh_after": (result.data or {}).get("ssh_after") if isinstance(result.data, dict) else None,
+            },
+        )
+        return PowerActionResult(**op_result_dict(result))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
+
+
 @router.post("/tenants/{tenant_id}/instances/{instance_id}/firewall/cloudflare")
 def firewall_add_cloudflare(
     tenant_id: str,
