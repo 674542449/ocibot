@@ -56,6 +56,19 @@ class FirewallDeleteRules(BaseModel):
     rule_ids: list[str]
 
 
+class CloudflareRulesCreate(BaseModel):
+    """一键放行 Cloudflare CDN 回源网段。
+
+    ports 默认 80/443（Cloudflare 代理 HTTP/HTTPS 走的就是这两个）。
+    上限 8 个端口不是洁癖：每个端口 × 22 个网段 = 22 条规则，而 NSG 每组只有
+    120 条（Oracle 硬限制）—— 让人一次填十几个端口，只会在写到一半时撞上限。
+    """
+
+    nsg_id: str
+    ports: list[int] = Field(default_factory=lambda: [80, 443], max_length=8)
+    include_ipv6: bool = True
+
+
 def _row(db: Session, user_id: str, tenant_id: str):
     try:
         return get_owned_tenant(db, user_id, tenant_id)
@@ -269,6 +282,50 @@ def firewall_open_all(
             action="firewall.open_all",
             target=instance_id,
             detail={"tenant_id": tenant_id, "ok": result.ok, "message": result.message},
+        )
+        return PowerActionResult(**op_result_dict(result))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
+
+
+@router.post("/tenants/{tenant_id}/instances/{instance_id}/firewall/cloudflare")
+def firewall_add_cloudflare(
+    tenant_id: str,
+    instance_id: str,
+    body: CloudflareRulesCreate,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> PowerActionResult:
+    """放行 Cloudflare 官方 CDN 网段（入站 TCP）。
+
+    网段实时从 api.cloudflare.com 取，取不到退回面板内置的那份并在文案里说明。
+    """
+    _ = instance_id
+    row = _row(db, user.id, tenant_id)
+    try:
+        session = get_session_for_row(row)
+        result = session.add_cloudflare_rules(
+            body.nsg_id,
+            # 原样透传：把 [] 变成 None 会让「明确清空」被当成「没传」，
+            # 于是默默写进 80/443（见 add_cloudflare_rules 里那段注释）。
+            ports=list(body.ports),
+            include_ipv6=bool(body.include_ipv6),
+        )
+        # 写审计：这是一次会改变谁能访问这台机器的动作，和 open_all 同一性质。
+        write_audit(
+            db,
+            owner_id=user.id,
+            action="firewall.cloudflare",
+            target=instance_id,
+            detail={
+                "tenant_id": tenant_id,
+                "nsg_id": body.nsg_id,
+                "ports": list(body.ports or []),
+                "include_ipv6": bool(body.include_ipv6),
+                "ok": result.ok,
+                "message": result.message,
+                "data": result.data if isinstance(result.data, dict) else None,
+            },
         )
         return PowerActionResult(**op_result_dict(result))
     except Exception as exc:  # noqa: BLE001

@@ -390,6 +390,30 @@
           </div>
         </div>
         <button class="primary" style="margin-top: 0.4rem" @click="addRule(g.id)">添加规则</button>
+
+        <!-- Cloudflare 回源网段一键放行。
+             放在每个 NSG 卡片里而不是页顶：规则是加到某一个具体安全组上的，
+             顶上那个「放行全部端口」是整机级动作，两者不是一回事。 -->
+        <div class="cf-block">
+          <div class="row" style="gap: 0.5rem; align-items: flex-end; flex-wrap: wrap">
+            <div class="field" style="margin: 0; max-width: 190px">
+              <label>Cloudflare 端口</label>
+              <input v-model="cfForm.ports" placeholder="80,443" />
+            </div>
+            <label class="row" style="gap: 0.35rem; margin-bottom: 0.35rem">
+              <input v-model="cfForm.include_ipv6" type="checkbox" />
+              <span>含 IPv6</span>
+            </label>
+            <button :disabled="cfBusy" @click="addCloudflare(g.id)">
+              {{ cfBusy ? '写入中…' : '放行 Cloudflare 网段' }}
+            </button>
+          </div>
+          <div class="muted" style="font-size: 11px; margin-top: 0.3rem">
+            网段实时从 Cloudflare 官方接口取（15 个 IPv4 + 7 个 IPv6），按端口逐条加为入站
+            TCP 放行。安全规则是<strong>白名单</strong>：这只是「让 Cloudflare 进得来」，
+            不会关掉任何已有放行 —— 若上面还留着 0.0.0.0/0，源站仍然全网可达。
+          </div>
+        </div>
       </div>
 
       <!-- Subnet security lists: where the rules actually live for most instances.
@@ -1398,6 +1422,9 @@ async function deleteConsole(id: string) {
 
 // ---- firewall ----
 const fwGroups = ref<any[]>([])
+// Cloudflare 一键放行。默认 80/443 —— Cloudflare 代理 HTTP/HTTPS 走的就是这两个。
+const cfBusy = ref(false)
+const cfForm = reactive({ ports: '80,443', include_ipv6: true })
 // Subnet security lists — for most instances this is where the rules actually are.
 const fwSecurityLists = ref<any[]>([])
 const fwMsg = ref('')
@@ -1432,6 +1459,46 @@ async function loadFirewall() {
     if (!guard.superseded()) fwLoading.value = false
   }
 }
+async function addCloudflare(nsgId: string) {
+  const act = beginAction()
+  // 端口输入是自由文本，先在本地解析并去重 —— 让服务端替我们发现 "80,,443"
+  // 这种输入，代价是一次白跑的往返。
+  const ports = Array.from(
+    new Set(
+      String(cfForm.ports || '')
+        .split(/[,，\s]+/)
+        .map((x) => Number(x.trim()))
+        .filter((n) => Number.isInteger(n) && n >= 1 && n <= 65535),
+    ),
+  )
+  if (!ports.length) {
+    error.value = '请填写至少一个端口（例如 80,443）'
+    return
+  }
+  // 不加确认框：这是**增量放行**，不删不断，和「添加规则」同一性质。
+  // 顶上那个「放行全部端口」会清空既有规则，所以那个才需要确认。
+  cfBusy.value = true
+  error.value = ''
+  try {
+    const { data } = await api.post(
+      `/tenants/${act.tenant}/instances/${act.target}/firewall/cloudflare`,
+      { nsg_id: nsgId, ports, include_ipv6: cfForm.include_ipv6 },
+    )
+    if (act.moved()) return
+    // 服务端在「已有 0.0.0.0/0」时会带上一段警告，而那条警告比「成功」本身更重要
+    // —— 用户以为自己锁好了源站，实际上没有。所以 ok 也可能带警告，走 error 框显示。
+    const warned = String(data.message || '').includes('⚠')
+    if (data.ok && !warned) msg.value = data.message
+    else error.value = data.message
+    await loadFirewall()
+  } catch (e: any) {
+    if (act.moved()) return
+    error.value = e?.message || '操作失败'
+  } finally {
+    cfBusy.value = false
+  }
+}
+
 async function openAllFirewall() {
   const act = beginAction()
   if (
@@ -2119,6 +2186,15 @@ watch([tenantId, instanceId], async () => {
   align-items: center;
   gap: 0.35rem 0.5rem;
 }
+/* Cloudflare 一键放行那一块。跟上面的「添加规则」表单用一条分隔线隔开：
+   两者都往同一个 NSG 写规则，但一个是手填单条、一个是批量灌 20 多条，
+   混在一起会让人以为下面那个按钮用的是上面填的 CIDR。 */
+.cf-block {
+  margin-top: 0.6rem;
+  padding-top: 0.6rem;
+  border-top: 1px dashed var(--border);
+}
+
 .ipv6-chip {
   margin-left: 0;
   margin-top: 0;

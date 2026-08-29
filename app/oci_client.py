@@ -3855,6 +3855,169 @@ class TenantSession:
     def add_instance_firewall_rule(self, nsg_id: str, spec: FirewallRuleSpec) -> OperationResult:
         return self.add_nsg_rules(nsg_id, [spec])
 
+    # NSG 每组最多 120 条规则（入+出合计），服务限额页标注**不可调整**。
+    # Cloudflare 是 15 个 v4 + 7 个 v6 网段，配 80+443 就是 44 条 —— 占掉三分之一多，
+    # 所以写之前必须先算，撞上限时给的是一条能看懂的话，而不是 Oracle 的 400。
+    NSG_RULE_LIMIT = 120
+
+    def add_cloudflare_rules(
+        self,
+        nsg_id: str,
+        *,
+        ports: Optional[list[int]] = None,
+        include_ipv6: bool = True,
+    ) -> OperationResult:
+        """一键放行 Cloudflare CDN 回源网段（入站 TCP）。
+
+        用途是「源站只让 Cloudflare 访问」。但要说清楚一件事：OCI 的安全规则是
+        **白名单**，加放行不会关掉任何东西 —— 如果这个 NSG 里已经有一条
+        `0.0.0.0/0` 放行了同样的端口，加完 Cloudflare 网段**一点保护都没有**，
+        源站照样全网可达。面板不替用户删那条宽规则（那是破坏性动作），
+        但必须把这件事顶到最前面说，否则用户会以为自己已经锁好了。
+        """
+        from app import cloudflare_ips as cf
+
+        # `None`（没传）才用默认值；显式传空列表是**参数错误**，不能悄悄替换成
+        # 80/443 —— 那等于写了一批用户没要求的放行规则。
+        raw_ports = [80, 443] if ports is None else list(ports)
+        wanted_ports = sorted({int(p) for p in raw_ports if 1 <= int(p) <= 65535})
+        if not wanted_ports:
+            return OperationResult(
+                ok=False, message="至少要指定一个端口（例如 80、443）"
+            )
+
+        feed = cf.fetch_cloudflare_ips()
+        cidrs = list(feed["ipv4"]) + (list(feed["ipv6"]) if include_ipv6 else [])
+        if not cidrs:
+            return OperationResult(ok=False, message="没有取到任何 Cloudflare 网段")
+
+        try:
+            existing = oci.pagination.list_call_get_all_results(
+                self.network.list_network_security_group_security_rules,
+                nsg_id,
+                retry_strategy=sdk_bounded_paged_retry_strategy(),
+            ).data or []
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=safe_error_text(exc))
+
+        # 已有的入站规则：(源 CIDR, 端口区间)。用来做两件事 —— 跳过重复，
+        # 以及找出那些「已经比 Cloudflare 更宽」的规则。
+        ingress: list[tuple[str, Optional[int], Optional[int], str]] = []
+        for rule in existing:
+            if str(getattr(rule, "direction", "") or "").upper() != "INGRESS":
+                continue
+            source = str(getattr(rule, "source", "") or "")
+            if not source:
+                continue
+            proto = str(getattr(rule, "protocol", "") or "")
+            opts = getattr(rule, "tcp_options", None)
+            rng = getattr(opts, "destination_port_range", None) if opts else None
+            lo = getattr(rng, "min", None) if rng else None
+            hi = getattr(rng, "max", None) if rng else None
+            ingress.append((source, lo, hi, proto))
+
+        def _already(cidr: str, port: int) -> bool:
+            """这个 (网段, 端口) 是不是已经被某条现有入站规则覆盖了。"""
+            for source, lo, hi, proto in ingress:
+                if proto not in ("6", "all"):
+                    continue
+                if not cf.covers(source, cidr):
+                    continue
+                if lo is None or hi is None:      # 没有端口限制 = 全端口
+                    return True
+                if int(lo) <= port <= int(hi):
+                    return True
+            return False
+
+        specs: list[FirewallRuleSpec] = []
+        skipped = 0
+        for cidr in cidrs:
+            for port in wanted_ports:
+                if _already(cidr, port):
+                    skipped += 1
+                    continue
+                specs.append(
+                    FirewallRuleSpec(
+                        direction="INGRESS",
+                        protocol="6",
+                        cidr=cidr,
+                        port_min=port,
+                        port_max=port,
+                        description=f"Cloudflare CDN {port}",
+                    )
+                )
+
+        # 「已经全放行」要单独说 —— 它和「重复点了两次」长得一样（都是全部跳过），
+        # 但含义完全相反：一个是已经加过了，一个是**根本没在保护**。
+        wide_open = [
+            p
+            for p in wanted_ports
+            if any(
+                s in ("0.0.0.0/0", "::/0")
+                and proto in ("6", "all")
+                and (lo is None or hi is None or int(lo) <= p <= int(hi))
+                for s, lo, hi, proto in ingress
+            )
+        ]
+        warn = ""
+        if wide_open:
+            warn = (
+                chr(10)
+                + "⚠ 这个安全组里已经有 0.0.0.0/0 或 ::/0 放行了端口 "
+                + "、".join(str(p) for p in wide_open)
+                + "。安全规则是**白名单**，加放行不会关掉任何东西 —— "
+                "只要那条宽规则还在，源站就仍然全网可达，加 Cloudflare 网段并不会把它挡住。"
+                "要做到「只让 Cloudflare 访问」，得把那条宽规则删掉。"
+            )
+
+        if not specs:
+            return OperationResult(
+                ok=True,
+                message=(
+                    f"无需新增：{len(cidrs)} 个 Cloudflare 网段 × {len(wanted_ports)} 个端口"
+                    f"已全部被现有规则覆盖。{warn}"
+                ),
+                data={"added": 0, "skipped": skipped, "source": feed["source"], "wide_open": wide_open},
+            )
+
+        room = self.NSG_RULE_LIMIT - len(existing)
+        if len(specs) > room:
+            return OperationResult(
+                ok=False,
+                message=(
+                    f"规则数不够：需要新增 {len(specs)} 条，而这个安全组已有 {len(existing)} 条，"
+                    f"每组上限 {self.NSG_RULE_LIMIT} 条（Oracle 硬限制，不可调整），只剩 {max(0, room)} 条。"
+                    + chr(10)
+                    + "可以只选一个端口、或关掉 IPv6 来减少条数，也可以把用不到的旧规则删掉。"
+                ),
+                data={"needed": len(specs), "existing": len(existing), "limit": self.NSG_RULE_LIMIT},
+            )
+
+        result = self.add_nsg_rules(nsg_id, specs)
+        if not result.ok:
+            return result
+        src_note = "" if feed["source"] == "live" else chr(10) + feed.get("note", "")
+        return OperationResult(
+            ok=True,
+            message=(
+                f"已放行 Cloudflare CDN 网段：新增 {len(specs)} 条入站规则"
+                f"（{len(cidrs)} 个网段 × 端口 {'、'.join(str(p) for p in wanted_ports)}）"
+                + (f"，跳过 {skipped} 条已存在的" if skipped else "")
+                + f"。{src_note}{warn}"
+            ),
+            data={
+                "added": len(specs),
+                "skipped": skipped,
+                "cidrs": len(cidrs),
+                "ports": wanted_ports,
+                "source": feed["source"],
+                "etag": feed.get("etag", ""),
+                "wide_open": wide_open,
+            },
+        )
+
     def delete_nsg_rules(self, nsg_id: str, rule_ids: list[str]) -> OperationResult:
         ids = [value for value in rule_ids if value]
         try:

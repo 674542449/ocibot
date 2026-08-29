@@ -139,6 +139,7 @@ def make_session():
     s.add_instance_firewall_rule.return_value = R(True, "已添加", {})
     s.delete_nsg_rules.return_value = R(True, "已删除", {})
     s.replace_instance_firewall_with_open_all.return_value = R(True, "已全开放", {})
+    s.add_cloudflare_rules.return_value = R(True, "已放行 Cloudflare CDN 网段", {"added": 44})
     s.list_reserved_public_ips.return_value = [{"id": "pip1", "ip_address": "1.1.1.1"}]
     s.create_reserved_public_ip.return_value = R(True, "已创建", {"ip_address": "1.1.1.1"})
     s.delete_reserved_public_ip.return_value = R(True, "已删除", {})
@@ -348,6 +349,8 @@ def test_every_endpoint_is_wired() -> None:
             (f"/api/tenants/{tid}/instances/{iid}/firewall/delete-rules",
              {"nsg_id": "nsg1", "rule_ids": ["r1"]}),
             (f"/api/tenants/{tid}/instances/{iid}/firewall/open-all", None),
+            (f"/api/tenants/{tid}/instances/{iid}/firewall/cloudflare",
+             {"nsg_id": "nsg1", "ports": [80, 443], "include_ipv6": True}),
             # Regression: this returned 502 "name 'quota_guard' is not defined".
             (f"/api/tenants/{tid}/instances/{iid}/boot-volume", {"size_in_gbs": 60}),
             (f"/api/tenants/{tid}/instances/{iid}/console-output", None),
