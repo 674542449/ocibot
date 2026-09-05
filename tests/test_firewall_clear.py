@@ -308,8 +308,9 @@ def test_a_wide_open_security_list_means_the_clear_closed_nothing():
     assert "并没有关掉任何端口" in r.message
     assert "全端口对公网开放" in r.message
     assert "白名单" in r.message
-    # 要给出路：面板改不了安全列表，得说清楚去哪改。
-    assert "只读" in r.message and "Oracle 控制台" in r.message
+    # 要给出路。以前这里只能说「面板对安全列表是只读的，请到 Oracle 控制台改」——
+    # 把用户推出产品之外。现在面板自己有「让防火墙真正生效」这个动作，就该指给他。
+    assert "让防火墙真正生效" in r.message
     # 也要说清楚面板不碰机器内防火墙 —— 否则用户会以为 ufw 也被清了。
     assert "ufw" in r.message
     # 这条必须排在 22 端口结论**前面**：它是更要紧的那一句。

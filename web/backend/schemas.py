@@ -276,6 +276,17 @@ class PowerActionResult(BaseModel):
     work_request_id: str = ""
 
 
+class TightenSecurityListResult(PowerActionResult):
+    """收紧子网安全列表的返回值 —— 比 PowerActionResult 多一个 ``data``。
+
+    预检要把「将要删哪几条规则」「谁会因此失联」「要不要动别人建的列表」带回前端。
+    只给 message 的话，界面就只能去匹配中文字符串来决定下一步问什么 ——
+    文案改一个字，那个分支就悄悄失灵，而失灵的方向是**跳过确认直接写**。
+    """
+
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
 class TerminateRequest(BaseModel):
     preserve_boot_volume: bool = False
 

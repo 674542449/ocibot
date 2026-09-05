@@ -317,6 +317,31 @@
       </div>
       <p class="muted diag-msg" style="margin: 0; font-size: 12px">{{ fwMsg }}</p>
 
+      <!-- 子网安全列表里只要还有一条公网入站，下面那一整套 NSG 规则就**不改变任何
+           可达性**。不先说这件事，用户会在一个不起作用的面板上认真配规则。
+           把绕过 NSG 的那几条**原样列出来** —— 只说「有一条全开」的话，
+           Oracle 默认列表里那条 TCP 22 from 0.0.0.0/0 就永远不会被人看见。 -->
+      <div v-if="fwBypass.length" class="card warn-box">
+        <strong>⚠ 下面的 NSG 规则当前不起作用</strong>
+        <div class="muted diag-msg" style="font-size: 12px; margin-top: 0.35rem">
+          OCI 的生效规则是「子网安全列表 ∪ NSG」，任一放行即放行 —— 所以不论 NSG 里
+          写什么，下面这些端口都是对公网开着的：
+          <ul style="margin: 0.35rem 0 0; padding-left: 1.2rem">
+            <li v-for="sl in fwBypass" :key="sl.name">
+              {{ sl.name }}：{{ sl.rules.join('、') }}
+            </li>
+          </ul>
+          收紧之后只删这些「对公网开端口」的入站规则，ICMP 和出站一条不动，
+          NSG 才会真正决定端口开放情况。<br />
+          安全列表是<strong>子网级</strong>的，同子网（以及共用同一份列表的其它子网）
+          里的实例也会一起受影响，所以会先列出要删的每一条规则、并检查有没有实例会
+          因此失去入站。
+        </div>
+        <button class="primary" style="margin-top: 0.5rem" :disabled="fwBusy" @click="tightenSubnet()">
+          {{ fwBusy ? '处理中…' : '让防火墙真正生效' }}
+        </button>
+      </div>
+
       <div v-if="fwLoading" class="card muted" style="padding: 0.75rem; font-size: 13px">
         正在读取防火墙规则…
       </div>
@@ -1423,6 +1448,10 @@ async function deleteConsole(id: string) {
 
 // ---- firewall ----
 const fwGroups = ref<any[]>([])
+// 子网安全列表里**绕过 NSG 对公网开端口**的那些规则，按列表分组。
+// 非空 = 这台机器的 NSG 规则形同虚设（生效规则是安全列表 ∪ NSG）。
+// 判定留在后端（_rule_opens_public_ports）—— 在 TS 里重写一份必然漂移。
+const fwBypass = ref<{ name: string; rules: string[] }[]>([])
 // Cloudflare 一键放行。默认 80/443 —— Cloudflare 代理 HTTP/HTTPS 走的就是这两个。
 const cfBusy = ref(false)
 const cfForm = reactive({ ports: '80,443', include_ipv6: true })
@@ -1452,6 +1481,7 @@ async function loadFirewall() {
     fwMsg.value = data.message || ''
     if (data.ok === false) error.value = data.message || '加载防火墙规则失败'
     fwGroups.value = data.data?.groups || []
+    fwBypass.value = data.data?.bypass_lists || []
     fwSecurityLists.value = data.data?.security_lists || []
   } catch (e: any) {
     if (guard.stale()) return
@@ -1497,6 +1527,65 @@ async function addCloudflare(nsgId: string) {
     error.value = e?.message || '操作失败'
   } finally {
     cfBusy.value = false
+  }
+}
+
+async function tightenSubnet() {
+  const act = beginAction()
+  const url = `/tenants/${act.tenant}/instances/${act.target}/firewall/tighten-subnet`
+  fwBusy.value = true
+  error.value = ''
+  try {
+    // 先**只读**地问一遍：要删哪几条、谁会因此失联、要不要动别人建的列表。
+    // 确认框里摆的是后端算出来的真实规则，不是这里拼的一句概述 —— 用户完全可能
+    // 在 Oracle 控制台里手工开过 3306，面板无权替他判断那是不是笔误。
+    let force = false
+    let includeForeign = false
+    let approved = false
+    // 最多三步：外来列表同意 → 失联名单同意 → 最终确认。写成有界循环而不是
+    // 递归，是为了让「没点确认就不写」这件事一眼可查。
+    for (let step = 0; step < 3 && !approved; step++) {
+      const { data } = await api.post(url, {
+        preview: true,
+        force,
+        include_foreign: includeForeign,
+      })
+      if (act.moved()) return
+      const text = String(data.message || '')
+      if (data.ok) {
+        if (!confirm(text + '\n\n继续？')) return
+        approved = true
+        break
+      }
+      // 分支靠后端给的结构化标志，不靠匹配中文 —— 文案改一个字就失灵，
+      // 而失灵的方向是「跳过确认直接写」。
+      if (data.data?.needs_foreign_consent && !includeForeign) {
+        if (!confirm(text + '\n\n一并收紧这些列表？')) return
+        includeForeign = true
+        continue
+      }
+      if ((data.data?.at_risk || []).length && !force) {
+        if (!confirm(text + '\n\n仍然收紧？')) return
+        force = true
+        continue
+      }
+      error.value = text
+      return
+    }
+    if (!approved) return
+    const { data } = await api.post(url, { force, include_foreign: includeForeign })
+    if (act.moved()) return
+    if (data.ok && !String(data.message || '').includes('⚠')) {
+      msg.value = data.message
+    } else {
+      error.value = data.message
+    }
+    await loadFirewall()
+  } catch (e: any) {
+    if (act.moved()) return
+    error.value = e?.message || '操作失败'
+  } finally {
+    fwBusy.value = false
   }
 }
 
@@ -2093,6 +2182,7 @@ function resetInstanceState() {
   bootlogMsg.value = ''
   consoleList.value = []
   fwGroups.value = []
+  fwBypass.value = []
   fwSecurityLists.value = []
   fwMsg.value = ''
   reservedIps.value = []

@@ -16,7 +16,7 @@ from web.backend.auth import get_current_user
 from web.backend.db import get_db
 from web.backend.models import SshHostKey, User
 from web.backend.oci_bridge import get_owned_tenant, get_session_for_row, op_result_dict
-from web.backend.schemas import PowerActionResult
+from web.backend.schemas import PowerActionResult, TightenSecurityListResult
 from web.backend.ssh_hostkey import UNREACHABLE as HOSTKEY_UNREACHABLE
 from web.backend.ssh_hostkey import check_instance_host_key, forget_host_key, known_hosts_for
 
@@ -284,6 +284,71 @@ def firewall_open_all(
             detail={"tenant_id": tenant_id, "ok": result.ok, "message": result.message},
         )
         return PowerActionResult(**op_result_dict(result))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
+
+
+class TightenSecurityListRequest(BaseModel):
+    # 预检发现有实例会失去入站时,必须显式 force 才继续。
+    force: bool = False
+    # 只读一遍并把「将要删掉哪几条规则」原样报回来,一个字节都不写。
+    # 界面拿它填确认框 —— 用户可能真的在 Oracle 控制台里手工开过 3306,
+    # 让他先看见那一条,再决定要不要删。
+    preview: bool = False
+    # 动 Oracle 自带的那份默认安全列表（面板没建过它)要第二次确认。
+    include_foreign: bool = False
+
+
+@router.post("/tenants/{tenant_id}/instances/{instance_id}/firewall/tighten-subnet")
+def firewall_tighten_subnet(
+    tenant_id: str,
+    instance_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+    payload: TightenSecurityListRequest | None = None,
+) -> TightenSecurityListResult:
+    """收紧子网安全列表,让 NSG 真正决定可达性。
+
+    子网级写操作,会波及同子网所有实例 —— 和 open_all / clear 同级,写审计。
+    """
+    row = _row(db, user.id, tenant_id)
+    force = bool(payload.force) if payload else False
+    preview = bool(payload.preview) if payload else False
+    include_foreign = bool(payload.include_foreign) if payload else False
+    try:
+        session = get_session_for_row(row)
+        info = session.get_instance(instance_id, resolve_ips=False)
+        result = session.tighten_subnet_security_list(
+            instance_id,
+            info.compartment_id,
+            force=force,
+            preview=preview,
+            include_foreign=include_foreign,
+        )
+        data = result.data if isinstance(result.data, dict) else {}
+        # 预检是纯读,写审计只会把「谁真的改了子网」这条线索淹掉。
+        if not preview:
+            write_audit(
+                db,
+                owner_id=user.id,
+                action="firewall.tighten_subnet",
+                target=instance_id,
+                detail={
+                    "tenant_id": tenant_id,
+                    "force": force,
+                    "include_foreign": include_foreign,
+                    "ok": result.ok,
+                    "message": result.message,
+                    # 子网级动作,事后要能回答「当时波及了哪些实例」。
+                    "subnet_id": data.get("subnet_id"),
+                    "at_risk": data.get("at_risk"),
+                    # 删的是哪几条规则 —— 尤其是别人建的列表里那几条,
+                    # 审计里没有它就没法回答「那条 3306 是谁删的」。
+                    "removals": data.get("removals"),
+                    "subnets": data.get("subnets"),
+                },
+            )
+        return TightenSecurityListResult(**op_result_dict(result), data=data)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 

@@ -14,7 +14,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 # 每一次 OCI 失败都在这里留一条服务端记录。
 #
@@ -682,6 +682,10 @@ DEFAULT_VCN_NAME = "default-vcn"
 DEFAULT_SUBNET_NAME = "public-subnet"
 DEFAULT_IGW_NAME = "internet-gateway"
 DEFAULT_RT_NAME = "public-route-table"
+# 名字保持历史值不动:改名会让存量那些叫 open-security-list 的列表变成孤儿 ——
+# 面板按名字匹配来复用和修复它们,改了名就再也找不到、也就再也修不了。
+# 规则内容已经从「全开」改成基线（见 _baseline_security_list_rules），
+# 名字里的 "open" 只是历史包袱。
 DEFAULT_SL_NAME = "open-security-list"
 DEFAULT_VCN_DNS_LABEL = "defaultvcn"
 DEFAULT_INSTANCE_NAME = "instance"
@@ -2735,6 +2739,100 @@ class TenantSession:
             )
         return ingress, egress
 
+    # 面板写进子网安全列表的规则描述前缀 —— 用来区分「面板写的」和「用户手工改的」。
+    # 收紧动作只动带这个前缀的规则,绝不碰用户自己加的。
+    SL_RULE_TAG = "ocibot"
+
+    @staticmethod
+    def _baseline_security_list_rules(
+        *, include_ipv6: bool = False, vcn_cidrs: Sequence[str] = ()
+    ) -> tuple[list, list]:
+        """子网安全列表的**基线**规则：入站几乎为空，出站放开。
+
+        这是让面板防火墙真正生效的关键。OCI 里
+        **生效规则 = 子网安全列表 ∪ VNIC 的所有 NSG**（securityrules.htm），
+        而安全列表是**子网级**的、NSG 是**实例级**的。以前面板往安全列表里写了一条
+        `protocol=all, source=0.0.0.0/0` 的全开入站 —— 于是 NSG 里写什么都不改变
+        可达性：详情页的加规则/删规则/Cloudflare 白名单/清空全是摆设，
+        创建向导里「不允许外网直接访问」那个勾更是从来没生效过。
+
+        入站留空之后 NSG 就是唯一的入站控制点（"Without security rules, no traffic
+        is allowed in and out of VNICs"），面板对某台实例做的事才只作用于那台实例。
+
+        保留的两条 ICMP 抄的是 Oracle 自己默认安全列表的做法：
+
+          * `type 3 code 4` from 0.0.0.0/0 —— Path MTU Discovery。文档原话：
+            "enables Compute instances to receive Path MTU Discovery fragmentation
+            messages"。删掉它不会立刻断网，而是让**大包**静默丢失 —— 表现为
+            ssh 能连上但 scp 卡死、curl 小页面正常大文件卡住。这类故障极难排查，
+            不值得为了「更干净」去省这一条。
+          * `type 3` from VCN CIDR —— VCN 内部的连通性错误消息，同上。
+
+        出站保留 all：**有状态**规则的回程包本来就自动放行（"the response is
+        tracked and automatically allowed back to the originating host, regardless
+        of any egress rules"），所以出站留在安全列表里不会削弱入站管控；而把它也
+        搬进 NSG 的话，子网里任何一台没有 NSG 的机器会连出网都没有 —— 那是把
+        「面板管不到的实例」直接打死，代价远大于收益。
+        """
+        tag = TenantSession.SL_RULE_TAG
+        ingress = [
+            oci.core.models.IngressSecurityRule(
+                protocol="1",  # ICMP
+                source="0.0.0.0/0",
+                source_type="CIDR_BLOCK",
+                is_stateless=False,
+                icmp_options=oci.core.models.IcmpOptions(type=3, code=4),
+                description=f"{tag} Path MTU Discovery",
+            ),
+        ]
+        # Oracle 默认安全列表的第三条:VCN 内部的 ICMP type 3（**全部 code**）。
+        # 文档在列完这三条之后直接写 "Don't remove those rules" —— 少了它,
+        # 同 VCN 内的「端口不可达 / 主机不可达」错误消息回不来,表现是本该秒失败的
+        # 连接要等到超时。只在拿得到 VCN CIDR 时加(建网路径拿得到;收紧路径不一定)。
+        for cidr in vcn_cidrs:
+            if not cidr or ":" in cidr:
+                continue
+            ingress.append(
+                oci.core.models.IngressSecurityRule(
+                    protocol="1",
+                    source=cidr,
+                    source_type="CIDR_BLOCK",
+                    is_stateless=False,
+                    icmp_options=oci.core.models.IcmpOptions(type=3),
+                    description=f"{tag} VCN 内 ICMP",
+                )
+            )
+        egress = [
+            oci.core.models.EgressSecurityRule(
+                protocol="all",
+                destination="0.0.0.0/0",
+                destination_type="CIDR_BLOCK",
+                is_stateless=False,
+                description=f"{tag} IPv4 出站",
+            ),
+        ]
+        if include_ipv6:
+            ingress.append(
+                oci.core.models.IngressSecurityRule(
+                    protocol="58",  # ICMPv6
+                    source="::/0",
+                    source_type="CIDR_BLOCK",
+                    is_stateless=False,
+                    icmp_options=oci.core.models.IcmpOptions(type=2),  # Packet Too Big
+                    description=f"{tag} IPv6 Packet Too Big",
+                )
+            )
+            egress.append(
+                oci.core.models.EgressSecurityRule(
+                    protocol="all",
+                    destination="::/0",
+                    destination_type="CIDR_BLOCK",
+                    is_stateless=False,
+                    description=f"{tag} IPv6 出站",
+                )
+            )
+        return ingress, egress
+
     def _ensure_internet_gateway(self, vcn_id: str, compartment_id: str) -> Any:
         gateways = oci.pagination.list_call_get_all_results(
             self.network.list_internet_gateways, compartment_id, vcn_id=vcn_id,
@@ -2914,8 +3012,16 @@ class TenantSession:
             None,
         )
         if managed is not None:
+            # 只按名字复用、**不校验规则内容** —— 存量里那些全开的列表会原样被复用。
+            # 收紧它们是一个破坏性的子网级动作,不能在建网路径上顺手做,
+            # 得由用户显式触发（见 tighten_subnet_security_list）。
             return managed
-        ingress, egress = self._open_security_list_rules(include_ipv6=include_ipv6)
+        # 新建的一律用**基线**规则:入站几乎为空,让 NSG 成为唯一的入站控制点。
+        # 以前这里写的是全开入站,导致 NSG 里做什么都不改变可达性（见
+        # _baseline_security_list_rules 的说明）。
+        ingress, egress = self._baseline_security_list_rules(
+            include_ipv6=include_ipv6, vcn_cidrs=self._vcn_ipv4_cidrs(vcn_id)
+        )
         return self.network.create_security_list(
             oci.core.models.CreateSecurityListDetails(
                 compartment_id=compartment_id,
@@ -3777,6 +3883,30 @@ class TenantSession:
                 data={
                     "groups": groups,
                     "security_lists": security_lists,
+                    # 子网安全列表里**绕过 NSG 对公网开端口**的入站规则,按列表分组。
+                    # 非空 = NSG 里做什么都不改变可达性,界面必须先把这件事说了,
+                    # 否则用户会在一个不起作用的面板上认真配规则。
+                    #
+                    # 这里的判定是「公网源 + 能开端口的协议」,而不是只认 protocol=all
+                    # 的全开（那个判定还在,清空路径用它回答另一个问题）。Oracle 自带的
+                    # 默认安全列表写的是 TCP 22 from 0.0.0.0/0 —— 它不是「全开」,却同样
+                    # 让 NSG 说了不算,而绝大多数租户用的正是那种网络。只报「全开」
+                    # 等于对他们什么都没报。
+                    "bypass_lists": [
+                        {
+                            "name": sl["display_name"],
+                            "rules": [
+                                self._describe_norm_ingress(rule)
+                                for rule in (sl.get("rules") or [])
+                                if self._rule_opens_public_ports(rule)
+                            ],
+                        }
+                        for sl in security_lists
+                        if any(
+                            self._rule_opens_public_ports(rule)
+                            for rule in (sl.get("rules") or [])
+                        )
+                    ],
                     # 读全了没有。清空防火墙那条路径靠它区分「确实没有放行 22」和
                     # 「这次没读到」—— 后者不能被讲成前者。
                     "security_lists_complete": sl_complete,
@@ -4141,6 +4271,453 @@ class TenantSession:
             return ""
         return str(net)
 
+    # 「打开了公网端口」的协议。ICMP(1/58) 不算 —— 它开不了端口,而且 Oracle 自己的
+    # 默认列表就带着两条 ICMP,连它们一起删只会让排障变难。
+    _PORT_PROTOCOLS = frozenset({"all", "6", "17"})
+    _PROTOCOL_LABELS = {"all": "全部协议", "6": "TCP", "17": "UDP", "1": "ICMP", "58": "ICMPv6"}
+
+    @staticmethod
+    def _rule_opens_public_ports(rule: dict) -> bool:
+        """这条（已归一化的）入站规则是不是「对公网打开了端口」。
+
+        比 _ingress_wide_open 宽:那个只认 protocol=all 的整段全开,而 Oracle 自己的
+        默认安全列表写的是一条 **TCP 22 from 0.0.0.0/0**。它不是「全开」,却同样让
+        NSG 说了不算 —— 用户在 NSG 里只放 80,机器的 22 照样对全网开着。
+        只报「全开」的话,绝大多数租户（用 Oracle 向导建的网络）根本看不到警告。
+        """
+        if str(rule.get("direction", "") or "").upper() != "INGRESS":
+            return False
+        if str(rule.get("protocol", "") or "") not in TenantSession._PORT_PROTOCOLS:
+            return False
+        return str(rule.get("cidr", "") or "").strip() in TenantSession._PUBLIC_SOURCES
+
+    @classmethod
+    def _sdk_ingress_opens_public_ports(cls, rule: Any) -> bool:
+        """同上,但作用在 SDK 对象上（收紧路径读到的是原始规则,不是归一化后的 dict）。"""
+        if str(getattr(rule, "protocol", "") or "") not in cls._PORT_PROTOCOLS:
+            return False
+        return str(getattr(rule, "source", "") or "").strip() in cls._PUBLIC_SOURCES
+
+    @classmethod
+    def _describe_sdk_ingress(cls, rule: Any) -> str:
+        """把一条要被删掉的规则说成人话 —— 用户得先看见它,才谈得上「同意删」。"""
+        proto = str(getattr(rule, "protocol", "") or "")
+        label = cls._PROTOCOL_LABELS.get(proto, "协议 " + proto)
+        options = getattr(rule, "tcp_options", None) or getattr(rule, "udp_options", None)
+        port_range = getattr(options, "destination_port_range", None) if options else None
+        if port_range is not None:
+            lo, hi = getattr(port_range, "min", None), getattr(port_range, "max", None)
+            label += " " + (str(lo) if lo == hi else str(lo) + "-" + str(hi))
+        else:
+            label += " 全部端口"
+        text = label + " ← " + str(getattr(rule, "source", "") or "")
+        desc = str(getattr(rule, "description", "") or "").strip()
+        if desc:
+            text += "（" + desc + "）"
+        return text
+
+    @classmethod
+    def _describe_norm_ingress(cls, rule: dict) -> str:
+        """同 _describe_sdk_ingress，但作用在归一化后的 dict 上（读取路径用的形态）。"""
+        proto = str(rule.get("protocol", "") or "")
+        label = cls._PROTOCOL_LABELS.get(proto, "协议 " + proto)
+        port = str(rule.get("port", "") or "").strip()
+        label += " " + ("全部端口" if port in ("", "全部") else port)
+        return label + " ← " + str(rule.get("cidr", "") or "")
+
+    def _vcn_ipv4_cidrs(self, vcn_id: str) -> list[str]:
+        """VCN 的 IPv4 网段。拿不到就返回空 —— 基线里那条 VCN 内 ICMP 只是锦上添花,
+        为它让整条建网路径失败不值得。"""
+        try:
+            vcn = self.network.get_vcn(vcn_id).data
+        except Exception:  # noqa: BLE001
+            return []
+        blocks = list(getattr(vcn, "cidr_blocks", None) or [])
+        single = str(getattr(vcn, "cidr_block", "") or "")
+        if single and single not in blocks:
+            blocks.append(single)
+        return [b for b in blocks if b and ":" not in b]
+
+    def _subnets_sharing(self, vcn_id: str, compartment_id: str, sl_ids: set[str]) -> tuple[list[dict], bool]:
+        """VCN 里**也挂着这些安全列表**的子网。
+
+        安全列表是可以被同一个 VCN 里多个子网共用的。只预检实例自己那个子网,就会
+        在「别的子网里有台没有 NSG 的机器」时把它悄悄关在门外 —— 而那台机器根本不在
+        用户这次操作的视野里。返回 (子网列表, 读全了没有)。
+
+        ``complete`` 只看**子网自己那个 compartment** 读没读到。顺带扫一遍租户根
+        compartment 是为了捞跨 compartment 的兄弟子网,但那次读失败不算「没读全」——
+        非管理员在根 compartment 上列资源本来就经常 403/404,把它算成失败等于让
+        这个按钮对最需要它的那批人永远点不动。而兄弟子网跟 VCN 同 compartment
+        是压倒性的常态。
+        """
+        found: dict[str, dict] = {}
+        complete = True
+        comps: list[str] = []
+        for cid in (compartment_id, self.tenant.tenancy_ocid.strip()):
+            if cid and cid not in comps:
+                comps.append(cid)
+        for index, comp in enumerate(comps):
+            try:
+                for sub in self.list_subnets(compartment_id=comp, vcn_id=vcn_id):
+                    if set(sub.get("security_list_ids") or []) & sl_ids:
+                        found[sub["id"]] = sub
+            except Exception:  # noqa: BLE001
+                if index == 0:
+                    complete = False
+        return list(found.values()), complete
+
+    def _subnet_vnics_at_risk(self, subnet_id: str) -> tuple[list[str], bool]:
+        """子网里**没有任何 NSG 入站放行**的 VNIC —— 收紧安全列表后它们会失去入站。
+
+        返回 (描述列表, 读全了没有)。读不全时**不能**当成「没有风险」：这是一个会
+        波及整个子网的写操作，预检读失败就该停手，而不是假装没事。
+
+        代价是 1 + N 次调用（列子网私有 IP，再逐个读 VNIC）。这是用户主动点的破坏性
+        动作，不是页面导航 —— CLAUDE.md 那条「别为翻页花 OCI 额度」管不到这里，
+        而把人锁在外面的代价远大于几次 API 调用。
+        """
+        at_risk: list[str] = []
+        try:
+            ips = oci.pagination.list_call_get_all_results(
+                self.network.list_private_ips,
+                subnet_id=subnet_id,
+                retry_strategy=sdk_bounded_paged_retry_strategy(),
+            ).data or []
+        except Exception:  # noqa: BLE001
+            return [], False
+        seen: set[str] = set()
+        complete = True
+        for ip in ips:
+            vnic_id = str(getattr(ip, "vnic_id", "") or "")
+            if not vnic_id or vnic_id in seen:
+                continue
+            seen.add(vnic_id)
+            try:
+                vnic = self.network.get_vnic(vnic_id).data
+            except Exception:  # noqa: BLE001
+                complete = False
+                continue
+            label = (
+                str(getattr(vnic, "display_name", "") or "")
+                or str(getattr(ip, "ip_address", "") or "")
+                or vnic_id[-8:]
+            )
+            nsg_ids = [n for n in (getattr(vnic, "nsg_ids", None) or []) if n]
+            if not nsg_ids:
+                at_risk.append(label + "（没有任何 NSG）")
+                continue
+            allows = False
+            for nsg_id in nsg_ids:
+                try:
+                    rules = oci.pagination.list_call_get_all_results(
+                        self.network.list_network_security_group_security_rules,
+                        nsg_id,
+                        retry_strategy=sdk_bounded_paged_retry_strategy(),
+                    ).data or []
+                except Exception:  # noqa: BLE001
+                    complete = False
+                    allows = True  # 读不到就别替它下「没放行」的结论
+                    break
+                if any(
+                    str(getattr(r, "direction", "") or "").upper() == "INGRESS" for r in rules
+                ):
+                    allows = True
+                    break
+            if not allows:
+                at_risk.append(label + "（NSG 里没有任何入站规则）")
+        return at_risk, complete
+
+    def tighten_subnet_security_list(
+        self,
+        instance_id: str,
+        compartment_id: str,
+        *,
+        force: bool = False,
+        include_foreign: bool = False,
+        preview: bool = False,
+    ) -> OperationResult:
+        """删掉子网安全列表里所有「对公网开端口」的入站规则，让 NSG 真正说了算。
+
+        这是「面板的防火墙是不是真的有效」这件事的**总开关**。OCI 的生效规则是
+        **子网安全列表 ∪ VNIC 的所有 NSG**（securityrules.htm）。只要安全列表里还有
+        一条公网入站，面板在 NSG 上做的一切就都不改变可达性 —— 加规则/删规则/
+        Cloudflare 白名单/清空全是摆设，创建向导里「不允许外网直接访问」也从没生效过。
+
+        两种来源都要处理，漏掉哪一种这个功能都不成立：
+
+        * 面板自己建的 ``open-security-list``：老版本往里写过 protocol=all + 0.0.0.0/0。
+        * **Oracle 建 VCN 时自带的默认安全列表**：里面有一条 ``TCP 22 from
+          0.0.0.0/0``。它不是「全开」，所以不触发全开告警，但同样让 NSG 说了不算 ——
+          用户在 NSG 里只放 80，机器的 22 照样对全网开着。而绝大多数租户用的正是
+          这种网络（面板优先复用现有子网，一个子网都没有时才自己建）。
+          只肯动自己建的列表 = 对绝大多数人来说这个按钮什么也没做。
+
+        动别人建的列表要 ``include_foreign``（界面上是第二次确认）。不管哪种列表，
+        删之前都用 ``preview=True`` 把**每一条**要删的规则原样报给用户 —— 用户可能
+        真的在 Oracle 控制台里手工开过 3306，面板无权替他判断那是不是笔误。
+
+        ICMP 一条不删（它开不了端口，而且缺了它排障会变得很难受），出站一条不动
+        （有状态规则的回程包本来就自动放行）。
+
+        顺序很重要：先确认**每个受影响子网**里的每个 VNIC 都有 NSG 入站放行，
+        再动手。安全列表可以被同一个 VCN 里多个子网共用，只看实例自己那个子网，
+        会在别的子网里悄悄关掉一台机器 —— 那台机器根本不在用户这次操作的视野里。
+        """
+        state = self.get_instance_firewall(instance_id, compartment_id)
+        if not state.ok:
+            return state
+        data = state.data or {}
+        subnet_id = str(data.get("subnet_id") or "")
+        if not subnet_id:
+            return OperationResult(ok=False, message="找不到实例所在的子网")
+        include_ipv6 = bool(data.get("has_ipv6"))
+
+        try:
+            subnet = self.network.get_subnet(subnet_id).data
+            sl_ids = list(getattr(subnet, "security_list_ids", None) or [])
+            vcn_id = str(getattr(subnet, "vcn_id", "") or "")
+            subnet_comp = str(getattr(subnet, "compartment_id", "") or compartment_id)
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=safe_error_text(exc))
+
+        # --- 读齐所有列表，算出每一条要删的规则 -------------------------------
+        targets: list[dict] = []
+        for sl_id in sl_ids:
+            try:
+                sl = self.network.get_security_list(sl_id).data
+            except Exception:  # noqa: BLE001
+                return OperationResult(
+                    ok=False,
+                    message="读不到子网的安全列表，无法安全地收紧 —— 已停手，什么都没改。",
+                )
+            tags = getattr(sl, "freeform_tags", None) or {}
+            name = str(getattr(sl, "display_name", "") or "") or sl_id[-8:]
+            mine = (
+                tags.get("managed_by") == "oci-console-helper"
+                or name in LEGACY_DEFAULT_SL_NAMES
+            )
+            ingress = list(getattr(sl, "ingress_security_rules", None) or [])
+            drop = [r for r in ingress if self._sdk_ingress_opens_public_ports(r)]
+            if drop:
+                targets.append(
+                    {
+                        "id": sl_id,
+                        "name": name,
+                        "mine": mine,
+                        "ingress": ingress,
+                        "drop": drop,
+                        "rules": [self._describe_sdk_ingress(r) for r in drop],
+                    }
+                )
+
+        if not targets:
+            return OperationResult(
+                ok=True,
+                message=(
+                    "子网安全列表里已经没有对公网开端口的入站规则 —— 这台机器实际开放"
+                    "的端口现在由它自己的 NSG 决定，无需改动。"
+                ),
+                data={"subnet_id": subnet_id, "removals": [], "at_risk": []},
+            )
+
+        removals = [
+            {"list": t["name"], "foreign": not t["mine"], "rules": t["rules"]}
+            for t in targets
+        ]
+        foreign = [t["name"] for t in targets if not t["mine"]]
+
+        def _rule_lines() -> str:
+            out: list[str] = []
+            for item in removals:
+                out.append(
+                    "  " + item["list"] + ("（不是面板建的）" if item["foreign"] else "") + "："
+                )
+                out.extend("    · " + r for r in item["rules"])
+            return chr(10).join(out)
+
+        # --- 别人的列表要单独同意 -------------------------------------------
+        if foreign and not include_foreign:
+            return OperationResult(
+                ok=False,
+                message=(
+                    "要收紧的安全列表里有不是本面板创建的（"
+                    + "、".join(foreign)
+                    + "）—— 多半是 Oracle 建 VCN 时自带的那份默认列表。"
+                    + chr(10)
+                    + "不动它的话，下面这些规则会继续绕过 NSG 放行端口，"
+                    "「只开 22 和 80」就仍然不成立："
+                    + chr(10)
+                    + _rule_lines()
+                    + chr(10)
+                    + "确认要一并收紧，就再点一次确认。"
+                ),
+                data={
+                    "subnet_id": subnet_id,
+                    "removals": removals,
+                    "foreign": foreign,
+                    "needs_foreign_consent": True,
+                },
+            )
+
+        # --- 预检：每个受影响子网里谁会失去入站 --------------------------------
+        touched = {t["id"] for t in targets}
+        if vcn_id:
+            shared, shared_ok = self._subnets_sharing(vcn_id, subnet_comp, touched)
+        else:
+            shared, shared_ok = [], True
+        check_ids = {subnet_id} | {s["id"] for s in shared}
+        names = {s["id"]: s.get("display_name") or s["id"][-8:] for s in shared}
+        at_risk: list[str] = []
+        complete = shared_ok
+        for sid in sorted(check_ids):
+            risk, ok = self._subnet_vnics_at_risk(sid)
+            complete = complete and ok
+            prefix = "" if sid == subnet_id else names.get(sid, sid[-8:]) + " / "
+            at_risk.extend(prefix + x for x in risk)
+
+        if not complete and not force:
+            return OperationResult(
+                ok=False,
+                message=(
+                    "预检没读全受影响的子网/实例，无法判断收紧后谁会失去入站 —— "
+                    "已停手，什么都没改。"
+                    + chr(10)
+                    + "这是一个会波及整个子网的操作，读不全就不该动手。请稍后重试。"
+                ),
+                data={"subnet_id": subnet_id, "removals": removals},
+            )
+        if at_risk and not force:
+            return OperationResult(
+                ok=False,
+                message=(
+                    "收紧后这 " + str(len(at_risk)) + " 台会失去入站（它们不靠安全列表就进不来）："
+                    + chr(10)
+                    + chr(10).join("  · " + x for x in at_risk)
+                    + chr(10)
+                    + "先给它们各自的 NSG 加上需要的入站规则，再回来收紧。"
+                    "确实要带着这个后果继续，就勾上「仍然收紧」。"
+                ),
+                data={"subnet_id": subnet_id, "removals": removals, "at_risk": at_risk},
+            )
+
+        if preview:
+            extra = ""
+            if len(check_ids) > 1:
+                extra = (
+                    chr(10)
+                    + "注意：这些安全列表还挂在同 VCN 的另外 "
+                    + str(len(check_ids) - 1)
+                    + " 个子网上，那些子网里的实例也会一起受影响。"
+                )
+            return OperationResult(
+                ok=True,
+                message=(
+                    "将从子网安全列表里删掉下面这些「对公网开端口」的入站规则："
+                    + chr(10)
+                    + _rule_lines()
+                    + chr(10)
+                    + "ICMP（Path MTU Discovery 等）和出站规则一条不动。"
+                    "删完之后，各实例实际开放的端口由它自己的 NSG 决定。"
+                    + extra
+                ),
+                data={
+                    "subnet_id": subnet_id,
+                    "removals": removals,
+                    "at_risk": at_risk,
+                    "foreign": foreign,
+                    "subnets": sorted(check_ids),
+                    "preview": True,
+                },
+            )
+
+        # --- 动手 ------------------------------------------------------------
+        base_ingress, _base_egress = self._baseline_security_list_rules(
+            include_ipv6=include_ipv6,
+            vcn_cidrs=self._vcn_ipv4_cidrs(vcn_id) if vcn_id else (),
+        )
+        changed: list[str] = []
+        for t in targets:
+            drop_ids = {id(r) for r in t["drop"]}
+            kept = [r for r in t["ingress"] if id(r) not in drop_ids]
+            have = {
+                (str(getattr(r, "protocol", "") or ""), str(getattr(r, "source", "") or ""))
+                for r in kept
+            }
+            # 补基线只补面板自己的列表。别人的列表按「只删不加」处理 —— 我们已经在
+            # 动别人的东西了，再往里塞规则超出了用户同意的范围。
+            added = (
+                [r for r in base_ingress if (str(r.protocol), str(r.source)) not in have]
+                if t["mine"]
+                else []
+            )
+            try:
+                self.network.update_security_list(
+                    t["id"],
+                    oci.core.models.UpdateSecurityListDetails(
+                        ingress_security_rules=kept + added
+                    ),
+                )
+            except ServiceError as exc:
+                return OperationResult(
+                    ok=False,
+                    message="收紧 " + t["name"] + " 失败：" + _format_service_error(exc)
+                    + (
+                        chr(10) + "前面 " + str(len(changed)) + " 个列表已经改了。"
+                        if changed
+                        else ""
+                    ),
+                    data={"changed": changed},
+                )
+            except Exception as exc:  # noqa: BLE001
+                return OperationResult(
+                    ok=False, message=safe_error_text(exc), data={"changed": changed}
+                )
+            changed.append(
+                t["name"] + "：删掉 " + str(len(t["drop"])) + " 条公网入站"
+                + ("，补 " + str(len(added)) + " 条基线 ICMP" if added else "")
+            )
+
+        note = ""
+        if len(check_ids) > 1:
+            note += (
+                chr(10)
+                + "这些安全列表同时挂在同 VCN 的另外 "
+                + str(len(check_ids) - 1)
+                + " 个子网上，那些子网里的实例也一起受了影响。"
+            )
+        if at_risk:
+            note += (
+                chr(10)
+                + "⚠ 已按要求继续，下面 " + str(len(at_risk)) + " 台现在应该已经失去入站："
+                + chr(10)
+                + chr(10).join("  · " + x for x in at_risk)
+            )
+        return OperationResult(
+            ok=True,
+            message=(
+                "已收紧子网安全列表 —— 从现在起，这台机器实际开放的端口由它自己的 NSG 决定。"
+                + chr(10)
+                + chr(10).join("  · " + x for x in changed)
+                + chr(10)
+                + "ICMP 一条没删（其中 Path MTU Discovery 那条删掉会让大包静默丢失，"
+                "表现为 ssh 能连但 scp 卡死），出站也一条没动"
+                "（有状态规则的回程包本来就自动放行）。"
+                + note
+            ),
+            data={
+                "subnet_id": subnet_id,
+                "changed": changed,
+                "removals": removals,
+                "at_risk": at_risk,
+                "foreign": foreign,
+                "subnets": sorted(check_ids),
+            },
+        )
+
+
     def clear_instance_firewall_rules(
         self,
         instance_id: str,
@@ -4229,8 +4806,9 @@ class TenantSession:
                 "清空 NSG 并没有关掉任何端口，服务器仍然全端口对公网开放。"
                 "NSG 是白名单不是拒绝规则，清空它只是少一个放行来源。"
                 + chr(10)
-                + "要真的收紧，得改那条子网安全列表；本面板对安全列表是只读的，"
-                "请到 Oracle 控制台修改。（机器内的 iptables / ufw 面板从不碰，仍按你自己的配置生效。）",
+                + "要真的收紧，得改那条子网安全列表 —— 本页顶部的「让防火墙真正生效」"
+                "就是干这个的：它删掉安全列表里所有对公网开端口的入站规则，"
+                "之后 NSG 才说了算。（机器内的 iptables / ufw 面板从不碰，仍按你自己的配置生效。）",
             )
 
         after = chr(10).join(verdicts)

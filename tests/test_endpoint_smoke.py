@@ -141,6 +141,7 @@ def make_session():
     s.replace_instance_firewall_with_open_all.return_value = R(True, "已全开放", {})
     s.add_cloudflare_rules.return_value = R(True, "已放行 Cloudflare CDN 网段", {"added": 44})
     s.clear_instance_firewall_rules.return_value = R(True, "已清空", {"removed": 7, "ssh_after": True})
+    s.tighten_subnet_security_list.return_value = R(True, "已收紧", {"changed": [], "at_risk": []})
     s.list_reserved_public_ips.return_value = [{"id": "pip1", "ip_address": "1.1.1.1"}]
     s.create_reserved_public_ip.return_value = R(True, "已创建", {"ip_address": "1.1.1.1"})
     s.delete_reserved_public_ip.return_value = R(True, "已删除", {})
@@ -351,6 +352,13 @@ def test_every_endpoint_is_wired() -> None:
              {"nsg_id": "nsg1", "rule_ids": ["r1"]}),
             (f"/api/tenants/{tid}/instances/{iid}/firewall/open-all", None),
             (f"/api/tenants/{tid}/instances/{iid}/firewall/clear", None),
+            (f"/api/tenants/{tid}/instances/{iid}/firewall/tighten-subnet", {"force": False}),
+            # 预检走的是同一个路由的另一条分支（只读、不写审计、返回体多一个 data）——
+            # 它单独错了的话，界面会拿不到确认框内容而直接落到那次真写。
+            (
+                f"/api/tenants/{tid}/instances/{iid}/firewall/tighten-subnet",
+                {"preview": True, "include_foreign": True},
+            ),
             (f"/api/tenants/{tid}/instances/{iid}/firewall/cloudflare",
              {"nsg_id": "nsg1", "ports": [80, 443], "include_ipv6": True}),
             # Regression: this returned 502 "name 'quota_guard' is not defined".
