@@ -290,3 +290,72 @@ def test_the_message_admits_the_scope_is_only_the_primary_vnic():
     """resolve_primary_network 命中 is_primary 就 break —— 只清主网卡的安全组。"""
     s = _session([_nsg("nsg1", [_r("a")])], [_sl("默认", [_r("s1")])])
     assert "主网卡" in s.clear_instance_firewall_rules("i", "c").message
+
+
+def test_a_wide_open_security_list_means_the_clear_closed_nothing():
+    """比「22 通不通」更要紧的一句。
+
+    用户的真实场景：子网安全列表（面板自己建的 oci-worker-vcn 默认列表）出入站
+    全放开，清空 NSG 之后来问「我服务器现在端口是什么情况」。
+
+    只报「22 仍然可达」是**没错但会误导**的：它让人以为只是 SSH 没断，而实际上
+    所有端口都还对公网开着、这次操作一个端口都没关上。NSG 是白名单不是拒绝规则。
+    """
+    wide = _r("s1", protocol="all", port="全部", cidr="0.0.0.0/0")
+    s = _session([_nsg("nsg1", [_r("a")])], [_sl("Default Security List for oci-worker-vcn", [wide])])
+    r = s.clear_instance_firewall_rules("i", "c")
+    assert r.ok
+    assert "并没有关掉任何端口" in r.message
+    assert "全端口对公网开放" in r.message
+    assert "白名单" in r.message
+    # 要给出路：面板改不了安全列表，得说清楚去哪改。
+    assert "只读" in r.message and "Oracle 控制台" in r.message
+    # 也要说清楚面板不碰机器内防火墙 —— 否则用户会以为 ufw 也被清了。
+    assert "ufw" in r.message
+    # 这条必须排在 22 端口结论**前面**：它是更要紧的那一句。
+    assert r.data["verdicts"][0].startswith("⚠")
+
+
+def test_a_narrow_security_list_does_not_trigger_the_wide_open_note():
+    """只放行 22 的安全列表不是「全开」，别乱报。"""
+    s = _session([_nsg("nsg1", [_r("a")])], [_sl("默认", [_r("s1", port="22")])])
+    msg = s.clear_instance_firewall_rules("i", "c").message
+    assert "并没有关掉任何端口" not in msg
+
+
+def test_a_tcp_only_wide_rule_is_not_called_all_ports():
+    """TCP 全端口不挡 UDP —— 不能说成「所有端口全开」。"""
+    tcp_wide = _r("s1", protocol="6", port="全部", cidr="0.0.0.0/0")
+    s = _session([_nsg("nsg1", [_r("a")])], [_sl("默认", [tcp_wide])])
+    msg = s.clear_instance_firewall_rules("i", "c").message
+    assert "并没有关掉任何端口" not in msg
+
+
+def test_no_user_facing_message_uses_markdown_asterisks():
+    """面板的错误条 / 成功条是**纯文本**，`**强调**` 会原样显示成星号。
+
+    `_format_service_error` 里早就写着这条约定，然后同一个文件里有四处违反它 ——
+    包括那条约定自己下面几行的 404 提示。注释里用 ** 强调没问题（那是给读代码的人
+    看的），进到 message 里就不行。
+    """
+    import ast
+    import pathlib
+
+    bad = []
+    for name in ("app/oci_client.py", "app/free_quota.py", "app/cloudflare_ips.py"):
+        src = pathlib.Path(name).read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        doc_lines = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
+                if ast.get_docstring(node, clean=False) and node.body:
+                    first = node.body[0]
+                    if isinstance(first, ast.Expr):
+                        doc_lines.add(first.value.lineno)
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+                continue
+            if "**" not in node.value or node.lineno in doc_lines:
+                continue
+            bad.append(f"{name}:{node.lineno} {node.value.strip()[:60]}")
+    assert not bad, "这些会显示给用户的字符串里带 markdown 星号：\n" + "\n".join(bad)

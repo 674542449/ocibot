@@ -199,18 +199,20 @@ def test_oracle_expired_flag_wins_even_when_the_date_is_in_the_future():
 
 # ---------------------------------------------------------------- 时区
 
-@pytest.mark.parametrize(
-    "offset_hours, expected_date",
-    [
-        (8, "2026-09-02"),   # UTC+8：20:00Z 已经是次日 04:00
-        (0, "2026-09-01"),
-        (-5, "2026-09-01"),  # UTC-5：仍是当天 15:00
-    ],
-)
-def test_expiry_date_is_rendered_in_local_time(monkeypatch, offset_hours, expected_date):
-    """到期日期按本地时区印；旧代码固定取 UTC 日历日，UTC+8 下少一天。"""
+@pytest.mark.parametrize("offset_hours", [8, 0, -5])
+def test_expiry_date_is_rendered_in_local_time(monkeypatch, offset_hours):
+    """到期日期按本地时区印；旧代码固定取 UTC 日历日，UTC+8 下少一天。
+
+    到期时刻取「今天往后 30 天」的 20:00Z，**不写死绝对日期**。
+    原来钉的是 2026-09-01，时钟走过那天之后 summary 变成「已过期（…）」，
+    startswith(日期) 必然失败 —— 一颗到期就炸的时间炸弹，和被测逻辑无关。
+    20:00Z 这个钟点是关键：UTC+8 下它落到次日，正是这条测试要证明的事。
+    """
     _pin_timezone(monkeypatch, offset_hours)
-    expires_at = datetime(2026, 9, 1, 20, 0, tzinfo=timezone.utc)
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).replace(
+        hour=20, minute=0, second=0, microsecond=0
+    )
+    expected_date = (expires_at + timedelta(hours=offset_hours)).strftime("%Y-%m-%d")
     eff = _effective(expires_at - timedelta(days=POLICY_DAYS))
     assert eff["summary"].startswith(expected_date)
     # expires_at 仍是同一个绝对时刻，只是渲染换了时区

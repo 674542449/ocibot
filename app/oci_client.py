@@ -3985,7 +3985,7 @@ class TenantSession:
                 chr(10)
                 + "⚠ 这个安全组里已经有 0.0.0.0/0 或 ::/0 放行了端口 "
                 + "、".join(str(p) for p in wide_open)
-                + "。安全规则是**白名单**，加放行不会关掉任何东西 —— "
+                + "。安全规则是「白名单」，加放行不会关掉任何东西 —— "
                 "只要那条宽规则还在，源站就仍然全网可达，加 Cloudflare 网段并不会把它挡住。"
                 "要做到「只让 Cloudflare 访问」，得把那条宽规则删掉。"
             )
@@ -4065,6 +4065,26 @@ class TenantSession:
     # 「全网可达」的两个源。其余任何值（含私网段、service OCID、NSG OCID）
     # 都**不算**公网放行。
     _PUBLIC_SOURCES = frozenset({"0.0.0.0/0", "::/0"})
+
+    @staticmethod
+    def _ingress_wide_open(rule: dict, *, family: str = "v4") -> bool:
+        """这条入站规则是不是「对全网放开**所有**端口」。
+
+        用来回答一个比「22 通不通」更要紧的问题：这次清空到底有没有收紧什么。
+        子网安全列表里但凡有这么一条，NSG 里放什么都不影响可达性 —— 清空 NSG
+        一个端口都没关上，而只报「22 仍然可达」会让人以为只是 SSH 没断。
+        """
+        if str(rule.get("direction", "") or "").upper() != "INGRESS":
+            return False
+        # 只有「全部协议」才算整段全开；TCP 全端口不挡 UDP。
+        if str(rule.get("protocol", "") or "") != "all":
+            return False
+        if str(rule.get("port", "") or "").strip() not in ("", "全部"):
+            return False
+        source = str(rule.get("cidr", "") or "").strip()
+        if source not in TenantSession._PUBLIC_SOURCES:
+            return False
+        return (source == "::/0") is (family == "v6")
 
     @staticmethod
     def _ingress_tcp_scope(rule: dict, port: int, *, family: str = "v4") -> str:
@@ -4189,6 +4209,30 @@ class TenantSession:
             )
 
         verdicts = [_verdict("v4")] + ([_verdict("v6")] if has_ipv6 else [])
+
+        # 比「22 通不通」更要紧的一句：这次清空到底有没有收紧什么。
+        wide = sorted(
+            {
+                sl["display_name"]
+                for sl in security_lists
+                for rule in (sl.get("rules") or [])
+                for fam in (("v4", "v6") if has_ipv6 else ("v4",))
+                if self._ingress_wide_open(rule, family=fam)
+            }
+        )
+        if sl_complete and wide:
+            verdicts.insert(
+                0,
+                "⚠ 子网安全列表（"
+                + "、".join(wide)
+                + "）有一条对全网放开「所有端口」的入站规则 —— "
+                "清空 NSG 并没有关掉任何端口，服务器仍然全端口对公网开放。"
+                "NSG 是白名单不是拒绝规则，清空它只是少一个放行来源。"
+                + chr(10)
+                + "要真的收紧，得改那条子网安全列表；本面板对安全列表是只读的，"
+                "请到 Oracle 控制台修改。（机器内的 iptables / ufw 面板从不碰，仍按你自己的配置生效。）",
+            )
+
         after = chr(10).join(verdicts)
         if any(v.startswith("⚠") for v in verdicts):
             after += (
@@ -5730,7 +5774,7 @@ class TenantSession:
                     )
                     # 截断必须说出来。一个偏小但看起来权威的合计，比读不到更糟。
                     + (
-                        f"（注意：用量记录超过 {pages_read} 页，下面的合计**不完整**）"
+                        f"（注意：用量记录超过 {pages_read} 页，下面的合计并不完整）"
                         if truncated_pages
                         else ""
                     )
@@ -8595,7 +8639,7 @@ def _format_service_error(exc: ServiceError) -> str:
             "\n  1) 该用户的 IAM 策略没有覆盖这个 Compartment（最常见）；"
             "\n  2) 租户里配置的 Compartment OCID 填错，或资源其实在别的 Compartment；"
             "\n  3) 资源在另一个区域。"
-            "\n  4) Oracle 侧的瞬时故障 —— 这个码**不保证**是永久的，重读一次就好的情况确实存在。"
+            "\n  4) Oracle 侧的瞬时故障 —— 这个码并不保证是永久的，重读一次就好的情况确实存在。"
             "\n可在租户页点「测试连接」：它会分别探 Compute 和 Identity、区分 read / inspect 两种 verb，"
             "并对 404 自动重读一次，用来判断这次到底是瞬时还是持续。"
         )
