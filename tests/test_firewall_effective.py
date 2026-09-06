@@ -352,7 +352,9 @@ def test_it_stops_when_some_instance_would_lose_inbound():
     assert r.ok is False
     assert not s.updated, "预检没过还是动手了"
     assert "web-2" in r.message
-    assert "先给它们各自的 NSG 加上" in r.message
+    # 同子网有好几台机器时用户会连着撞上这条。光说「给它们加规则」等于把他推回去
+    # 研究 NSG 是什么 —— 而他要的恰恰是不用懂这个。必须给出下一步该点哪个按钮。
+    assert "一键修复防火墙" in r.message
 
 
 def test_it_checks_every_subnet_that_shares_the_same_list():
