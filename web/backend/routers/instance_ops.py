@@ -16,7 +16,11 @@ from web.backend.auth import get_current_user
 from web.backend.db import get_db
 from web.backend.models import SshHostKey, User
 from web.backend.oci_bridge import get_owned_tenant, get_session_for_row, op_result_dict
-from web.backend.schemas import PowerActionResult, TightenSecurityListResult
+from web.backend.schemas import (
+    PowerActionResult,
+    SecurityListResult,
+    TightenSecurityListResult,
+)
 from web.backend.ssh_hostkey import UNREACHABLE as HOSTKEY_UNREACHABLE
 from web.backend.ssh_hostkey import check_instance_host_key, forget_host_key, known_hosts_for
 
@@ -349,6 +353,286 @@ def firewall_tighten_subnet(
                 },
             )
         return TightenSecurityListResult(**op_result_dict(result), data=data)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# 子网安全列表:面板的**第一编辑面**。
+#
+# 为什么要有这一整组,而不是复用上面那几个 NSG 路由:OCI 的生效规则是
+# 「子网安全列表 ∪ VNIC 的所有 NSG」,而在 Oracle 控制台里建的机器根本没有 NSG ——
+# 入站完全由安全列表决定。只让面板改 NSG,对这批机器等于防火墙功能不存在。
+#
+# 路径**另开**而不是把老路径指过来:前端老构建仍然往 /firewall/rules 送 nsg_id,
+# 悄悄改语义会让「我以为改的是这一台」变成「改了整个子网」。
+#
+# 五个动作全部写审计。判据用的是本文件既有的那条:改变可达性的、或动到共享状态的
+# 就记 —— 而安全列表按定义就是子网共享的,连单条规则的增删都会波及同子网所有实例。
+# 这一点和它们的 NSG 版不同(那边单条规则的增删不记审计)。
+
+class SecurityListTarget(BaseModel):
+    """这次写操作落在哪一份安全列表上。
+
+    留空只在子网**只挂着一份**列表时成立。挂了多份(Oracle 允许最多 5 份)却不指定,
+    随手挑第一份很可能挑中 Oracle 自带的那份默认列表,而用户以为改的是别的。
+    """
+
+    security_list_id: str = Field(default="", max_length=255)
+
+
+class SecurityListRuleCreate(SecurityListTarget):
+    # 只接受 INGRESS。这一路写的是 IngressSecurityRule,出站规则是另一个字段、
+    # 另一套语义 —— 收下 "EGRESS" 再默默按入站写,等于用户以为加了出站限制,
+    # 实际上给自己开了一个入站口子。宁可 400。
+    direction: str = "INGRESS"
+    protocol: str = "all"  # all | 6 | 17 | 1 | 58
+    cidr: str = "0.0.0.0/0"
+    port_min: Optional[int] = None
+    port_max: Optional[int] = None
+    # 无状态与否是内容键的一部分 —— 表单里不给,就有一类规则永远删不掉。
+    stateless: bool = False
+    description: str = Field(default="", max_length=255)
+
+
+class SecurityListDeleteRules(SecurityListTarget):
+    # 按**内容键**删,不是 OCID —— 安全列表的规则没有服务端 id。
+    # 上限取 200,即 OCI 每份列表的入站规则硬上限,超过的都不可能是真的。
+    rule_keys: list[str] = Field(default_factory=list, max_length=200)
+
+
+class SecurityListCloudflare(SecurityListTarget):
+    ports: list[int] = Field(default_factory=lambda: [80, 443], max_length=8)
+    include_ipv6: bool = True
+
+
+@router.post("/tenants/{tenant_id}/instances/{instance_id}/firewall/security-list/rules")
+def add_security_list_rule(
+    tenant_id: str,
+    instance_id: str,
+    body: SecurityListRuleCreate,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> SecurityListResult:
+    """往子网安全列表加一条入站规则（幂等合并,已存在的跳过）。"""
+    row = _row(db, user.id, tenant_id)
+    try:
+        session = get_session_for_row(row)
+        info = session.get_instance(instance_id, resolve_ips=False)
+        direction = body.direction.strip().upper() or "INGRESS"
+        if direction != "INGRESS":
+            raise HTTPException(
+                status_code=400,
+                detail="子网安全列表这一路只支持入站规则（INGRESS）。出站规则请在 Oracle 控制台修改。",
+            )
+        spec = FirewallRuleSpec(
+            direction=direction,
+            protocol=body.protocol.strip().lower() or "all",
+            cidr=body.cidr.strip(),
+            port_min=body.port_min,
+            port_max=body.port_max if body.port_max is not None else body.port_min,
+            stateless=bool(body.stateless),
+            description=body.description.strip(),
+        )
+        try:
+            # 归一化和 ICMP 的 1/58 纠正都在 _security_list_ingress_model 里,
+            # 所以这里只把明显的输入错误(非法 CIDR / 端口)提前变成 400。
+            session.normalize_cidr_source(spec.cidr)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=safe_error_text(exc)) from exc
+        result = session.add_security_list_rules(
+            instance_id,
+            info.compartment_id,
+            security_list_id=body.security_list_id.strip(),
+            specs=[spec],
+        )
+        data = result.data if isinstance(result.data, dict) else {}
+        write_audit(
+            db,
+            owner_id=user.id,
+            action="firewall.sl_add",
+            target=instance_id,
+            detail={
+                "tenant_id": tenant_id,
+                "security_list_id": data.get("security_list_id"),
+                "subnet_id": data.get("subnet_id"),
+                "rule": f"{spec.protocol} {spec.cidr} {spec.port_min}-{spec.port_max}",
+                "added": data.get("added"),
+                "skipped": data.get("skipped"),
+                "ok": result.ok,
+                "message": result.message,
+            },
+        )
+        return SecurityListResult(**op_result_dict(result), data=data)
+    except HTTPException:
+        # 必须在裸 except 之前 —— 否则上面那个 400 会被下面吞成 502。
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
+
+
+@router.post("/tenants/{tenant_id}/instances/{instance_id}/firewall/security-list/delete-rules")
+def delete_security_list_rules(
+    tenant_id: str,
+    instance_id: str,
+    body: SecurityListDeleteRules,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> SecurityListResult:
+    """按内容键删除子网安全列表的入站规则。"""
+    row = _row(db, user.id, tenant_id)
+    try:
+        session = get_session_for_row(row)
+        info = session.get_instance(instance_id, resolve_ips=False)
+        result = session.delete_security_list_rules(
+            instance_id,
+            info.compartment_id,
+            security_list_id=body.security_list_id.strip(),
+            rule_keys=list(body.rule_keys or []),
+        )
+        data = result.data if isinstance(result.data, dict) else {}
+        write_audit(
+            db,
+            owner_id=user.id,
+            action="firewall.sl_delete",
+            target=instance_id,
+            detail={
+                "tenant_id": tenant_id,
+                "security_list_id": data.get("security_list_id"),
+                "subnet_id": data.get("subnet_id"),
+                # 键本身就是规则内容,事后要能回答「那条 3306 是谁删的」。
+                # 截断到 20 条:write_audit 会在 4000 字符处硬切,切在半截 JSON 上
+                # 整行都没法解析。
+                "rule_keys": list(body.rule_keys or [])[:20],
+                "removed": data.get("removed"),
+                "ok": result.ok,
+                "message": result.message,
+            },
+        )
+        return SecurityListResult(**op_result_dict(result), data=data)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
+
+
+@router.post("/tenants/{tenant_id}/instances/{instance_id}/firewall/security-list/open-all")
+def security_list_open_all(
+    tenant_id: str,
+    instance_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+    payload: SecurityListTarget | None = None,
+) -> SecurityListResult:
+    """在子网安全列表上放行全部协议、全部端口。"""
+    row = _row(db, user.id, tenant_id)
+    sl_id = payload.security_list_id.strip() if payload else ""
+    try:
+        session = get_session_for_row(row)
+        info = session.get_instance(instance_id, resolve_ips=False)
+        result = session.open_all_security_list(
+            instance_id, info.compartment_id, security_list_id=sl_id
+        )
+        data = result.data if isinstance(result.data, dict) else {}
+        write_audit(
+            db,
+            owner_id=user.id,
+            action="firewall.sl_open_all",
+            target=instance_id,
+            detail={
+                "tenant_id": tenant_id,
+                "security_list_id": data.get("security_list_id"),
+                "subnet_id": data.get("subnet_id"),
+                "ok": result.ok,
+                "message": result.message,
+            },
+        )
+        return SecurityListResult(**op_result_dict(result), data=data)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
+
+
+@router.post("/tenants/{tenant_id}/instances/{instance_id}/firewall/security-list/clear")
+def security_list_clear(
+    tenant_id: str,
+    instance_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+    payload: SecurityListTarget | None = None,
+) -> SecurityListResult:
+    """清空子网安全列表的入站规则（出站一条不动）。"""
+    row = _row(db, user.id, tenant_id)
+    sl_id = payload.security_list_id.strip() if payload else ""
+    try:
+        session = get_session_for_row(row)
+        info = session.get_instance(instance_id, resolve_ips=False)
+        result = session.clear_security_list_rules(
+            instance_id, info.compartment_id, security_list_id=sl_id
+        )
+        data = result.data if isinstance(result.data, dict) else {}
+        write_audit(
+            db,
+            owner_id=user.id,
+            action="firewall.sl_clear",
+            target=instance_id,
+            detail={
+                "tenant_id": tenant_id,
+                "security_list_id": data.get("security_list_id"),
+                "subnet_id": data.get("subnet_id"),
+                "removed": data.get("removed"),
+                # 清空是五个动作里最破坏性的一个 —— 删掉的规则本身要留档,
+                # 否则事后没法回答「那条 3306 是谁删的 / 原来放行了什么」。
+                # 截断到 30 条:write_audit 在 4000 字符处硬切,切在半截 JSON 上整行都没法解析。
+                "removed_rules": (data.get("removed_rules") or [])[:30],
+                # 清完之后还有谁在放行 —— 事后要能回答「那次到底关上了没有」。
+                "still_allowing": data.get("still_allowing"),
+                "wide_open": data.get("wide_open"),
+                "ok": result.ok,
+                "message": result.message,
+            },
+        )
+        return SecurityListResult(**op_result_dict(result), data=data)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
+
+
+@router.post("/tenants/{tenant_id}/instances/{instance_id}/firewall/security-list/cloudflare")
+def security_list_add_cloudflare(
+    tenant_id: str,
+    instance_id: str,
+    body: SecurityListCloudflare,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> SecurityListResult:
+    """在子网安全列表上一键放行 Cloudflare CDN 回源网段。"""
+    row = _row(db, user.id, tenant_id)
+    try:
+        session = get_session_for_row(row)
+        info = session.get_instance(instance_id, resolve_ips=False)
+        result = session.add_cloudflare_security_list_rules(
+            instance_id,
+            info.compartment_id,
+            security_list_id=body.security_list_id.strip(),
+            ports=list(body.ports or []),
+            include_ipv6=bool(body.include_ipv6),
+        )
+        data = result.data if isinstance(result.data, dict) else {}
+        write_audit(
+            db,
+            owner_id=user.id,
+            action="firewall.sl_cloudflare",
+            target=instance_id,
+            detail={
+                "tenant_id": tenant_id,
+                "security_list_id": data.get("security_list_id"),
+                "ports": list(body.ports or []),
+                "include_ipv6": bool(body.include_ipv6),
+                "added": data.get("added"),
+                "skipped": data.get("skipped"),
+                "wide_open": data.get("wide_open"),
+                "ok": result.ok,
+                "message": result.message,
+            },
+        )
+        return SecurityListResult(**op_result_dict(result), data=data)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 

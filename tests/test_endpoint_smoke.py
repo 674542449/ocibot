@@ -142,6 +142,16 @@ def make_session():
     s.add_cloudflare_rules.return_value = R(True, "已放行 Cloudflare CDN 网段", {"added": 44})
     s.clear_instance_firewall_rules.return_value = R(True, "已清空", {"removed": 7, "ssh_after": True})
     s.tighten_subnet_security_list.return_value = R(True, "已收紧", {"changed": [], "at_risk": []})
+    s.add_security_list_rules.return_value = R(True, "已添加 1 条", {"added": 1, "skipped": 0})
+    s.delete_security_list_rules.return_value = R(True, "已删除 1 条", {"removed": 1})
+    s.open_all_security_list.return_value = R(True, "已放行全部端口", {})
+    s.clear_security_list_rules.return_value = R(True, "已清空", {"removed": 3, "others_allow": []})
+    s.add_cloudflare_security_list_rules.return_value = R(
+        True, "已放行 Cloudflare CDN 网段", {"added": 30, "skipped": 0}
+    )
+    # 路由在构造 spec 之前会调它做输入校验 —— MagicMock 会返回 MagicMock，
+    # 拆包成 (cidr, is_v6) 也能过，但显式给个真值更接近真实行为。
+    s.normalize_cidr_source.return_value = ("0.0.0.0/0", False)
     s.list_reserved_public_ips.return_value = [{"id": "pip1", "ip_address": "1.1.1.1"}]
     s.create_reserved_public_ip.return_value = R(True, "已创建", {"ip_address": "1.1.1.1"})
     s.delete_reserved_public_ip.return_value = R(True, "已删除", {})
@@ -353,6 +363,43 @@ def test_every_endpoint_is_wired() -> None:
             (f"/api/tenants/{tid}/instances/{iid}/firewall/open-all", None),
             (f"/api/tenants/{tid}/instances/{iid}/firewall/clear", None),
             (f"/api/tenants/{tid}/instances/{iid}/firewall/tighten-subnet", {"force": False}),
+            # 子网安全列表这一组是面板的第一编辑面 —— 五条路由全要走一遍。
+            # 它们各自 try 里都有可能抛的分支，而 OCI 相关路由把异常统统吞成
+            # 502，单元测试看不见；这里是唯一会亮红灯的地方。
+            (
+                f"/api/tenants/{tid}/instances/{iid}/firewall/security-list/rules",
+                {
+                    "security_list_id": "ocid1.securitylist.oc1..sl1",
+                    "direction": "INGRESS",
+                    "protocol": "6",
+                    "cidr": "0.0.0.0/0",
+                    "port_min": 80,
+                    "port_max": 80,
+                },
+            ),
+            (
+                f"/api/tenants/{tid}/instances/{iid}/firewall/security-list/delete-rules",
+                {
+                    "security_list_id": "ocid1.securitylist.oc1..sl1",
+                    "rule_keys": ["6|CIDR_BLOCK|0.0.0.0/0|tcp:80-80/*|udp:-|icmp:-|stateful|"],
+                },
+            ),
+            (
+                f"/api/tenants/{tid}/instances/{iid}/firewall/security-list/open-all",
+                {"security_list_id": "ocid1.securitylist.oc1..sl1"},
+            ),
+            (
+                f"/api/tenants/{tid}/instances/{iid}/firewall/security-list/clear",
+                {"security_list_id": "ocid1.securitylist.oc1..sl1"},
+            ),
+            (
+                f"/api/tenants/{tid}/instances/{iid}/firewall/security-list/cloudflare",
+                {
+                    "security_list_id": "ocid1.securitylist.oc1..sl1",
+                    "ports": [80, 443],
+                    "include_ipv6": True,
+                },
+            ),
             # 预检走的是同一个路由的另一条分支（只读、不写审计、返回体多一个 data）——
             # 它单独错了的话，界面会拿不到确认框内容而直接落到那次真写。
             (

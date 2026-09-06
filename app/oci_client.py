@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
@@ -3861,8 +3862,11 @@ class TenantSession:
             # Most instances have NO NSG on the VNIC — OCI's default networking puts
             # ingress/egress rules on the SUBNET's security list instead. Reading
             # only nsg_ids therefore showed an empty firewall panel for any instance
-            # not launched with this panel's managed NSG. Security lists are reported
-            # read-only: the add/delete endpoints operate on NSGs.
+            # not launched with this panel's managed NSG.
+            #
+            # 安全列表现在是**可编辑的**(见 add_security_list_rules 一族)。这是
+            # 0.4.109 的改动:在 Oracle 控制台建的机器根本没有 NSG,入站全由安全列表
+            # 决定 —— 只让面板改 NSG,对这批机器等于防火墙功能不存在。
             security_lists, sl_complete = self._subnet_security_lists_checked(
                 network.subnet_id
             )
@@ -3871,7 +3875,7 @@ class TenantSession:
             if groups:
                 parts.append(f"{len(groups)} 个网络安全组（NSG）")
             if security_lists:
-                parts.append(f"{len(security_lists)} 个子网安全列表（只读）")
+                parts.append(f"{len(security_lists)} 个子网安全列表")
             if parts:
                 message = "已加载 " + " · ".join(parts)
             else:
@@ -3955,11 +3959,26 @@ class TenantSession:
                 rules.append(self._normalize_firewall_rule(rule, direction="INGRESS"))
             for rule in list(getattr(sl, "egress_security_rules", None) or []):
                 rules.append(self._normalize_firewall_rule(rule, direction="EGRESS"))
+            tags = getattr(sl, "freeform_tags", None) or {}
+            name = getattr(sl, "display_name", "") or sl_id[-8:]
             out.append(
                 {
                     "id": sl_id,
-                    "display_name": getattr(sl, "display_name", "") or sl_id[-8:],
+                    "display_name": name,
                     "rules": rules,
+                    # 200 条上限是按**入站**算的,而 rules 里入站出站是混在一起的。
+                    # 界面直接拿 rules.length 去比 200 会高估,所以在这里数清楚。
+                    "ingress_count": sum(
+                        1 for r in rules if str(r.get("direction", "")).upper() == "INGRESS"
+                    ),
+                    "ingress_limit": TenantSession.SECURITY_LIST_INGRESS_LIMIT,
+                    # 是不是面板自己建的。不是的话(多半是 Oracle 建 VCN 时自带的那份)
+                    # 照样能改 —— 那正是绝大多数租户唯一生效的入站控制点 —— 但界面
+                    # 要先说清楚这是别人的东西。
+                    "managed_by_panel": bool(
+                        tags.get("managed_by") == "oci-console-helper"
+                        or name in LEGACY_DEFAULT_SL_NAMES
+                    ),
                 }
             )
         return out, complete
@@ -3988,8 +4007,15 @@ class TenantSession:
         # the caller passes it in. NSG rules have it on the object.
         direction = direction or (getattr(rule, "direction", "") or "")
         protocol = getattr(rule, "protocol", "") or ""
+        rule_id = getattr(rule, "id", "") or ""
+        # 安全列表的入站规则**没有** OCID(NSG 规则才有),所以删除只能靠按内容算的键。
+        # 界面把它原样送回来 —— 用下标当句柄的话,列表一变就会删错行。
+        key = ""
+        if not rule_id and str(direction).upper() == "INGRESS":
+            key = TenantSession._sl_rule_key(rule)
         return {
-            "id": getattr(rule, "id", "") or "",
+            "id": rule_id,
+            "key": key,
             "direction": direction,
             "direction_label": TenantSession._firewall_direction_label(direction),
             "protocol": protocol,
@@ -4002,6 +4028,782 @@ class TenantSession:
 
     def add_instance_firewall_rule(self, nsg_id: str, spec: FirewallRuleSpec) -> OperationResult:
         return self.add_nsg_rules(nsg_id, [spec])
+
+    # ---------------------------------------------------------------- 安全列表编辑
+    #
+    # 面板过去只编辑 NSG（实例级），而 OCI 的生效规则是「子网安全列表 ∪ NSG」——
+    # 于是在 Oracle 控制台里建的机器（没有任何 NSG，入站全靠安全列表）在面板上
+    # 根本改不了防火墙，而面板上改的东西又常常不改变可达性。
+    #
+    # 参考实现（oci-launcher）没有这个问题，原因很朴素：它编辑的就是安全列表本身。
+    # 这里把那条路补上 —— 安全列表成为面板的第一编辑面，NSG 仍然保留。
+
+    # 每个安全列表最多 200 条入站规则（出站另算 200）。服务限额页标注**不可调整**。
+    # Cloudflare 一次要写 ~44 条,占掉五分之一,所以写之前必须先算。
+    SECURITY_LIST_INGRESS_LIMIT = 200
+
+    # OCI 读回一条它自己也不认识的 source_type 时,SDK 会把它替换成这个字面量
+    # （ingress_security_rule.py 的 setter）。读-改-写会把这个字符串原样发回去,
+    # 而 OCI 不接受它 —— 那是一条**用户没碰过**的规则被我们改坏。宁可整次停手。
+    _UNKNOWN_ENUM = "UNKNOWN_ENUM_VALUE"
+
+    @staticmethod
+    def normalize_cidr_source(text: str) -> tuple[str, bool]:
+        """把用户填的来源规整成标准 CIDR,返回 (CIDR, 是不是 IPv6)。
+
+        单个 IP 补成 /32 或 /128；``1.2.3.4/24`` 归一成 ``1.2.3.0/24``。
+
+        **必须在算内容键之前做。** 安全列表的规则没有 OCID（和 NSG 规则不同),
+        唯一的句柄是按内容算出来的键 —— 而 ``1.2.3.4/24`` 和 ``1.2.3.0/24``
+        是同一条规则的两种写法。不归一化,幂等添加会重复写,按键删除会删不掉。
+        """
+        raw = (text or "").strip()
+        if not raw:
+            raise ValueError("来源不能为空")
+        if "/" not in raw:
+            addr = ipaddress.ip_address(raw)  # 不是 IP 就抛 ValueError,交给上层
+            return f"{addr}/{32 if addr.version == 4 else 128}", addr.version == 6
+        net = ipaddress.ip_network(raw, strict=False)
+        return str(net), net.version == 6
+
+    @classmethod
+    def _sl_rule_effect(cls, rule: Any) -> str:
+        """一条入站规则的**作用**,写成一个字符串。
+
+        安全列表的规则没有服务端 id,所以按内容算键是唯一的办法。这个函数刻意
+        **不含 description**:两条效果完全相同、只是说明不一样的规则,对网络来说
+        就是同一条 —— 幂等添加拿它比较,免得同一个端口被写进去两次。
+
+        几个不能省的细节,少一个就会删错规则或重复写:
+
+        * ``source_type`` —— 服务网关规则的 source 是 ``oci-phx-objectstorage``
+          这种服务名而不是 CIDR,不带上它就会和同名的 CIDR 规则撞键。
+        * ``source_port_range`` —— 参考实现只看目的端口,于是一条带源端口范围的
+          用户规则会和不带的撞键,按键删除会删掉用户没选的那条。
+        * ``is_stateless`` 的 None 和 False —— OCI 读回来是显式 false,我们自己
+          构造的是 None,不归一就会认成两条不同的规则。
+        * 「没有 options」和「显式 1-65535」是两条不同的规则（前者才是全端口),
+          所以空范围用一个独立的记号,不能和显式范围合并。
+        """
+        def _pr(options: Any, attr: str) -> str:
+            pr = getattr(options, attr, None) if options is not None else None
+            if pr is None:
+                return "*"  # 没写 = 全部,和显式 1-65535 是两条不同的规则
+            lo, hi = getattr(pr, "min", None), getattr(pr, "max", None)
+            return f"{lo}-{hi}"
+
+        tcp = getattr(rule, "tcp_options", None)
+        udp = getattr(rule, "udp_options", None)
+        icmp = getattr(rule, "icmp_options", None)
+        parts = [
+            str(getattr(rule, "protocol", "") or ""),
+            str(getattr(rule, "source_type", None) or "CIDR_BLOCK"),
+            str(getattr(rule, "source", "") or ""),
+            "tcp:" + _pr(tcp, "destination_port_range") + "/" + _pr(tcp, "source_port_range")
+            if tcp is not None
+            else "tcp:-",
+            "udp:" + _pr(udp, "destination_port_range") + "/" + _pr(udp, "source_port_range")
+            if udp is not None
+            else "udp:-",
+            "icmp:{}/{}".format(getattr(icmp, "type", None), getattr(icmp, "code", None))
+            if icmp is not None
+            else "icmp:-",
+            "stateless" if bool(getattr(rule, "is_stateless", False)) else "stateful",
+        ]
+        return "|".join(parts)
+
+    @classmethod
+    def _sl_rule_key(cls, rule: Any) -> str:
+        """删除用的句柄 —— 在「作用」之上再带上 description。
+
+        为什么比 _sl_rule_effect 多一段:用户可能写了
+        ``TCP 443 说明=网站`` 和 ``TCP 443 说明=API`` 两条。按作用删会把两条一起
+        删掉,而他只在界面上点了其中一行。参考实现就是这么做的,这里不抄。
+        """
+        return cls._sl_rule_effect(rule) + "|" + str(getattr(rule, "description", "") or "")
+
+    @classmethod
+    def _security_list_ingress_model(cls, spec: FirewallRuleSpec) -> Any:
+        """把一条 FirewallRuleSpec 变成安全列表的入站规则。
+
+        和 NSG 那份 (_firewall_rule_model) 不能共用:安全列表用的是
+        IngressSecurityRule,没有 direction / id 字段,字段集不一样。
+
+        三处**必须**这么写:
+
+        * options 只在对应协议的分支里挂 —— ``tcp_options`` 对 ``protocol="all"``
+          是非法的（文档:"Optional and valid only for TCP"),挂了会 400。
+        * ICMP 跟着来源的族走:IPv6 来源必须是 58。写成 1 不会报错,但 IPv6 根本
+          不跑协议 1 —— 界面会显示「ping 已放行」而 ping 一直不通。
+        * description 空串要送 None。API 的 description 是 Min Length 1,而 Python
+          的序列化器只丢 None、不丢空串。
+
+        纠正必须在 ``validate()`` **之前**做:校验器有一条「ICMPv4 规则必须使用
+        IPv4 CIDR」,会把 ``protocol=1 + ::/0`` 直接打回 —— 而那恰恰是我们要顺手
+        改成 58 的那种输入。先校验的话,这段纠正永远走不到。
+        """
+        source, is_v6 = cls.normalize_cidr_source(spec.cidr)
+        protocol = str(spec.protocol).strip().lower()
+        if protocol in ("1", "58", "icmp", "icmpv6"):
+            protocol = "58" if is_v6 else "1"
+        elif protocol in ("tcp",):
+            protocol = "6"
+        elif protocol in ("udp",):
+            protocol = "17"
+        elif protocol in ("", "*", "all protocols"):
+            protocol = "all"
+        # 校验**纠正之后**的值 —— 否则纠正等于绕过了检查。
+        dataclasses.replace(spec, protocol=protocol, cidr=source).validate()
+        kwargs: dict[str, Any] = {}
+        if protocol in ("6", "17") and (spec.port_min is not None or spec.port_max is not None):
+            start = int(spec.port_min if spec.port_min is not None else spec.port_max)
+            end = int(spec.port_max if spec.port_max is not None else start)
+            port_range = oci.core.models.PortRange(min=start, max=end)
+            if protocol == "6":
+                kwargs["tcp_options"] = oci.core.models.TcpOptions(
+                    destination_port_range=port_range
+                )
+            else:
+                kwargs["udp_options"] = oci.core.models.UdpOptions(
+                    destination_port_range=port_range
+                )
+        description = (spec.description or "").strip()[:255]
+        return oci.core.models.IngressSecurityRule(
+            protocol=protocol,
+            source=source,
+            source_type="CIDR_BLOCK",
+            is_stateless=bool(spec.stateless),
+            description=description or None,
+            **kwargs,
+        )
+
+    def _resolve_security_list(
+        self, instance_id: str, compartment_id: str, security_list_id: str = ""
+    ) -> tuple[str, dict]:
+        """定位这次要写的安全列表,返回 (安全列表 OCID, 上下文)。
+
+        一个子网最多可以挂 5 份安全列表。**不给 OCID 就自己挑第一份**是错的 ——
+        挑中的很可能是 Oracle 自带的那份默认列表,而用户以为改的是别的。所以:
+        只有一份时才默认,多于一份就报错并把候选列出来。
+
+        给了 OCID 也要核对它确实挂在这台实例的子网上 —— 否则从实例详情页就能改到
+        租户里任意一份安全列表,那和「在这台机器上操作防火墙」是两回事。
+        """
+        state = self.get_instance_firewall(instance_id, compartment_id)
+        if not state.ok:
+            raise OCIClientError(state.message or "读取防火墙状态失败")
+        data = state.data or {}
+        lists = list(data.get("security_lists") or [])
+        ctx = {
+            "subnet_id": str(data.get("subnet_id") or ""),
+            "has_ipv6": bool(data.get("has_ipv6")),
+            # 缺省 **False**。这个键不在的话说明上游换了形状,而这里是「读全了没有」——
+            # 本项目的规矩是这种判断必须朝失败一侧兜底:默认 True 等于让一个未来的
+            # 调用方悄悄继承一句没根据的「都读到了」。
+            "complete": bool(data.get("security_lists_complete", False)),
+            "lists": lists,
+            # NSG 也要带上。清空一份安全列表之后「端口关上了没有」这个问题,
+            # 答案是「安全列表 ∪ NSG」—— 只看别的安全列表,会把一台 NSG 还开着
+            # 22 的机器讲成已经收紧。这个方向的错误代价最大。
+            "groups": list(data.get("groups") or []),
+        }
+        if not ctx["complete"]:
+            raise OCIClientError(
+                "这次没读全子网的安全列表,无法确定要改哪一份 —— 已停手,什么都没改。请稍后重试。"
+            )
+        ids = [str(sl.get("id") or "") for sl in lists]
+        wanted = (security_list_id or "").strip()
+        if wanted:
+            if wanted not in ids:
+                raise OCIClientError(
+                    "这份安全列表没有挂在该实例的子网上,拒绝修改。请刷新页面后重试。"
+                )
+            return wanted, ctx
+        if not ids:
+            raise OCIClientError("该实例的子网没有关联任何安全列表")
+        if len(ids) > 1:
+            names = "、".join(str(sl.get("display_name") or "") for sl in lists)
+            raise OCIClientError(
+                "这个子网挂了 " + str(len(ids)) + " 份安全列表(" + names + "),"
+                "请先在页面上选定要改哪一份。"
+            )
+        return ids[0], ctx
+
+    def _read_security_list(self, sl_id: str) -> tuple[Any, str, list]:
+        """读一份安全列表,连 etag 一起带回来。
+
+        etag 是**响应头**,不在 .data 里 —— 所以这里不能像别处那样直接 ``.data``。
+        写回去时带上它,两个人同时改就会 412 而不是一方的规则被静默吞掉。
+        安全列表是读-改-写的:后写的人会把整份入站规则覆盖掉。
+        """
+        resp = self.network.get_security_list(sl_id)
+        sl = resp.data
+        etag = ""
+        try:
+            # 头名字实际是 ``ETag``。SDK 现在返回 CaseInsensitiveDict,所以
+            # ``.get("etag")`` 碰巧能拿到 —— 但这条并发保护不该建立在容器类型上:
+            # 换成普通 dict 就静默变成「没有 etag」,写操作照常成功,只是不再有保护,
+            # 没有任何地方会报错。所以自己做大小写无关的查找。
+            headers = resp.headers or {}
+            for name, value in dict(headers).items():
+                if str(name).lower() == "etag":
+                    etag = str(value or "")
+                    break
+        except Exception:  # noqa: BLE001 - headers 是可选的,拿不到就退化成无并发保护
+            etag = ""
+        ingress = list(getattr(sl, "ingress_security_rules", None) or [])
+        return sl, etag, ingress
+
+    def _write_security_list_ingress(
+        self, sl_id: str, ingress: list, etag: str = ""
+    ) -> OperationResult:
+        """写回入站规则。**只写入站** —— 出站一个字节都不碰。
+
+        这一点是硬性的:Python SDK 的序列化器只丢掉 None 的字段
+        (base_client 里 ``if getattr(obj, attr) is not None``),所以不传
+        egress_security_rules 时请求体里根本没有那个键,OCI 保持原样。
+        但传空列表 ``[]`` **不是 None**,会序列化成 ``"egressSecurityRules": []``
+        —— 那会把整个子网的出站规则清空,机器连不上外网,而界面只说「已清空入站」。
+        永远不要写 ``egress_security_rules=... or []``。
+        """
+        for rule in ingress:
+            if str(getattr(rule, "source_type", "") or "") == self._UNKNOWN_ENUM:
+                return OperationResult(
+                    ok=False,
+                    message=(
+                        "这份安全列表里有一条本 SDK 不认识的规则(source_type 无法识别),"
+                        "改写会把它破坏掉 —— 已停手,什么都没改。" + chr(10)
+                        + "请到 Oracle 控制台处理那条规则,或升级面板后重试。"
+                    ),
+                )
+        details = oci.core.models.UpdateSecurityListDetails(ingress_security_rules=ingress)
+        kwargs: dict[str, Any] = {}
+        if etag:
+            kwargs["if_match"] = etag
+        try:
+            self.network.update_security_list(sl_id, details, **kwargs)
+        except ServiceError as exc:
+            if getattr(exc, "status", None) in (409, 412):
+                return OperationResult(
+                    ok=False,
+                    message=(
+                        "这份安全列表刚被别处改过(另一个标签页,或 Oracle 控制台),"
+                        "为免覆盖对方的改动已经停手。请刷新后重试。"
+                    ),
+                )
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=safe_error_text(exc))
+        return OperationResult(ok=True, message="")
+
+    def _sl_result_context(self, sl_id: str, ctx: dict) -> dict:
+        name = ""
+        for sl in ctx.get("lists") or []:
+            if str(sl.get("id") or "") == sl_id:
+                name = str(sl.get("display_name") or "")
+                break
+        return {
+            "security_list_id": sl_id,
+            "security_list_name": name,
+            "subnet_id": ctx.get("subnet_id", ""),
+        }
+
+    # 每次写都把爆炸半径带上 —— 用户是从**某一台实例**的详情页点进来的,很容易
+    # 以为只影响这一台。
+    #
+    # 措辞是「所有关联子网」而不是「同一子网」:安全列表属于 VCN,一份列表可以同时
+    # 挂在多个子网上(Oracle 建 VCN 时自带的那份默认列表尤其如此)。说成「同一子网」
+    # 会让用户以为影响面止于眼前这个子网 —— 那是把实情说小了,而说小的方向正是
+    # 「点下去之后才发现别处也变了」。
+    _SL_SCOPE_NOTE = (
+        "安全列表不属于单台实例:挂着这份列表的「所有子网」里的实例都会一起生效。"
+    )
+
+    def _still_allowing(self, ctx: dict, sl_id: str, kept: list) -> tuple[list[str], list[str]]:
+        """删/清之后,**还有谁在放行入站**。返回 (还有入站的来源, 其中全开的来源)。
+
+        生效规则是「子网的所有安全列表 ∪ VNIC 的所有 NSG」,任一放行即放行。所以
+        「删掉这条规则,这个端口就关上了」这句话在并集下**通常是假的** —— 而它恰恰是
+        用户在确认框里最想听到的那句。这个项目已经为同一类误导修过三次
+        (0.4.106 / 0.4.107 / 0.4.108),这里不再犯第四次:判定放在后端算一次,
+        三条写路径(删除 / 清空 / Cloudflare)共用,界面不重写。
+
+        ``kept`` 是这份列表**写回之后**剩下的规则(SDK 对象);其余来源用
+        get_instance_firewall 已经读到的归一化数据。
+        """
+        sources: list[str] = []
+        wide: list[str] = []
+        me = self._sl_result_context(sl_id, ctx).get("security_list_name") or "这份安全列表"
+
+        # 自己剩下的规则。全开的那条最要命:它让同列表里删掉任何一条都不改变可达性。
+        if kept:
+            sources.append(me)
+            if any(
+                str(getattr(r, "protocol", "") or "") == "all"
+                and str(getattr(r, "source", "") or "") in self._PUBLIC_SOURCES
+                for r in kept
+            ):
+                wide.append(me)
+
+        def _scan(items, id_key: str) -> None:
+            for item in items or []:
+                if id_key and str(item.get("id") or "") == sl_id:
+                    continue
+                rules = [
+                    r
+                    for r in (item.get("rules") or [])
+                    if str(r.get("direction", "")).upper() == "INGRESS"
+                ]
+                if not rules:
+                    continue
+                name = str(item.get("display_name") or "")
+                sources.append(name)
+                if any(self._ingress_wide_open(r, family=f) for r in rules for f in ("v4", "v6")):
+                    wide.append(name)
+
+        _scan(ctx.get("lists"), "id")
+        _scan(ctx.get("groups"), "")
+        return sources, wide
+
+    @staticmethod
+    def _union_verdict(sources: list[str], wide: list[str], *, strict: bool = False) -> str:
+        """把「谁还在放行」写成一句不会给错安心的话。
+
+        ``⚠`` 在本项目里是个前端约定:带它的消息会进红框。所以给不给这个记号,
+        取决于用户这次**想干什么**:
+
+        * ``strict``(清空):意图是「全关掉」。只要还有任何来源在放行,这个意图就
+          没达成 —— 进红框。宁可烦人,也别给错安心:这个方向的错误会让人以为
+          机器已经收紧了。
+        * 非 strict(删掉某一条):意图只是「去掉这一条」。别的来源还在放行是常态,
+          每次都标红等于把红框用废。只有「同时还躺着一条全网全端口放行」时才标 ——
+          那种情况下这次删除**一个端口都没关上**,是真的白做。
+        """
+        if wide:
+            return (
+                "⚠ 这并没有关上任何端口:" + "、".join(sorted(set(wide)))
+                + " 里还有一条对全网放开「所有端口」的入站规则,生效规则是并集。"
+            )
+        if sources:
+            return (
+                ("⚠ " if strict else "")
+                + "这台机器还有别的入站放行来源(" + "、".join(sorted(set(sources)))
+                + ")—— 具体哪些端口还开着,要看它们里面写了什么。"
+            )
+        # 注意措辞:groups 来自 get_instance_firewall,而它只读**主 VNIC** 的 NSG。
+        # 一台挂了第二块网卡、而那块网卡上另有 NSG 的实例,这里是看不到的。
+        # 所以说的是「主网卡上没有别的来源了」,不是「这台机器一定连不上」。
+        return (
+            "这台机器的主网卡上已经没有别的入站放行来源 —— 外部网络应当连不上任何端口,"
+            "包括 SSH。(如果这台实例还挂了第二块网卡,那块网卡自己的 NSG 不在本页范围内。)"
+        )
+
+    def add_security_list_rules(
+        self,
+        instance_id: str,
+        compartment_id: str,
+        *,
+        security_list_id: str = "",
+        specs: list[FirewallRuleSpec],
+    ) -> OperationResult:
+        """往子网安全列表加入站规则。已经存在的**跳过**而不是报错。
+
+        幂等按「作用」比较(_sl_rule_effect),不看 description —— 同一个端口对同一个
+        来源已经放行过了,再写一条只是占掉 200 条配额里的一格。
+        """
+        try:
+            sl_id, ctx = self._resolve_security_list(instance_id, compartment_id, security_list_id)
+        except OCIClientError as exc:
+            return OperationResult(ok=False, message=str(exc))
+        return self._add_rules_to(sl_id, ctx, specs)
+
+    def _add_rules_to(self, sl_id: str, ctx: dict, specs: list[FirewallRuleSpec]) -> OperationResult:
+        """同上,但安全列表**已经定位过**。
+
+        单独拆出来是因为 open_all / Cloudflare 那两个入口自己已经 resolve 过一次,
+        而 _resolve_security_list 里那次 get_instance_firewall 要走好几个 OCI 调用
+        (读 VNIC、读每个 NSG 的规则、读子网的每份安全列表)。让它们再走一遍等于
+        一次点击花两份配额 —— 而这个项目对 OCI 调用量是敏感的(见 CLAUDE.md)。
+        """
+        base = self._sl_result_context(sl_id, ctx)
+
+        try:
+            wanted = [self._security_list_ingress_model(spec) for spec in specs]
+        except ValueError as exc:
+            return OperationResult(ok=False, message=str(exc), data=base)
+
+        try:
+            _sl, etag, existing = self._read_security_list(sl_id)
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc), data=base)
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=safe_error_text(exc), data=base)
+
+        seen = {self._sl_rule_effect(r) for r in existing}
+        fresh: list[Any] = []
+        skipped = 0
+        for rule in wanted:
+            effect = self._sl_rule_effect(rule)
+            if effect in seen:
+                skipped += 1
+                continue
+            seen.add(effect)
+            fresh.append(rule)
+
+        if not fresh:
+            return OperationResult(
+                ok=True,
+                message="这些规则已经存在,没有重复添加。",
+                data={**base, "added": 0, "skipped": skipped, "total": len(existing)},
+            )
+
+        room = self.SECURITY_LIST_INGRESS_LIMIT - len(existing)
+        if len(fresh) > room:
+            return OperationResult(
+                ok=False,
+                message=(
+                    "规则数不够:需要新增 " + str(len(fresh)) + " 条,而这份安全列表已有 "
+                    + str(len(existing)) + " 条,上限 " + str(self.SECURITY_LIST_INGRESS_LIMIT)
+                    + " 条入站(Oracle 硬限制,不可调整),只剩 " + str(max(0, room)) + " 条。"
+                    + chr(10) + "先删掉用不到的旧规则,或减少这次要加的条数。"
+                ),
+                data={**base, "needed": len(fresh), "existing": len(existing),
+                      "limit": self.SECURITY_LIST_INGRESS_LIMIT},
+            )
+
+        written = self._write_security_list_ingress(sl_id, existing + fresh, etag)
+        if not written.ok:
+            return OperationResult(ok=False, message=written.message, data=base)
+        note = "" if not skipped else "(另有 " + str(skipped) + " 条已存在,跳过)"
+        return OperationResult(
+            ok=True,
+            message=(
+                "已添加 " + str(len(fresh)) + " 条入站规则" + note + "。"
+                + chr(10) + self._SL_SCOPE_NOTE
+            ),
+            data={**base, "added": len(fresh), "skipped": skipped,
+                  "total": len(existing) + len(fresh)},
+        )
+
+    def delete_security_list_rules(
+        self,
+        instance_id: str,
+        compartment_id: str,
+        *,
+        security_list_id: str = "",
+        rule_keys: list[str],
+    ) -> OperationResult:
+        """按内容键删除入站规则。
+
+        键是后端算的(_sl_rule_key),界面原样送回来 —— 因为安全列表的规则没有 OCID,
+        用下标当句柄的话,列表一变(别处加了一条、或这次删了一条)就会删错行。
+        """
+        try:
+            sl_id, ctx = self._resolve_security_list(instance_id, compartment_id, security_list_id)
+        except OCIClientError as exc:
+            return OperationResult(ok=False, message=str(exc))
+        base = self._sl_result_context(sl_id, ctx)
+
+        keys = {str(k) for k in (rule_keys or []) if str(k or "").strip()}
+        if not keys:
+            return OperationResult(ok=False, message="没有指定要删除的规则", data=base)
+
+        try:
+            _sl, etag, existing = self._read_security_list(sl_id)
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc), data=base)
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=safe_error_text(exc), data=base)
+
+        kept = [r for r in existing if self._sl_rule_key(r) not in keys]
+        removed = len(existing) - len(kept)
+        if not removed:
+            return OperationResult(
+                ok=False,
+                message="这些规则已经不在了(可能别处刚删过)。请刷新列表。",
+                data={**base, "removed": 0},
+            )
+
+        written = self._write_security_list_ingress(sl_id, kept, etag)
+        if not written.ok:
+            return OperationResult(ok=False, message=written.message, data=base)
+        # 删掉一条 ≠ 那个端口关上了。最常见的情况就是同一份列表里还躺着一条
+        # 「全部协议 / 0.0.0.0/0」—— 面板自己的「放行全部端口」就会写这么一条。
+        sources, wide = self._still_allowing(ctx, sl_id, kept)
+        return OperationResult(
+            ok=True,
+            message=(
+                "已删除 " + str(removed) + " 条入站规则。"
+                + chr(10) + self._union_verdict(sources, wide)
+                + chr(10) + self._SL_SCOPE_NOTE
+            ),
+            data={**base, "removed": removed, "total": len(kept),
+                  "still_allowing": sources, "wide_open": wide},
+        )
+
+    def open_all_security_list(
+        self, instance_id: str, compartment_id: str, *, security_list_id: str = ""
+    ) -> OperationResult:
+        """在安全列表上放行全部协议、全部端口(IPv4,以及有 IPv6 时的 ::/0)。"""
+        try:
+            sl_id, ctx = self._resolve_security_list(instance_id, compartment_id, security_list_id)
+        except OCIClientError as exc:
+            return OperationResult(ok=False, message=str(exc))
+        specs = [
+            FirewallRuleSpec(
+                direction="INGRESS", protocol="all", cidr="0.0.0.0/0",
+                description=self.SL_RULE_TAG + " 全部放行 IPv4",
+            )
+        ]
+        if ctx.get("has_ipv6"):
+            specs.append(
+                FirewallRuleSpec(
+                    direction="INGRESS", protocol="all", cidr="::/0",
+                    description=self.SL_RULE_TAG + " 全部放行 IPv6",
+                )
+            )
+        result = self._add_rules_to(sl_id, ctx, specs)
+        if result.ok:
+            return OperationResult(
+                ok=True,
+                message=(
+                    "已在安全列表上放行全部端口 —— 这台机器上所有在监听的服务都暴露到公网了。"
+                    + chr(10) + self._SL_SCOPE_NOTE
+                ),
+                data=result.data,
+            )
+        return result
+
+    def clear_security_list_rules(
+        self, instance_id: str, compartment_id: str, *, security_list_id: str = ""
+    ) -> OperationResult:
+        """清空这份安全列表的**入站**规则(出站一条不动)。
+
+        清完之后要老实说两件事,少说哪件都会误导:
+
+        1. 同子网还挂着别的安全列表、或这台机器还有 NSG 的话,端口**没有**真的关上
+           —— 生效规则是并集,少一个放行来源不等于关闭。这个坑面板已经踩过三次。
+        2. Oracle 默认列表里那两条 ICMP 也会一起没了。删掉 type 3 code 4 不会立刻
+           断网,而是让大包静默丢失 —— ssh 连得上、scp 卡死,极难排查。
+        """
+        try:
+            sl_id, ctx = self._resolve_security_list(instance_id, compartment_id, security_list_id)
+        except OCIClientError as exc:
+            return OperationResult(ok=False, message=str(exc))
+        base = self._sl_result_context(sl_id, ctx)
+
+        try:
+            _sl, etag, existing = self._read_security_list(sl_id)
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc), data=base)
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=safe_error_text(exc), data=base)
+
+        had_icmp = any(getattr(r, "icmp_options", None) is not None for r in existing)
+        if not existing:
+            return OperationResult(
+                ok=True,
+                message="这份安全列表本来就没有入站规则,无需改动。",
+                data={**base, "removed": 0},
+            )
+
+        written = self._write_security_list_ingress(sl_id, [], etag)
+        if not written.ok:
+            return OperationResult(ok=False, message=written.message, data=base)
+
+        # 还有谁在放行?别的安全列表 **和** 这台机器的 NSG。生效规则是并集,
+        # 任一还有入站放行,端口就没有真的关上。只查安全列表、不查 NSG 的话,
+        # 一台 NSG 里还开着 22 的机器会被讲成「已经收紧」—— 那正是这个项目
+        # 已经修过三次的那类误导。判定和删除路径共用一份。
+        sources, wide = self._still_allowing(ctx, sl_id, [])
+        lines = [
+            "已清空这份安全列表的 " + str(len(existing)) + " 条入站规则(出站一条没动)。",
+            # strict:清空的意图就是「全关掉」,没达成就该进红框。
+            self._union_verdict(sources, wide, strict=True),
+        ]
+        if had_icmp:
+            lines.append(
+                "顺带删掉了 ICMP 放行。其中 Path MTU Discovery 那条删掉不会立刻断网,"
+                "而是让大包静默丢失(表现为 ssh 能连、scp 卡死)—— 需要的话在下面重新加回来。"
+            )
+        lines.append("恢复办法:本页「添加规则」或「放行全部端口」都走 Oracle API,不需要先连上机器。")
+        return OperationResult(
+            ok=True,
+            message=chr(10).join(lines),
+            data={**base, "removed": len(existing), "still_allowing": sources,
+                  "wide_open": wide,
+                  # 删掉的规则原样留给审计 —— 这是五个动作里最破坏性的一个,
+                  # 事后要能回答「原来放行了什么」。
+                  "removed_rules": [self._describe_sdk_ingress(r) for r in existing]},
+        )
+
+
+    def add_cloudflare_security_list_rules(
+        self,
+        instance_id: str,
+        compartment_id: str,
+        *,
+        security_list_id: str = "",
+        ports: Optional[list[int]] = None,
+        include_ipv6: bool = True,
+    ) -> OperationResult:
+        """在**子网安全列表**上一键放行 Cloudflare 回源网段（入站 TCP）。
+
+        和 NSG 那份 (add_cloudflare_rules) 是同一件事的另一个落点。绝大多数机器
+        没有 NSG,入站全由安全列表决定 —— 只有 NSG 那份的话,这个功能对他们不存在。
+
+        OCI 的安全规则是**白名单**:加放行不会关掉任何东西。所以如果这份列表里
+        已经有一条 `0.0.0.0/0` 放行了同样的端口,加完 Cloudflare 网段**一点保护
+        都没有**,源站照样全网可达。面板不替用户删那条宽规则(那是破坏性动作),
+        但必须把这件事顶到最前面说,否则用户会以为自己已经锁好了。
+        """
+        from app import cloudflare_ips as cf
+
+        # `None`（没传）才用默认值；显式传空列表是**参数错误**,不能悄悄替换成
+        # 80/443 —— 那等于写了一批用户没要求的放行规则。
+        raw_ports = [80, 443] if ports is None else list(ports)
+        wanted_ports = sorted({int(p) for p in raw_ports if 1 <= int(p) <= 65535})
+        if not wanted_ports:
+            return OperationResult(ok=False, message="至少要指定一个端口（例如 80、443）")
+
+        try:
+            sl_id, ctx = self._resolve_security_list(instance_id, compartment_id, security_list_id)
+        except OCIClientError as exc:
+            return OperationResult(ok=False, message=str(exc))
+        base = self._sl_result_context(sl_id, ctx)
+
+        if not ctx.get("has_ipv6"):
+            # IPv4-only 的 VCN 会拒绝 ::/0 的规则,写下去整批都失败。
+            include_ipv6 = False
+        feed = cf.fetch_cloudflare_ips()
+        cidrs = list(feed["ipv4"]) + (list(feed["ipv6"]) if include_ipv6 else [])
+        if not cidrs:
+            return OperationResult(ok=False, message="没有取到任何 Cloudflare 网段", data=base)
+
+        try:
+            _sl, _etag, existing = self._read_security_list(sl_id)
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc), data=base)
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=safe_error_text(exc), data=base)
+
+        # 现有入站规则的 (来源, 端口区间, 协议)。既用来跳过重复,也用来找出那些
+        # 「已经比 Cloudflare 更宽」的规则 —— 后者才是这个功能真正的成败点。
+        seen: list[tuple[str, Optional[int], Optional[int], str]] = []
+        for rule in existing:
+            if str(getattr(rule, "source_type", None) or "CIDR_BLOCK") != "CIDR_BLOCK":
+                continue  # 服务网关规则的 source 是服务名,不是 CIDR
+            source = str(getattr(rule, "source", "") or "")
+            if not source:
+                continue
+            opts = getattr(rule, "tcp_options", None)
+            rng = getattr(opts, "destination_port_range", None) if opts else None
+            seen.append(
+                (
+                    source,
+                    getattr(rng, "min", None) if rng else None,
+                    getattr(rng, "max", None) if rng else None,
+                    str(getattr(rule, "protocol", "") or ""),
+                )
+            )
+
+        def _already(cidr: str, port: int) -> bool:
+            for source, lo, hi, proto in seen:
+                if proto not in ("6", "all"):
+                    continue
+                if not cf.covers(source, cidr):
+                    continue
+                if lo is None or hi is None:  # 没有端口限制 = 全端口
+                    return True
+                if int(lo) <= port <= int(hi):
+                    return True
+            return False
+
+        # 「已经比 Cloudflare 更宽」不能只看这一份列表。生效规则是并集 —— 同子网的
+        # 另一份安全列表、或这台机器的 NSG 上有一条全网放行 80/443,加再多 Cloudflare
+        # 网段也挡不住任何人直连源站。漏掉这一半,警告就只在最不需要它的时候才出现。
+        wide_open = {
+            str(port)
+            for port in wanted_ports
+            for source, lo, hi, proto in seen
+            if source in self._PUBLIC_SOURCES
+            and proto in ("6", "all")
+            and (lo is None or hi is None or int(lo) <= port <= int(hi))
+        }
+        elsewhere: list[str] = []
+        for item in list(ctx.get("lists") or []) + list(ctx.get("groups") or []):
+            if str(item.get("id") or "") == sl_id:
+                continue
+            for rule in item.get("rules") or []:
+                for port in wanted_ports:
+                    if any(
+                        self._ingress_tcp_scope(rule, port, family=fam) == "public"
+                        for fam in ("v4", "v6")
+                    ):
+                        wide_open.add(str(port))
+                        name = str(item.get("display_name") or "")
+                        if name and name not in elsewhere:
+                            elsewhere.append(name)
+        wide_open = sorted(wide_open, key=int)
+
+        specs: list[FirewallRuleSpec] = []
+        skipped = 0
+        for cidr in cidrs:
+            for port in wanted_ports:
+                if _already(cidr, port):
+                    skipped += 1
+                    continue
+                specs.append(
+                    FirewallRuleSpec(
+                        direction="INGRESS",
+                        protocol="6",
+                        cidr=cidr,
+                        port_min=port,
+                        port_max=port,
+                        description=f"Cloudflare CDN {port}",
+                    )
+                )
+
+        warn = ""
+        if wide_open:
+            where = "这份安全列表"
+            if elsewhere:
+                where += "或 " + "、".join(elsewhere)
+            warn = (
+                chr(10)
+                + "⚠ " + where + "已经有对全网放行 " + "、".join(wide_open)
+                + " 端口的入站规则 —— 加上 Cloudflare 网段并不会让源站变安全,"
+                "任何人仍然能绕过 CDN 直连。要真正只让 Cloudflare 进来,"
+                "得先把那条全网规则删掉。"
+            )
+
+        if not specs:
+            return OperationResult(
+                ok=True,
+                message=(
+                    "无需新增：" + str(len(cidrs)) + " 个 Cloudflare 网段 × "
+                    + str(len(wanted_ports)) + " 个端口已全部被现有规则覆盖。" + warn
+                ),
+                data={**base, "added": 0, "skipped": skipped,
+                      "source": feed["source"], "wide_open": wide_open},
+            )
+
+        result = self._add_rules_to(sl_id, ctx, specs)
+        if not result.ok:
+            return result
+        src_note = "" if feed["source"] == "live" else chr(10) + feed.get("note", "")
+        added = int((result.data or {}).get("added") or 0)
+        return OperationResult(
+            ok=True,
+            message=(
+                "已在安全列表上放行 " + str(len(cidrs)) + " 个 Cloudflare 网段的 "
+                + "、".join(str(p) for p in wanted_ports) + " 端口（新增 " + str(added)
+                + " 条，跳过 " + str(skipped) + " 条已覆盖的）。"
+                + chr(10) + self._SL_SCOPE_NOTE + src_note + warn
+            ),
+            data={**base, "added": added, "skipped": skipped,
+                  "source": feed["source"], "wide_open": wide_open},
+        )
 
     # NSG 每组最多 120 条规则（入+出合计），服务限额页标注**不可调整**。
     # Cloudflare 是 15 个 v4 + 7 个 v6 网段，配 80+443 就是 44 条 —— 占掉三分之一多，

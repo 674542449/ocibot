@@ -287,6 +287,18 @@ class TightenSecurityListResult(PowerActionResult):
     data: dict[str, Any] = Field(default_factory=dict)
 
 
+class SecurityListResult(PowerActionResult):
+    """安全列表写操作的返回值 —— 比 PowerActionResult 多一个 ``data``。
+
+    添加是幂等合并:已存在的规则被跳过而不是报错,所以「加了几条 / 跳过几条 /
+    这份列表现在几条(上限 200)」只能从 data 里读。``op_result_dict`` 会把
+    ``result.data`` 整个丢掉,所以这里必须自己接住 —— 和 TightenSecurityListResult
+    同一个理由:只给 message 的话,界面就只能去匹配中文字符串。
+    """
+
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
 class TerminateRequest(BaseModel):
     preserve_boot_volume: bool = False
 

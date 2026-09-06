@@ -307,14 +307,17 @@
     </div>
 
     <div v-if="tab === 'firewall'" class="card stack">
+      <!-- 一个页面上有两个控制面,按钮就必须各归各的卡片。以前顶部这三个按钮
+           全都作用于 NSG,而用户以为它们管的是「这台机器的防火墙」—— 于是在
+           没有 NSG 的机器上点了半天,一个端口都没动。 -->
       <div class="row" style="justify-content: space-between">
-        <h3 style="margin: 0">防火墙 (NSG)</h3>
-        <div class="row">
-          <button :disabled="fwLoading" @click="loadFirewall">刷新</button>
-          <button class="danger" :disabled="fwBusy" @click="openAllFirewall">放行全部端口</button>
-          <button class="danger" :disabled="fwBusy" @click="clearFirewall">清空所有规则</button>
-        </div>
+        <h3 style="margin: 0">防火墙</h3>
+        <button :disabled="fwLoading" @click="loadFirewall">刷新</button>
       </div>
+      <p class="muted" style="margin: 0; font-size: 12px">
+        OCI 的生效规则是「<strong>子网安全列表 ∪ 实例的所有 NSG</strong>」，任一放行即放行。
+        在 Oracle 控制台建的机器通常没有 NSG，入站完全由下面的子网安全列表决定。
+      </p>
       <p class="muted diag-msg" style="margin: 0; font-size: 12px">{{ fwMsg }}</p>
 
       <!-- 子网安全列表里只要还有一条公网入站，下面那一整套 NSG 规则就**不改变任何
@@ -355,7 +358,22 @@
       >
         <div class="muted" style="font-size: 13px">
           该实例没有关联的网络安全组（NSG），其子网也没有可读的安全列表。<br />
-          放行端口可点「放行全部端口」（为该实例创建并绑定一个 NSG），或在 Oracle 控制台为子网添加安全列表规则。
+          正常情况下不该是这样 —— 多半是这次没读到（限流或权限）。先点「刷新」再看一次。
+        </div>
+        <!-- 这个按钮必须留在这里。它走的是 replace_instance_firewall_with_open_all，
+             那条路径在实例没有 NSG 时会**新建并绑定**一个 —— 也就是说，它恰恰是
+             这个空态下唯一能用的动作。上一版把它挪进了 v-if="fwGroups.length"
+             的标题栏，于是这段文案指着一个在此状态下根本不渲染的按钮。 -->
+        <button class="danger" style="margin-top: 0.5rem" :disabled="fwBusy" @click="openAllFirewall">
+          为该实例新建 NSG 并放行全部端口
+        </button>
+      </div>
+
+      <div v-if="fwGroups.length" class="row" style="justify-content: space-between">
+        <h4 style="margin: 0.5rem 0 0">网络安全组 (NSG) · 只作用于这一台</h4>
+        <div class="row">
+          <button class="danger" :disabled="fwBusy" @click="openAllFirewall">NSG 放行全部端口</button>
+          <button class="danger" :disabled="fwBusy" @click="clearFirewall">清空 NSG 规则</button>
         </div>
       </div>
 
@@ -442,17 +460,36 @@
         </div>
       </div>
 
-      <!-- Subnet security lists: where the rules actually live for most instances.
-           Read-only here — the add/delete endpoints operate on NSGs. -->
+      <!-- 子网安全列表 —— 面板的第一编辑面。
+           对绝大多数机器（在 Oracle 控制台建的、没有 NSG 的）这里就是**唯一**决定
+           端口开不开的地方。以前它在这一页是只读的，等于把防火墙功能整个关在门外。 -->
+      <h4 v-if="fwSecurityLists.length" style="margin: 0.75rem 0 0">
+        子网安全列表 · 作用于整个子网
+      </h4>
       <div
         v-for="sl in fwSecurityLists"
         :key="sl.id"
         class="card"
         style="padding: 0.75rem"
       >
-        <div style="font-weight: 600">
-          {{ sl.display_name }}
-          <span class="badge">子网安全列表 · 只读</span>
+        <div class="row" style="justify-content: space-between; align-items: flex-start">
+          <div>
+            <div style="font-weight: 600">
+              {{ sl.display_name }}
+              <span v-if="!sl.managed_by_panel" class="badge">Oracle 自带</span>
+            </div>
+            <div class="muted" style="font-size: 11px">
+              入站 {{ sl.ingress_count ?? 0 }} 条 · 上限 {{ sl.ingress_limit ?? 200 }} 条
+            </div>
+          </div>
+          <div class="row">
+            <button class="danger" :disabled="fwBusy" @click="slAction('open-all', sl)">
+              放行全部端口
+            </button>
+            <button class="danger" :disabled="fwBusy" @click="slAction('clear', sl)">
+              清空入站规则
+            </button>
+          </div>
         </div>
         <div class="muted" style="font-size: 11px; word-break: break-all">{{ sl.id }}</div>
         <div class="table-wrap" style="margin-top: 0.5rem">
@@ -463,23 +500,73 @@
                 <th>协议</th>
                 <th>CIDR</th>
                 <th>端口</th>
+                <th>说明</th>
+                <th>状态跟踪</th>
+                <th></th>
               </tr>
             </thead>
             <tbody>
               <tr v-if="!(sl.rules || []).length">
-                <td colspan="4" class="muted empty">该安全列表没有规则</td>
+                <!-- 只说这一份列表的事实。「外部网络连不上任何端口」是**机器级**结论，
+                     而生效规则是并集 —— 同子网另一份列表或这台机器的 NSG 都可能还开着 22。 -->
+                <td colspan="7" class="muted empty">
+                  这份安全列表没有任何规则，不放行也不阻断任何东西。用下面的表单放行需要的端口。
+                </td>
               </tr>
-              <tr v-for="(r, i) in sl.rules || []" :key="`${sl.id}-${i}`">
+              <!-- key 用后端算的内容键，不用下标：安全列表的规则没有 OCID，
+                   而删一行之后数组会重排，下标 key 会让 Vue 把状态复用到错的行上。 -->
+              <tr v-for="(r, i) in sl.rules || []" :key="r.key || `${sl.id}-${i}`">
                 <td>{{ r.direction_label || r.direction }}</td>
                 <td>{{ r.protocol_label || r.protocol }}</td>
                 <td>{{ r.cidr }}</td>
                 <td>{{ r.port }}</td>
+                <td>{{ r.description || '—' }}</td>
+                <td>{{ r.stateless ? '无状态' : '有状态' }}</td>
+                <td>
+                  <!-- 出站规则和算不出键的规则不给删按钮：这一路只改入站。 -->
+                  <button
+                    v-if="r.key"
+                    class="danger"
+                    :disabled="fwBusy"
+                    @click="deleteSlRule(sl, r)"
+                  >
+                    删
+                  </button>
+                </td>
               </tr>
             </tbody>
           </table>
         </div>
-        <p class="muted" style="margin: 0.4rem 0 0; font-size: 12px">
-          安全列表规则请在 Oracle 控制台修改；面板的「添加规则 / 放行全部端口」只作用于 NSG。
+
+        <div class="sl-form">
+          <select v-model="slForm.protocol">
+            <option value="6">TCP</option>
+            <option value="17">UDP</option>
+            <option value="1">ICMP（ping 等）</option>
+            <option value="all">全部协议</option>
+          </select>
+          <input v-model="slForm.cidr" placeholder="来源 0.0.0.0/0" style="width: 11rem" />
+          <input
+            v-if="slForm.protocol === '6' || slForm.protocol === '17'"
+            v-model="slForm.ports"
+            placeholder="端口 22，或 8000-8100，留空=全部"
+            style="width: 13rem"
+          />
+          <input v-model="slForm.description" placeholder="说明（可选）" maxlength="255" style="width: 10rem" />
+          <label class="row" style="gap: 0.3rem; font-size: 12px">
+            <input v-model="slForm.stateless" type="checkbox" />
+            无状态（一般不勾）
+          </label>
+          <button class="primary" :disabled="fwBusy || !slPreview.ok" @click="addSlRule(sl)">
+            添加规则
+          </button>
+          <button :disabled="fwBusy" @click="slAction('cloudflare', sl)">
+            放行 Cloudflare 80/443
+          </button>
+        </div>
+        <!-- 把「将要添加什么」原样摆出来，兼作输入校验：端口填错在点之前就看得见。 -->
+        <p class="muted" style="margin: 0.3rem 0 0; font-size: 12px">
+          {{ slPreview.text }}
         </p>
       </div>
     </div>
@@ -1455,6 +1542,46 @@ const fwBypass = ref<{ name: string; rules: string[] }[]>([])
 // Cloudflare 一键放行。默认 80/443 —— Cloudflare 代理 HTTP/HTTPS 走的就是这两个。
 const cfBusy = ref(false)
 const cfForm = reactive({ ports: '80,443', include_ipv6: true })
+// 子网安全列表的添加表单。**一份表单对所有列表** —— 一个子网最多 5 份安全列表,
+// 但同一时刻只可能在往其中一份里加规则,而按列表分开存会让「填了一半切到另一张卡」
+// 这种状态更难说清。ruleForm（NSG 那份）也是这个形状。
+const slForm = reactive({
+  protocol: '6',
+  cidr: '0.0.0.0/0',
+  ports: '',
+  description: '',
+  stateless: false,
+})
+
+// 「22」→[22,22]；「8000-8100」→[8000,8100]；空→null（=全部端口）。
+// 返回 undefined 表示格式不对 —— 和「留空」是两回事,不能混。
+function parsePorts(text: string): [number, number] | null | undefined {
+  const t = (text || '').trim()
+  if (!t) return null
+  const m = t.match(/^(\d{1,5})(?:\s*-\s*(\d{1,5}))?$/)
+  if (!m) return undefined
+  const lo = Number(m[1])
+  const hi = m[2] ? Number(m[2]) : lo
+  if (lo < 1 || hi > 65535 || lo > hi) return undefined
+  return [lo, hi]
+}
+
+// 把「将要添加什么」写成人话,兼作输入校验 —— 点下去之前就看得见对不对。
+const slPreview = computed(() => {
+  const f = slForm
+  const label =
+    { '6': 'TCP', '17': 'UDP', '1': 'ICMP', all: '全部协议' }[f.protocol] || f.protocol
+  const src = (f.cidr || '').trim()
+  if (!src) return { ok: false, text: '来源不能为空' }
+  if (f.protocol === '6' || f.protocol === '17') {
+    const parsed = parsePorts(f.ports)
+    if (parsed === undefined) return { ok: false, text: '端口格式不对：填 22，或 8000-8100，留空表示全部端口' }
+    const ports = parsed === null ? '全部端口' : parsed[0] === parsed[1] ? `端口 ${parsed[0]}` : `端口 ${parsed[0]}-${parsed[1]}`
+    return { ok: true, text: `将添加：${label} 来自 ${src} → ${ports}` }
+  }
+  return { ok: true, text: `将添加：${label} 来自 ${src}` }
+})
+
 // Subnet security lists — for most instances this is where the rules actually are.
 const fwSecurityLists = ref<any[]>([])
 const fwMsg = ref('')
@@ -1587,6 +1714,116 @@ async function tightenSubnet() {
   } finally {
     fwBusy.value = false
   }
+}
+
+// ---- 子网安全列表（面板的第一编辑面）----
+//
+// 每个写操作都走 beginAction()：安全列表是子网级的,如果用户在请求飞行途中切到了
+// 另一台机器,结果消息会落在新页面上、而描述的是旧页面的子网。NSG 那两个函数
+// （addRule / deleteRule）至今没有这道保护,这里不重复那个疏忽。
+
+// 安全列表是子网共享的 —— 每次确认都得把这句话摆出来,因为用户是从**某一台实例**
+// 的详情页点进来的,天然会以为只影响这一台。
+function slScope(sl: any) {
+  return `安全列表「${sl.display_name}」是子网级的：同一子网里的其它实例也会一起受影响。`
+}
+
+async function runSlWrite(
+  path: string,
+  body: Record<string, any>,
+  act: ReturnType<typeof beginAction>,
+) {
+  fwBusy.value = true
+  error.value = ''
+  try {
+    const { data } = await api.post(
+      `/tenants/${act.tenant}/instances/${act.target}/firewall/security-list/${path}`,
+      body,
+    )
+    if (act.moved()) return
+    // ⚠ 在消息里是一个约定：它表示「做成了，但有你必须知道的后果」。
+    if (data.ok && !String(data.message || '').includes('⚠')) {
+      msg.value = data.message
+    } else {
+      error.value = data.message
+    }
+    await loadFirewall()
+  } catch (e: any) {
+    if (act.moved()) return
+    error.value = e?.message || '操作失败'
+  } finally {
+    fwBusy.value = false
+  }
+}
+
+async function addSlRule(sl: any) {
+  // 只有 TCP/UDP 才有端口输入框（模板上是 v-if）。无条件校验 slForm.ports 的话，
+  // 用户在 TCP 上填错一半、切到 ICMP，输入框消失、预览也不再报错，可「添加」按钮
+  // 却被一个他已经看不见的值挡住 —— 无从下手。
+  const usesPorts = slForm.protocol === '6' || slForm.protocol === '17'
+  const parsed = usesPorts ? parsePorts(slForm.ports) : null
+  if (parsed === undefined) {
+    error.value = '端口格式不对：填 22，或 8000-8100，留空表示全部端口'
+    return
+  }
+  const act = beginAction()
+  await runSlWrite(
+    'rules',
+    {
+      security_list_id: sl.id,
+      direction: 'INGRESS',
+      protocol: slForm.protocol,
+      cidr: slForm.cidr.trim(),
+      // 不用端口的协议一律送 null —— 送 0 会被当成一个真实端口号。
+      port_min: usesPorts && parsed ? parsed[0] : null,
+      port_max: usesPorts && parsed ? parsed[1] : null,
+      stateless: slForm.stateless,
+      description: slForm.description.trim(),
+    },
+    act,
+  )
+}
+
+async function deleteSlRule(sl: any, rule: any) {
+  const what = `${rule.protocol_label || rule.protocol} ${rule.cidr} 端口 ${rule.port}`
+  // 这里**不能**写「删除后对应端口将无法从外部访问」。生效规则是
+  // 「子网的所有安全列表 ∪ 这台机器的所有 NSG」，任一放行即放行 —— 只要同一张表里
+  // 还躺着一条「全部协议 / 0.0.0.0/0」（面板自己的「放行全部端口」就会写一条），
+  // 这次删除一个端口都关不上。真正的结论由后端在并集上算完随结果返回。
+  if (
+    !confirm(
+      `删除这条入站规则：${what}\n\n${slScope(sl)}\n\n` +
+        `注意：删掉这条不等于端口就关上了 —— 生效规则是「所有安全列表 ∪ 所有 NSG」，\n` +
+        `其它规则可能仍然放行同一个端口。删完会告诉你还有谁在放行。\n\n继续？`,
+    )
+  )
+    return
+  const act = beginAction()
+  await runSlWrite('delete-rules', { security_list_id: sl.id, rule_keys: [rule.key] }, act)
+}
+
+async function slAction(kind: 'open-all' | 'clear' | 'cloudflare', sl: any) {
+  const prompts: Record<string, string> = {
+    'open-all':
+      `将在安全列表「${sl.display_name}」上放行全部协议、全部端口。\n` +
+      `这台机器上所有在监听的服务都会暴露到公网。\n\n${slScope(sl)}\n\n继续？`,
+    clear:
+      `将清空安全列表「${sl.display_name}」的全部入站规则（出站一条不动）。\n\n` +
+      // 对没有 NSG 的机器（在 Oracle 控制台建的那批，也是这个功能的主要用户）
+      // 这一条就是唯一的入站来源 —— 清空 = SSH 立刻断。这句必须在**点之前**说，
+      // 结果消息里再说就晚了。
+      `如果这是这台机器唯一的入站放行来源，SSH 会立刻断开，且只能从本页重新放行。\n` +
+      `同时会删掉 Oracle 默认的 ICMP 规则 —— 其中 Path MTU Discovery 那条没了之后，\n` +
+      `大包会静默丢失（表现为 ssh 能连、scp 卡死）。\n\n${slScope(sl)}\n\n继续？`,
+    cloudflare: '',
+  }
+  if (prompts[kind] && !confirm(prompts[kind])) return
+  const act = beginAction()
+  const body: Record<string, any> =
+    kind === 'cloudflare'
+      ? { security_list_id: sl.id, ports: [80, 443], include_ipv6: true }
+      : { security_list_id: sl.id }
+  await runSlWrite(kind, body, act)
 }
 
 async function clearFirewall() {
@@ -2184,6 +2421,13 @@ function resetInstanceState() {
   fwGroups.value = []
   fwBypass.value = []
   fwSecurityLists.value = []
+  // 换实例了，安全列表的表单也得清 —— 留着上一台填了一半的来源/端口，
+  // 下一次点「添加规则」就会把它写进**另一个子网**。
+  slForm.protocol = '6'
+  slForm.cidr = '0.0.0.0/0'
+  slForm.ports = ''
+  slForm.description = ''
+  slForm.stateless = false
   fwMsg.value = ''
   reservedIps.value = []
   bootInfo.value = null
@@ -2329,6 +2573,14 @@ watch([tenantId, instanceId], async () => {
 /* Cloudflare 一键放行那一块。跟上面的「添加规则」表单用一条分隔线隔开：
    两者都往同一个 NSG 写规则，但一个是手填单条、一个是批量灌 20 多条，
    混在一起会让人以为下面那个按钮用的是上面填的 CIDR。 */
+.sl-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+  margin-top: 0.5rem;
+}
+
 .cf-block {
   margin-top: 0.6rem;
   padding-top: 0.6rem;
