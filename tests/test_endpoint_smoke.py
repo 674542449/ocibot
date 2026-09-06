@@ -142,6 +142,7 @@ def make_session():
     s.add_cloudflare_rules.return_value = R(True, "已放行 Cloudflare CDN 网段", {"added": 44})
     s.clear_instance_firewall_rules.return_value = R(True, "已清空", {"removed": 7, "ssh_after": True})
     s.tighten_subnet_security_list.return_value = R(True, "已收紧", {"changed": [], "at_risk": []})
+    s.repair_instance_firewall.return_value = R(True, "修复完成", {"changed": []})
     s.add_security_list_rules.return_value = R(True, "已添加 1 条", {"added": 1, "skipped": 0})
     s.delete_security_list_rules.return_value = R(True, "已删除 1 条", {"removed": 1})
     s.open_all_security_list.return_value = R(True, "已放行全部端口", {})
@@ -363,6 +364,8 @@ def test_every_endpoint_is_wired() -> None:
             (f"/api/tenants/{tid}/instances/{iid}/firewall/open-all", None),
             (f"/api/tenants/{tid}/instances/{iid}/firewall/clear", None),
             (f"/api/tenants/{tid}/instances/{iid}/firewall/tighten-subnet", {"force": False}),
+            (f"/api/tenants/{tid}/instances/{iid}/firewall/repair", {"preview": True}),
+            (f"/api/tenants/{tid}/instances/{iid}/firewall/repair", {}),
             # 子网安全列表这一组是面板的第一编辑面 —— 五条路由全要走一遍。
             # 它们各自 try 里都有可能抛的分支，而 OCI 相关路由把异常统统吞成
             # 502，单元测试看不见；这里是唯一会亮红灯的地方。

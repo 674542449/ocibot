@@ -307,42 +307,43 @@
     </div>
 
     <div v-if="tab === 'firewall'" class="card stack">
-      <!-- 一个页面上有两个控制面,按钮就必须各归各的卡片。以前顶部这三个按钮
-           全都作用于 NSG,而用户以为它们管的是「这台机器的防火墙」—— 于是在
-           没有 NSG 的机器上点了半天,一个端口都没动。 -->
+      <!-- 这一页只讲一件事:**这台服务器实际开放哪些端口**。
+           OCI 底下其实有两套机制(子网安全列表 / NSG),但那是实现细节 ——
+           一次把两张表都摊给用户看,他会不知道该改哪一张,而两张都改对才算数。
+           所以:上面一张表 + 一句「现在算不算数」,其余折进「高级」。 -->
       <div class="row" style="justify-content: space-between">
         <h3 style="margin: 0">防火墙</h3>
         <button :disabled="fwLoading" @click="loadFirewall">刷新</button>
       </div>
-      <p class="muted" style="margin: 0; font-size: 12px">
-        OCI 的生效规则是「<strong>子网安全列表 ∪ 实例的所有 NSG</strong>」，任一放行即放行。
-        在 Oracle 控制台建的机器通常没有 NSG，入站完全由下面的子网安全列表决定。
-      </p>
       <p class="muted diag-msg" style="margin: 0; font-size: 12px">{{ fwMsg }}</p>
 
-      <!-- 子网安全列表里只要还有一条公网入站，下面那一整套 NSG 规则就**不改变任何
-           可达性**。不先说这件事，用户会在一个不起作用的面板上认真配规则。
-           把绕过 NSG 的那几条**原样列出来** —— 只说「有一条全开」的话，
-           Oracle 默认列表里那条 TCP 22 from 0.0.0.0/0 就永远不会被人看见。 -->
-      <div v-if="fwBypass.length" class="card warn-box">
-        <strong>⚠ 下面的 NSG 规则当前不起作用</strong>
+      <!-- 规则当前不算数:子网在兜底放行,这张表写什么都不改变可达性。
+           不先说这件事，用户会在一个不起作用的面板上认真配规则。 -->
+      <div v-if="!fwLoading && fwBypass.length" class="card warn-box">
+        <strong>⚠ 下面这些规则当前不生效</strong>
         <div class="muted diag-msg" style="font-size: 12px; margin-top: 0.35rem">
-          OCI 的生效规则是「子网安全列表 ∪ NSG」，任一放行即放行 —— 所以不论 NSG 里
-          写什么，下面这些端口都是对公网开着的：
+          这台服务器所在的子网正在兜底放行下面这些端口，所以不论这张表里写什么，
+          它们都对公网开着：
           <ul style="margin: 0.35rem 0 0; padding-left: 1.2rem">
-            <li v-for="sl in fwBypass" :key="sl.name">
-              {{ sl.name }}：{{ sl.rules.join('、') }}
-            </li>
+            <li v-for="sl in fwBypass" :key="sl.name">{{ sl.rules.join('、') }}</li>
           </ul>
-          收紧之后只删这些「对公网开端口」的入站规则，ICMP 和出站一条不动，
-          NSG 才会真正决定端口开放情况。<br />
-          安全列表是<strong>子网级</strong>的，同子网（以及共用同一份列表的其它子网）
-          里的实例也会一起受影响，所以会先列出要删的每一条规则、并检查有没有实例会
-          因此失去入站。
+          点「一键修复」把这些放行搬到这台服务器自己名下，再从子网撤掉 ——
+          <strong>能连上的端口一个都不会变</strong>，变的是从此这张表说了算：
+          在这里删一条，就真的少一个端口。
         </div>
-        <button class="primary" style="margin-top: 0.5rem" :disabled="fwBusy" @click="tightenSubnet()">
-          {{ fwBusy ? '处理中…' : '让防火墙真正生效' }}
+        <button class="primary" style="margin-top: 0.5rem" :disabled="fwBusy" @click="repairFirewall()">
+          {{ fwBusy ? '处理中…' : '一键修复防火墙' }}
         </button>
+      </div>
+
+      <!-- 反过来的好消息也要说。用户问的就是「现在到底算不算数」，
+           只在出问题时才出声、平时一片空白，他没法确认。 -->
+      <div
+        v-else-if="!fwLoading && fwGroups.length"
+        class="muted"
+        style="font-size: 12px; border-left: 3px solid var(--ok, #3a8); padding-left: 0.6rem"
+      >
+        ✅ 下面这张表就是这台服务器实际开放的端口 —— 在这里删一条，就真的少一个端口。
       </div>
 
       <div v-if="fwLoading" class="card muted" style="padding: 0.75rem; font-size: 13px">
@@ -357,33 +358,41 @@
         style="padding: 0.75rem"
       >
         <div class="muted" style="font-size: 13px">
-          该实例没有关联的网络安全组（NSG），其子网也没有可读的安全列表。<br />
+          这台服务器还没有属于自己的防火墙规则，也没读到子网的放行配置。<br />
           正常情况下不该是这样 —— 多半是这次没读到（限流或权限）。先点「刷新」再看一次。
         </div>
-        <!-- 这个按钮必须留在这里。它走的是 replace_instance_firewall_with_open_all，
-             那条路径在实例没有 NSG 时会**新建并绑定**一个 —— 也就是说，它恰恰是
-             这个空态下唯一能用的动作。上一版把它挪进了 v-if="fwGroups.length"
-             的标题栏，于是这段文案指着一个在此状态下根本不渲染的按钮。 -->
-        <button class="danger" style="margin-top: 0.5rem" :disabled="fwBusy" @click="openAllFirewall">
-          为该实例新建 NSG 并放行全部端口
+      </div>
+
+      <!-- 有子网放行、但这台机器还没有自己的规则表:这正是「开机时搞错了」的样子。
+           一键修复会把子网现在放行的东西搬到它自己名下，可达性不变。 -->
+      <div
+        v-else-if="!fwGroups.length"
+        class="card"
+        style="padding: 0.75rem"
+      >
+        <div class="muted" style="font-size: 13px">
+          这台服务器还没有属于自己的防火墙规则 —— 它的端口目前由整个子网的配置决定，
+          在这里改不了，改了也只会影响同子网的其它机器。<br />
+          点「一键修复」给它建一套自己的规则，并把子网现在放行的东西原样搬过来：
+          <strong>能连上的端口一个都不会变</strong>，但从此这张表说了算。
+        </div>
+        <button class="primary" style="margin-top: 0.5rem" :disabled="fwBusy" @click="repairFirewall()">
+          {{ fwBusy ? '处理中…' : '一键修复防火墙' }}
         </button>
       </div>
 
       <div v-if="fwGroups.length" class="row" style="justify-content: space-between">
-        <h4 style="margin: 0.5rem 0 0">网络安全组 (NSG) · 只作用于这一台</h4>
+        <h4 style="margin: 0.5rem 0 0">这台服务器的规则</h4>
         <div class="row">
-          <button class="danger" :disabled="fwBusy" @click="openAllFirewall">NSG 放行全部端口</button>
-          <button class="danger" :disabled="fwBusy" @click="clearFirewall">清空 NSG 规则</button>
+          <button class="danger" :disabled="fwBusy" @click="openAllFirewall">放行全部端口</button>
+          <button class="danger" :disabled="fwBusy" @click="clearFirewall">清空所有规则</button>
         </div>
       </div>
 
+      <!-- OCID 和「网络安全组」这些字眼对用户没有意义，收进「高级」。
+           这里只留规则本身。 -->
       <div v-for="g in fwGroups" :key="g.id" class="card" style="padding: 0.75rem">
-        <div style="font-weight: 600">
-          {{ g.display_name }}
-          <span v-if="g.is_managed" class="badge">managed</span>
-        </div>
-        <div class="muted" style="font-size: 11px; word-break: break-all">{{ g.id }}</div>
-        <div class="table-wrap" style="margin-top: 0.5rem">
+        <div class="table-wrap">
           <table>
             <thead>
               <tr>
@@ -460,115 +469,126 @@
         </div>
       </div>
 
-      <!-- 子网安全列表 —— 面板的第一编辑面。
-           对绝大多数机器（在 Oracle 控制台建的、没有 NSG 的）这里就是**唯一**决定
-           端口开不开的地方。以前它在这一页是只读的，等于把防火墙功能整个关在门外。 -->
-      <h4 v-if="fwSecurityLists.length" style="margin: 0.75rem 0 0">
-        子网安全列表 · 作用于整个子网
-      </h4>
-      <div
-        v-for="sl in fwSecurityLists"
-        :key="sl.id"
-        class="card"
-        style="padding: 0.75rem"
-      >
-        <div class="row" style="justify-content: space-between; align-items: flex-start">
-          <div>
-            <div style="font-weight: 600">
-              {{ sl.display_name }}
-              <span v-if="!sl.managed_by_panel" class="badge">Oracle 自带</span>
-            </div>
-            <div class="muted" style="font-size: 11px">
-              入站 {{ sl.ingress_count ?? 0 }} 条 · 上限 {{ sl.ingress_limit ?? 200 }} 条
-            </div>
-          </div>
-          <div class="row">
-            <button class="danger" :disabled="fwBusy" @click="slAction('open-all', sl)">
-              放行全部端口
-            </button>
-            <button class="danger" :disabled="fwBusy" @click="slAction('clear', sl)">
-              清空入站规则
-            </button>
-          </div>
-        </div>
-        <div class="muted" style="font-size: 11px; word-break: break-all">{{ sl.id }}</div>
-        <div class="table-wrap" style="margin-top: 0.5rem">
-          <table>
-            <thead>
-              <tr>
-                <th>方向</th>
-                <th>协议</th>
-                <th>CIDR</th>
-                <th>端口</th>
-                <th>说明</th>
-                <th>状态跟踪</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-if="!(sl.rules || []).length">
-                <!-- 只说这一份列表的事实。「外部网络连不上任何端口」是**机器级**结论，
-                     而生效规则是并集 —— 同子网另一份列表或这台机器的 NSG 都可能还开着 22。 -->
-                <td colspan="7" class="muted empty">
-                  这份安全列表没有任何规则，不放行也不阻断任何东西。用下面的表单放行需要的端口。
-                </td>
-              </tr>
-              <!-- key 用后端算的内容键，不用下标：安全列表的规则没有 OCID，
-                   而删一行之后数组会重排，下标 key 会让 Vue 把状态复用到错的行上。 -->
-              <tr v-for="(r, i) in sl.rules || []" :key="r.key || `${sl.id}-${i}`">
-                <td>{{ r.direction_label || r.direction }}</td>
-                <td>{{ r.protocol_label || r.protocol }}</td>
-                <td>{{ r.cidr }}</td>
-                <td>{{ r.port }}</td>
-                <td>{{ r.description || '—' }}</td>
-                <td>{{ r.stateless ? '无状态' : '有状态' }}</td>
-                <td>
-                  <!-- 出站规则和算不出键的规则不给删按钮：这一路只改入站。 -->
-                  <button
-                    v-if="r.key"
-                    class="danger"
-                    :disabled="fwBusy"
-                    @click="deleteSlRule(sl, r)"
-                  >
-                    删
-                  </button>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-
-        <div class="sl-form">
-          <select v-model="slForm.protocol">
-            <option value="6">TCP</option>
-            <option value="17">UDP</option>
-            <option value="1">ICMP（ping 等）</option>
-            <option value="all">全部协议</option>
-          </select>
-          <input v-model="slForm.cidr" placeholder="来源 0.0.0.0/0" style="width: 11rem" />
-          <input
-            v-if="slForm.protocol === '6' || slForm.protocol === '17'"
-            v-model="slForm.ports"
-            placeholder="端口 22，或 8000-8100，留空=全部"
-            style="width: 13rem"
-          />
-          <input v-model="slForm.description" placeholder="说明（可选）" maxlength="255" style="width: 10rem" />
-          <label class="row" style="gap: 0.3rem; font-size: 12px">
-            <input v-model="slForm.stateless" type="checkbox" />
-            无状态（一般不勾）
-          </label>
-          <button class="primary" :disabled="fwBusy || !slPreview.ok" @click="addSlRule(sl)">
-            添加规则
-          </button>
-          <button :disabled="fwBusy" @click="slAction('cloudflare', sl)">
-            放行 Cloudflare 80/443
-          </button>
-        </div>
-        <!-- 把「将要添加什么」原样摆出来，兼作输入校验：端口填错在点之前就看得见。 -->
-        <p class="muted" style="margin: 0.3rem 0 0; font-size: 12px">
-          {{ slPreview.text }}
+      <!-- 子网安全列表:OCI 的另一套入站机制,作用于整个子网而不是单台机器。
+           **默认折起来**。用户要的是「这台服务器开了哪些端口」,把两套机制并排摊开
+           只会让他不知道该改哪一张 —— 而两张都改对才算数。
+           留着不删的理由:一键修复动的就是它,出了问题得能看到里面到底有什么;
+           另外同子网有多台机器时,直接改这里比逐台修复省事。 -->
+      <details v-if="fwSecurityLists.length" class="fw-advanced">
+        <summary>高级：子网共享的放行规则（同子网所有机器一起生效）</summary>
+        <p class="muted" style="font-size: 12px; margin: 0.4rem 0 0">
+          这是 OCI 的另一套入站规则，作用范围是<strong>整个子网</strong>，不是单台机器。
+          正常情况下不用动它 —— 上面的「一键修复」会把它里面的公网放行搬到各台机器名下。
+          只有在同子网机器很多、想一次性放行时才需要在这里改。
         </p>
-      </div>
+        <!-- 子网安全列表 —— 面板的第一编辑面。
+             对绝大多数机器（在 Oracle 控制台建的、没有 NSG 的）这里就是**唯一**决定
+             端口开不开的地方。以前它在这一页是只读的，等于把防火墙功能整个关在门外。 -->
+
+        <div
+          v-for="sl in fwSecurityLists"
+          :key="sl.id"
+          class="card"
+          style="padding: 0.75rem"
+        >
+          <div class="row" style="justify-content: space-between; align-items: flex-start">
+            <div>
+              <div style="font-weight: 600">
+                {{ sl.display_name }}
+                <span v-if="!sl.managed_by_panel" class="badge">Oracle 自带</span>
+              </div>
+              <div class="muted" style="font-size: 11px">
+                入站 {{ sl.ingress_count ?? 0 }} 条 · 上限 {{ sl.ingress_limit ?? 200 }} 条
+              </div>
+            </div>
+            <div class="row">
+              <button class="danger" :disabled="fwBusy" @click="slAction('open-all', sl)">
+                放行全部端口
+              </button>
+              <button class="danger" :disabled="fwBusy" @click="slAction('clear', sl)">
+                清空入站规则
+              </button>
+            </div>
+          </div>
+          <div class="muted" style="font-size: 11px; word-break: break-all">{{ sl.id }}</div>
+          <div class="table-wrap" style="margin-top: 0.5rem">
+            <table>
+              <thead>
+                <tr>
+                  <th>方向</th>
+                  <th>协议</th>
+                  <th>CIDR</th>
+                  <th>端口</th>
+                  <th>说明</th>
+                  <th>状态跟踪</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-if="!(sl.rules || []).length">
+                  <!-- 只说这一份列表的事实。「外部网络连不上任何端口」是**机器级**结论，
+                       而生效规则是并集 —— 同子网另一份列表或这台机器的 NSG 都可能还开着 22。 -->
+                  <td colspan="7" class="muted empty">
+                    这份安全列表没有任何规则，不放行也不阻断任何东西。用下面的表单放行需要的端口。
+                  </td>
+                </tr>
+                <!-- key 用后端算的内容键，不用下标：安全列表的规则没有 OCID，
+                     而删一行之后数组会重排，下标 key 会让 Vue 把状态复用到错的行上。 -->
+                <tr v-for="(r, i) in sl.rules || []" :key="r.key || `${sl.id}-${i}`">
+                  <td>{{ r.direction_label || r.direction }}</td>
+                  <td>{{ r.protocol_label || r.protocol }}</td>
+                  <td>{{ r.cidr }}</td>
+                  <td>{{ r.port }}</td>
+                  <td>{{ r.description || '—' }}</td>
+                  <td>{{ r.stateless ? '无状态' : '有状态' }}</td>
+                  <td>
+                    <!-- 出站规则和算不出键的规则不给删按钮：这一路只改入站。 -->
+                    <button
+                      v-if="r.key"
+                      class="danger"
+                      :disabled="fwBusy"
+                      @click="deleteSlRule(sl, r)"
+                    >
+                      删
+                    </button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="sl-form">
+            <select v-model="slForm.protocol">
+              <option value="6">TCP</option>
+              <option value="17">UDP</option>
+              <option value="1">ICMP（ping 等）</option>
+              <option value="all">全部协议</option>
+            </select>
+            <input v-model="slForm.cidr" placeholder="来源 0.0.0.0/0" style="width: 11rem" />
+            <input
+              v-if="slForm.protocol === '6' || slForm.protocol === '17'"
+              v-model="slForm.ports"
+              placeholder="端口 22，或 8000-8100，留空=全部"
+              style="width: 13rem"
+            />
+            <input v-model="slForm.description" placeholder="说明（可选）" maxlength="255" style="width: 10rem" />
+            <label class="row" style="gap: 0.3rem; font-size: 12px">
+              <input v-model="slForm.stateless" type="checkbox" />
+              无状态（一般不勾）
+            </label>
+            <button class="primary" :disabled="fwBusy || !slPreview.ok" @click="addSlRule(sl)">
+              添加规则
+            </button>
+            <button :disabled="fwBusy" @click="slAction('cloudflare', sl)">
+              放行 Cloudflare 80/443
+            </button>
+          </div>
+          <!-- 把「将要添加什么」原样摆出来，兼作输入校验：端口填错在点之前就看得见。 -->
+          <p class="muted" style="margin: 0.3rem 0 0; font-size: 12px">
+            {{ slPreview.text }}
+          </p>
+        </div>
+      </details>
     </div>
 
     <!-- Reserved IP -->
@@ -1657,26 +1677,26 @@ async function addCloudflare(nsgId: string) {
   }
 }
 
-async function tightenSubnet() {
+// ---- 一键修复 ----
+//
+// 用户的诉求只有一句:「防火墙按我写的生效,别搞两套」。这个按钮就是那一下。
+//
+// 流程和 tightenSubnet 同构(第 3 步就是它):先只读地问一遍要做什么,把计划原样
+// 摆进确认框,用户点头才写。分支靠后端返回的结构化标志,不靠匹配中文 ——
+// 文案改一个字就失灵,而失灵的方向是**跳过确认直接写**。
+async function repairFirewall() {
   const act = beginAction()
-  const url = `/tenants/${act.tenant}/instances/${act.target}/firewall/tighten-subnet`
+  const url = `/tenants/${act.tenant}/instances/${act.target}/firewall/repair`
   fwBusy.value = true
   error.value = ''
   try {
-    // 先**只读**地问一遍：要删哪几条、谁会因此失联、要不要动别人建的列表。
-    // 确认框里摆的是后端算出来的真实规则，不是这里拼的一句概述 —— 用户完全可能
-    // 在 Oracle 控制台里手工开过 3306，面板无权替他判断那是不是笔误。
     let force = false
     let includeForeign = false
     let approved = false
-    // 最多三步：外来列表同意 → 失联名单同意 → 最终确认。写成有界循环而不是
-    // 递归，是为了让「没点确认就不写」这件事一眼可查。
+    // 最多三步:外来列表同意 -> 失联名单同意 -> 最终确认。写成有界循环而不是递归,
+    // 是为了让「没点确认就不写」一眼可查。
     for (let step = 0; step < 3 && !approved; step++) {
-      const { data } = await api.post(url, {
-        preview: true,
-        force,
-        include_foreign: includeForeign,
-      })
+      const { data } = await api.post(url, { preview: true, force, include_foreign: includeForeign })
       if (act.moved()) return
       const text = String(data.message || '')
       if (data.ok) {
@@ -1684,15 +1704,13 @@ async function tightenSubnet() {
         approved = true
         break
       }
-      // 分支靠后端给的结构化标志，不靠匹配中文 —— 文案改一个字就失灵，
-      // 而失灵的方向是「跳过确认直接写」。
       if (data.data?.needs_foreign_consent && !includeForeign) {
-        if (!confirm(text + '\n\n一并收紧这些列表？')) return
+        if (!confirm(text + '\n\n一并处理这些列表？')) return
         includeForeign = true
         continue
       }
       if ((data.data?.at_risk || []).length && !force) {
-        if (!confirm(text + '\n\n仍然收紧？')) return
+        if (!confirm(text + '\n\n仍然继续？')) return
         force = true
         continue
       }
@@ -2573,6 +2591,19 @@ watch([tenantId, instanceId], async () => {
 /* Cloudflare 一键放行那一块。跟上面的「添加规则」表单用一条分隔线隔开：
    两者都往同一个 NSG 写规则，但一个是手填单条、一个是批量灌 20 多条，
    混在一起会让人以为下面那个按钮用的是上面填的 CIDR。 */
+.fw-advanced {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.5rem 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.fw-advanced > summary {
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--muted, #888);
+}
+
 .sl-form {
   display: flex;
   flex-wrap: wrap;

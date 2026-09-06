@@ -637,6 +637,69 @@ def security_list_add_cloudflare(
         raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
+class RepairFirewallRequest(BaseModel):
+    """一键修复。三个开关和 tighten 那边同义,因为第 3 步就是它。"""
+
+    preview: bool = False
+    force: bool = False
+    include_foreign: bool = False
+
+
+@router.post("/tenants/{tenant_id}/instances/{instance_id}/firewall/repair")
+def firewall_repair(
+    tenant_id: str,
+    instance_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+    payload: RepairFirewallRequest | None = None,
+) -> TightenSecurityListResult:
+    """一键修复:让「这台服务器的防火墙规则」这张表真正说了算。
+
+    建安全组 -> 把子网当前的公网放行原样搬进来 -> 从子网删掉那一批。
+    搬进来的和删掉的是同一批,所以可达性不变。
+
+    第 3 步是子网级写操作,会波及同子网所有实例 —— 和 tighten 同级,写审计。
+    """
+    row = _row(db, user.id, tenant_id)
+    preview = bool(payload.preview) if payload else False
+    force = bool(payload.force) if payload else False
+    include_foreign = bool(payload.include_foreign) if payload else False
+    try:
+        session = get_session_for_row(row)
+        info = session.get_instance(instance_id, resolve_ips=False)
+        result = session.repair_instance_firewall(
+            instance_id,
+            info.compartment_id,
+            preview=preview,
+            force=force,
+            include_foreign=include_foreign,
+        )
+        data = result.data if isinstance(result.data, dict) else {}
+        # 预检是纯读,写审计只会把「谁真的改了子网」这条线索淹掉。
+        if not preview:
+            write_audit(
+                db,
+                owner_id=user.id,
+                action="firewall.repair",
+                target=instance_id,
+                detail={
+                    "tenant_id": tenant_id,
+                    "force": force,
+                    "include_foreign": include_foreign,
+                    "ok": result.ok,
+                    "message": result.message,
+                    "changed": data.get("changed"),
+                    "copied": data.get("copied"),
+                    "subnet_id": data.get("subnet_id"),
+                    "at_risk": data.get("at_risk"),
+                    "removals": data.get("removals"),
+                },
+            )
+        return TightenSecurityListResult(**op_result_dict(result), data=data)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
+
+
 @router.post("/tenants/{tenant_id}/instances/{instance_id}/firewall/clear")
 def firewall_clear(
     tenant_id: str,

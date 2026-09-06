@@ -435,12 +435,12 @@ def test_running_it_twice_is_a_no_op():
 # ------------------------------------------------------------------ 可见性
 
 
-def test_the_firewall_page_says_when_the_nsg_is_pointless():
-    """安全列表放行了公网端口时，先告诉用户下面那套 NSG 规则不起作用 ——
-    否则他会在一个不生效的面板上认真配规则。"""
+def test_the_firewall_page_says_when_the_rules_do_not_apply():
+    """子网在兜底放行时，先告诉用户下面这张表不生效 ——
+    否则他会在一个不起作用的面板上认真配规则。"""
     ui = UI.read_text(encoding="utf-8")
     assert "fwBypass" in ui
-    assert "NSG 规则当前不起作用" in ui
+    assert "下面这些规则当前不生效" in ui
     assert "bypass_lists" in ui, "没从后端读那个标志"
     # 判定留在后端,别在 TS 里重写一份必然漂移的。
     assert "0.0.0.0/0" not in ui.split("fwBypass")[1][:900]
@@ -452,50 +452,33 @@ def test_the_banner_lists_the_actual_rules_not_just_a_count():
     assert "sl.rules.join" in ui
 
 
-def test_the_tighten_button_cannot_be_talked_into_skipping_confirmation():
-    """`@click="tightenSubnet"` 会把 PointerEvent 当参数传进去（truthy）。
-
-    以前那个参数是 force —— 点一下就同时跳过确认框和预检。现在函数干脆不收参数，
-    从源头上没得可传。
-    """
+def test_the_fix_is_one_button_and_it_previews_before_writing():
+    """用户要的是一次点击。而这一下会动整个子网，所以必须先只读地问一遍、
+    把计划摆进确认框，点头才写。"""
     ui = UI.read_text(encoding="utf-8")
-    assert "async function tightenSubnet() {" in ui, "别给它加回参数"
-    assert '@click="tightenSubnet()"' in ui
+    assert "repairFirewall()" in ui
+    assert "一键修复防火墙" in ui
+    fn = ui.split("async function repairFirewall()")[1].split("async function ")[0]
+    assert "preview: true" in fn
+    assert "if (!approved) return" in fn
 
 
-def test_the_ui_branches_on_flags_not_on_chinese_prose():
+def test_the_fix_branches_on_flags_not_on_chinese_prose():
     """靠 message 里有没有某几个汉字来决定「要不要再确认一次」，
     文案改一个字就失灵 —— 而失灵的方向是**跳过确认直接写**。"""
     ui = UI.read_text(encoding="utf-8")
-    fn = ui.split("async function tightenSubnet()")[1].split("async function clearFirewall")[0]
+    fn = ui.split("async function repairFirewall()")[1].split("async function ")[0]
     assert "needs_foreign_consent" in fn
     assert "at_risk" in fn
     assert "会失去入站" not in fn, "又回去匹配中文了"
 
 
-def test_the_ui_previews_before_it_writes():
-    ui = UI.read_text(encoding="utf-8")
-    fn = ui.split("async function tightenSubnet()")[1].split("async function clearFirewall")[0]
-    assert "preview: true" in fn
-    # 没点确认就不能落到那次真写。
-    assert "if (!approved) return" in fn
+def test_the_bare_tighten_button_is_gone_from_the_ui():
+    """光收紧子网（不把放行搬到实例名下）会让机器直接失联。
 
-
-def test_a_root_compartment_403_does_not_block_the_button():
-    """非管理员在租户根 compartment 上列资源本来就经常被拒。
-
-    把那次失败算成「没读全」，等于让这个按钮对最需要它的那批人永远点不动 ——
-    而兄弟子网跟 VCN 同 compartment 是压倒性的常态。
+    一键修复是它的安全版本：先搬后删，可达性不变。所以界面上不再暴露裸的收紧动作。
+    后端 tighten_subnet_security_list 保留 —— 修复的第 3 步就是它。
     """
-    s = _session([_sl("open-security-list", [_ing()])])
-    real = s.list_subnets
-
-    def _only_own(compartment_id=None, vcn_id=None):
-        if compartment_id != "comp-1":
-            raise RuntimeError("NotAuthorizedOrNotFound")
-        return real(compartment_id=compartment_id, vcn_id=vcn_id)
-
-    s.list_subnets = _only_own
-    r = s.tighten_subnet_security_list("i", "c")
-    assert r.ok, r.message
-    assert s.updated
+    ui = UI.read_text(encoding="utf-8")
+    assert "async function tightenSubnet" not in ui
+    assert 'firewall/tighten-subnet' not in ui

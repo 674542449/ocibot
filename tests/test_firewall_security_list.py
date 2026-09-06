@@ -570,11 +570,23 @@ def test_the_page_states_the_subnet_blast_radius():
     assert "同一子网里的其它实例也会一起受影响" in ui
 
 
-def test_the_nsg_buttons_say_they_are_nsg_buttons():
-    """两个控制面共存时，按钮就必须各归各的。以前顶部那三个全作用于 NSG，
-    而用户以为它们管的是「这台机器的防火墙」。"""
+def test_the_default_view_shows_exactly_one_rules_table():
+    """用户的原话：「两个都显示我都懵逼了」。
+
+    OCI 底下确实是两套机制，但那是实现细节 —— 一次把两张表并排摊开，
+    用户不知道该改哪一张，而两张都改对才算数。所以子网那套折进 <details>，
+    默认视图里只有「这台服务器的规则」。
+    """
     ui = UI.read_text(encoding="utf-8")
-    assert "NSG 放行全部端口" in ui and "清空 NSG 规则" in ui
+    assert "这台服务器的规则" in ui
+    # 子网那段必须在折叠块里。
+    assert '<details v-if="fwSecurityLists.length"' in ui
+    # 折叠块之外不能再渲染一份子网规则表。（条件里引用 fwSecurityLists 是可以的 ——
+    # 空态就要靠它判断「两边都没读到」；这里查的是有没有第二个 v-for。）
+    head, _, _tail = ui.partition('<details v-if="fwSecurityLists.length"')
+    assert 'v-for="sl in fwSecurityLists"' not in head, "折叠块之外还渲染了一份子网规则表"
+    # 「网络安全组 / NSG」这种内部行话不该出现在默认视图的标题上。
+    assert "网络安全组 (NSG)" not in head
 
 
 def test_the_security_list_writes_use_the_navigation_guard():
@@ -649,15 +661,18 @@ def test_the_clear_dialog_warns_that_ssh_goes_away():
     assert "SSH 会立刻断开" in fn
 
 
-def test_the_empty_firewall_state_offers_a_button_that_actually_renders():
-    """空态那段文案指向的动作必须在**这个状态下**真的可点。
+def test_a_machine_with_no_rules_of_its_own_is_offered_the_one_click_fix():
+    """「如果之前已经开机搞错了的，就提醒一个一键修复。」
 
-    上一版把「放行全部端口」挪进了 v-if="fwGroups.length" 的标题栏，
-    而空态恰恰是 fwGroups 为空时才渲染 —— 文案指着一个不存在的按钮。
+    没有自己规则表的机器，端口由整个子网决定 —— 在这一页改不了，改了也只会
+    影响同子网的别人。这正是「开机时搞错了」的样子，空态必须给出那一下。
+    并且这个动作要在**这个状态下**真的渲染：上一版把它挪进了
+    v-if="fwGroups.length" 的标题栏，而空态恰恰是 fwGroups 为空时才出现。
     """
     ui = UI.read_text(encoding="utf-8")
-    block = ui.split("该实例没有关联的网络安全组")[1][:700]
-    assert "openAllFirewall" in block, "空态里没有可点的动作"
+    block = ui.split('v-else-if="!fwGroups.length"')[1][:1200]
+    assert "repairFirewall()" in block, "空态里没有可点的动作"
+    assert "能连上的端口一个都不会变" in block, "没说清修复不会改变可达性"
 
 
 def test_the_per_list_empty_row_states_only_a_fact_about_that_list():
@@ -704,3 +719,178 @@ def test_the_etag_lookup_does_not_depend_on_the_header_container_type():
         )
         s.add_security_list_rules("i", "c", security_list_id="sl-1", specs=[_spec()])
         assert s.if_match == ["e1"], headers
+
+
+# ------------------------------------------------------------------ 一键修复
+
+
+def _repair_session(*, groups=None, sl_rules=None, complete=True):
+    """一键修复的会话桩。
+
+    它只做三件事:建安全组(如果没有)、把子网的公网放行搬进来、再从子网删掉。
+    这里把这三步各自的落点都记下来，好断言顺序和内容。
+    """
+    s = T.__new__(T)
+    s.created = []
+    s.added = []
+    s.tightened = []
+    lists = [{"id": "sl-1", "display_name": "默认列表", "rules": list(sl_rules or [])}]
+
+    s.get_instance_firewall = lambda *a, **k: OperationResult(  # type: ignore[method-assign]
+        ok=True,
+        message="",
+        data={
+            "groups": list(groups or []),
+            "security_lists": lists,
+            "security_lists_complete": complete,
+            "subnet_id": "subnet-1",
+            "has_ipv6": False,
+        },
+    )
+
+    def _ensure(_i, _c, *, open_all=True):
+        s.created.append(open_all)
+        # 建完之后这台机器就有安全组了 —— 让下一次读能看到。
+        groups_now = [{"id": "nsg-1", "display_name": "fw", "rules": []}]
+        s.get_instance_firewall = lambda *a, **k: OperationResult(
+            ok=True,
+            message="",
+            data={
+                "groups": groups_now,
+                "security_lists": lists,
+                "security_lists_complete": complete,
+                "subnet_id": "subnet-1",
+                "has_ipv6": False,
+            },
+        )
+        return OperationResult(ok=True, message="", data={"nsg_ids": ["nsg-1"]})
+
+    s.ensure_instance_nsg = _ensure  # type: ignore[method-assign]
+
+    def _add(nsg_id, specs):
+        s.added.append((nsg_id, list(specs)))
+        return OperationResult(ok=True, message="")
+
+    s.add_nsg_rules = _add  # type: ignore[method-assign]
+
+    def _tighten(_i, _c, *, force=False, include_foreign=False, preview=False):
+        s.tightened.append({"force": force, "include_foreign": include_foreign})
+        return OperationResult(ok=True, message="已收紧", data={})
+
+    s.tighten_subnet_security_list = _tighten  # type: ignore[method-assign]
+    return s
+
+
+def _norm(protocol="6", port="22", cidr="0.0.0.0/0", direction="INGRESS", desc=""):
+    return {
+        "direction": direction,
+        "protocol": protocol,
+        "port": port,
+        "cidr": cidr,
+        "stateless": False,
+        "description": desc,
+    }
+
+
+def test_repair_copies_the_subnet_allows_in_before_stripping_them():
+    """顺序不能反。先删子网、后补 NSG 的话，中间那个窗口里子网所有机器同时失联。"""
+    s = _repair_session(sl_rules=[_norm(port="22"), _norm(port="80")])
+    r = s.repair_instance_firewall("i", "c")
+    assert r.ok, r.message
+    assert s.created == [False], "建安全组时不该顺手全开"
+    assert s.added, "没有把子网的放行搬进来"
+    assert s.tightened, "没有收紧子网"
+    # 搬进来的端口就是子网原来放行的那些 —— 这是「可达性不变」的全部内容。
+    ports = sorted(sp.port_min for _n, specs in s.added for sp in specs)
+    assert ports == [22, 80]
+
+
+def test_repair_promises_reachability_does_not_change_and_means_it():
+    """搬进来的和删掉的必须是同一批。多搬 = 修完比修前更开放；
+    少搬 = 用户的服务突然连不上。"""
+    rules = [_norm(port="22"), _norm(protocol="all", port="全部"), _norm(protocol="17", port="53")]
+    s = _repair_session(sl_rules=rules)
+    r = s.repair_instance_firewall("i", "c")
+    assert r.ok
+    moved = [sp for _n, specs in s.added for sp in specs]
+    assert len(moved) == len(rules)
+    assert "可达性没有变化" in r.message
+
+
+def test_repair_does_not_copy_icmp_or_private_sources():
+    """ICMP 开不了端口，收紧也不会删它；私网源的规则同样不在收紧范围内。
+    照搬过去只是噪音，而且会让「搬进来的 = 删掉的」这个等式不成立。"""
+    s = _repair_session(
+        sl_rules=[
+            _norm(protocol="1", port="类型 3 代码 4"),
+            _norm(cidr="10.0.0.0/16", port="22"),
+            _norm(port="443"),
+        ]
+    )
+    r = s.repair_instance_firewall("i", "c")
+    assert r.ok
+    moved = [sp for _n, specs in s.added for sp in specs]
+    assert [sp.port_min for sp in moved] == [443]
+
+
+def test_repair_skips_rules_the_nsg_already_has():
+    """已经有等价规则就别重复写 —— NSG 每组只有 120 条。"""
+    have = [{"id": "nsg-1", "display_name": "fw", "rules": [_norm(port="22")]}]
+    s = _repair_session(groups=have, sl_rules=[_norm(port="22"), _norm(port="80")])
+    r = s.repair_instance_firewall("i", "c")
+    assert r.ok
+    moved = [sp for _n, specs in s.added for sp in specs]
+    assert [sp.port_min for sp in moved] == [80]
+    assert s.created == [], "已经有安全组了还去建一个"
+
+
+def test_repair_is_a_no_op_when_there_is_nothing_to_fix():
+    have = [{"id": "nsg-1", "display_name": "fw", "rules": []}]
+    s = _repair_session(groups=have, sl_rules=[_norm(protocol="1", port="类型 3 代码 4")])
+    r = s.repair_instance_firewall("i", "c")
+    assert r.ok and (r.data or {}).get("already_ok") is True
+    assert not s.added and not s.tightened and not s.created
+
+
+def test_repair_preview_writes_nothing():
+    """这一下会动整个子网，所以必须能先只读地问一遍。"""
+    s = _repair_session(sl_rules=[_norm(port="22")])
+    r = s.repair_instance_firewall("i", "c", preview=True)
+    assert r.ok and (r.data or {}).get("preview") is True
+    assert not s.created and not s.added and not s.tightened
+
+
+def test_repair_stops_before_touching_the_subnet_if_it_cannot_read_it():
+    """读不全就不知道要搬哪些 —— 搬少了用户的服务就断了。"""
+    s = _repair_session(sl_rules=[_norm()], complete=False)
+    r = s.repair_instance_firewall("i", "c")
+    assert r.ok is False
+    assert not s.created and not s.added and not s.tightened
+
+
+def test_repair_says_the_subnet_is_untouched_when_the_earlier_steps_fail():
+    """建组或搬规则失败时，子网必须一个字节都没动 —— 否则可达性就真的变了。"""
+    s = _repair_session(sl_rules=[_norm()])
+    s.add_nsg_rules = lambda _n, _s: OperationResult(ok=False, message="配额不足")
+    r = s.repair_instance_firewall("i", "c")
+    assert r.ok is False
+    assert not s.tightened
+    assert "一个字节都没动" in r.message
+
+
+def test_repair_reports_when_only_the_subnet_step_failed():
+    """前两步做了、第三步被预检拦下 —— 这时规则还没生效，不能报成功。
+    但也不能只说「失败」：安全组和规则已经在了，用户得知道现在是什么状态。"""
+    s = _repair_session(sl_rules=[_norm()])
+    # 真实的 tighten 会把名单写进 message（见 tighten_subnet_security_list），
+    # 桩要照做 —— 否则这条测试断言的是一个现实里不存在的形状。
+    s.tighten_subnet_security_list = lambda *a, **k: OperationResult(
+        ok=False,
+        message="收紧后这 1 台会失去入站：" + chr(10) + "  · web-2（没有任何 NSG）",
+        data={"at_risk": ["web-2"]},
+    )
+    r = s.repair_instance_firewall("i", "c")
+    assert r.ok is False
+    assert "还没真正生效" in r.message
+    assert "web-2" in r.message
+    assert (r.data or {}).get("at_risk") == ["web-2"]

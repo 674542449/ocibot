@@ -3802,7 +3802,15 @@ class TenantSession:
                 return OperationResult(ok=True, message="网络安全组已不存在")
             return OperationResult(ok=False, message=_format_service_error(exc))
 
-    def ensure_instance_nsg(self, instance_id: str, compartment_id: str) -> OperationResult:
+    def ensure_instance_nsg(
+        self, instance_id: str, compartment_id: str, *, open_all: bool = True
+    ) -> OperationResult:
+        """确保这台实例有自己的 NSG,没有就建一个并挂上。
+
+        ``open_all`` 默认 True 是历史调用方(详情页「一键开放全部端口」)的语义。
+        一键修复要传 False:它随后会把子网当前的放行原样搬进来,先开全部会把
+        「可达性不变」这个承诺变成谎话 —— 修完比修前更开放。
+        """
         try:
             network = self.resolve_primary_network(instance_id, compartment_id)
             if network.nsg_ids:
@@ -3817,6 +3825,7 @@ class TenantSession:
                 compartment_id=subnet.compartment_id,
                 display_name=f"{instance_id[-8:]}-firewall",
                 include_ipv6=bool(network.ipv6_addresses),
+                open_all=open_all,
             )
             if not created.ok:
                 return created
@@ -5519,6 +5528,257 @@ class TenantSession:
             },
         )
 
+
+    # ------------------------------------------------------------------ 一键修复
+    #
+    # 用户的诉求只有一句:「防火墙按我写的生效,别搞两套」。
+    #
+    # 挡在中间的是 OCI 的生效规则 ——「子网安全列表 ∪ VNIC 的所有 NSG」。
+    # 面板要让一张**按服务器算**的规则表真正说了算,就得同时满足两件事:
+    #   1. 这台机器有自己的 NSG（那才是「单独的规则」);
+    #   2. 子网安全列表不再对公网开端口(否则它兜底放行,NSG 写什么都不算)。
+    #
+    # 修复动作把这两件事做成一次点击,而且**可达性不变**:先把子网当前放行的每一条
+    # 公网入站原样搬进这台机器的 NSG,再从子网把它们删掉。搬进来的和删掉的是同一批,
+    # 所以修复前后能连上的端口完全一样 —— 变的只是「谁说了算」。
+    #
+    # 这个顺序不能反。先删子网、后补 NSG 的话,中间那个窗口里子网所有机器同时失联。
+
+    @staticmethod
+    def _norm_rule_to_spec(rule: dict) -> Optional[FirewallRuleSpec]:
+        """把一条**归一化后**的入站规则还原成 FirewallRuleSpec。
+
+        用于把子网安全列表里的放行搬进 NSG。解析的是 _normalize_firewall_rule
+        自己产出的那四种端口形态:``全部`` / ``22`` / ``80-443`` / ``类型 3 代码 4``。
+
+        ICMP(带「类型」的)返回 None —— 它开不了端口,tighten 也不会删它,
+        搬过去只是噪音。解析不出来的一律返回 None:宁可少搬一条(用户看得见、
+        可以自己补),也不要凭猜写一条和原来不一样的规则进去。
+        """
+        protocol = str(rule.get("protocol", "") or "")
+        cidr = str(rule.get("cidr", "") or "").strip()
+        if not cidr or protocol not in TenantSession._PORT_PROTOCOLS:
+            return None
+        text = str(rule.get("port", "") or "").strip()
+        port_min = port_max = None
+        if text and text not in ("全部",):
+            if text.startswith("类型"):
+                return None
+            try:
+                if "-" in text:
+                    lo, hi = text.split("-", 1)
+                    port_min, port_max = int(lo), int(hi)
+                else:
+                    port_min = port_max = int(text)
+            except ValueError:
+                return None
+        return FirewallRuleSpec(
+            direction="INGRESS",
+            protocol=protocol,
+            cidr=cidr,
+            port_min=port_min,
+            port_max=port_max,
+            stateless=bool(rule.get("stateless")),
+            description=str(rule.get("description", "") or "")[:255],
+        )
+
+    @staticmethod
+    def _norm_rule_effect(rule: dict) -> str:
+        """一条归一化规则的「作用」—— 用来判断 NSG 里是不是已经有等价的一条。"""
+        return "|".join(
+            [
+                str(rule.get("direction", "")).upper(),
+                str(rule.get("protocol", "") or ""),
+                str(rule.get("cidr", "") or ""),
+                str(rule.get("port", "") or ""),
+            ]
+        )
+
+    @classmethod
+    def _spec_effect(cls, spec: FirewallRuleSpec) -> str:
+        """同上,但作用在 spec 上。两边的端口文案要拼成一样,否则去重会失效。"""
+        if spec.port_min is None and spec.port_max is None:
+            port = "全部"
+        else:
+            lo = spec.port_min if spec.port_min is not None else spec.port_max
+            hi = spec.port_max if spec.port_max is not None else lo
+            port = str(lo) if lo == hi else f"{lo}-{hi}"
+        return "|".join([spec.direction.upper(), str(spec.protocol), spec.cidr, port])
+
+    def repair_instance_firewall(
+        self,
+        instance_id: str,
+        compartment_id: str,
+        *,
+        preview: bool = False,
+        force: bool = False,
+        include_foreign: bool = False,
+    ) -> OperationResult:
+        """一键修复:让「这台服务器的防火墙规则」这张表真正说了算。
+
+        做三件事,顺序固定:
+
+        1. 这台机器还没有自己的安全组就建一个并挂上(建之前不放行任何东西;
+           它是白名单,新挂一个只会让规则变多、不会挡掉任何现有流量)。
+        2. 把子网安全列表当前**对公网开端口**的每一条原样搬进这个安全组。
+        3. 从子网安全列表里删掉那同一批规则。
+
+        搬进来的和删掉的是同一批 —— 所以修复前后能连上的端口完全一样。
+        变的只是这些放行从「整个子网共享」变成「这台机器自己的」,
+        从此在这张表里删一条,就真的少一个端口。
+
+        第 3 步是子网级的,会波及同子网所有实例,所以直接复用
+        tighten_subnet_security_list —— 它自带预检(逐台确认不会有实例失去入站)、
+        外来列表的二次确认,以及只删公网放行、不碰用户私网规则和 ICMP 的判定。
+        """
+        state = self.get_instance_firewall(instance_id, compartment_id)
+        if not state.ok:
+            return state
+        data = state.data or {}
+        if not bool(data.get("security_lists_complete", False)):
+            return OperationResult(
+                ok=False,
+                message=(
+                    "这次没读全子网的安全列表,无法确定要搬哪些规则 —— 已停手,什么都没改。"
+                    + chr(10) + "请稍后点「刷新」重试。"
+                ),
+            )
+        groups = list(data.get("groups") or [])
+        security_lists = list(data.get("security_lists") or [])
+
+        # 子网现在对公网放行的每一条 —— 这既是要搬走的,也正是 tighten 会删的那一批。
+        bypassing = [
+            rule
+            for sl in security_lists
+            for rule in (sl.get("rules") or [])
+            if self._rule_opens_public_ports(rule)
+        ]
+        have = {
+            self._norm_rule_effect(r)
+            for g in groups
+            for r in (g.get("rules") or [])
+        }
+        specs: list[FirewallRuleSpec] = []
+        skipped_unparsed = 0
+        for rule in bypassing:
+            spec = self._norm_rule_to_spec(rule)
+            if spec is None:
+                skipped_unparsed += 1
+                continue
+            effect = self._spec_effect(spec)
+            if effect in have:
+                continue
+            have.add(effect)
+            specs.append(spec)
+
+        plan: list[str] = []
+        if not groups:
+            plan.append("为这台服务器创建一个独立的安全组(它是白名单,新建不会挡掉任何现有流量)")
+        if specs:
+            plan.append(
+                "把子网现在放行的 " + str(len(specs)) + " 条公网入站原样搬进来"
+            )
+        if bypassing:
+            plan.append(
+                "再把这 " + str(len(bypassing)) + " 条从子网安全列表里删掉 —— "
+                "搬进来的和删掉的是同一批,所以能连上的端口一个都不变"
+            )
+        if not plan:
+            return OperationResult(
+                ok=True,
+                message=(
+                    "无需修复:这台服务器已经有自己的安全组,子网安全列表也没有对公网"
+                    "开端口的规则 —— 下面这张表就是它实际开放的端口。"
+                ),
+                data={"already_ok": True, "changed": []},
+            )
+
+        note = ""
+        if skipped_unparsed:
+            note = (
+                chr(10) + "另有 " + str(skipped_unparsed) + " 条子网规则看不懂、不会搬 —— "
+                "修复后如果发现某个端口不通,在这张表里手动加回来即可。"
+            )
+
+        if preview:
+            return OperationResult(
+                ok=True,
+                message=(
+                    "将执行:" + chr(10)
+                    + chr(10).join("  " + str(i + 1) + ". " + p for i, p in enumerate(plan))
+                    + chr(10)
+                    + "做完之后,下面这张表就是这台服务器实际开放的端口 —— 删一条就真的少一个端口。"
+                    + note
+                ),
+                data={"preview": True, "plan": plan, "copy": len(specs),
+                      "drop": len(bypassing)},
+            )
+
+        changed: list[str] = []
+
+        # 1. 先确保有自己的安全组。不放行任何东西 —— 要放行什么由第 2 步照搬。
+        if not groups:
+            created = self.ensure_instance_nsg(instance_id, compartment_id, open_all=False)
+            if not created.ok:
+                return OperationResult(
+                    ok=False,
+                    message="创建安全组失败:" + (created.message or "") + chr(10)
+                    + "子网安全列表一个字节都没动。",
+                    data={"changed": changed},
+                )
+            changed.append("已创建并挂载这台服务器的独立安全组")
+            state = self.get_instance_firewall(instance_id, compartment_id)
+            if not state.ok:
+                return state
+            groups = list((state.data or {}).get("groups") or [])
+            if not groups:
+                return OperationResult(
+                    ok=False,
+                    message="已创建安全组但没挂上,请刷新后重试。子网安全列表未改动。",
+                    data={"changed": changed},
+                )
+
+        # 2. 把子网的放行搬进来。必须**先搬后删** —— 反过来做,中间那个窗口里
+        #    子网所有机器同时失联。
+        target = str(groups[0].get("id") or "")
+        if specs:
+            added = self.add_nsg_rules(target, specs)
+            if not added.ok:
+                return OperationResult(
+                    ok=False,
+                    message="把子网规则搬进安全组时失败:" + (added.message or "") + chr(10)
+                    + "子网安全列表一个字节都没动,可达性不变。",
+                    data={"changed": changed},
+                )
+            changed.append("已搬入 " + str(len(specs)) + " 条原本由子网放行的规则")
+
+        # 3. 最后才动子网。tighten 自带预检:逐台确认没有实例会因此失去入站。
+        tightened = self.tighten_subnet_security_list(
+            instance_id, compartment_id, force=force, include_foreign=include_foreign
+        )
+        if not tightened.ok:
+            return OperationResult(
+                ok=False,
+                message=(
+                    (chr(10).join("  · " + c for c in changed) + chr(10) if changed else "")
+                    + "子网这一步没做成,所以规则还没真正生效:" + chr(10)
+                    + (tightened.message or "")
+                ),
+                data={**(tightened.data or {}), "changed": changed, "stage": "tighten"},
+            )
+        changed.append("已从子网安全列表删掉那批公网放行")
+
+        return OperationResult(
+            ok=True,
+            message=(
+                "修复完成 —— 从现在起,下面这张表就是这台服务器实际开放的端口,"
+                "删一条就真的少一个端口。" + chr(10)
+                + chr(10).join("  · " + c for c in changed)
+                + chr(10) + "可达性没有变化:搬进来的和从子网删掉的是同一批规则。"
+                + note
+            ),
+            data={**(tightened.data or {}), "changed": changed, "copied": len(specs)},
+        )
 
     def clear_instance_firewall_rules(
         self,
