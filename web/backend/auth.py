@@ -16,7 +16,18 @@ from web.backend.config import get_settings
 from web.backend.db import get_db
 from web.backend.models import User
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# bcrypt 的代价是**故意**的:12 轮在这台机器上约 190ms 一次哈希,登录爆破因此变得
+# 不划算。生产环境不要调低它。
+#
+# 但测试套件为此付了 33 秒(1239 条测试里 172 次 hashpw,全部来自建用户的 fixture,
+# 没有一次是在验证哈希强度)—— 那是开发内循环的三分之一。所以轮数做成可配的,
+# 只在 tests/conftest.py 里调低。
+#
+# 下限钉死在 12:配错或环境变量泄漏到线上时,拿到的是「和以前一样安全」而不是
+# 「悄悄降到 4 轮」。想更高可以往上调。
+pwd_context = CryptContext(
+    schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=get_settings().bcrypt_rounds
+)
 security = HTTPBearer(auto_error=False)
 
 COOKIE_NAME = "ocibot_token"

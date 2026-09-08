@@ -691,8 +691,9 @@ async function createBlock() {
     const { data } = await api.post(`/tenants/${tenantId.value}/block-volumes`, { ...createForm })
     if (data.ok) {
       msg.value = data.message
-      await loadBlock()
-      await loadQuota()
+      // 列表和配额互不依赖。本文件的初始加载早就是 Promise.all，
+      // 只是变更之后的这几处漏了 —— 按钮的忙态因此白等一整趟往返。
+      await Promise.all([loadBlock(), loadQuota()])
     } else error.value = data.message
   } catch (e: any) {
     error.value = e?.message || '创建失败'
@@ -708,8 +709,9 @@ async function deleteBlock(v: any) {
     const { data } = await api.delete(`/tenants/${tenantId.value}/block-volumes/${v.id}`)
     if (data.ok) {
       msg.value = data.message
-      await loadBlock()
-      await loadQuota()
+      // 列表和配额互不依赖。本文件的初始加载早就是 Promise.all，
+      // 只是变更之后的这几处漏了 —— 按钮的忙态因此白等一整趟往返。
+      await Promise.all([loadBlock(), loadQuota()])
     } else error.value = data.message
   } catch (e: any) {
     error.value = e?.message || '删除失败'
@@ -773,8 +775,9 @@ async function resizeBlock(v: any) {
     })
     if (data.ok) {
       msg.value = data.message
-      await loadBlock()
-      await loadQuota()
+      // 列表和配额互不依赖。本文件的初始加载早就是 Promise.all，
+      // 只是变更之后的这几处漏了 —— 按钮的忙态因此白等一整趟往返。
+      await Promise.all([loadBlock(), loadQuota()])
     } else error.value = data.message
   } catch (e: any) {
     error.value = e?.message || '扩容失败'

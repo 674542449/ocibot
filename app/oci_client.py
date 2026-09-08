@@ -344,6 +344,10 @@ def persistent_404_note(rereads: int) -> str:
 # requests.Session, which tolerates concurrent GETs; keep pools small so a
 # large tenancy does not spawn hundreds of threads.
 _IP_RESOLVE_WORKERS = 8
+# 防火墙页一次读:各 NSG 的规则 + 子网安全列表那一支。免费套餐一个实例最多
+# 5 个 NSG、子网最多 5 份安全列表,所以 6 已经覆盖到顶,不必更高 ——
+# 并发度开大只会在限流时更快撞上熔断器。
+_FIREWALL_READ_WORKERS = 6
 _COMPARTMENT_WORKERS = 5
 
 from app.config_store import TenantConfig
@@ -1315,6 +1319,21 @@ class TenantSession:
         self._last_tree_errors: list[str] = []
         self._build()
 
+    # 会话共用的签名器。真实会话在 _build 里赋值;测试里用 TenantSession.__new__
+    # 造的裸对象没走过 _build,所以这里给一个类级缺省,让 _signer_kw 能安全降级。
+    _signer: Any = None
+
+    @property
+    def _signer_kw(self) -> dict:
+        """把共用签名器传给按区域另建的 client —— 没有就**整个键都不传**。
+
+        不能传 `signer=None`:SDK 的判断是 `if 'signer' in kwargs`,键在就直接用它的
+        值,于是 None 会变成「没有签名器」,请求签不了名。没有签名器时省掉这个键,
+        client 自己会从 config 里再解析一次私钥 —— 慢,但正确。
+        """
+        signer = getattr(self, "_signer", None)
+        return {"signer": signer} if signer is not None else {}
+
     def _cb_kwargs(self, service: str) -> dict:
         """本会话的 client kwargs —— 见模块级 cb_kwargs()。"""
         return cb_kwargs(service, str(getattr(self.tenant, "id", "") or ""))
@@ -1335,10 +1354,41 @@ class TenantSession:
             }
             # Validate config early
             oci.config.validate_config(self._config)
+
+            # 私钥**只解析一次**，九个 client 共用同一个 Signer。
+            #
+            # 不这么做的话，每个 client 的构造函数各自 load_pem_private_key 一遍 ——
+            # 而 cryptography 在加载 RSA 私钥时会跑一次密钥自洽性校验，那一步是纯 CPU：
+            #
+            #     RSA-2048  校验 33.5ms   跳过校验 0.02ms
+            #     RSA-4096  校验 225.6ms  跳过校验 0.02ms
+            #
+            # 于是建一个 TenantSession 要 293ms（2048 位）或 2073ms（4096 位），
+            # 其中 98.6% 花在重复解析同一把密钥上。这笔钱在每个租户第一次操作时付，
+            # 而 SessionManager.get 是在一把**进程级锁**里构造 session 的 ——
+            # 也就是说这两秒会把同一个 worker 里所有租户的请求一起堵住。
+            #
+            # Signer 与区域无关（区域在 endpoint 里），所以 _config_for_region 那几个
+            # 按区域重建的 client 也能共用它。
+            #
+            # 传了 signer= 之后 client 会跳过自己那次 validate，所以上面那句
+            # validate_config 要留着。注意它**不校验私钥本身**（实测：坏密钥能通过）——
+            # 真正把坏密钥挡下来的是构造 Signer，而它就在同一个 try 里，
+            # 所以 InvalidPrivateKey 仍然在原来的位置抛出。
+            self._signer = oci.signer.Signer(
+                tenancy=self._config["tenancy"],
+                user=self._config["user"],
+                fingerprint=self._config["fingerprint"],
+                private_key_file_location=None,
+                private_key_content=self._config["key_content"],
+            )
             # Client-level SDK retry for transient 429 / 5xx / timeouts.
             # LaunchInstance overrides this with NoneRetryStrategy so capacity
             # retry + application 429 cooldown stay the single control plane.
-            retry_kw = {"retry_strategy": sdk_default_retry_strategy()}
+            retry_kw = {
+                "retry_strategy": sdk_default_retry_strategy(),
+                "signer": self._signer,
+            }
 
             # 熔断器必须**每租户 × 每服务**一个。
             #
@@ -1366,7 +1416,9 @@ class TenantSession:
             #
             # Compute **不要**加：它本来就没有熔断器，加上等于凭空引入一个新的失败
             # 模式，而实例列表和实例详情正好全压在它身上。
-            _cb_kw = self._cb_kwargs
+            # 每个 client 都带上共用的 signer（见上面那段）。
+            def _cb_kw(service: str) -> dict:
+                return {**self._cb_kwargs(service), "signer": self._signer}
 
             self._compute = ComputeClient(self._config, **retry_kw)
             self._network = VirtualNetworkClient(self._config, **_cb_kw("network"))
@@ -1460,6 +1512,7 @@ class TenantSession:
                 if home and home != self.tenant.region.strip():
                     self._usage = UsageapiClient(
                         self._config_for_region(home),
+                        **self._signer_kw,
                         **cb_kwargs("usage", str(getattr(self.tenant, "id", "") or "")),
                     )
             except Exception:  # noqa: BLE001
@@ -3851,8 +3904,22 @@ class TenantSession:
     def get_instance_firewall(self, instance_id: str, compartment_id: str) -> OperationResult:
         try:
             network = self.resolve_primary_network(instance_id, compartment_id)
-            groups = []
-            for nsg_id in network.nsg_ids:
+
+            # 拿到主 VNIC 之后，剩下的读**互相没有依赖**：每个 NSG 的规则、以及子网
+            # 那一整支（get_subnet 再读各安全列表），可以同时发出去。串着读的话，
+            # 2 个 NSG + 3 份安全列表要 11 个来回；并发之后深度是 2（子网那支最长）。
+            #
+            # 刻意用**扁平**的一层池：每个 NSG 一个任务（它内部那两次调用是串的），
+            # 加子网那一支一个任务。再往里拆一层没有意义 —— 子网那支两跳，本来就是
+            # 下限；拆了只是多开线程。
+            #
+            # 每个任务里的 try/except 位置一个字都没动：一份读不到的安全列表仍然只
+            # 让 complete=False，而不是把整次读打回。complete 必须是 AND 归约，
+            # 不能写成「列表非空」—— 读失败和「确实没有」是两回事。
+            #
+            # 顺序不能靠完成顺序：结果按 nsg_ids 的原顺序摆回去，否则界面上的卡片
+            # 每次刷新都可能换位置。
+            def _read_group(nsg_id: str) -> dict:
                 nsg = self.network.get_network_security_group(nsg_id).data
                 rules = oci.pagination.list_call_get_all_results(
                     self.network.list_network_security_group_security_rules,
@@ -3860,14 +3927,19 @@ class TenantSession:
                     retry_strategy=sdk_bounded_paged_retry_strategy(),
                 ).data
                 tags = getattr(nsg, "freeform_tags", None) or {}
-                groups.append(
-                    {
-                        "id": nsg_id,
-                        "display_name": getattr(nsg, "display_name", "") or nsg_id[-8:],
-                        "is_managed": self._is_ocibot_managed_nsg(tags),
-                        "rules": [self._normalize_firewall_rule(rule) for rule in rules],
-                    }
-                )
+                return {
+                    "id": nsg_id,
+                    "display_name": getattr(nsg, "display_name", "") or nsg_id[-8:],
+                    "is_managed": self._is_ocibot_managed_nsg(tags),
+                    "rules": [self._normalize_firewall_rule(rule) for rule in rules],
+                }
+
+            nsg_ids = list(network.nsg_ids)
+            with ThreadPoolExecutor(max_workers=min(_FIREWALL_READ_WORKERS, len(nsg_ids) + 1)) as pool:
+                sl_future = pool.submit(self._subnet_security_lists_checked, network.subnet_id)
+                # pool.map 保序，和 nsg_ids 一一对应。
+                groups = list(pool.map(_read_group, nsg_ids)) if nsg_ids else []
+                security_lists, sl_complete = sl_future.result()
             # Most instances have NO NSG on the VNIC — OCI's default networking puts
             # ingress/egress rules on the SUBNET's security list instead. Reading
             # only nsg_ids therefore showed an empty firewall panel for any instance
@@ -3876,10 +3948,6 @@ class TenantSession:
             # 安全列表现在是**可编辑的**(见 add_security_list_rules 一族)。这是
             # 0.4.109 的改动:在 Oracle 控制台建的机器根本没有 NSG,入站全由安全列表
             # 决定 —— 只让面板改 NSG,对这批机器等于防火墙功能不存在。
-            security_lists, sl_complete = self._subnet_security_lists_checked(
-                network.subnet_id
-            )
-
             parts = []
             if groups:
                 parts.append(f"{len(groups)} 个网络安全组（NSG）")
@@ -3957,10 +4025,26 @@ class TenantSession:
             subnet = self.network.get_subnet(subnet_id).data
         except Exception:  # noqa: BLE001 - best effort; NSGs are still returned
             return out, False
-        for sl_id in list(getattr(subnet, "security_list_ids", None) or []):
+        # 一次 get_subnet 之后，各份安全列表之间互不依赖 —— 并发读。
+        # 结果保序（pool.map），因为界面按这个顺序渲染卡片。
+        sl_ids = list(getattr(subnet, "security_list_ids", None) or [])
+
+        def _fetch(sl_id: str):
             try:
-                sl = self.network.get_security_list(sl_id).data
+                return sl_id, self.network.get_security_list(sl_id).data
             except Exception:  # noqa: BLE001
+                # 读失败**不是**「这份列表没有规则」。返回 None 让调用方把
+                # complete 置 False —— 空列表是断言，读失败不是。
+                return sl_id, None
+
+        if len(sl_ids) > 1:
+            with ThreadPoolExecutor(max_workers=min(_FIREWALL_READ_WORKERS, len(sl_ids))) as pool:
+                fetched = list(pool.map(_fetch, sl_ids))
+        else:
+            fetched = [_fetch(sl_id) for sl_id in sl_ids]
+
+        for sl_id, sl in fetched:
+            if sl is None:
                 complete = False
                 continue
             rules: list[dict] = []
@@ -5247,6 +5331,7 @@ class TenantSession:
         force: bool = False,
         include_foreign: bool = False,
         preview: bool = False,
+        state: Optional[OperationResult] = None,
     ) -> OperationResult:
         """删掉子网安全列表里所有「对公网开端口」的入站规则，让 NSG 真正说了算。
 
@@ -5275,7 +5360,10 @@ class TenantSession:
         再动手。安全列表可以被同一个 VCN 里多个子网共用，只看实例自己那个子网，
         会在别的子网里悄悄关掉一台机器 —— 那台机器根本不在用户这次操作的视野里。
         """
-        state = self.get_instance_firewall(instance_id, compartment_id)
+        # 调用方手里已经有这次读的结果时就别再读一遍。这里只用到 subnet_id 和
+        # has_ipv6 —— 两个都不会因为中途建了 NSG、加了规则而变。
+        # 一键修复正是这种情况:它自己刚读过,再读一次就是白花一整趟往返。
+        state = state or self.get_instance_firewall(instance_id, compartment_id)
         if not state.ok:
             return state
         data = state.data or {}
@@ -5758,8 +5846,16 @@ class TenantSession:
             changed.append("已搬入 " + str(len(specs)) + " 条原本由子网放行的规则")
 
         # 3. 最后才动子网。tighten 自带预检:逐台确认没有实例会因此失去入站。
+        # state 传进去:我们上面刚读过,而 tighten 只需要里面的 subnet_id 和 has_ipv6,
+        # 那两个不会因为刚建的 NSG 而变。少一整趟 get_instance_firewall。
+        # 它的预检（_subnet_vnics_at_risk）读的是网络接口本身，不走这份 state，
+        # 所以刚挂上的 NSG 一样看得到。
         tightened = self.tighten_subnet_security_list(
-            instance_id, compartment_id, force=force, include_foreign=include_foreign
+            instance_id,
+            compartment_id,
+            force=force,
+            include_foreign=include_foreign,
+            state=state,
         )
         if not tightened.ok:
             return OperationResult(
@@ -7516,7 +7612,11 @@ class TenantSession:
         if home:
             cfg["region"] = home
         try:
-            client = InvoiceServiceClient(cfg, **cb_kwargs("invoice", str(getattr(self.tenant, "id", "") or "")))
+            client = InvoiceServiceClient(
+                cfg,
+                **self._signer_kw,
+                **cb_kwargs("invoice", str(getattr(self.tenant, "id", "") or "")),
+            )
             # "INVOICE_DATE" is the billing period this table is ordered by, and it
             # is one of the values the service accepts — the enum is small and
             # closed, so it is asserted rather than assumed. Sending anything else
@@ -8265,7 +8365,11 @@ class TenantSession:
         home = self._home_region()
         if home and home != self.tenant.region.strip():
             try:
-                identity = IdentityClient(self._config_for_region(home), **cb_kwargs("identity", str(getattr(self.tenant, "id", "") or "")))
+                identity = IdentityClient(
+                    self._config_for_region(home),
+                    **self._signer_kw,
+                    **cb_kwargs("identity", str(getattr(self.tenant, "id", "") or "")),
+                )
             except Exception:  # noqa: BLE001
                 identity = self.identity
 
@@ -8313,6 +8417,7 @@ class TenantSession:
         return IdentityDomainsClient(
             cfg,
             service_endpoint=endpoint,
+            **self._signer_kw,
             **cb_kwargs("identitydomains", str(getattr(self.tenant, "id", "") or "")),
         )
 
@@ -8709,6 +8814,7 @@ class TenantSession:
             try:
                 client = SubscriptionClient(
                     self._config_for_region(region),
+                    **self._signer_kw,
                     **cb_kwargs("subscription", str(getattr(self.tenant, "id", "") or "")),
                 )
                 resp = client.list_subscriptions(compartment_id=tenancy, entity_version="V1")

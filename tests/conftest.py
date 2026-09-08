@@ -18,3 +18,11 @@ import os
 
 os.environ.setdefault("OCIBOT_MASTER_KEY", "test-suite-master-key-0123456789abcdef")
 os.environ.setdefault("OCIBOT_JWT_SECRET", "test-suite-jwt-secret-0123456789abcdef")
+
+# bcrypt 轮数只在测试里调低。全套 1239 条测试要建 172 次用户,12 轮时这一项就是
+# 33 秒 —— 占整个套件的三分之一,而没有一条测试是在验证哈希强度。
+#
+# 用一个**测试专用**的变量名而不是 OCIBOT_BCRYPT_ROUNDS:后者在生产路径上会被
+# max(12, ...) 兜住,而这个变量除了这里没有任何地方会设,泄漏到线上的唯一途径是
+# 有人手动 export 它。
+os.environ.setdefault("OCIBOT_BCRYPT_TEST_ROUNDS", "4")

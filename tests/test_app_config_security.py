@@ -235,3 +235,55 @@ def test_bad_secrets_serve_503_everywhere_instead_of_crash_looping(monkeypatch):
     assert health.status_code == 503
     assert "SECRETS ARE BAD: do X" in health.json()["detail"]
     assert post.status_code == 503  # nothing is reachable, not just health
+
+
+# ---------------------------------------------------------------------------
+# bcrypt 工作因子
+# ---------------------------------------------------------------------------
+#
+# 轮数做成可配的，唯一目的是让测试套件别为 172 次建用户的 fixture 付 33 秒。
+# 这个旋钮的风险方向很明确：配错、或者测试用的环境变量泄漏到线上，
+# 会把口令哈希悄悄降到 4 轮 —— 而那是**不会有任何报错**的一种削弱。
+# 下面两条把「生产永远不低于 12」钉死。
+
+
+def test_the_shipped_bcrypt_default_is_12():
+    """改这个默认值需要先改掉这条测试 —— 那时你会看见这段注释。"""
+    from web.backend.config import Settings
+
+    assert Settings.model_fields["bcrypt_rounds_setting"].default == 12
+
+
+def test_production_never_drops_below_12_even_if_misconfigured(monkeypatch):
+    """OCIBOT_BCRYPT_ROUNDS 被设成 4 也没用 —— 生产路径 max(12, ...) 兜底。"""
+    from web.backend.config import Settings
+
+    s = Settings(OCIBOT_BCRYPT_ROUNDS=4)  # type: ignore[call-arg]
+    monkeypatch.delenv("OCIBOT_BCRYPT_TEST_ROUNDS", raising=False)
+    assert s.bcrypt_rounds == 12
+    assert Settings(OCIBOT_BCRYPT_ROUNDS=14).bcrypt_rounds == 14  # type: ignore[call-arg]
+
+
+def test_only_the_test_only_variable_can_lower_it(monkeypatch):
+    """降轮数只有一条路：显式设 OCIBOT_BCRYPT_TEST_ROUNDS。
+
+    用一个测试专用的变量名，是为了让「泄漏到线上」需要有人手动 export 一个
+    名字里就写着 TEST 的东西，而不是抄错一行部署配置。
+    """
+    from web.backend.config import Settings
+
+    monkeypatch.setenv("OCIBOT_BCRYPT_TEST_ROUNDS", "4")
+    assert Settings().bcrypt_rounds == 4
+    # 垃圾值不能把它变成 0 轮或抛异常。
+    monkeypatch.setenv("OCIBOT_BCRYPT_TEST_ROUNDS", "不是数字")
+    assert Settings().bcrypt_rounds == 12
+    monkeypatch.setenv("OCIBOT_BCRYPT_TEST_ROUNDS", "0")
+    assert Settings().bcrypt_rounds == 4  # 下限 4，不会退化成明文
+
+
+def test_hashing_actually_uses_the_configured_rounds():
+    """光有 Settings 字段不算数 —— 要确认它真的接到了 passlib 上。"""
+    from web.backend.auth import hash_password
+
+    # conftest 把测试轮数设成了 4，bcrypt 的哈希串里第二段就是轮数。
+    assert hash_password("x").split("$")[2] == "04"

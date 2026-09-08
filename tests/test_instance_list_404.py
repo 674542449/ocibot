@@ -282,9 +282,10 @@ def test_the_collapse_path_re_reads_before_raising():
     assert "_is_ambiguous_404" in src
 
 
-def test_only_404_is_re_read():
+def test_only_404_is_re_read(monkeypatch):
     """429 / 5xx / 401 都不该触发复读：限流有 SDK 自己的退避，401 是真的凭据问题。"""
-    from app.oci_client import _REREAD_DELAYS, read_with_404_evidence
+    from app import oci_client
+    from app.oci_client import read_with_404_evidence
 
     calls = []
 
@@ -305,11 +306,16 @@ def test_only_404_is_re_read():
         assert len(calls) == 1, f"{status} 只该调用一次，实际 {len(calls)}"
 
     # 404 才复读，且次数有界。
+    #
+    # 把等待时间清零：断言看的是**复读次数**（rereads == len(_REREAD_DELAYS)），
+    # 真去睡那 1.2s + 3.0s 一秒钟的覆盖都不多买，只是让整套测试多花 4.2 秒。
+    # 生产那两个间隔一个字都没动，断言仍然读同一个元组，所以它变了这里也跟着变。
+    monkeypatch.setattr(oci_client, "_REREAD_DELAYS", (0.0, 0.0))
     calls.clear()
     ok, _v, _e, rereads = read_with_404_evidence(_boom(404, "NotAuthorizedOrNotFound"))
     assert not ok
-    assert rereads == len(_REREAD_DELAYS)
-    assert len(calls) == len(_REREAD_DELAYS) + 1
+    assert rereads == len(oci_client._REREAD_DELAYS)
+    assert len(calls) == len(oci_client._REREAD_DELAYS) + 1
 
 
 def test_a_successful_first_read_costs_nothing_extra():

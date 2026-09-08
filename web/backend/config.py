@@ -30,7 +30,29 @@ class Settings(BaseSettings):
     # /api/health 正是操作员确认"更新有没有装上"的唯一手段（README 排障表第一行），
     # test_version_bump.py 也看不见这种偏差。ClassVar 不参与 pydantic 解析，任何环境
     # 变量都改不动它。
-    app_version: ClassVar[str] = "0.4.110"
+    app_version: ClassVar[str] = "0.4.111"
+
+    # bcrypt 的工作因子。生产**不要**调低 —— 12 轮约 190ms 一次哈希,正是它让
+    # 在线爆破不划算。这个旋钮存在只有一个用途:测试套件里 172 次建用户的 fixture
+    # 哈希占了整整 33 秒,而它们一次都没在验证哈希强度。
+    #
+    # 读取时会 max(12, ...) 兜底(见 bcrypt_rounds),所以即使这个值被误设成 4、
+    # 或者测试用的环境变量泄漏到线上,拿到的仍然是 12。要降只能在进程里显式设
+    # OCIBOT_BCRYPT_TEST_ROUNDS,那个变量除了 conftest 没有别的地方设。
+    bcrypt_rounds_setting: int = Field(default=12, alias="OCIBOT_BCRYPT_ROUNDS")
+
+    @property
+    def bcrypt_rounds(self) -> int:
+        import os
+
+        test_rounds = os.environ.get("OCIBOT_BCRYPT_TEST_ROUNDS", "").strip()
+        if test_rounds:
+            try:
+                return max(4, min(31, int(test_rounds)))
+            except ValueError:
+                pass
+        # 生产路径:永远不低于 12。
+        return max(12, int(self.bcrypt_rounds_setting or 12))
 
     debug: bool = Field(default=False, alias="OCIBOT_DEBUG")
 

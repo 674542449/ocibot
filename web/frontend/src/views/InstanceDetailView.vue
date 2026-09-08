@@ -2377,8 +2377,11 @@ async function refreshAll() {
   loading.value = true
   error.value = ''
   try {
-    await loadInstance()
-    await loadCurrentTab()
+    // 并发：每个 tab 的加载函数都用路由上的 tenantId/instanceId 拼 URL，
+    // 没有一个读 instance.value —— 所以不必等实例详情先回来。
+    // （唯一真有依赖的是备份列表，它在 loadCurrentTab 内部串在 loadBoot 之后，
+    //  那一处保持不变。）beginLoad/stale 保护是按加载器各自算的，不受影响。
+    await Promise.all([loadInstance(), loadCurrentTab()])
   } catch (e: any) {
     if (guard.stale()) return
     error.value = e?.message || '加载失败'
@@ -2405,8 +2408,11 @@ onMounted(async () => {
     // Only the instance summary is required to open the page.
     // Metrics / console / firewall / volume load when the user opens that tab
     // (or clicks 刷新全部), to avoid background Oracle polling.
-    await loadInstance()
-    await loadCurrentTab()
+    // 并发：每个 tab 的加载函数都用路由上的 tenantId/instanceId 拼 URL，
+    // 没有一个读 instance.value —— 所以不必等实例详情先回来。
+    // （唯一真有依赖的是备份列表，它在 loadCurrentTab 内部串在 loadBoot 之后，
+    //  那一处保持不变。）beginLoad/stale 保护是按加载器各自算的，不受影响。
+    await Promise.all([loadInstance(), loadCurrentTab()])
   } catch (e: any) {
     if (guard.stale()) return
     error.value = e?.message || '加载失败'
@@ -2473,8 +2479,11 @@ watch([tenantId, instanceId], async () => {
   const guard = beginLoad('page')
   loading.value = true
   try {
-    await loadInstance()
-    await loadCurrentTab()
+    // 并发：每个 tab 的加载函数都用路由上的 tenantId/instanceId 拼 URL，
+    // 没有一个读 instance.value —— 所以不必等实例详情先回来。
+    // （唯一真有依赖的是备份列表，它在 loadCurrentTab 内部串在 loadBoot 之后，
+    //  那一处保持不变。）beginLoad/stale 保护是按加载器各自算的，不受影响。
+    await Promise.all([loadInstance(), loadCurrentTab()])
   } catch (e: any) {
     if (guard.stale()) return
     error.value = e?.message || '加载失败'
