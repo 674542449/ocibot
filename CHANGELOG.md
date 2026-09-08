@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.4.112 — 2026-09-07
+
+把上一版列出的四项也做了。
+
+### 维护
+
+- **【高】配额快照的四块读取改成并发 —— 这是服务端最热的一条路径。**
+  `get_free_quota_usage` 的实例 / 引导卷 / 块存储卷 / 对象存储四块读取互不依赖，
+  串着读只是把四段网络等待加起来。而 `quota_guard` 在**每一次抢机重试**前都要走
+  一遍。每块保持自己那套 try/except 原封不动搬进各自的任务，`notes` 按原顺序拼回
+  （它是给人看的），`read_incomplete` 仍然是 OR 归约 —— 那是配额守卫「读不全就别
+  放行」的唯一依据。`_last_tree_errors` 的清零和读取整个搬进实例那块：它挂在进程
+  级共享的 TenantSession 上，这三步之间不能插进别的任务。
+
+- **【高】测试套件 57 秒 → 28 秒。** 装上 pytest-xdist，`-n 6`。
+  `pytest.ini` 里固定 `--dist loadfile`：套件有 21 个模块级 fixture，而每个测试模块
+  在 import 时各自 `mkdtemp()` 出一个库再 `setdefault("DATABASE_URL")` 认领它 ——
+  默认的 `--dist load` 会把同一个文件打散到不同 worker，那些 fixture 每个 worker
+  重跑一遍，模块的 SQLite 状态被劈成几半。并行不在 `addopts` 里默认打开：跑单个
+  文件时 worker 启动加收集的钱（`import oci` 就 1.2 秒）不划算。实测拐点在 6 个
+  （4 个 31.0s / 6 个 22.6s / 8 个 23.0s / 12 个 23.1s），别用 `-n auto`。
+
+- **【中】入口包 187.8 KB → 142.7 KB（gzip 71.2 → 54.2，-24%），axios 移除。**
+  入口包是唯一阻塞首屏的那个，而这里用到的 axios 能力只有几十行。换成一个 fetch
+  封装，逐字复刻四件调用方依赖的事 —— 每一件失灵都是**静默**的：小写普通对象的
+  `headers`（两处直接下标取「本次是不是瞬时故障」）、`err.response`（导出失败的
+  Blob 正文、创建失败的 status 分支）、blob 请求失败时错误正文仍是 Blob、
+  超时消息里带 `timeout`（创建页靠它决定要不要提示「机器可能已经开出来了」）。
+
+  这个仓库没有前端测试运行器，而这个模块在**每一个请求**的路径上，所以新增
+  `web/frontend/test/client.check.mjs`：起一台真实 HTTP 服务器跑 14 条断言，
+  由 `tests/test_api_client_contract.py` 带进 Python 套件（没有 node 就跳过）。
+  用四个变异验证过它真的会红：把 headers 换成 Headers 实例、改掉超时文案、
+  让 blob 错误正文退化成 JSON、把参数过滤写成真值判断 —— 四个都被逮到。
+
+- **【中】`OCIBOT_API_WORKERS` 默认 2 → 1。** 这不是性能取舍：这个负载是等 OCI
+  网络不是烧 CPU，第二个 worker 不让任何请求变快。实测内存 285.2 MB → 127.5 MB
+  （uvicorn 0.51 用 spawn，两个 worker 是两个全新解释器，没有写时复制可省；
+  单 worker 时它连监督进程都不 fork）。在 1 GB 的 Always Free 机器上是六分之一内存。
+
+  顺带修好两件「按进程算」的事：WebSSH 并发会话上限、登录限流的内存桶
+  （`web/AUDIT.md` 里记着的已知缺口）—— 单进程之后它们才是真正的全局上限。
+  代价是没有第二个进程兜底，ASGI 进程崩了要等 Docker 重启；内存宽裕、更看重崩溃
+  隔离的话把这个值改回 2。
+
+- 一条测试从「读源码找字面量」改成真的跑一遍看结果。
+  `test_a_failed_object_storage_read_marks_the_snapshot_incomplete` 原来断言
+  `get_free_quota_usage` 的源码里有 `read_incomplete = True` —— 钉的是「代码长什么
+  样」而不是「行为是什么」，于是这次并发化只改了局部变量名它就红了，而行为一个字
+  没变。锁内调用清单那条同理：快照那四块现在是并发的，钉集合与位置，不钉顺序。
+
+### 升级
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.112
+```
+
 ## 0.4.111 — 2026-09-07
 
 性能。全部经过测量，不是猜的。

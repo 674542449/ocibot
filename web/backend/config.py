@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     # /api/health 正是操作员确认"更新有没有装上"的唯一手段（README 排障表第一行），
     # test_version_bump.py 也看不见这种偏差。ClassVar 不参与 pydantic 解析，任何环境
     # 变量都改不动它。
-    app_version: ClassVar[str] = "0.4.111"
+    app_version: ClassVar[str] = "0.4.112"
 
     # bcrypt 的工作因子。生产**不要**调低 —— 12 轮约 190ms 一次哈希,正是它让
     # 在线爆破不划算。这个旋钮存在只有一个用途:测试套件里 172 次建用户的 fixture
@@ -120,7 +120,11 @@ class Settings(BaseSettings):
 
     # API process workers (Docker / production entrypoint). 1 is safest with
     # in-process WebSSH session counters; 2+ improves HTTP throughput.
-    api_workers: int = Field(default=2, alias="OCIBOT_API_WORKERS")
+    # 默认 1：这个负载是等 OCI 网络而不是烧 CPU，第二个 worker 不让任何请求变快，
+    # 却多占约 158 MB（uvicorn 用 spawn，两个 worker 是两个全新解释器）。
+    # 单进程还让 WebSSH 会话上限和登录限流桶从「每进程」变成真正的全局。
+    # 内存宽裕、更看重崩溃隔离的话改回 2。详见 web/Dockerfile 里那段说明。
+    api_workers: int = Field(default=1, alias="OCIBOT_API_WORKERS")
 
     # Secure default: only the FIRST user may self-register (becomes admin).
     # After that, registration is closed unless an admin re-opens it (env here or

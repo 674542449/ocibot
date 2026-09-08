@@ -349,6 +349,10 @@ _IP_RESOLVE_WORKERS = 8
 # 并发度开大只会在限流时更快撞上熔断器。
 _FIREWALL_READ_WORKERS = 6
 _COMPARTMENT_WORKERS = 5
+# 配额快照的四块读取（实例 / 引导卷 / 块存储卷 / 对象存储，可选出网流量）。
+# 最多五块，所以 5 就到顶。这条路径在抢机重试前每次都走一遍，并发度再高只会
+# 更快撞上 per-tenancy 限流 —— 而那正是抢机循环要抢的同一份额度。
+_QUOTA_READ_WORKERS = 5
 
 from app.config_store import TenantConfig
 
@@ -6405,86 +6409,123 @@ class TenantSession:
         """
         from app import free_quota
 
+        # 四块读取（实例 / 引导卷 / 块存储卷 / 对象存储，外加可选的出网流量）
+        # **互相没有依赖**，串着读只是把四段网络等待加起来。这条路径是服务端最热的
+        # 一条 —— quota_guard 在**每一次抢机重试**前都要走一遍。
+        #
+        # 每块保持自己那套 try/except 原封不动，只是搬进各自的任务里：
+        # notes / read_incomplete 的语义必须逐字不变（read_incomplete 是配额守卫
+        # 「读不全就别放行」的唯一依据，而 notes 里混着无害的提示，
+        # 用「有没有 notes」来判断会把正常创建也挡掉）。
+        #
+        # 结果按**原来的顺序**拼回去：notes 是给人看的，顺序变了摘要就换了面貌。
+        #
+        # _last_tree_errors 的清零和读取整个搬进实例那块。它挂在**进程级共享的**
+        # TenantSession 上（见 InstanceInfo.read_note 上面那段注释里点名的旧坑），
+        # 所以「清零 → 调用 → 读回」这三步之间不能插进别的任务；放在同一个任务里
+        # 就仍然是顺序执行的。别的三块都不碰它。
         notes: list[str] = []
-        # Tracks whether any read that feeds a *cap* (compute / block storage) came
-        # back incomplete. Deliberately separate from `notes`, which also carries
-        # benign informational messages such as the object-storage approximation
-        # warning — gating on "any notes" would block legitimate launches.
         read_incomplete = False
 
-        self._last_tree_errors = []
-        try:
-            instances = self.list_instances_tree(resolve_ips=False)
-            if self._last_tree_errors:
-                read_incomplete = True
-                # Name the first cause: a count alone cannot tell "one compartment
-                # was throttled" (retry) apart from "the subtree could not be
-                # enumerated at all" (an IAM policy the operator has to fix).
-                notes.append(
-                    f"部分区间实例读取失败（{len(self._last_tree_errors)} 处）：{self._last_tree_errors[0]}"
-                )
-        except Exception as exc:  # noqa: BLE001
-            instances = []
-            read_incomplete = True
-            notes.append(f"实例读取失败：{exc}")
-
-        volumes: list[dict[str, Any]] = []
-        try:
-            bv = self.list_boot_volumes(include_subcompartments=True, include_attachments=True)
-            data = bv.data if isinstance(bv.data, dict) else {}
-            if not bv.ok or (data.get("errors") or []):
-                read_incomplete = True
-                notes.append("引导卷读取不完整")
-            for v in data.get("volumes", []) or []:
-                volumes.append({**v, "kind": "boot"})
-        except Exception as exc:  # noqa: BLE001
-            read_incomplete = True
-            notes.append(f"引导卷读取失败：{exc}")
-
-        if include_block:
+        def _read_instances() -> tuple[list, list[str], bool]:
+            local_notes: list[str] = []
+            self._last_tree_errors = []
             try:
-                blk = self.list_block_volumes(include_subcompartments=True, include_attachments=True)
-                data = blk.data if isinstance(blk.data, dict) else {}
-                if not blk.ok or (data.get("errors") or []):
-                    read_incomplete = True
-                    notes.append("块存储卷读取不完整")
-                for v in data.get("volumes", []) or []:
-                    volumes.append({**v, "kind": "block"})
+                items = self.list_instances_tree(resolve_ips=False)
+                if self._last_tree_errors:
+                    # Name the first cause: a count alone cannot tell "one compartment
+                    # was throttled" (retry) apart from "the subtree could not be
+                    # enumerated at all" (an IAM policy the operator has to fix).
+                    local_notes.append(
+                        f"部分区间实例读取失败（{len(self._last_tree_errors)} 处）："
+                        f"{self._last_tree_errors[0]}"
+                    )
+                    return items, local_notes, True
+                return items, local_notes, False
             except Exception as exc:  # noqa: BLE001
-                read_incomplete = True
-                notes.append(f"块存储卷读取失败：{exc}")
+                local_notes.append(f"实例读取失败：{exc}")
+                return [], local_notes, True
 
-        object_usage: dict[str, Any] = {}
-        try:
-            est = self.estimate_object_storage_usage()
-            if est.ok and isinstance(est.data, dict):
-                object_usage = est.data
-            else:
-                # 读不到就让 object_usage 留空 —— build_quota_snapshot 据此**省略**
-                # 这根仪表，而不是画一根「已用 0 / 20 GB，正常」的假仪表。
-                read_incomplete = True
-            if est.message:
-                # 以前这条在 not est.ok 时会被 append 两次（上面一次、下面一次），
-                # 于是同一句话在摘要里重复出现。
-                notes.append(est.message)
-        except Exception as exc:  # noqa: BLE001
-            read_incomplete = True
-            notes.append(f"对象存储读取失败：{exc}")
+        def _read_volumes(kind: str) -> tuple[list[dict[str, Any]], list[str], bool]:
+            label = "引导卷" if kind == "boot" else "块存储卷"
+            reader = self.list_boot_volumes if kind == "boot" else self.list_block_volumes
+            local_notes: list[str] = []
+            out: list[dict[str, Any]] = []
+            try:
+                res = reader(include_subcompartments=True, include_attachments=True)
+                data = res.data if isinstance(res.data, dict) else {}
+                incomplete = bool(not res.ok or (data.get("errors") or []))
+                if incomplete:
+                    local_notes.append(f"{label}读取不完整")
+                for v in data.get("volumes", []) or []:
+                    out.append({**v, "kind": kind})
+                return out, local_notes, incomplete
+            except Exception as exc:  # noqa: BLE001
+                local_notes.append(f"{label}读取失败：{exc}")
+                return out, local_notes, True
 
-        egress_usage: dict[str, Any] = {}
-        if include_egress:
+        def _read_object() -> tuple[dict[str, Any], list[str], bool]:
+            local_notes: list[str] = []
+            try:
+                est = self.estimate_object_storage_usage()
+                incomplete = False
+                usage: dict[str, Any] = {}
+                if est.ok and isinstance(est.data, dict):
+                    usage = est.data
+                else:
+                    # 读不到就让 object_usage 留空 —— build_quota_snapshot 据此**省略**
+                    # 这根仪表，而不是画一根「已用 0 / 20 GB，正常」的假仪表。
+                    incomplete = True
+                if est.message:
+                    # 以前这条在 not est.ok 时会被 append 两次（上面一次、下面一次），
+                    # 于是同一句话在摘要里重复出现。
+                    local_notes.append(est.message)
+                return usage, local_notes, incomplete
+            except Exception as exc:  # noqa: BLE001
+                local_notes.append(f"对象存储读取失败：{exc}")
+                return {}, local_notes, True
+
+        def _read_egress() -> tuple[dict[str, Any], list[str], bool]:
+            local_notes: list[str] = []
             try:
                 egress = self.get_network_egress_usage()
                 if egress.ok and isinstance(egress.data, dict):
-                    egress_usage = egress.data
                     if egress.data.get("note"):
-                        notes.append(str(egress.data["note"]))
-                elif egress.message:
+                        local_notes.append(str(egress.data["note"]))
+                    return egress.data, local_notes, False
+                if egress.message:
                     # Informational only — an unreadable egress figure must not set
                     # read_incomplete, which would fail-closed on every launch.
-                    notes.append(f"出网流量读取失败：{egress.message}")
+                    local_notes.append(f"出网流量读取失败：{egress.message}")
             except Exception as exc:  # noqa: BLE001
-                notes.append(f"出网流量读取失败：{exc}")
+                local_notes.append(f"出网流量读取失败：{exc}")
+            return {}, local_notes, False
+
+        tasks: list[tuple[str, Any]] = [("instances", _read_instances), ("boot", lambda: _read_volumes("boot"))]
+        if include_block:
+            tasks.append(("block", lambda: _read_volumes("block")))
+        tasks.append(("object", _read_object))
+        if include_egress:
+            tasks.append(("egress", _read_egress))
+
+        with ThreadPoolExecutor(max_workers=min(_QUOTA_READ_WORKERS, len(tasks))) as pool:
+            done = list(pool.map(lambda t: (t[0], t[1]()), tasks))
+
+        instances: list = []
+        volumes: list[dict[str, Any]] = []
+        object_usage: dict[str, Any] = {}
+        egress_usage: dict[str, Any] = {}
+        for key, (payload, local_notes, incomplete) in done:
+            notes.extend(local_notes)
+            read_incomplete = read_incomplete or incomplete
+            if key == "instances":
+                instances = payload
+            elif key in ("boot", "block"):
+                volumes.extend(payload)
+            elif key == "object":
+                object_usage = payload
+            else:
+                egress_usage = payload
 
         snapshot = free_quota.build_quota_snapshot(
             instances=instances,

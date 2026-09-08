@@ -54,7 +54,7 @@ Docker Compose 固定使用 **PostgreSQL 16**（服务名 `db`）。
 | 项 | 实现 |
 |----|------|
 | DB | PostgreSQL + `pool_pre_ping` + 可配 pool size |
-| API | `OCIBOT_API_WORKERS`（默认 2）多进程 uvicorn |
+| API | `OCIBOT_API_WORKERS`（默认 1）uvicorn |
 | 响应 | `GZipMiddleware` 压缩 JSON / 静态 |
 | 前端 | 生产构建由 API 同域托管，减少跨域 |
 | 健康检查 | 容器 `HEALTHCHECK` + compose health，便于编排 |
@@ -67,7 +67,10 @@ OCIBOT_DB_POOL_SIZE=20
 OCIBOT_DB_MAX_OVERFLOW=40
 ```
 
-> WebSSH 会话计数在进程内；多 worker 时每进程各自限额。需要更强终端并发可把 `OCIBOT_API_WORKERS=1` 或后续改为 Redis 计数。
+> WebSSH 会话计数、登录限流的内存桶都在进程内。**默认单 worker**，所以它们是真正的全局上限；
+> 调成 >1 的话这些上限会乘以 worker 数（见 `web/AUDIT.md` 里记的已知缺口）。
+> 单 worker 也省约 158 MB —— 这个负载是等 OCI 网络不是烧 CPU，多开进程不会让请求变快。
+> 内存宽裕、更看重「一个进程崩了还有另一个顶着」的话再往上调。
 
 ## 备份
 

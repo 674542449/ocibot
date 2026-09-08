@@ -121,7 +121,26 @@ ENV OCIBOT_GIT_SHA=${OCIBOT_GIT_SHA}
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
-ENV OCIBOT_API_WORKERS=2
+# 默认 1 个 worker。
+#
+# 这不是性能取舍 —— 这个负载是**等 OCI 网络**，不是烧 CPU，第二个 worker 并不能
+# 让任何请求变快。它的代价倒是实打实的（本机实测，Windows/py3.13，未裁剪 SDK）：
+#
+#     OCIBOT_API_WORKERS=2  ->  285.2 MB（监督进程 30.2 + 两个 worker 各 127.5）
+#     OCIBOT_API_WORKERS=1  ->  127.5 MB（单进程，uvicorn 根本不 fork 监督进程）
+#
+# 省下的 ~158 MB 在 1 GB 的 Always Free 机器上是六分之一的内存。uvicorn 0.51
+# 用的是 spawn，所以两个 worker 是两个全新解释器，没有写时复制可省。
+#
+# 还顺带修好两件「按进程算」的事:WebSSH 的并发会话上限、以及登录限流的内存桶
+# （web/AUDIT.md 里记着「in-process rate limiter 是 per-worker」这个已知缺口）——
+# 单进程之后它们才真的是全局上限,而不是「乘以 worker 数」。
+#
+# 代价:没有第二个进程兜底,ASGI 进程崩了要等 Docker 重启（compose 里是
+# restart: unless-stopped）。这个负载几乎所有异常都被路由的 except 兜住了,
+# 整进程崩溃是极小概率事件,拿它换六分之一内存是划算的。
+# 机器内存宽裕、更看重崩溃隔离的话,把这个值改回 2。
+ENV OCIBOT_API_WORKERS=1
 # 只读根文件系统下写不进去，写失败是静默的，只是白费一次 syscall。上面的
 # compileall 已经把 .pyc 烤进镜像了。
 ENV PYTHONDONTWRITEBYTECODE=1

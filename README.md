@@ -195,7 +195,7 @@ docker compose up -d --build
 | `OCIBOT_ALLOW_OPEN_REGISTRATION` | 默认 `0` | 首用户后是否开放注册 |
 | `OCIBOT_TRUST_PROXY` | 默认 `0` | 是否信任 `X-Forwarded-For`（仅反代后开启） |
 | `OCIBOT_FORWARDED_ALLOW_IPS` | 反代地址/CIDR | 允许携带代理头的来源，默认回环；勿用 `*` |
-| `OCIBOT_API_WORKERS` | 默认 `2` | API 进程数 |
+| `OCIBOT_API_WORKERS` | 默认 `1` | API 进程数。这个负载是等 OCI 网络不是烧 CPU，加进程不会更快，每个多占约 158 MB |
 | `OCIBOT_PORT` | 默认 `8000` | 宿主机映射端口 |
 | `OCIBOT_BIND` | 反代后设 `127.0.0.1` | 端口绑定的宿主机网卡，默认 `0.0.0.0` |
 | `OCIBOT_WORKER_BACKGROUND_OCI` | 默认 `1` | 设 `0` 则 Worker 完全不主动发起云 API 请求；容量重试任务将**不执行**（面板会明确提示） |

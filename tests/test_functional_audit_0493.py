@@ -302,16 +302,37 @@ def test_a_lost_user_data_script_is_reported_not_swallowed():
 def test_a_failed_object_storage_read_marks_the_snapshot_incomplete():
     """读不到不能等于「用了 0」。read_incomplete 会一路传到前端显示
     「读取不完整」，而不是让人看着一个权威的错数字。
-    同时那条 note 以前会被 append 两次。"""
-    import inspect
+    同时那条 note 以前会被 append 两次。
 
-    from app.oci_client import TenantSession as TS
+    以前这条是**读源码**断言字面量 `read_incomplete = True` 的。那种写法钉的是
+    「代码长什么样」而不是「行为是什么」—— 0.4.111 把这四块读取改成并发之后，
+    局部变量换了名字，测试就红了，而行为一个字没变。改成真的跑一遍看结果。
+    """
+    from types import SimpleNamespace
 
-    src = inspect.getsource(TS.get_free_quota_usage)
-    block = src[src.index("object_usage"):]
-    block = block[: block.index("egress_usage")]
-    assert "read_incomplete = True" in block, "对象存储读失败没有标记快照不完整"
-    assert block.count("notes.append(est.message)") == 1, "同一条 note 被追加了两次"
+    from app.oci_client import OperationResult, TenantSession as TS
+
+    def _snapshot(est: OperationResult) -> dict:
+        s = TS.__new__(TS)
+        s.tenant = SimpleNamespace(account_tier="free", region="ap-tokyo-1")
+        s._last_tree_errors = []
+        s.list_instances_tree = lambda **_k: []
+        s.list_boot_volumes = lambda **_k: OperationResult(ok=True, message="", data={"volumes": []})
+        s.list_block_volumes = lambda **_k: OperationResult(ok=True, message="", data={"volumes": []})
+        s.estimate_object_storage_usage = lambda **_k: est
+        return TS.get_free_quota_usage(s).data or {}
+
+    # 读失败 → 快照必须自称不完整（配额守卫据此 fail closed）。
+    failed = _snapshot(OperationResult(ok=False, message="列出存储桶失败", data=None))
+    assert failed["read_incomplete"] is True, "对象存储读失败没有标记快照不完整"
+    # 那条 note 只能出现一次。以前 not ok 时会被 append 两次。
+    assert [n for n in failed["notes"] if "列出存储桶失败" in n] == ["列出存储桶失败"]
+
+    # 读成功 → 不能因为对象存储就把整份快照说成不完整。
+    good = _snapshot(
+        OperationResult(ok=True, message="", data={"object_storage_gb_used": 1.0})
+    )
+    assert good["read_incomplete"] is False
 
 
 # ---------------------------------------------------------------------------

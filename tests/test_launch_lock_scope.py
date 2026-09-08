@@ -78,23 +78,46 @@ class _ObjectPage:
 class _SdkObjectStorage:
     """OCI SDK 的 ObjectStorageClient 替身；estimator 只会碰 list_objects。"""
 
-    def __init__(self, log: list[tuple[str, bool]], tenant_id_box: dict[str, str]):
+    def __init__(
+        self,
+        log: list[tuple[str, bool]],
+        tenant_id_box: dict[str, str],
+        held: list[bool] | None = None,
+    ):
         self._log = log
         self._box = tenant_id_box
+        # 和 _RecordingSession 共用同一个一元列表:对象存储枚举也跑在快照的线程池里,
+        # 同样要按**请求线程**的锁状态记账，而不是按发起线程。
+        self._held = held if held is not None else [False]
 
     def list_objects(self, namespace: str, bucket: str, **_kw: Any) -> _Res:
-        _record(self._log, self._box, f"object_storage.list_objects[{bucket}]")
+        _record(
+            self._log,
+            self._box,
+            f"object_storage.list_objects[{bucket}]",
+            inherited=self._held[0],
+        )
         return _Res(data=_ObjectPage([SimpleNamespace(name="a.bin", size=1024)]))
 
 
-def _record(log: list[tuple[str, bool]], box: dict[str, str], name: str) -> None:
+def _record(
+    log: list[tuple[str, bool]],
+    box: dict[str, str],
+    name: str,
+    *,
+    inherited: bool = False,
+) -> None:
     """记下一次 OCI 调用，以及**发生时锁是不是握着的**。
 
     用 quota_guard.launch_lock_held 而不是自己在上下文管理器里插标记：这是生产代码
-    自己的谓词（按线程记账），路由跑在 TestClient 的同一个工作线程里，所以它回答的
-    就是「这次调用是不是在锁内发出的」。
+    自己的谓词。但它是**按线程**记账的（"True when THIS thread already holds"），
+    而配额快照现在把四块读取分发到线程池里并发跑 —— 池里的线程当然不是锁的持有者。
+
+    真正该问的是「这次调用发生时，请求线程还握着锁吗」：握着的话它就在临界区里，
+    照样占着别人的排队时间，和它由哪个线程发出无关。所以快照期间的调用带
+    ``inherited=True`` 进来，用快照开始时（在请求线程上）取到的那个值。
     """
-    log.append((name, launch_lock_held(box["tenant_id"])))
+    log.append((name, inherited or launch_lock_held(box["tenant_id"])))
 
 
 class _RecordingSession:
@@ -107,19 +130,33 @@ class _RecordingSession:
     方法只是把每一次调用记下来。
     """
 
-    get_free_quota_usage = TenantSession.get_free_quota_usage
     estimate_object_storage_usage = TenantSession.estimate_object_storage_usage
+
+    def get_free_quota_usage(self, **kwargs: Any):
+        """真实实现，外面包一层「这次快照开始时锁握着没有」。
+
+        快照内部会把四块读取分发到线程池里并发跑，池线程不是锁的持有者 ——
+        但它们跑的时候请求线程正阻塞在 pool.map 上、锁一直握着。所以先在**这个**
+        线程上取一次锁状态，快照期间的每一次记账都用它。
+        """
+        self._held[0] = launch_lock_held(self._box["tenant_id"])
+        try:
+            return TenantSession.get_free_quota_usage(self, **kwargs)
+        finally:
+            self._held[0] = False
 
     def __init__(self, tenant_id_box: dict[str, str], *, buckets: int = 2):
         self.calls: list[tuple[str, bool]] = []
         self._box = tenant_id_box
         self._buckets = buckets
         self._last_tree_errors: list[str] = []
+        # 一元列表而不是布尔字段:要和下面那个 SDK 替身**共用**同一份状态。
+        self._held: list[bool] = [False]
         self.tenant = SimpleNamespace(account_tier="free", region="ap-tokyo-1")
-        self.object_storage = _SdkObjectStorage(self.calls, tenant_id_box)
+        self.object_storage = _SdkObjectStorage(self.calls, tenant_id_box, self._held)
 
     def _log(self, name: str) -> None:
-        _record(self.calls, self._box, name)
+        _record(self.calls, self._box, name, inherited=self._held[0])
 
     # --- 免费额度快照要用到的读 ---------------------------------------------
     def list_instances_tree(self, resolve_ips: bool = False, **_kw: Any) -> list[dict[str, Any]]:
@@ -292,9 +329,12 @@ def test_calls_inside_the_lock_are_pinned(client, monkeypatch):
     resp, session = _launch(client, monkeypatch)
     assert resp.status_code == 200, resp.text
 
-    assert _inside(session) == [
-        # 副区判定：home_region 在 TenantSession 里是按 session 缓存的，实际只打一次。
-        "home_region",
+    inside = _inside(session)
+
+    # 快照里那四块读取现在是**并发**的（见 get_free_quota_usage），所以它们之间
+    # 没有固定顺序 —— 钉的是集合与条数。这个测试本来要防的就是「锁内多了一次调用」，
+    # 那件事集合照样看得出来；而顺序一旦写死，并发化就只能靠改测试来通过。
+    snapshot = {
         # 免费额度快照 —— 判决真正需要的三份读。
         "list_instances_tree",
         "list_boot_volumes",
@@ -304,10 +344,20 @@ def test_calls_inside_the_lock_are_pinned(client, monkeypatch):
         "list_buckets",
         "object_storage.list_objects[b1]",
         "object_storage.list_objects[b2]",
+    }
+    assert sorted(inside) == sorted(
+        # 副区判定：home_region 在 TenantSession 里是按 session 缓存的，实际只打一次。
+        ["home_region"]
+        + sorted(snapshot)
         # 写 Oracle（可能建 NSG / VCN），必须留在锁内。
-        "prepare_launch_network",
-        "launch_from_payload",
-    ], session.calls
+        + ["prepare_launch_network", "launch_from_payload"]
+    ), session.calls
+
+    # 仍然固定的那部分顺序：副区判定在最前，写 Oracle 的两步在**所有读之后**，
+    # 且 prepare 在 launch 之前。并发只发生在快照内部。
+    assert inside[0] == "home_region", session.calls
+    assert inside[-2:] == ["prepare_launch_network", "launch_from_payload"], session.calls
+    assert set(inside[1:-2]) == snapshot, session.calls
 
     # launch-meta 是在锁**外**取的。它是这条路由第二贵的读，被挪进锁里过一次就
     # 白白拉长所有人的排队。
