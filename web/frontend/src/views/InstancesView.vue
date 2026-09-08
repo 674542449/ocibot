@@ -9,7 +9,11 @@
       </div>
       <div class="page-tools">
         <select v-model="tenantId">
-          <option v-if="!tenants.length" value="" disabled>请先添加租户</option>
+          <!-- 「还没读到」和「确实一个都没有」是两回事。tenants 在 /api/tenants
+               回来之前是空数组，直接显示「请先添加租户」等于对着一个有两个租户的
+               人说他一个都没配 —— 而那正好发生在每次打开面板的头几百毫秒。 -->
+          <option v-if="tenantsLoading" value="" disabled>载入租户…</option>
+          <option v-else-if="!tenants.length" value="" disabled>请先添加租户</option>
           <option v-for="t in tenants" :key="t.id" :value="t.id">{{ t.name }} · {{ t.region }}</option>
         </select>
         <input v-model="search" type="search" placeholder="搜索名称 / IP / OCID" />
@@ -82,6 +86,15 @@
               <template v-else-if="partialWarn">
                 没有读到任何实例，而且本次读取是不完整的 —— 这更可能是权限问题，
                 而不是「这个账号没有实例」。请到租户页点「测试连接」确认。
+              </template>
+              <!-- loadedOnce 之前不能说「暂无实例」。本页刻意不自动拉取
+                   （CLAUDE.md 0.4.13），所以「表是空的」在没点刷新之前是**常态**，
+                   不是结论。以前这里直接说「暂无实例。请先在租户添加 API」——
+                   于是页面上半部分的卡片写着「不会自动拉取，点刷新」，
+                   下半部分同时写着「你没有实例，去加 API」，两句话互相打架，
+                   而后者对一个配置完好的账号来说是假的。 -->
+              <template v-else-if="!loadedOnce">
+                尚未加载。选择租户后点右上角「刷新」读取列表。
               </template>
               <template v-else>暂无实例。请先在「租户」添加 API，再「创建实例」。</template>
             </td>
@@ -245,7 +258,9 @@
         </tbody>
       </table>
     </div>
-    <p class="muted" style="font-size: 12px; margin: 0">
+    <!-- 没加载过就不报数：「共 0 / 0 台」会给上面那句「暂无实例」作证，
+         而两者在没点刷新之前都只是「还没读」。 -->
+    <p v-if="loadedOnce" class="muted" style="font-size: 12px; margin: 0">
       共 {{ filtered.length }} / {{ instances.length }} 台 · 单击公网 / 私网 / IPv6 可复制
     </p>
   </div>
@@ -430,6 +445,8 @@ const resolveIps = ref(false)
 const search = ref('')
 const loading = ref(false)
 const loadedOnce = ref(false)
+// 「租户列表还没读到」≠「一个租户都没有」。只用来区分下拉框里那两句话。
+const tenantsLoading = ref(true)
 /** 非空表示这份列表**不完整**（有 compartment 读不到）。 */
 const partialWarn = ref('')
 const acting = ref('')
@@ -630,6 +647,16 @@ function copyIp(text?: string | null, ev?: Event) {
 }
 
 async function loadTenants() {
+  try {
+    await loadTenantsInner()
+  } finally {
+    // 无论成败都要落下这个标志：读失败时下拉框应该回到「请先添加租户」，
+    // 而不是永远停在「载入租户…」上 —— 那会让人以为还在转。
+    tenantsLoading.value = false
+  }
+}
+
+async function loadTenantsInner() {
   const { data } = await api.get<Tenant[]>('/tenants')
   tenants.value = data
   // Default to the locked tenant (else the first); if the current selection was

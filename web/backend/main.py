@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import re
+import hashlib
+import base64
 import logging
 import sys
 from contextlib import asynccontextmanager
@@ -148,6 +151,49 @@ def _fail_closed_app(message: str) -> FastAPI:
     return app
 
 
+def _inline_script_hashes() -> list[str]:
+    """``dist/index.html`` 里每段内联 ``<script>`` 的 CSP 哈希。
+
+    为什么需要它：CSP 里写的是 ``script-src 'self'``，而 ``'self'`` **不包含内联
+    脚本** —— 于是 index.html 里那两段内联脚本一行都没执行过。这不是理论问题，
+    浏览器控制台里一直躺着一条明确的违规：
+
+        Executing inline script violates the following Content Security Policy
+        directive 'script-src 'self''. Either the 'unsafe-inline' keyword,
+        a hash ('sha256-...'), or a nonce is required.
+
+    后果有两个，都静默：
+      * 防主题闪烁那段（读 localStorage 提前设 data-theme）从来没生效，
+        用浅色主题的人每次打开都先闪一下深色；
+      * 会话探测没法提前发，打开面板的请求链多一整个往返。
+
+    不加 ``'unsafe-inline'``：那等于把整类注入的口子重新打开，而这是个多租户
+    控制台（web/AUDIT.md 记着十轮审计）。加哈希只放行**这几段确定的字节**，
+    而且不影响 ``'self'`` 对外部脚本的授权（只有 'strict-dynamic' 会）。
+
+    换行必须先归一化成 LF 再算。HTML 的输入流预处理会把 CRLF/CR 折成 LF，
+    浏览器算哈希时看到的是折算之后的字节。这台机器上 git 的 autocrlf 让工作区
+    是 CRLF、而 Docker 里构建出来的是 LF —— 不归一化的话，同一份文件在开发机
+    和线上会算出两个不同的哈希，而失败方式是「内联脚本被静默拦掉」，
+    也就是回到今天这个状态，没有任何报错。
+    """
+    index = _DIST_DIR / "index.html"
+    try:
+        html = index.read_text(encoding="utf-8")
+    except Exception:  # noqa: BLE001 - 没有构建产物时（纯 API 部署）就没有内联脚本
+        return []
+    out: list[str] = []
+    for match in re.finditer(
+        r"<script(?P<attrs>[^>]*)>(?P<body>.*?)</script>", html, re.S | re.I
+    ):
+        if "src=" in match.group("attrs").lower():
+            continue  # 外部脚本走 'self'，不需要哈希
+        body = match.group("body").replace("\r\n", "\n").replace("\r", "\n")
+        digest = hashlib.sha256(body.encode("utf-8")).digest()
+        out.append("'sha256-" + base64.b64encode(digest).decode("ascii") + "'")
+    return out
+
+
 def create_app() -> FastAPI:
     if _STARTUP_BLOCK is not None:
         return _fail_closed_app(_STARTUP_BLOCK)
@@ -240,6 +286,10 @@ def create_app() -> FastAPI:
                 )
         return await call_next(request)
 
+    # 启动时算一次。dist 是构建进镜像的（Dockerfile 里 COPY，不是挂载），
+    # 所以 HTML 和进程是同一个不可变单元，不存在算完之后文件又变了的情况。
+    _script_hashes = "".join(" " + h for h in _inline_script_hashes())
+
     @app.middleware("http")
     async def security_headers(request, call_next):
         response = await call_next(request)
@@ -270,7 +320,9 @@ def create_app() -> FastAPI:
             "img-src 'self' data: blob:; "
             "font-src 'self' data:; "
             "style-src 'self' 'unsafe-inline'; "
-            "script-src 'self'; "
+            # 'self' 不覆盖内联脚本，所以 index.html 里那两段（防主题闪烁、
+            # 提前发会话探测）要按内容哈希单独放行。见 _inline_script_hashes。
+            f"script-src 'self'{_script_hashes}; "
             # 只允许同源连接。裸 ws:/wss: 曾经在这里，语义是"任意主机的 WebSocket"，
             # 于是这条策略里最值钱的那道外发防线（default-src 'self' 挡住的数据外传）
             # 被自己打开了一个口子：一段注入脚本或一个被投毒的前端依赖，就能把 DOM、

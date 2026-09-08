@@ -60,15 +60,34 @@ export const useAuthStore = defineStore('auth', () => {
     await refreshMe()
   }
 
+  type Me = {
+    id: string
+    username: string
+    is_admin?: boolean
+    totp_enabled?: boolean
+    locked_tenant_id?: string
+  }
+
+  /** index.html 在 JS 下载之前就发出去的那次 /auth/me（见那里的注释）。
+   *
+   * 只认一次：登录之后 refreshMe 会再被调用，那次必须真的走网络，
+   * 否则拿到的是**登录前**那份 null，界面会以为还没登录。
+   */
+  function takeBootMe(): Promise<Me | null> | null {
+    const w = window as any
+    const p = w.__ocibotMe
+    if (!p) return null
+    w.__ocibotMe = null
+    return p
+  }
+
   async function refreshMe() {
     try {
-      const { data } = await api.get<{
-        id: string
-        username: string
-        is_admin?: boolean
-        totp_enabled?: boolean
-        locked_tenant_id?: string
-      }>('/auth/me')
+      const boot = takeBootMe()
+      // null 代表那次探测没成功（含 401 未登录）—— 和下面 catch 分支同义，
+      // 所以直接抛到 catch 里，走同一段清理逻辑，不复制一份。
+      const data = boot ? ((await boot) ?? (() => { throw new Error('unauthenticated') })())
+                        : (await api.get<Me>('/auth/me')).data
       username.value = data.username
       isAdmin.value = !!data.is_admin
       totpEnabled.value = !!data.totp_enabled

@@ -293,14 +293,30 @@ function onResize() {
 }
 
 /**
- * Warm the other routes' chunks while the browser is idle.
+ * Warm the other routes' chunks once the page the user is looking at has settled.
  *
  * Views are lazy-loaded, so the FIRST click on each nav item pays for a download
  * before anything renders — on a high-latency link that reads as "the panel is
  * slow" even though the server answered in milliseconds. Fetching them ahead of
- * time turns that into an instant switch. Runs on idle so it never competes with
- * the page the user is actually looking at, and the files are immutably cached,
+ * time turns that into an instant switch, and the files are immutably cached,
  * so this costs one download per deploy rather than per visit.
+ *
+ * 这一段以前只用 requestIdleCallback，注释里写着「跑在空闲时，所以永远不会和用户
+ * 正在看的页面抢」。那句话是错的：requestIdleCallback 看的是**主线程空闲**，
+ * 不是**网络空闲**。实测（本地，浏览器 Performance API）：
+ *
+ *     /api/tenants + /api/system/status   731ms → 933ms
+ *     预取第一个 chunk                     819ms 开始   ← 抢在中间
+ *
+ * 主线程在首屏画完之后立刻就空了，而网络还在拉这个页面自己要的数据。六个 chunk
+ * 一共 55 KB（gzip），和整条关键路径 64 KB 几乎一样多 —— 在自托管机器那种上行
+ * 受限的链路上，这就是实打实地把用户等的东西往后挤。
+ *
+ * 所以改成两道闸：
+ *   1. 等页面自己的请求安静下来再开始（用 PerformanceObserver 数在途请求；
+ *      拿不到就退回一个固定延迟）。
+ *   2. 用户明确说了要省流量、或者链路本来就慢，就整个不预取 —— 那种链路上
+ *      55 KB 的收益是负的。
  */
 function prefetchRoutes() {
   // InstancesView and this layout ship in the entry bundle (see router), so the
@@ -315,6 +331,13 @@ function prefetchRoutes() {
     // for, so it is warmed too — just last.
     () => import('@/views/InstanceDetailView.vue'),
   ]
+  // 省流量模式，或者 2G/3G 这种链路：预取的收益是负的，直接不做。
+  const conn = (navigator as any).connection
+  if (conn?.saveData) return
+  if (typeof conn?.effectiveType === 'string' && /(^|-)([23]g|slow-2g)$/.test(conn.effectiveType)) {
+    return
+  }
+
   let i = 0
   const step = () => {
     if (i >= load.length) return
@@ -327,7 +350,34 @@ function prefetchRoutes() {
     if (typeof ric === 'function') ric(step, { timeout: 3000 })
     else window.setTimeout(step, 300)
   }
-  schedule()
+
+  // 等页面自己的网络请求安静下来。判据是「最近 500ms 没有新的资源加载完成」——
+  // 比等 load 事件更准：这个页面的数据是 XHR 拉的，load 早就触发过了。
+  const QUIET_MS = 500
+  const CAP_MS = 5000
+  let timer = 0
+  let observer: PerformanceObserver | null = null
+  const start = () => {
+    if (timer) window.clearTimeout(timer)
+    timer = 0
+    observer?.disconnect()
+    observer = null
+    schedule()
+  }
+  const arm = () => {
+    if (timer) window.clearTimeout(timer)
+    timer = window.setTimeout(start, QUIET_MS)
+  }
+  try {
+    observer = new PerformanceObserver(arm)
+    observer.observe({ type: 'resource', buffered: true })
+    arm()
+    // 兜底：页面一直有动静（比如轮询）也不能永远不预取。
+    window.setTimeout(start, CAP_MS)
+  } catch {
+    // 没有 PerformanceObserver 就退回一个固定延迟 —— 仍然比原来立刻开始好。
+    window.setTimeout(start, 1500)
+  }
 }
 
 onMounted(() => {

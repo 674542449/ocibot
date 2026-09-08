@@ -20,6 +20,29 @@
         var t = localStorage.getItem('ocibot_theme')
         if (t === 'dark' || t === 'light') document.documentElement.setAttribute('data-theme', t)
       } catch (e) {}
+
+      // 会话探测提前到这里发，别等 JS 跑起来。
+      //
+      // 路由守卫在放行任何页面之前都要先 await refreshMe()，而那要等
+      // index.js 下载完、解析完、Vue 起来之后才发得出去 —— 于是打开面板的链条是
+      //   HTML → index.js(54KB) → /auth/me → 视图 chunk / 数据
+      // 四段**串行**。远端自托管机器上一段就是一个往返，白屏时间里有整整一段是
+      // 在等一个 3ms 就能答完的请求。
+      //
+      // 放在这里的话，它和 index.js 的下载并行，等 Vue 起来时结果往往已经到了。
+      // 只是提前发同一个请求，不是多发一个：守卫本来每次开面板都要发它。
+      //
+      // 失败一律咽掉成 null（含 401）—— 下面 refreshMe 对 null 的处理和它原来
+      // catch 分支完全一样（clearLocal + 返回 false）。这里**绝不能**跳转登录页：
+      // 首次的 /auth/me 401 是正常的未登录状态，交给路由守卫处理。
+      try {
+        window.__ocibotMe = fetch('/api/auth/me', {
+          credentials: 'same-origin',
+          headers: { accept: 'application/json' },
+        })
+          .then(function (r) { return r.ok ? r.json() : null })
+          .catch(function () { return null })
+      } catch (e) {}
     </script>
   </head>
   <body>
