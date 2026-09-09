@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     # /api/health 正是操作员确认"更新有没有装上"的唯一手段（README 排障表第一行），
     # test_version_bump.py 也看不见这种偏差。ClassVar 不参与 pydantic 解析，任何环境
     # 变量都改不动它。
-    app_version: ClassVar[str] = "0.4.113"
+    app_version: ClassVar[str] = "0.4.114"
 
     # bcrypt 的工作因子。生产**不要**调低 —— 12 轮约 190ms 一次哈希,正是它让
     # 在线爆破不划算。这个旋钮存在只有一个用途:测试套件里 172 次建用户的 fixture

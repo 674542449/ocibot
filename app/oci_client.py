@@ -4393,6 +4393,123 @@ class TenantSession:
             return OperationResult(ok=False, message=safe_error_text(exc))
         return OperationResult(ok=True, message="")
 
+    @classmethod
+    def _security_list_egress_model(cls, spec: FirewallRuleSpec) -> Any:
+        """把一条 spec 变成安全列表的**出站**规则。
+
+        和入站那份不能共用:EgressSecurityRule 用的是 ``destination`` /
+        ``destination_type``，没有 ``source`` —— 字段名不一样，传错会静默变成
+        一条不匹配任何流量的规则。其余（协议纠正、端口只挂在对应协议分支、
+        空 description 送 None）和 _security_list_ingress_model 一致。
+        """
+        destination, is_v6 = cls.normalize_cidr_source(spec.cidr)
+        protocol = str(spec.protocol).strip().lower()
+        if protocol in ("1", "58", "icmp", "icmpv6"):
+            protocol = "58" if is_v6 else "1"
+        elif protocol == "tcp":
+            protocol = "6"
+        elif protocol == "udp":
+            protocol = "17"
+        elif protocol in ("", "*", "all protocols"):
+            protocol = "all"
+        # 校验纠正之后的值。direction 换成 EGRESS 再校验 —— 那才是要写的方向。
+        dataclasses.replace(
+            spec, direction="EGRESS", protocol=protocol, cidr=destination
+        ).validate()
+        kwargs: dict[str, Any] = {}
+        if protocol in ("6", "17") and (spec.port_min is not None or spec.port_max is not None):
+            start = int(spec.port_min if spec.port_min is not None else spec.port_max)
+            end = int(spec.port_max if spec.port_max is not None else start)
+            port_range = oci.core.models.PortRange(min=start, max=end)
+            key = "tcp_options" if protocol == "6" else "udp_options"
+            model = oci.core.models.TcpOptions if protocol == "6" else oci.core.models.UdpOptions
+            kwargs[key] = model(destination_port_range=port_range)
+        description = (spec.description or "").strip()[:255]
+        return oci.core.models.EgressSecurityRule(
+            protocol=protocol,
+            destination=destination,
+            destination_type="CIDR_BLOCK",
+            is_stateless=bool(spec.stateless),
+            description=description or None,
+            **kwargs,
+        )
+
+    @classmethod
+    def _sl_egress_effect(cls, rule: Any) -> str:
+        """出站规则的「作用」。和入站那份同构，只是看 destination。
+
+        幂等添加靠它:同一个目的地、同一个协议已经放行过了，再写一条只是占掉
+        200 条出站配额里的一格。
+        """
+        def _pr(options: Any, attr: str) -> str:
+            pr = getattr(options, attr, None) if options is not None else None
+            if pr is None:
+                return "*"
+            return f"{getattr(pr, 'min', None)}-{getattr(pr, 'max', None)}"
+
+        tcp = getattr(rule, "tcp_options", None)
+        udp = getattr(rule, "udp_options", None)
+        icmp = getattr(rule, "icmp_options", None)
+        return "|".join(
+            [
+                str(getattr(rule, "protocol", "") or ""),
+                str(getattr(rule, "destination_type", None) or "CIDR_BLOCK"),
+                str(getattr(rule, "destination", "") or ""),
+                "tcp:" + _pr(tcp, "destination_port_range") + "/" + _pr(tcp, "source_port_range")
+                if tcp is not None
+                else "tcp:-",
+                "udp:" + _pr(udp, "destination_port_range") + "/" + _pr(udp, "source_port_range")
+                if udp is not None
+                else "udp:-",
+                "icmp:{}/{}".format(getattr(icmp, "type", None), getattr(icmp, "code", None))
+                if icmp is not None
+                else "icmp:-",
+                "stateless" if bool(getattr(rule, "is_stateless", False)) else "stateful",
+            ]
+        )
+
+    def _write_security_list_egress(
+        self, sl_id: str, egress: list, etag: str = ""
+    ) -> OperationResult:
+        """写回出站规则。**只写出站** —— 入站一个字节都不碰。
+
+        和 _write_security_list_ingress 完全镜像，同一个陷阱反过来:不传
+        ``ingress_security_rules`` 时请求体里没有那个键，OCI 保持原样；
+        但传空列表 ``[]`` 会序列化成 ``"ingressSecurityRules": []``，
+        **把整个子网的入站规则清空** —— 同子网所有机器同时失联，
+        而界面只会说「已放行出站」。永远不要写 ``ingress_security_rules=... or []``。
+        """
+        for rule in egress:
+            if str(getattr(rule, "destination_type", "") or "") == self._UNKNOWN_ENUM:
+                return OperationResult(
+                    ok=False,
+                    message=(
+                        "这份安全列表里有一条本 SDK 不认识的出站规则"
+                        "(destination_type 无法识别),改写会把它破坏掉 —— 已停手，什么都没改。"
+                        + chr(10)
+                        + "请到 Oracle 控制台处理那条规则，或升级面板后重试。"
+                    ),
+                )
+        details = oci.core.models.UpdateSecurityListDetails(egress_security_rules=egress)
+        kwargs: dict[str, Any] = {}
+        if etag:
+            kwargs["if_match"] = etag
+        try:
+            self.network.update_security_list(sl_id, details, **kwargs)
+        except ServiceError as exc:
+            if getattr(exc, "status", None) in (409, 412):
+                return OperationResult(
+                    ok=False,
+                    message=(
+                        "这份安全列表刚被别处改过(另一个标签页，或 Oracle 控制台)，"
+                        "为免覆盖对方的改动已经停手。请刷新后重试。"
+                    ),
+                )
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=safe_error_text(exc))
+        return OperationResult(ok=True, message="")
+
     def _sl_result_context(self, sl_id: str, ctx: dict) -> dict:
         name = ""
         for sl in ctx.get("lists") or []:
@@ -4641,35 +4758,102 @@ class TenantSession:
     def open_all_security_list(
         self, instance_id: str, compartment_id: str, *, security_list_id: str = ""
     ) -> OperationResult:
-        """在安全列表上放行全部协议、全部端口(IPv4,以及有 IPv6 时的 ::/0)。"""
+        """在子网安全列表上放行全部**出站**。入站一条都不加。
+
+        这个按钮以前写的是子网级的 ``all / 0.0.0.0/0`` **入站** —— 而那正是
+        「一键修复」和 tighten 存在的理由:子网级的入站放行会让每台机器自己的
+        安全组说了不算（生效规则是并集，任一放行即放行）。于是高级区里藏着一个
+        一键拆掉面板核心修复的按钮，点完之后「只开 22 和 80」又变成谎话。
+
+        出站放在子网这一层则是安全的，两个理由:
+
+        * 有状态规则的回程包本来就自动放行（"the response is tracked and
+          automatically allowed back to the originating host, regardless of any
+          egress rules"），所以子网出站全开**不削弱入站管控**;
+        * 反过来，出站要是搬进 NSG，子网里任何一台没有 NSG 的机器会连出网都没有。
+
+        所以分工是:入站归各台机器自己的安全组，出站归子网。
+        """
         try:
             sl_id, ctx = self._resolve_security_list(instance_id, compartment_id, security_list_id)
         except OCIClientError as exc:
             return OperationResult(ok=False, message=str(exc))
+        base = self._sl_result_context(sl_id, ctx)
+
         specs = [
             FirewallRuleSpec(
-                direction="INGRESS", protocol="all", cidr="0.0.0.0/0",
-                description=self.SL_RULE_TAG + " 全部放行 IPv4",
+                direction="EGRESS", protocol="all", cidr="0.0.0.0/0",
+                description=self.SL_RULE_TAG + " 全部放行出站 IPv4",
             )
         ]
         if ctx.get("has_ipv6"):
+            # IPv4-only 的 VCN 会拒绝 ::/0，整批一起失败。
             specs.append(
                 FirewallRuleSpec(
-                    direction="INGRESS", protocol="all", cidr="::/0",
-                    description=self.SL_RULE_TAG + " 全部放行 IPv6",
+                    direction="EGRESS", protocol="all", cidr="::/0",
+                    description=self.SL_RULE_TAG + " 全部放行出站 IPv6",
                 )
             )
-        result = self._add_rules_to(sl_id, ctx, specs)
-        if result.ok:
+
+        try:
+            wanted = [self._security_list_egress_model(spec) for spec in specs]
+        except ValueError as exc:
+            return OperationResult(ok=False, message=str(exc), data=base)
+
+        try:
+            sl, etag, _ingress = self._read_security_list(sl_id)
+            existing = list(getattr(sl, "egress_security_rules", None) or [])
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc), data=base)
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=safe_error_text(exc), data=base)
+
+        seen = {self._sl_egress_effect(r) for r in existing}
+        fresh = []
+        skipped = 0
+        for rule in wanted:
+            effect = self._sl_egress_effect(rule)
+            if effect in seen:
+                skipped += 1
+                continue
+            seen.add(effect)
+            fresh.append(rule)
+
+        if not fresh:
             return OperationResult(
                 ok=True,
                 message=(
-                    "已在安全列表上放行全部端口 —— 这台机器上所有在监听的服务都暴露到公网了。"
-                    + chr(10) + self._SL_SCOPE_NOTE
+                    "出站本来就是全放行的，没有改动。" + chr(10)
+                    + "入站不归这里管 —— 每台机器实际开放哪些端口，由它自己的防火墙规则决定。"
                 ),
-                data=result.data,
+                data={**base, "added": 0, "skipped": skipped, "direction": "EGRESS"},
             )
-        return result
+
+        room = self.SECURITY_LIST_INGRESS_LIMIT - len(existing)
+        if len(fresh) > room:
+            return OperationResult(
+                ok=False,
+                message=(
+                    "出站规则数不够:需要新增 " + str(len(fresh)) + " 条，而这份安全列表已有 "
+                    + str(len(existing)) + " 条出站，上限 "
+                    + str(self.SECURITY_LIST_INGRESS_LIMIT) + " 条(Oracle 硬限制)。"
+                ),
+                data={**base, "needed": len(fresh), "existing": len(existing)},
+            )
+
+        written = self._write_security_list_egress(sl_id, existing + fresh, etag)
+        if not written.ok:
+            return OperationResult(ok=False, message=written.message, data=base)
+        return OperationResult(
+            ok=True,
+            message=(
+                "已放行全部出站(新增 " + str(len(fresh)) + " 条)，入站一条没加。"
+                + chr(10)
+                + "入站不归子网这一层管 —— 每台机器实际开放哪些端口，由它自己的防火墙规则决定。"
+                + chr(10) + self._SL_SCOPE_NOTE
+            ),
+            data={**base, "added": len(fresh), "skipped": skipped, "direction": "EGRESS"},
+        )
 
     def clear_security_list_rules(
         self, instance_id: str, compartment_id: str, *, security_list_id: str = ""

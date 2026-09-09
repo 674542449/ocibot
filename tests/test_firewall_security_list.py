@@ -219,14 +219,15 @@ def test_description_does_not_change_the_effect_but_does_change_the_delete_handl
 # ------------------------------------------------------------------ 会话装配
 
 
-def _session(*, lists, ingress=None, etag="etag-1", has_ipv6=False, groups=None):
+def _session(*, lists, ingress=None, etag="etag-1", has_ipv6=False, groups=None, egress=None):
     """接了必要几根线的 TenantSession。
 
     ``lists`` 是 get_instance_firewall 会返回的那份摘要；``ingress`` 是
     get_security_list 读回来的真实规则对象。
     """
     s = T.__new__(T)
-    s.written = []
+    s.written = []          # 入站写回
+    s.written_egress = []   # 出站写回
     s.if_match = []
     s.tenant = SimpleNamespace(tenancy_ocid="ocid1.tenancy..root")
     rules = list(ingress or [])
@@ -249,7 +250,7 @@ def _session(*, lists, ingress=None, etag="etag-1", has_ipv6=False, groups=None)
                 id=sl_id,
                 display_name="sl",
                 ingress_security_rules=list(rules),
-                egress_security_rules=[SimpleNamespace(protocol="all")],
+                egress_security_rules=list(egress or []),
             ),
             # 真实的响应头是 ``ETag``,SDK 把它放在 CaseInsensitiveDict 里。
             # 桩里写小写的话,代码退回成大小写敏感的查找仍然会绿 —— 而线上
@@ -258,10 +259,16 @@ def _session(*, lists, ingress=None, etag="etag-1", has_ipv6=False, groups=None)
         )
 
     def _update(sl_id, details, **kw):
-        s.written.append((sl_id, list(details.ingress_security_rules or [])))
         s.if_match.append(kw.get("if_match"))
-        # 出站字段必须原样是 None —— 传了就会被序列化,清空整个子网的出站。
-        assert details.egress_security_rules is None
+        # 写哪个方向，另一个方向就必须原样是 None。传了（哪怕是空列表）都会被
+        # 序列化成 `"...SecurityRules": []`，把那个方向整个清空 —— 而界面只会说
+        # 「已改另一个方向」。两边都要钉，因为这两条写路径是镜像的。
+        if details.egress_security_rules is not None:
+            assert details.ingress_security_rules is None, "写出站时带上了入站"
+            s.written_egress.append((sl_id, list(details.egress_security_rules)))
+        else:
+            assert details.egress_security_rules is None, "写入站时带上了出站"
+            s.written.append((sl_id, list(details.ingress_security_rules or [])))
         return SimpleNamespace(data=None)
 
     s._network = SimpleNamespace(get_security_list=_get, update_security_list=_update)
@@ -400,15 +407,65 @@ def test_it_refuses_a_security_list_that_is_not_on_this_instance_subnet():
 # ------------------------------------------------------------------ 全开 / 清空
 
 
-def test_open_all_adds_a_v4_rule_and_only_adds_v6_when_the_vcn_has_it():
-    """IPv4-only 的 VCN 会拒绝 ``::/0`` 的规则，整批一起失败。"""
-    s = _session(lists=[_sl()])
-    assert s.open_all_security_list("i", "c", security_list_id="sl-1").ok
-    assert len(s.written[0][1]) == 1
+def test_open_all_on_the_subnet_opens_egress_and_adds_no_ingress():
+    """子网这一层的「放行全部」只能是**出站**。
 
+    以前它写的是子网级的 ``all / 0.0.0.0/0`` **入站** —— 而那正是「一键修复」和
+    tighten 存在的理由：子网级入站放行会让每台机器自己的安全组说了不算（生效规则
+    是并集）。于是高级区里藏着一个一键拆掉面板核心修复的按钮。
+
+    出站放在子网这层是安全的：有状态规则的回程包本来就自动放行，所以子网出站全开
+    不会让任何人多连进来一个端口。
+    """
+    s = _session(lists=[_sl()])
+    r = s.open_all_security_list("i", "c", security_list_id="sl-1")
+    assert r.ok, r.message
+    assert s.written_egress, "没有写出站"
+    assert not s.written, "往子网安全列表里加了入站规则"
+    written = s.written_egress[0][1]
+    assert all(type(x).__name__ == "EgressSecurityRule" for x in written), written
+    assert len(written) == 1
+    assert (r.data or {}).get("direction") == "EGRESS"
+    # 用户要看得懂它只动了出站。
+    assert "入站" in r.message and "出站" in r.message
+
+
+def test_open_all_only_adds_the_v6_egress_rule_when_the_vcn_has_ipv6():
+    """IPv4-only 的 VCN 会拒绝 ``::/0``，整批一起失败。"""
     s6 = _session(lists=[_sl()], has_ipv6=True)
     assert s6.open_all_security_list("i", "c", security_list_id="sl-1").ok
-    assert len(s6.written[0][1]) == 2
+    assert len(s6.written_egress[0][1]) == 2
+
+
+def test_open_all_is_idempotent_on_egress():
+    """出站本来就全开时不该再写一条 —— 那只是白占 200 条配额里的一格。"""
+    existing = T._security_list_egress_model(
+        FirewallRuleSpec(direction="EGRESS", protocol="all", cidr="0.0.0.0/0")
+    )
+    s = _session(lists=[_sl()], egress=[existing])
+    r = s.open_all_security_list("i", "c", security_list_id="sl-1")
+    assert r.ok
+    assert not s.written_egress and not s.written
+    assert "本来就是全放行" in r.message
+
+
+def test_writing_egress_never_carries_ingress_in_the_request_body():
+    """和入站那条镜像的陷阱：传 ``ingress_security_rules=[]`` 会序列化出来，
+    **把整个子网的入站清空** —— 同子网所有机器同时失联，而界面只说「已放行出站」。
+    """
+    from oci.base_client import BaseClient
+
+    client = BaseClient.__new__(BaseClient)
+    client.complex_type_mappings = oci.core.models.__dict__
+    rule = T._security_list_egress_model(
+        FirewallRuleSpec(direction="EGRESS", protocol="all", cidr="0.0.0.0/0")
+    )
+    unset = oci.core.models.UpdateSecurityListDetails(egress_security_rules=[rule])
+    assert "ingressSecurityRules" not in client.sanitize_for_serialization(unset)
+    wipes = oci.core.models.UpdateSecurityListDetails(
+        egress_security_rules=[rule], ingress_security_rules=[]
+    )
+    assert "ingressSecurityRules" in client.sanitize_for_serialization(wipes)
 
 
 def test_clear_empties_ingress_and_says_what_that_costs():
@@ -699,7 +756,8 @@ def test_open_all_and_cloudflare_resolve_the_security_list_only_once():
 
     for fn in (T.open_all_security_list, T.add_cloudflare_security_list_rules):
         src = inspect.getsource(fn)
-        assert "_add_rules_to(" in src, fn.__name__
+        # 各自只 resolve 一次，且不再绕道会重新 resolve 的那个公开方法。
+        assert src.count("self._resolve_security_list(") == 1, fn.__name__
         assert "self.add_security_list_rules(" not in src, fn.__name__
 
 

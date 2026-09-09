@@ -477,9 +477,11 @@
       <details v-if="fwSecurityLists.length" class="fw-advanced">
         <summary>高级：子网共享的放行规则（同子网所有机器一起生效）</summary>
         <p class="muted" style="font-size: 12px; margin: 0.4rem 0 0">
-          这是 OCI 的另一套入站规则，作用范围是<strong>整个子网</strong>，不是单台机器。
-          正常情况下不用动它 —— 上面的「一键修复」会把它里面的公网放行搬到各台机器名下。
-          只有在同子网机器很多、想一次性放行时才需要在这里改。
+          这是 OCI 的另一套规则，作用范围是<strong>整个子网</strong>，不是单台机器。
+          正常情况下不用动它 —— 上面的「一键修复」会把它里面的公网放行搬到各台机器名下。<br />
+          分工是：<strong>入站归上面那张表</strong>（每台机器自己的），
+          <strong>出站归这里</strong>。在这一层加入站放行会让每台机器的设置说了不算 ——
+          生效规则是「子网 ∪ 机器」，任一放行即放行。
         </p>
         <!-- 子网安全列表 —— 面板的第一编辑面。
              对绝大多数机器（在 Oracle 控制台建的、没有 NSG 的）这里就是**唯一**决定
@@ -502,8 +504,11 @@
               </div>
             </div>
             <div class="row">
-              <button class="danger" :disabled="fwBusy" @click="slAction('open-all', sl)">
-                放行全部端口
+              <!-- 子网这一层只管出站。入站归各台机器自己的规则表 ——
+                   在这里加子网级入站会让每台机器的设置说了不算（生效规则是并集），
+                   等于一键拆掉「一键修复」刚建立的秩序。 -->
+              <button :disabled="fwBusy" @click="slAction('open-all', sl)">
+                放行全部出站
               </button>
               <button class="danger" :disabled="fwBusy" @click="slAction('clear', sl)">
                 清空入站规则
@@ -1806,8 +1811,9 @@ async function deleteSlRule(sl: any, rule: any) {
   const what = `${rule.protocol_label || rule.protocol} ${rule.cidr} 端口 ${rule.port}`
   // 这里**不能**写「删除后对应端口将无法从外部访问」。生效规则是
   // 「子网的所有安全列表 ∪ 这台机器的所有 NSG」，任一放行即放行 —— 只要同一张表里
-  // 还躺着一条「全部协议 / 0.0.0.0/0」（面板自己的「放行全部端口」就会写一条），
-  // 这次删除一个端口都关不上。真正的结论由后端在并集上算完随结果返回。
+  // 还躺着一条「全部协议 / 0.0.0.0/0」入站（Oracle 建 VCN 时可能自带，
+  // 用户也可能在 Oracle 控制台手工加过），这次删除一个端口都关不上。
+  // 真正的结论由后端在并集上算完随结果返回。
   if (
     !confirm(
       `删除这条入站规则：${what}\n\n${slScope(sl)}\n\n` +
@@ -1823,8 +1829,10 @@ async function deleteSlRule(sl: any, rule: any) {
 async function slAction(kind: 'open-all' | 'clear' | 'cloudflare', sl: any) {
   const prompts: Record<string, string> = {
     'open-all':
-      `将在安全列表「${sl.display_name}」上放行全部协议、全部端口。\n` +
-      `这台机器上所有在监听的服务都会暴露到公网。\n\n${slScope(sl)}\n\n继续？`,
+      `将在安全列表「${sl.display_name}」上放行全部**出站**流量（入站一条都不加）。\n\n` +
+      `出站放在子网这一层是安全的：有状态规则的回程包本来就自动放行，\n` +
+      `所以这不会让任何人多连进来一个端口。\n` +
+      `每台机器实际开放哪些端口，仍然由它自己的防火墙规则决定。\n\n${slScope(sl)}\n\n继续？`,
     clear:
       `将清空安全列表「${sl.display_name}」的全部入站规则（出站一条不动）。\n\n` +
       // 对没有 NSG 的机器（在 Oracle 控制台建的那批，也是这个功能的主要用户）

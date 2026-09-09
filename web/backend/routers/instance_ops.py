@@ -522,7 +522,12 @@ def security_list_open_all(
     db: Annotated[Session, Depends(get_db)],
     payload: SecurityListTarget | None = None,
 ) -> SecurityListResult:
-    """在子网安全列表上放行全部协议、全部端口。"""
+    """在子网安全列表上放行全部**出站**流量。入站一条都不加。
+
+    子网这一层不管入站 —— 子网级的入站放行会让每台机器自己的安全组说了不算
+    （生效规则是并集），等于一键拆掉「一键修复」刚建立的秩序。
+    出站放这里则不削弱任何入站管控：有状态规则的回程包本来就自动放行。
+    """
     row = _row(db, user.id, tenant_id)
     sl_id = payload.security_list_id.strip() if payload else ""
     try:
