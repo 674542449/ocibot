@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.4.115 — 2026-09-12
+
+root + 密码模式也能自动重试抢 ARM 机了。
+
+### 功能
+
+- **【高】容量自动重试不再限于 SSH 密钥模式。**
+
+  创建向导里选「root + 服务器密码」时，「容量不足时加入自动重试」以前是灰的，
+  后端也在两处拒绝（`build_launch_request` 和 `sanitize_launch_payload`）。
+  当初拦它的理由是对的 —— **明文密码绝不能进 `launch_payload`**，那是存在库里的
+  明文 JSON。但那个理由约束的是「密码不能落在 payload 里」，不是「密码模式不能重试」。
+
+  仓库里早有先例：自定义启动脚本（可能含密钥）走 `CapacityJob.user_data_encrypted`，
+  Fernet 加密存在任务行上、开机那一刻才解密。密码现在走同一条路：新增
+  `CapacityJob.root_password_encrypted`。`launch_payload` 里仍然一个字都没有 ——
+  sanitize 那条 forbidden 检查原样保留，混进去的密码字段照旧打回。
+
+  worker 开机时解密后传给 `launch_from_payload`，所以抢到的机器和即时创建的一样，
+  会带上 `ocibot_root_password` 标签，实例列表里点「root 密码」就能看到。
+  成功通知里只提示去哪看，**不写密码本身**（推送渠道不可信）。任务列表接口只回
+  `has_root_password: true/false`。
+
+  **解不开时 fail closed。** 这和启动脚本解不开「照样开机」是刻意相反的：脚本丢了
+  能事后补跑，密码丢了这台机器就谁都登不进去，还吃掉了 Always Free 额度。所以
+  主密钥变过导致解密失败时：任务标失败、写一条尝试日志说明原因、发通知、
+  **不消耗尝试次数**、不去开机 —— 而不是每 3 分钟撞一次同样的错。
+
+### 维护
+
+- `_ensure_schema` 会给老安装的 `capacity_jobs` 补上这一列，带 `DEFAULT ''`。
+  新增测试用一个去掉这一列的库验证升级路径，并确认老代码路径的 INSERT 仍然成立。
+- 三个 worker 测试桩的 `launch_from_payload` 签名补上 `root_password=`。
+  以前那个 `for_retry=not bool(root_password)` 是拿「有没有传密码」当「是不是重试」
+  用的代理，现在两者无关，`launch_from_payload` 直接校验。
+- `tests/test_capacity_retry_password.py` 新增 10 条。全量 1263 passed。
+
+### 升级
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.115
+```
+
 ## 0.4.114 — 2026-09-09
 
 高级区那个「放行全部端口」写的是子网级**入站** —— 一键就能拆掉整套防火墙。改成出站。

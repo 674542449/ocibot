@@ -731,7 +731,11 @@ SAFE_LAUNCH_FIELDS = {
 
 
 def sanitize_launch_payload(payload: dict, *, for_retry: bool = False) -> dict:
-    """Return a validated launch payload that never contains credentials."""
+    """Return a validated launch payload that never contains credentials.
+
+    ``for_retry`` 保留是为了兼容调用方;自 0.4.115 起它不再限制认证方式 ——
+    重试与即时创建持久化的是同一份不含凭据的 payload,密码另走加密字段。
+    """
     if not isinstance(payload, dict):
         raise ValueError("启动参数格式无效")
     forbidden = {"root_password", "password", "password_confirm", "secrets"}
@@ -743,8 +747,11 @@ def sanitize_launch_payload(payload: dict, *, for_retry: bool = False) -> dict:
     auth_mode = str(clean.get("auth_mode") or "key").strip().lower()
     if auth_mode not in {"key", "password"}:
         raise ValueError("认证方式必须为 key 或 password")
-    if for_retry and auth_mode != "key":
-        raise ValueError("root 密码模式不支持容量自动重试")
+    # 密码模式**可以**进重试。以前这里拒绝,理由是「密码不能落盘」—— 那个理由现在
+    # 仍然成立,但它约束的是 launch_payload(明文 JSON),不是模式本身:密码和
+    # 自定义启动脚本一样,Fernet 加密后存在 job 行的独立字段里,开机那一刻才解密
+    # (见 CapacityJob.root_password_encrypted / worker 里的解密段)。上面那条
+    # forbidden 检查仍然保证 payload 里永远没有明文密码。
     clean["auth_mode"] = auth_mode
     required = ("compartment_id", "availability_domain", "shape", "image_id", "subnet_id")
     missing = [name for name in required if not str(clean.get(name) or "").strip()]
@@ -3546,7 +3553,9 @@ class TenantSession:
         idempotency_key: str = "",
     ) -> OperationResult:
         """Launch from a secret-free payload; password / user-data only in memory."""
-        clean = sanitize_launch_payload(payload, for_retry=not bool(root_password))
+        # 以前写的是 for_retry=not bool(root_password):拿「有没有传密码」当
+        # 「是不是重试」用,是个代理。现在两者无关,直接校验。
+        clean = sanitize_launch_payload(payload)
         return self.launch_instance(
             display_name=clean.get("display_name", DEFAULT_INSTANCE_NAME),
             compartment_id=clean["compartment_id"],

@@ -309,7 +309,7 @@ def format_launch_confirm_rows(
         net_parts.append("IPv6")
     net_text = " · ".join(net_parts)
 
-    if as_retry and auth != "password":
+    if as_retry:
         interval = retry_interval if retry_interval is not None else "—"
         attempts = retry_max if retry_max is not None else "—"
         retry_text = f"是（间隔 {interval} 秒 · 最多 {attempts} 次）"

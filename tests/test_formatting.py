@@ -134,7 +134,7 @@ def test_format_launch_confirm_rows_fixed_micro_defaults():
         boot_vpu_label="平衡 (10 VPUs/GB)",
         auth_mode="password",
         assign_public_ip=False,
-        as_retry=True,  # password mode should still report 否 via auth path in UI; here we check password auth text
+        as_retry=True,
         free_tier_tag="免费 AMD",
     )
     by_label = dict(rows)
@@ -143,8 +143,8 @@ def test_format_launch_confirm_rows_fixed_micro_defaults():
     assert "镜像默认" in by_label["硬盘"]
     assert by_label["登录方式"] == "root + 服务器密码"
     assert "仅私网" in by_label["网络"]
-    # as_retry ignored for password auth display
-    assert by_label["容量重试"] == "否"
+    # 0.4.115 起密码模式也能进重试,摘要要如实显示。
+    assert by_label["容量重试"].startswith("是")
 
 
 def test_format_launch_confirm_message_aligns_labels():

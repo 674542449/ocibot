@@ -703,8 +703,6 @@ def build_launch_request(
     open_guest_firewall = bool(body.get("open_guest_firewall", True))
     as_retry = bool(body.get("as_retry", False))
     retry_all_ads = bool(body.get("retry_all_ads", False))
-    if as_retry and auth_mode != "key":
-        raise ValueError("容量自动重试仅支持 root + SSH 公钥模式")
 
     # Custom first-boot script (cloud-init). Kept OUT of the persisted payload;
     # for retry jobs the caller stores it Fernet-encrypted on the job row.

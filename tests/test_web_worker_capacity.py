@@ -39,7 +39,7 @@ class _FakeSession:
     def __init__(self, result: _Result):
         self._result = result
 
-    def launch_from_payload(self, payload, custom_user_data="", idempotency_key=""):
+    def launch_from_payload(self, payload, root_password="", custom_user_data="", idempotency_key=""):
         return self._result
 
     def get_free_quota_usage(self, free_only_mode: bool = True):

@@ -67,6 +67,7 @@ def _capacity_out(row: CapacityJob) -> CapacityJobOut:
         launch_payload=dict(row.launch_payload or {}),
         fallback_configs=list(row.fallback_configs or []),
         has_user_data=bool(row.user_data_encrypted),
+        has_root_password=bool(row.root_password_encrypted),
     )
 
 

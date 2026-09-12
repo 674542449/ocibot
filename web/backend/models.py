@@ -124,6 +124,10 @@ class CapacityJob(Base):
     # Fernet-encrypted custom cloud-init script (may contain secrets, so it is
     # never stored inside launch_payload). Decrypted only at launch time.
     user_data_encrypted: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    # root 密码模式的密码,同样 Fernet 加密、只在开机那一刻解密。
+    # 空串 = 密钥模式(或老版本建的任务)。default="" 是给 _ensure_schema 用的:
+    # 它会据此生成 DEFAULT '',让已有安装升级时能给 NOT NULL 列补上这一列。
+    root_password_encrypted: Mapped[str] = mapped_column(Text, default="", nullable=False)
     interval_sec: Mapped[int] = mapped_column(Integer, default=180)
     max_attempts: Mapped[int] = mapped_column(Integer, default=200)
     attempts: Mapped[int] = mapped_column(Integer, default=0)

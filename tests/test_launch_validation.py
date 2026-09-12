@@ -33,9 +33,15 @@ def test_safe_payload_defaults_and_vpu_validation():
         sanitize_launch_payload({**BASE, "boot_volume_vpus_per_gb": 25})
 
 
-def test_password_cannot_be_retried_or_persisted():
-    with pytest.raises(ValueError):
-        sanitize_launch_payload({**BASE, "auth_mode": "password"}, for_retry=True)
+def test_password_mode_may_retry_but_the_password_itself_never_persists():
+    """0.4.115 起密码模式可以进容量重试 —— 密码走 CapacityJob.root_password_encrypted
+    （Fernet，开机那一刻才解密），和自定义启动脚本同一条路。
+
+    底线没变：launch_payload 是明文 JSON，密码字段混进去仍然要被打回。
+    这条以前叫 test_password_cannot_be_retried_or_persisted，前半句已经不成立。
+    """
+    clean = sanitize_launch_payload({**BASE, "auth_mode": "password"}, for_retry=True)
+    assert clean["auth_mode"] == "password"
     with pytest.raises(ValueError):
         sanitize_launch_payload({**BASE, "root_password": "secret"})
 

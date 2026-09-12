@@ -60,7 +60,7 @@ class _FakeSession:
     def __init__(self, calls: list[str]):
         self.calls = calls
 
-    def launch_from_payload(self, payload, custom_user_data="", idempotency_key=""):
+    def launch_from_payload(self, payload, root_password="", custom_user_data="", idempotency_key=""):
         self.calls.append(str(payload.get("availability_domain") or ""))
         return _Result()
 

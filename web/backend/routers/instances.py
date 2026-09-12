@@ -898,6 +898,10 @@ def launch_instance(
     payload = built["payload"]
     root_password = built["root_password"]
     custom_user_data = str(built.get("custom_user_data") or "")
+    # 密码模式进重试时,密码要跟着任务走 —— 和启动脚本一样加密存在 job 行上,
+    # **绝不**进 launch_payload(那是明文 JSON;sanitize 里的 forbidden 检查会把
+    # 混进去的密码字段直接打回)。密钥模式这里是空串。
+    job_root_password = str(built.get("root_password") or "")
     boot_vpu = int(payload.get("boot_volume_vpus_per_gb") or 10)
 
     count = max(1, int(body.count or 1))
@@ -1042,6 +1046,7 @@ def launch_instance(
                 availability_domains=list(built.get("availability_domains") or []),
                 fallback_configs=list(built.get("fallback_configs") or []),
                 user_data_encrypted=encrypt_text(custom_user_data) if custom_user_data else "",
+                root_password_encrypted=encrypt_text(job_root_password) if job_root_password else "",
                 interval_sec=int(built["retry_interval_sec"]),
                 max_attempts=int(built["retry_max_attempts"]),
                 attempts=0,

@@ -474,6 +474,37 @@ class Worker:
                 user_data_lost = True
                 log.exception("decrypt user_data failed job=%s (continuing without it)", job.id)
 
+        # root 密码模式:密码和启动脚本一样加密存在任务行上,这里解开。
+        #
+        # 解不开的处理和 user_data **相反**:启动脚本丢了还能开机、事后补跑;
+        # 密码丢了这台机器就**登不进去** —— cloud-init 会因为密码为空直接拒绝,
+        # 就算侥幸开出来也是一台谁都进不了的机器,还吃掉了 Always Free 额度。
+        # 所以这里 fail closed:任务标为失败、发通知、**不消耗尝试次数**,
+        # 而不是每 3 分钟撞一次同样的错。
+        root_password = ""
+        if str((job.launch_payload or {}).get("auth_mode") or "key") == "password":
+            try:
+                root_password = decrypt_text(job.root_password_encrypted or "")
+            except Exception:  # noqa: BLE001
+                root_password = ""
+                log.exception("decrypt root_password failed job=%s", job.id)
+            if not root_password:
+                msg = (
+                    "root 密码无法解密(主密钥可能已变更),密码模式的机器开出来也登不进去,"
+                    "任务已停止。请删除本任务后重新创建。"
+                )
+                # 进尝试日志:任务中心看的是这张表,只写 last_error 的话用户看到的是
+                # 一个「失败」状态却没有任何一条记录说为什么。
+                self._log_attempt(db, job, ok=False, message=msg, ad=ad, config_label=cfg_label)
+                job.enabled = False
+                job.status = "failed"
+                job.last_error = msg
+                job.next_run_at = None
+                db.commit()
+                self._notify_capacity_end(db, job, reason=msg)
+                db.commit()
+                return
+
         # 从这里开始到 LaunchInstance 返回为止，整段要和浏览器端的创建互斥。
         #
         # AUDIT.md pass 11 把「check-then-act 没有互斥」列为 High，并写着
@@ -648,7 +679,10 @@ class Worker:
         )
         try:
             result = session.launch_from_payload(
-                payload, custom_user_data=custom_user_data, idempotency_key=retry_token
+                payload,
+                root_password=root_password,
+                custom_user_data=custom_user_data,
+                idempotency_key=retry_token,
             )
         except Exception as exc:  # noqa: BLE001
             msg = str(exc)
@@ -736,6 +770,13 @@ class Worker:
                         "⚠ 自定义启动脚本无法解密（主密钥可能已变更），本次未应用 —— "
                         "这台机器没有跑过你的初始化脚本。\n"
                         if user_data_lost
+                        else ""
+                    )
+                    + (
+                        # 密码写在实例的 freeform 标签里(launch_instance 里那段),
+                        # 列表页读的就是它。不写进通知正文:推送渠道不可信。
+                        "root 密码：面板实例列表里点该机器的「root 密码」查看。\n"
+                        if root_password
                         else ""
                     )
                     + "公网 IP 请稍后在面板实例列表查看。"

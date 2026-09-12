@@ -520,6 +520,8 @@ class CapacityJobOut(BaseModel):
     launch_payload: dict[str, Any] = Field(default_factory=dict)
     fallback_configs: list[dict[str, Any]] = Field(default_factory=list)
     has_user_data: bool = False
+    # 密码模式的重试任务。只说「有没有」,密码本身永远不回给前端。
+    has_root_password: bool = False
 
     model_config = {"from_attributes": True}
 

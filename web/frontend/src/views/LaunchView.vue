@@ -418,8 +418,8 @@
       <div class="stack" style="border-top: 1px solid var(--border); padding-top: 0.75rem">
         <div class="choice-group">
           <label class="choice muted">
-            <input v-model="form.as_retry" type="checkbox" :disabled="form.auth_mode !== 'key'" />
-            <span>容量不足时加入自动重试（仅密钥模式，合规限速）</span>
+            <input v-model="form.as_retry" type="checkbox" />
+            <span>容量不足时加入自动重试（合规限速）</span>
           </label>
           <label class="choice muted">
             <input v-model="form.retry_all_ads" type="checkbox" :disabled="!form.as_retry" />
@@ -778,13 +778,6 @@ const shapeSpecHint = computed(() => {
   }
   return '此 Shape 为固定规格，OCPU / 内存由型号决定，不可修改'
 })
-
-watch(
-  () => form.auth_mode,
-  (mode) => {
-    if (mode !== 'key') form.as_retry = false
-  },
-)
 
 function padName() {
   const d = new Date()
