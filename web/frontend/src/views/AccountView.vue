@@ -812,17 +812,17 @@ onMounted(async () => {
   color: var(--danger);
   border-color: transparent;
 }
-:global(html[data-theme='dark']) .badge.st-ok,
-:global(html[data-theme='dark']) .badge.st-full {
+html[data-theme='dark'] .badge.st-ok,
+html[data-theme='dark'] .badge.st-full {
   color: #7dffa8;
   background: rgba(28, 78, 52, 0.85);
 }
-:global(html[data-theme='dark']) .badge.st-warn {
+html[data-theme='dark'] .badge.st-warn {
   color: #ffd27a;
   background: rgba(90, 64, 20, 0.85);
 }
-:global(html[data-theme='dark']) .badge.st-critical,
-:global(html[data-theme='dark']) .badge.st-over {
+html[data-theme='dark'] .badge.st-critical,
+html[data-theme='dark'] .badge.st-over {
   color: #ffb0ad;
   background: rgba(96, 40, 38, 0.85);
 }

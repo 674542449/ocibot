@@ -357,8 +357,9 @@
 
    这里**不要**写成 `:global(html[data-theme='dark']) .table-wrap …`：
    Vue 编译这种「:global 开头 + 后代」的写法会把后代部分整个丢掉，只剩下
-   `html[data-theme=dark]{…}`，等于把样式糊到 <html> 上（本项目另有 9 处
-   老代码踩了这个坑）。作用的元素本来就在本组件里，直接写祖先选择器即可，
+   `html[data-theme=dark]{…}`，等于把样式糊到 <html> 上（ToastHost / AccountView /
+   TenantsView 曾有 10 处这么写，0.4.117 统一改掉，tests/test_scoped_global_selector.py
+   守着不让它回来）。作用的元素本来就在本组件里，直接写祖先选择器即可，
    scope 属性会挂在最后一段上。 */
 html[data-theme='dark'] .table-wrap th.action-col {
   background: #191a1e;
