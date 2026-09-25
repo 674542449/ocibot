@@ -90,6 +90,12 @@ class Tenant(Base):
     # 只挡删除，编辑 / 测试连接等照常可用。default=False 让 _ensure_schema 给老库
     # 生成 DEFAULT 0 NOT NULL，升级后所有已有租户都是「未保护」。
     delete_protected: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # 开启保护的时间：租户页把受保护的排在最前，多个之间按「先保护的在前」。
+    # 可空且没有默认值 —— 0.4.116 里已经开了保护的行升级后是 NULL，前端退回按
+    # created_at 排。解除保护时清空，再开启就重新计时。
+    delete_protected_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # Legacy: last local password-expiry notify day (unused).
     pwd_expiry_notified_on: Mapped[str] = mapped_column(String(16), default="", nullable=False)
     # Budget alerts and the daily egress check were removed in 0.4.36, but these

@@ -173,6 +173,8 @@ class TenantOut(BaseModel):
     free_only_mode: bool = True
     # 删除保护：True 时单个 / 批量删除都会拒绝这个租户。
     delete_protected: bool = False
+    # 开启保护的时间（租户页据此把受保护的按先后排在最前）；未保护时为 None。
+    delete_protected_at: Optional[UtcDatetime] = None
     # Empty on a primary tenant; the primary's id on a 副区 (secondary region) row.
     parent_tenant_id: str = ""
     region_label: str = ""

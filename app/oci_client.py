@@ -741,6 +741,46 @@ SAFE_LAUNCH_FIELDS = {
 IPV6_PREFIX_LENGTHS = tuple(range(80, 129, 4))
 IPV6_SINGLE_ADDRESS_PREFIX = 128
 
+# VCN 服务限额：每个 VCN 能挂多少个 IPv6 地址段（CIDR）。文档里没写它的名字和
+# 默认值，是从真实账号的报错里拿到的（CreateIpv6 → 400 LimitExceeded，ap-singapore-2）：
+#   "Limit for ipv6-flexible-cidrs-allowed-count-per-vcn of 0 has been already reached."
+# 值为 0 就是 Oracle 没给这个账号开放地址段，只能去控制台申请提高限额。
+IPV6_CIDR_LIMIT_SERVICE = "vcn"
+IPV6_CIDR_LIMIT_NAME = "ipv6-flexible-cidrs-allowed-count-per-vcn"
+IPV6_CIDR_LIMIT_ZERO_MESSAGE = (
+    "该账号在当前区域的 VCN 服务限额「"
+    + IPV6_CIDR_LIMIT_NAME
+    + "」（每个 VCN 可分配的 IPv6 地址段数量）为 0，也就是 Oracle 还没给这个账号开放 IPv6 地址段，"
+    "面板这边无法绕过。需要在 Oracle 控制台「治理与管理 → 限制、配额和使用情况」里申请提高该限额"
+    "（服务选 Virtual Cloud Network / VCN），或提支持工单；免费账号通常要先升级为按量付费才能申请。"
+    "在此之前只能分配单个 IPv6 地址（/128）"
+)
+
+_LIMIT_EXCEEDED_RE = re.compile(r"Limit for ([\w.-]+) of (\d+)")
+
+
+def _ipv6_cidr_error_text(exc: "ServiceError") -> str:
+    """Explain a failed CreateIpv6(cidrPrefixLength); Oracle's own text goes last."""
+    raw = _format_service_error(exc)
+    code = str(getattr(exc, "code", "") or "")
+    match = _LIMIT_EXCEEDED_RE.search(str(getattr(exc, "message", "") or ""))
+    if match and match.group(1) == IPV6_CIDR_LIMIT_NAME and int(match.group(2)) == 0:
+        return f"{IPV6_CIDR_LIMIT_ZERO_MESSAGE}。（Oracle 原文：{raw}）"
+    if match or code == "LimitExceeded":
+        name, value = (match.group(1), match.group(2)) if match else ("?", "?")
+        return (
+            f"已达到 Oracle 服务限额 {name} = {value}：这个 VCN 上的 IPv6 地址段数量已用满。"
+            "可以先删掉不用的地址段，或在控制台「限制、配额和使用情况」里申请提高该限额。"
+            f"（Oracle 原文：{raw}）"
+        )
+    if int(getattr(exc, "status", 0) or 0) in (400, 409):
+        return (
+            f"{raw}。可能原因：子网的 IPv6 前缀是在 Oracle 支持地址段（2025-08）之前创建的，"
+            "需要提工单为该前缀开通，或给子网新加一个 IPv6 前缀；也可能是子网里剩余的连续地址"
+            "不够这么大的地址段，可以换一个更小的（如 /120）"
+        )
+    return raw
+
 
 def normalize_ipv6_prefix_length(value: Any) -> int:
     """Validate a requested IPv6 CIDR prefix length; None/"" mean a single /128."""
@@ -7252,6 +7292,35 @@ class TenantSession:
             pass
         return {}
 
+    def ipv6_cidr_limit_value(self) -> Optional[int]:
+        """This tenancy's IPv6-CIDR-per-VCN service limit, or None when unknown.
+
+        One ListLimitValues call filtered to that single limit name. None — not 0 —
+        whenever the value cannot be read (no permission, the Limits service does
+        not publish this name in the region, a network error): callers only refuse
+        on a positively read 0 and otherwise let CreateIpv6 decide, so a failed
+        read never blocks a tenancy that does have the feature.
+        """
+        try:
+            values = oci.pagination.list_call_get_all_results(
+                self.limits.list_limit_values,
+                self.tenant.tenancy_ocid,
+                service_name=IPV6_CIDR_LIMIT_SERVICE,
+                name=IPV6_CIDR_LIMIT_NAME,
+                retry_strategy=sdk_bounded_paged_retry_strategy(),
+            ).data or []
+        except Exception:  # noqa: BLE001
+            return None
+        numbers: list[int] = []
+        for item in values:
+            if str(getattr(item, "name", "") or "") != IPV6_CIDR_LIMIT_NAME:
+                continue
+            try:
+                numbers.append(int(getattr(item, "value", None)))
+            except (TypeError, ValueError):
+                continue
+        return max(numbers) if numbers else None
+
     def _wait_primary_vnic_attached(
         self, instance_id: str, compartment_id: str, *, timeout: float, interval: float = 15
     ) -> None:
@@ -7314,6 +7383,10 @@ class TenantSession:
             return OperationResult(ok=False, message=str(exc))
         if prefix == IPV6_SINGLE_ADDRESS_PREFIX:
             return self.assign_public_ipv6(instance_id, compartment_id)
+        # 限额为 0 时 CreateIpv6 必然 400。先查一次再动手：否则没有 IPv6 的实例会先被
+        # 分配一个普通地址（下面那步），然后地址段失败 —— 用户没要的东西反倒留下了。
+        if self.ipv6_cidr_limit_value() == 0:
+            return OperationResult(ok=False, message=IPV6_CIDR_LIMIT_ZERO_MESSAGE)
         try:
             if wait_for_vnic_sec > 0:
                 self._wait_primary_vnic_attached(
@@ -7370,14 +7443,7 @@ class TenantSession:
                 data={"cidr": cidr, "prefix_length": prefix, "address": address, "count": count},
             )
         except ServiceError as exc:
-            text = _format_service_error(exc)
-            if int(getattr(exc, "status", 0) or 0) in (400, 409):
-                text += (
-                    "。若子网的 IPv6 前缀是在 Oracle 支持 IPv6 地址段之前创建的，"
-                    "需要给该前缀提工单开通，或给子网新加一个 IPv6 前缀后再试；"
-                    "也可能是子网里剩余的连续地址不够这么大的地址段，可换一个更小的（如 /120）"
-                )
-            return OperationResult(ok=False, message=text)
+            return OperationResult(ok=False, message=_ipv6_cidr_error_text(exc))
         except OCIClientError as exc:
             return OperationResult(ok=False, message=safe_error_text(exc))
         except Exception as exc:  # noqa: BLE001

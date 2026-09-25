@@ -411,7 +411,8 @@
           选 /128 以外的值时，实例开机、网卡就绪后会由后台再给它分配一整段 IPv6
           （Oracle <code>CreateIpv6</code> 的 <code>cidrPrefixLength</code>，前缀 /80–/124 且能被 4 整除），
           结果记在「审计」页，失败也可以在实例详情里重新分配。
-          注意：子网的 IPv6 前缀若是 Oracle 支持地址段之前创建的，需要提工单开通；
+          前提：账号的 VCN 服务限额 <code>ipv6-flexible-cidrs-allowed-count-per-vcn</code> 大于 0 ——
+          不少账号默认是 0，需要先在 Oracle 控制台「限制、配额和使用情况」里申请提高；读到 0 时面板会直接拒绝创建。
           地址段只是路由到这台机器，系统里还需自行配置要用的地址。
         </p>
       </div>

@@ -212,6 +212,8 @@ export type Tenant = {
   free_only_mode: boolean
   /** 删除保护：开启后单个 / 批量删除都会被服务端拒绝。 */
   delete_protected: boolean
+  /** 开启删除保护的时间（ISO）；未保护、或 0.4.116 时开的保护为 null。 */
+  delete_protected_at: string | null
   /** '' on a primary tenant; the primary's id on a 副区 (secondary region) row. */
   parent_tenant_id: string
   /** Localized region name, e.g. 大阪. */

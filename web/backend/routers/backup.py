@@ -31,6 +31,23 @@ from web.backend.models import Tenant, User
 from web.backend.audit import write_audit
 from web.backend.uploads import read_upload_limited
 
+def _iso_or_empty(value: Any) -> str:
+    if not isinstance(value, datetime):
+        return ""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.isoformat()
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    """Timestamp from an archive; anything unparsable is simply dropped."""
+    try:
+        parsed = datetime.fromisoformat(str(value or "").strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
 router = APIRouter(prefix="/backup", tags=["backup"])
 
 # 这份归档 = 名下每一个甲骨文租户的**可直接使用的 API 私钥**。拿到它的人不需要
@@ -184,6 +201,7 @@ def export_encrypted_zip(
                 "account_tier": row.account_tier or "",
                 "free_only_mode": bool(getattr(row, "free_only_mode", True)),
                 "delete_protected": bool(getattr(row, "delete_protected", False)),
+                "delete_protected_at": _iso_or_empty(getattr(row, "delete_protected_at", None)),
                 # 副区 link. Ids are reissued on restore, so it is remapped there
                 # via the exported "id" above.
                 "parent_tenant_id": getattr(row, "parent_tenant_id", "") or "",
@@ -434,6 +452,13 @@ def import_encrypted_zip(
             free_only_mode=bool(item.get("free_only_mode", True)),
             # Older archives have no key → unprotected, which is what they were.
             delete_protected=bool(item.get("delete_protected", False)),
+            # Keeps the 先保护先排 order across a restore; a protected row from an
+            # archive without the timestamp just sorts by its creation order.
+            delete_protected_at=(
+                _parse_iso(item.get("delete_protected_at"))
+                if item.get("delete_protected")
+                else None
+            ),
         )
         # SAVEPOINT per row. A bare db.flush() here shares one transaction with
         # every row before it, so a single rejected INSERT rolled back the whole

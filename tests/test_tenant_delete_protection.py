@@ -216,3 +216,57 @@ def test_batch_request_is_bounded(client):
     assert client.post("/api/tenants/batch-delete", json={"ids": []}).status_code == 422
     too_many = [f"id-{i}" for i in range(201)]
     assert client.post("/api/tenants/batch-delete", json={"ids": too_many}).status_code == 422
+
+
+# --------------------------------------------------------------------------
+# 0.4.117：受保护的租户排在最前，多个之间「先保护的在前」—— 靠 delete_protected_at。
+# --------------------------------------------------------------------------
+
+
+def _row(client, tid: str) -> dict:
+    return next(t for t in client.get("/api/tenants").json() if t["id"] == tid)
+
+
+def test_protection_time_is_recorded_kept_on_repeat_and_cleared(client, owner):
+    tid = _tenant(owner, "timed")
+    assert _row(client, tid)["delete_protected_at"] is None
+
+    first = client.post(f"/api/tenants/{tid}/delete-protection", json={"protected": True}).json()
+    assert first["delete_protected_at"], "开启保护必须记时间，否则排不出先后"
+
+    # 重复开启不能重新计时 —— 否则一次重复请求就把它在列表里的位置往后挪了。
+    again = client.post(f"/api/tenants/{tid}/delete-protection", json={"protected": True}).json()
+    assert again["delete_protected_at"] == first["delete_protected_at"]
+
+    off = client.post(f"/api/tenants/{tid}/delete-protection", json={"protected": False}).json()
+    assert off["delete_protected_at"] is None
+
+
+def test_protection_times_follow_the_order_they_were_set(client, owner):
+    a = _tenant(owner, "order-a")
+    b = _tenant(owner, "order-b")
+    # b 先保护，a 后保护：先后以保护时间为准，与添加顺序无关。
+    tb = client.post(f"/api/tenants/{b}/delete-protection", json={"protected": True}).json()
+    ta = client.post(f"/api/tenants/{a}/delete-protection", json={"protected": True}).json()
+    assert tb["delete_protected_at"] <= ta["delete_protected_at"]
+
+
+def test_the_frontend_sorts_protected_tenants_first_by_protection_time():
+    """没有 JS 测试运行器，只能对源码下断言（同 test_locked_tenant.py 的做法）。"""
+    src = (
+        Path(__file__).resolve().parents[1] / "web" / "frontend" / "src" / "views" / "TenantsView.vue"
+    ).read_text(encoding="utf-8")
+    assert "delete_protected_at || t.created_at" in src
+    assert ".sort(byProtection)" in src
+
+
+def test_backup_round_trips_the_protection_time():
+    from datetime import datetime, timezone
+
+    from web.backend.routers.backup import _iso_or_empty, _parse_iso
+
+    when = datetime(2026, 9, 26, 8, 30, tzinfo=timezone.utc)
+    assert _parse_iso(_iso_or_empty(when)) == when
+    # SQLite 读回来是 naive —— 按 UTC 处理，而不是丢掉。
+    assert _parse_iso(_iso_or_empty(when.replace(tzinfo=None))) == when
+    assert _iso_or_empty(None) == "" and _parse_iso("") is None and _parse_iso("garbage") is None

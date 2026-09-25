@@ -292,6 +292,15 @@ def test_every_endpoint_is_wired() -> None:
                 existing.is_active = True
                 existing.totp_enabled = False
             db.commit()
+        # The login limiter is in-process and keyed on the client IP, which every
+        # module on this xdist worker shares ("testclient", 30 per 5 min). Whether
+        # this login hit 429 depended on how many login-using modules happened to
+        # land on the same worker first — an intermittent failure unrelated to
+        # wiring. Same reset as tests/test_locked_tenant.py::_login.
+        from web.backend.rate_limit import login_ip_limiter, login_user_limiter
+
+        login_ip_limiter._hits.clear()
+        login_user_limiter._hits.clear()
         r = c.post("/api/auth/login", json={"username": "smoke", "password": "supersecret123"})
         assert r.status_code == 200, f"login failed: {r.status_code} {r.text}"
 

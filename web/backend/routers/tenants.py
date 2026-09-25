@@ -92,6 +92,9 @@ def _to_out(row: Tenant) -> TenantOut:
         account_tier=row.account_tier or "",
         free_only_mode=bool(getattr(row, "free_only_mode", True)),
         delete_protected=bool(getattr(row, "delete_protected", False)),
+        delete_protected_at=getattr(row, "delete_protected_at", None)
+        if getattr(row, "delete_protected", False)
+        else None,
         parent_tenant_id=getattr(row, "parent_tenant_id", "") or "",
         region_label=region_area(row.region or ""),
         created_at=row.created_at,
@@ -732,6 +735,12 @@ def set_tenant_delete_protection(
         row = get_owned_tenant(db, user.id, tenant_id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=safe_error_text(exc)) from exc
+    if body.protected:
+        # 已经开着的再点一次不重新计时，否则重复请求会把它在列表里的位置往后挪。
+        if not row.delete_protected or row.delete_protected_at is None:
+            row.delete_protected_at = datetime.now(timezone.utc)
+    else:
+        row.delete_protected_at = None
     row.delete_protected = bool(body.protected)
     db.commit()
     db.refresh(row)

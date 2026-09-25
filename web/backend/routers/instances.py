@@ -16,6 +16,7 @@ from app.oci_client import (
     safe_error_text,
     OCIClientError,
     POWER_ACTIONS,
+    IPV6_CIDR_LIMIT_ZERO_MESSAGE,
     TERMINATE_PROTECT_TAG,
     is_capacity_message,
     normalize_ipv6_prefix_length,
@@ -942,6 +943,17 @@ def launch_instance(
         raise HTTPException(
             status_code=400,
             detail="容量重试每次只能抢 1 台。请把数量改回 1，或关闭「加入容量重试」后再批量创建。",
+        )
+
+    # 选了 IPv6 地址段、而账号的地址段限额读出来是 0：地址段是开机后才分配的，
+    # 放行的话机器照开、地址段必然失败（抢机任务更糟 —— 半夜抢到一台不是想要的）。
+    # 在建任何东西之前拒绝。放在 launch 锁外面：这是一次只读查询，不参与额度判定，
+    # 而锁内的 OCI 调用清单由 tests/test_launch_lock_scope.py 逐个钉住。
+    # 读不到限额（None）时照常放行，交给开机后的那一步去报真实错误。
+    if ipv6_prefix < 128 and session.ipv6_cidr_limit_value() == 0:
+        raise HTTPException(
+            status_code=400,
+            detail=IPV6_CIDR_LIMIT_ZERO_MESSAGE + "。可以把「IPv6 地址段」改回 /128 后再创建。",
         )
 
     # Always Free guard BEFORE network/NSG prep so we don't leave orphan resources.

@@ -414,7 +414,7 @@ function shortAd(ad: string) {
 }
 
 function tierLabel(t: string) {
-  return { paid: '已升级', free: '免费' }[t] || '未知'
+  return { paid: '升级', free: '免费' }[t] || '未知'
 }
 
 const quota = ref<any>(null)

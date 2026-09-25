@@ -550,17 +550,37 @@ let regionsSeq = 0
  */
 const regionsOwner = ref('')
 
-/** Primaries in name order, each immediately followed by its 副区 rows. */
+/** 开启保护的先后；0.4.116 里开的保护没有时间，退回按添加时间。 */
+function protectedSince(t: Tenant): number {
+  return Date.parse(t.delete_protected_at || t.created_at) || 0
+}
+
+/**
+ * 开了删除保护的排在最前，多个之间先保护的在前；其余保持添加顺序
+ * （Array.prototype.sort 是稳定排序，比较结果为 0 的不会动）。
+ */
+function byProtection(a: Tenant, b: Tenant): number {
+  if (a.delete_protected !== b.delete_protected) return a.delete_protected ? -1 : 1
+  return a.delete_protected ? protectedSince(a) - protectedSince(b) : 0
+}
+
+/**
+ * Primaries (protected first, see byProtection), each immediately followed by
+ * its 副区 rows sorted the same way. A protected 副区 moves to the top of its own
+ * group, not above its primary — the tree would stop reading as a tree.
+ * This order is local to this page on purpose: the server's list order decides
+ * which tenant other pages open with when nothing is locked (pickTenantId).
+ */
 const orderedTenants = computed(() => {
-  const primaries = tenants.value.filter((t) => !t.parent_tenant_id)
+  const primaries = tenants.value.filter((t) => !t.parent_tenant_id).sort(byProtection)
   const out: Tenant[] = []
   for (const p of primaries) {
     out.push(p)
-    out.push(...tenants.value.filter((c) => c.parent_tenant_id === p.id))
+    out.push(...tenants.value.filter((c) => c.parent_tenant_id === p.id).sort(byProtection))
   }
   // Orphans (parent deleted out-of-band) must still be listed, not silently hidden.
   const seen = new Set(out.map((t) => t.id))
-  out.push(...tenants.value.filter((t) => !seen.has(t.id)))
+  out.push(...tenants.value.filter((t) => !seen.has(t.id)).sort(byProtection))
   return out
 })
 
@@ -748,7 +768,7 @@ async function passwordExpiry(t: Tenant) {
 }
 
 function tierLabel(t: string) {
-  return { paid: '已升级', free: '免费' }[t] || '未知'
+  return { paid: '升级', free: '免费' }[t] || '未知'
 }
 
 function shortId(id: string) {
