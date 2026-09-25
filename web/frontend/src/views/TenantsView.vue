@@ -1146,10 +1146,10 @@ onMounted(async () => {
   border-color: transparent;
   color: var(--danger);
 }
-:global(html[data-theme='dark']) .parse-box.ok {
+html[data-theme='dark'] .parse-box.ok {
   color: #7dffa8;
 }
-:global(html[data-theme='dark']) .parse-box.bad {
+html[data-theme='dark'] .parse-box.bad {
   color: #ffb0ad;
 }
 .manual-block {

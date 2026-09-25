@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.4.117 — 2026-09-26
+
+深色主题下有 10 条组件样式从来没生效过，反而把颜色和底色写到了 `<html>` 上。
+
+### 修复
+
+- **深色主题的组件配色写成了 `:global(html[data-theme='dark']) .xxx`，被 Vue 吞掉后半截。**
+
+  Vue 的 scoped CSS 编译器把 `:global(...)` 当成「整条选择器都是全局的」，后面的
+  `.xxx` 整个丢掉，编译结果是一条裸的 `html[data-theme="dark"] { color: …; background: … }`。
+  两头落空：
+
+  - 本该变的元素没变 —— 租户页导入配置的 `.parse-box.ok / .bad` 提示框、账户页配额的
+    `.badge.st-ok / st-full / st-warn / st-critical / st-over` 徽章、右下角 `ToastHost`
+    的成功 / 失败 / 信息提示。其中 `.parse-box.ok` 和成功提示在深色下用的还是浅色主题
+    写死的 `#0a6e22` 深绿字，压在深色底上几乎看不清；其余几处退回到基于主题变量的
+    浅色规则，看得见，但不是为深色设计的那套高对比配色；
+  - 这些颜色反而全写到了 `<html>` 上，打包后只有一个样式表，哪条排在最后哪条赢。
+    `body` 自己设了 `color` 和背景，所以大部分时候被盖住，看不出来。
+
+  改成普通后代选择器 `html[data-theme='dark'] .xxx`：scoped 样式只给最后一段加
+  `data-v` 属性，正好是本意（租户页的 `.protect-badge` 和实例页的 `th.action-col`
+  早已是这种写法）。构建产物里除了主题变量那一块，已经没有裸的
+  `html[data-theme=dark]{…}` 规则。
+
+### 维护
+
+- 新增 `tests/test_scoped_global_selector.py`：扫描所有 `.vue` 的 `<style>` 块，
+  出现「`:global(...)` 后面还跟着选择器」就失败（注释里讲这个坑不算）。vue-tsc 和
+  `vite build` 都拦不住它 —— 编译产物是合法 CSS，只是意思变了。守卫本身也有测试：
+  先确认它认得出坏写法、放得过 `:global(.x)` 和 `.a :global(.b)` 这类合法写法，
+  并对 0.4.116 的源码验证过能报出全部 10 处。
+
+### 升级
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.117
+```
+
 ## 0.4.116 — 2026-09-26
 
 租户列表支持多选批量删除和「删除保护」；创建实例时可以选 IPv6 地址段（/120、/116、/112 …）。
