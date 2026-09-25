@@ -305,7 +305,7 @@ def test_regions_endpoint_splits_subscribed_from_available(client, monkeypatch):
     available = {r["region_name"] for r in d["available"]}
     assert "ap-osaka-1" in available and "ap-tokyo-1" not in available
     # Localized labels come from app.formatting.region_area.
-    assert next(r for r in d["available"] if r["region_name"] == "ap-osaka-1")["region_label"] == "大阪"
+    assert next(r for r in d["available"] if r["region_name"] == "ap-osaka-1")["region_label"] == "日本中部（大阪）"
 
 
 def test_subscribe_requires_explicit_confirmation(client, monkeypatch):
@@ -328,7 +328,7 @@ def test_subscribing_adds_a_linked_secondary_tenant(client, monkeypatch):
     child = d["tenant"]
     assert child["region"] == "eu-frankfurt-1"
     assert child["parent_tenant_id"] == tid
-    assert child["region_label"] == "法兰克福"
+    assert child["region_label"] == "德国中部（法兰克福）"
     # Always Free does not reach a 副区, so the row is created as billable —
     # otherwise the free-cap guard would refuse every launch in it.
     assert child["free_only_mode"] is False
@@ -667,4 +667,5 @@ def test_long_primary_name_does_not_overflow_the_child_name_column(client, monke
     ).json()
     assert d["ok"] is True, d
     assert len(d["tenant"]["name"]) <= 128
-    assert d["tenant"]["name"].endswith("首尔")
+    # 截断的是主租户名那一段，区域名（Oracle 官方中文名）必须完整保留在结尾。
+    assert d["tenant"]["name"].endswith(" · 韩国中部（首尔）")

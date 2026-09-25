@@ -98,25 +98,48 @@ def test_disabled_tenants_keep_their_chronological_position(tmp_path):
 def test_region_area_and_sidebar_label():
     from app.formatting import region_area
 
-    assert region_area("eu-amsterdam-1") == "阿姆斯特丹"
-    assert region_area("ap-tokyo-1") == "东京"
-    assert region_area("ap-osaka-1") == "大阪"
-    assert region_area("ap-singapore-1") == "新加坡"
-    assert region_area("ap-singapore-2") == "新加坡西"  # distinct from Singapore
-    assert region_area("eu-zurich-1") == "苏黎世"
-    assert region_area("us-sanjose-1") == "圣何塞"
-    assert region_area("uk-london-1") == "伦敦"
+    # Oracle 官方中文名（出处见 app/formatting.py::_REGION_NAME_ZH），逐字。
+    assert region_area("eu-amsterdam-1") == "荷兰西北部（阿姆斯特丹）"
+    assert region_area("ap-tokyo-1") == "日本东部（东京）"
+    assert region_area("ap-osaka-1") == "日本中部（大阪）"
+    assert region_area("ap-singapore-1") == "新加坡（新加坡）"
+    assert region_area("ap-singapore-2") == "新加坡西部（新加坡）"  # distinct from Singapore
+    assert region_area("eu-zurich-1") == "瑞士北部（苏黎世）"
+    assert region_area("us-sanjose-1") == "美国西部（圣何塞）"
+    assert region_area("us-phoenix-1") == "美国西部（凤凰城）"
+    assert region_area("uk-london-1") == "英国南部（伦敦）"
+    assert region_area("uk-cardiff-1") == "英国西部（纽波特）"
+    assert region_area("AP-Tokyo-1") == "日本东部（东京）"  # ids are case-insensitive
     # Unknown regions fall back to the region id, not a useless placeholder.
     assert region_area("xx-atlantis-9") == "xx-atlantis-9"
     assert region_area("") == "未知"
 
+
+def test_region_names_are_never_guessed():
+    """没有官方出处的区域必须原样显示标识符，而不是按城市名「猜」一个。
+
+    以前是按城市子串模糊匹配的：ap-kulai-2 会被猜不出来还算好，更糟的是一个带
+    tokyo 字样的新区域（比如 ap-tokyo-2）会被安上 ap-tokyo-1 的名字 —— 看着很像，
+    其实是另一个区域。
+    """
+    from app.formatting import region_area
+
+    # 标识符表的英文写法和中文官网不同，由操作者确认对应。
+    assert region_area("ap-kulai-2") == "马来西亚西部（古来）"
+    assert region_area("eu-madrid-3") == "西班牙中部 2（马德里）"
+    # 同城市的新编号不能继承老区域的名字。
+    assert region_area("ap-tokyo-2") == "ap-tokyo-2"
+    assert region_area("eu-frankfurt-2") == "欧盟主权区域中部（法兰克福）"
+
+
+def test_sidebar_label_uses_the_region_name():
     t = _mk("主力号")
     t.region = "eu-amsterdam-1"
     t.account_tier = "free"
-    assert t.area_label() == "阿姆斯特丹"
-    assert t.sidebar_label() == "阿姆斯特丹 - 免费 - 主力号"
+    assert t.area_label() == "荷兰西北部（阿姆斯特丹）"
+    assert t.sidebar_label() == "荷兰西北部（阿姆斯特丹） - 免费 - 主力号"
     t.description = "备用  生产机"
-    assert t.sidebar_label() == "阿姆斯特丹 - 免费 - 主力号 · 备用 生产机"
+    assert t.sidebar_label() == "荷兰西北部（阿姆斯特丹） - 免费 - 主力号 · 备用 生产机"
 
 
 def test_tier_label_text():

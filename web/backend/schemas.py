@@ -214,7 +214,7 @@ class TenantBatchDeleteResult(BaseModel):
 class TenantRegionItem(BaseModel):
     region_name: str
     region_key: str = ""
-    region_label: str = ""  # localized city name, e.g. 大阪
+    region_label: str = ""  # Oracle 官方中文名，e.g. 日本中部（大阪）；无出处时为标识符本身
     is_home_region: bool = False
     status: str = ""
     subscribed: bool = False

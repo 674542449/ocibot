@@ -10,75 +10,91 @@ import math
 from typing import Optional
 
 
-# Full OCI region id -> display name. Used when the same city token maps to
-# multiple commercial regions that must stay visually distinct (e.g. Singapore
-# vs Singapore West). Checked before the city-token table below.
-_REGION_AREA_EXACT = {
-    "ap-singapore-1": "新加坡",
-    "ap-singapore-2": "新加坡西",
-}
-
-# OCI region city token -> region name (Chinese). Keyed on the city so it
-# tolerates any realm prefix / index suffix, e.g. "eu-amsterdam-1" and
-# "ap-tokyo-1". Prefer _REGION_AREA_EXACT when two regions share a city token.
-_REGION_AREA = {
-    # Asia Pacific
-    "tokyo": "东京", "osaka": "大阪",
-    "seoul": "首尔", "chuncheon": "春川",
-    "singapore": "新加坡",  # fallback; ap-singapore-1/2 use exact map
-    "mumbai": "孟买", "hyderabad": "海得拉巴",
-    "sydney": "悉尼", "melbourne": "墨尔本",
-    "hongkong": "香港",
-    "kualalumpur": "吉隆坡",
-    "jakarta": "雅加达",
-    "bangkok": "曼谷",
-    "manila": "马尼拉",
-    # Europe
-    "amsterdam": "阿姆斯特丹",
-    "frankfurt": "法兰克福",
-    "zurich": "苏黎世",
-    "paris": "巴黎", "marseille": "马赛",
-    "milan": "米兰",
-    "madrid": "马德里",
-    "stockholm": "斯德哥尔摩",
-    "london": "伦敦", "cardiff": "卡迪夫", "newport": "纽波特",
-    "jovanovac": "约万诺瓦茨",
-    # Americas
-    "ashburn": "阿什本", "phoenix": "凤凰城", "sanjose": "圣何塞",
-    "chicago": "芝加哥", "sterling": "斯特灵", "tucson": "图森",
-    "langley": "兰利", "luke": "卢克",
-    "toronto": "多伦多", "montreal": "蒙特利尔",
-    "saopaulo": "圣保罗", "vinhedo": "维涅杜",
-    "santiago": "圣地亚哥", "valparaiso": "瓦尔帕莱索",
-    "bogota": "波哥大",
-    "queretaro": "克雷塔罗", "monterrey": "蒙特雷",
-    # Middle East / Africa
-    "jeddah": "吉达", "riyadh": "利雅得",
-    "dubai": "迪拜", "abudhabi": "阿布扎比",
-    "jerusalem": "耶路撒冷",
-    "johannesburg": "约翰内斯堡",
+# OCI 区域标识符 -> Oracle 官方中文区域名称。**只收有出处的，一个字都不自己译。**
+#
+# 名称逐字取自 Oracle 中文官网的区域列表：
+#   https://www.oracle.com/cn/cloud/public-cloud-regions/
+# 那一页只有名称、没有标识符，标识符靠英文名一一对上：中文名是英文官方名的直译
+# （「日本东部（东京）」= Japan East (Tokyo)），而英文名到标识符的对应取自
+#   https://docs.oracle.com/en-us/iaas/Content/General/Concepts/regions.htm
+# 两个欧盟主权区域的中文名和标识符同时出现在 Oracle 中文文档里：
+#   https://docs.oracle.com/cloud/help/zh_CN/epm-common/TSEPM/opc_gen_2_regions.htm
+#
+# 两条是操作者确认过的对应（名称仍逐字取自中文官网，只是标识符表的英文写法不同）：
+#   ap-kulai-2  = 「马来西亚西部（古来）」   标识符表写 "Malaysia West 2 (Kulai)"
+#   eu-madrid-3 = 「西班牙中部 2（马德里）」 标识符表写 "Spain Central (Madrid 3)"
+# 刻意**不收**的：肯尼亚、摩洛哥 2 —— 官网有名字，但文档里还没有标识符，显示标识符本身。
+# 以前这里是按城市名子串模糊匹配的自译表（「新加坡西」「卡迪夫」这类都是猜的），
+# 新区域上线时也会被猜成一个看着像、其实不对的名字。
+_REGION_NAME_ZH = {
+    # 北美地区
+    "us-ashburn-1": "美国东部（阿什本）",
+    "us-chicago-1": "美国中西部（芝加哥）",
+    "us-phoenix-1": "美国西部（凤凰城）",
+    "us-sanjose-1": "美国西部（圣何塞）",
+    "ca-montreal-1": "加拿大东南部（蒙特利尔）",
+    "ca-toronto-1": "加拿大东南部（多伦多）",
+    "mx-queretaro-1": "墨西哥中部（克雷塔罗）",
+    "mx-monterrey-1": "墨西哥东北部（蒙特雷）",
+    # 南美地区
+    "sa-saopaulo-1": "巴西东部（圣保罗）",
+    "sa-vinhedo-1": "巴西东南部（维涅杜）",
+    "sa-santiago-1": "智利中部（圣地亚哥）",
+    "sa-valparaiso-1": "智利西部（瓦尔帕莱索）",
+    "sa-bogota-1": "哥伦比亚中部（波哥大）",
+    # 欧洲
+    "eu-paris-1": "法国中部（巴黎）",
+    "eu-marseille-1": "法国南部（马赛）",
+    "eu-frankfurt-1": "德国中部（法兰克福）",
+    "eu-milan-1": "意大利西北部（米兰）",
+    "eu-turin-1": "意大利北部（都灵）",
+    "eu-amsterdam-1": "荷兰西北部（阿姆斯特丹）",
+    "eu-jovanovac-1": "塞尔维亚中部（乔万诺瓦茨）",
+    "eu-madrid-1": "西班牙中部（马德里）",
+    "eu-madrid-3": "西班牙中部 2（马德里）",
+    "eu-stockholm-1": "瑞典中部（斯德哥尔摩）",
+    "eu-zurich-1": "瑞士北部（苏黎世）",
+    "uk-london-1": "英国南部（伦敦）",
+    "uk-cardiff-1": "英国西部（纽波特）",
+    # 中东和非洲地区
+    "il-jerusalem-1": "以色列中部（耶路撒冷）",
+    "af-casablanca-1": "摩洛哥西部（卡萨布兰卡）",
+    "me-jeddah-1": "沙特阿拉伯西部（吉达）",
+    "me-riyadh-1": "沙特阿拉伯中部（利雅得）",
+    "af-johannesburg-1": "南非中部（约翰内斯堡）",
+    "me-dubai-1": "阿联酋东部（迪拜）",
+    "me-abudhabi-1": "阿联酋中部（阿布扎比）",
+    # 亚太地区
+    "ap-sydney-1": "澳大利亚东部（悉尼）",
+    "ap-melbourne-1": "澳大利亚东南部（墨尔本）",
+    "ap-mumbai-1": "印度西部（孟买）",
+    "ap-hyderabad-1": "印度南部（海得拉巴）",
+    "ap-batam-1": "印度尼西亚北部（巴淡）",
+    "ap-tokyo-1": "日本东部（东京）",
+    "ap-osaka-1": "日本中部（大阪）",
+    "ap-kulai-2": "马来西亚西部（古来）",
+    "ap-singapore-1": "新加坡（新加坡）",
+    "ap-singapore-2": "新加坡西部（新加坡）",
+    "ap-seoul-1": "韩国中部（首尔）",
+    "ap-chuncheon-1": "韩国北部（春川）",
+    # 主权区域
+    "eu-frankfurt-2": "欧盟主权区域中部（法兰克福）",
+    "eu-madrid-2": "欧盟主权区域南部（马德里）",
 }
 
 
 def region_area(region: str) -> str:
-    """Map an OCI region id to its region (city) name, e.g.
-    'eu-amsterdam-1' -> '阿姆斯特丹', 'ap-singapore-2' -> '新加坡西'.
+    """Oracle's official Chinese name for an OCI region id, e.g.
+    'ap-tokyo-1' -> '日本东部（东京）', 'ap-singapore-2' -> '新加坡西部（新加坡）'.
 
-    Falls back to the region id itself when unknown, which is still more useful
-    to the user than a generic placeholder.
+    Exact lookup only (see _REGION_NAME_ZH for the sources). An id without a
+    sourced name falls back to the id itself — still more useful than a generic
+    placeholder, and never a plausible-looking wrong name.
     """
     raw = (region or "").strip().lower()
     if not raw:
         return "未知"
-    exact = _REGION_AREA_EXACT.get(raw)
-    if exact:
-        return exact
-    # Match the longest city token first so e.g. "sanjose" wins over "jose".
-    compact = raw.replace("-", "").replace("_", "")
-    for city in sorted(_REGION_AREA, key=len, reverse=True):
-        if city in compact:
-            return _REGION_AREA[city]
-    return region.strip()
+    return _REGION_NAME_ZH.get(raw) or region.strip()
 
 
 # 全仓字节口径：十进制 SI，1 KB = 1000 B，标签写 KB/MB/GB。

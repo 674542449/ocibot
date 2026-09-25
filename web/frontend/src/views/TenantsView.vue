@@ -4,7 +4,7 @@
       <div>
         <h2>租户 / API 配置</h2>
         <p class="muted" style="margin: 0.2rem 0 0">
-          粘贴 OCI config；私钥仅服务端加密存储 · 「锁定为默认」后其他页面不用再选租户
+          粘贴 OCI config；私钥仅服务端加密存储 · 「锁定默认」后其他页面不用再选租户
         </p>
       </div>
       <div class="page-tools">
@@ -47,7 +47,6 @@
             <th>名称</th>
             <th>区域</th>
             <th>等级</th>
-            <th>密码到期</th>
             <th>Tenancy</th>
             <th>状态</th>
             <th>操作</th>
@@ -55,7 +54,7 @@
         </thead>
         <tbody>
           <tr v-if="tenants.length === 0">
-            <td colspan="8" class="muted empty">还没有租户，点击右上角添加，或粘贴原始 API 配置。</td>
+            <td colspan="7" class="muted empty">还没有租户，点击右上角添加，或粘贴原始 API 配置。</td>
           </tr>
           <tr v-for="t in orderedTenants" :key="t.id" :class="{ 'sub-row': !!t.parent_tenant_id }">
             <td class="sel-col">
@@ -88,37 +87,14 @@
                 <Icon name="lock" :size="12" /> 默认
               </span>
             </td>
-            <td>
-              {{ t.region }}
-              <span v-if="t.region_label && t.region_label !== t.region" class="muted">
-                · {{ t.region_label }}
-              </span>
+            <!-- 直接显示 Oracle 官方中文名（服务端 app/formatting.py::region_area，
+                 只收有出处的）；标识符放在悬停提示里。没有官方中文名的区域
+                 region_label 就是标识符本身，照样显示。 -->
+            <td class="nowrap-cell" :title="t.region">
+              {{ t.region_label || t.region }}
             </td>
-            <td>{{ tierLabel(t.account_tier) }}</td>
-            <!-- Own column on purpose: rendered inside 状态 it added a second line
-                 on query, growing the row and pushing every row below it down.
-                 Here the header reserves the width and the cell is simply empty
-                 until queried, so nothing moves. -->
-            <td class="pwd-cell">
-              <!-- Always a badge, even before the query: a plain "—" placeholder is
-                   shorter than a badge, so the first result grew the row. The
-                   placeholder keeps a CJK glyph so its line box matches the real
-                   value's exactly. -->
-              <span
-                class="badge"
-                :class="
-                  pwdStatus[t.id] ? (pwdStatus[t.id].days > 0 ? 'warn' : 'running') : 'pwd-empty'
-                "
-              >
-                {{
-                  pwdStatus[t.id]
-                    ? pwdStatus[t.id].days > 0
-                      ? pwdStatus[t.id].days + ' 天'
-                      : '未设置'
-                    : '未查询'
-                }}
-              </span>
-            </td>
+            <!-- 不折行：两个字的「免费」被表格挤成一字一行，整行高度翻倍。 -->
+            <td class="nowrap-cell">{{ tierLabel(t.account_tier) }}</td>
             <td class="muted" style="font-size: 12px; word-break: break-all">
               {{ shortId(t.tenancy_ocid) }}
             </td>
@@ -146,7 +122,7 @@
                     : '锁定后，实例 / 存储 / 创建实例 / 账号用量 进入时都自动选它'"
                   @click="toggleLock(t)"
                 >
-                  {{ isTenantLocked(t.id) ? '取消锁定' : '锁定为默认' }}
+                  {{ isTenantLocked(t.id) ? '取消锁定' : '锁定默认' }}
                 </button>
                 <!-- 诊断权限问题的入口。以前 /tenants/{id}/test 全站只有一个调用点:
                      粘贴导入时那个「保存后自动测试连接」复选框。手动添加、编辑、
@@ -709,10 +685,6 @@ async function removeSelected() {
   }
 }
 
-/** 每个租户的 defaultPasswordPolicy 到期天数（0 = 未设置 = 永不过期）。 */
-type PwdStatus = { days: number }
-const pwdStatus = reactive<Record<string, PwdStatus>>({})
-
 type PwdPolicy = { name: string; days: number; is_default: boolean; is_template: boolean }
 
 /** 读取 defaultPasswordPolicy 的天数；读不到就退回面板算出的结论。 */
@@ -738,6 +710,8 @@ async function readPasswordDays(tenantId: string): Promise<number | null> {
  * 若仍设着有效期，顺手调用关闭强制改密再读一次 —— 这两步合并成一个按钮是
  * 操作者要求的工作流（他要的结果始终是「关掉」）。按钮提示里写明了会执行关闭，
  * 免得一个叫「查询」的动作意外改了 Oracle 配置。
+ *
+ * 结果只走 toast：表格里原来的「密码到期」列在 0.4.120 按操作者要求去掉了。
  */
 async function passwordExpiry(t: Tenant) {
   busy.value = t.id
@@ -749,12 +723,10 @@ async function passwordExpiry(t: Tenant) {
       )
       if (!data.ok) {
         showToast(`${t.name}: 当前 ${days} 天后过期，关闭失败：${data.message || '未知原因'}`, 'err', 5000)
-        pwdStatus[t.id] = { days }
         return
       }
       days = await readPasswordDays(t.id)
     }
-    pwdStatus[t.id] = { days: days ?? 0 }
     showToast(
       (days ?? 0) > 0
         ? `${t.name}: defaultPasswordPolicy = ${days} 天`
@@ -1183,16 +1155,10 @@ onMounted(async () => {
 .sub-badge {
   margin-left: 0.35rem;
 }
-/* Fixed width so a result never resizes the column: a wider column narrows the
-   actions column until its buttons wrap, which grows EVERY row in the table. */
-.pwd-cell {
-  font-size: 12px;
+/* 区域、等级这两列内容短而且固定，不许折行：表格一挤，中文会被压成一字一行，
+   整行高度翻倍。宁可表格横向滚动（.table-wrap 本来就有）。 */
+.nowrap-cell {
   white-space: nowrap;
-  width: 5.6rem;
-  min-width: 5.6rem;
-}
-.pwd-empty {
-  visibility: hidden;
 }
 
 /* The 🔒 默认 badge keeps its space when hidden. Rendering it conditionally

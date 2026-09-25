@@ -216,7 +216,7 @@ export type Tenant = {
   delete_protected_at: string | null
   /** '' on a primary tenant; the primary's id on a 副区 (secondary region) row. */
   parent_tenant_id: string
-  /** Localized region name, e.g. 大阪. */
+  /** Oracle 官方中文区域名，e.g. 日本中部（大阪）；没有官方中文名时就是标识符本身。 */
   region_label: string
   created_at: string
   updated_at: string
