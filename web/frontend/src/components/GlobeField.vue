@@ -163,7 +163,8 @@ onMounted(() => {
 
     for (const s of STARS) {
       ctx.globalAlpha = s.a
-      ctx.fillStyle = '#c9c7ff'
+      // 纸面上的细尘，不是星空：暖灰，透明度沿用原来的随机值。
+      ctx.fillStyle = '#a8a294'
       ctx.beginPath()
       ctx.arc(s.x * w, s.y * h, s.r, 0, Math.PI * 2)
       ctx.fill()
@@ -187,7 +188,7 @@ onMounted(() => {
             started = true
           } else ctx.lineTo(q.x, q.y)
         }
-        ctx.strokeStyle = front ? 'rgba(140,132,255,0.22)' : 'rgba(140,132,255,0.07)'
+        ctx.strokeStyle = front ? 'rgba(61,60,55,0.2)' : 'rgba(61,60,55,0.06)'
         ctx.stroke()
       }
     }
@@ -211,7 +212,7 @@ onMounted(() => {
           started = true
         } else ctx.lineTo(q.x, q.y)
       }
-      ctx.strokeStyle = 'rgba(150,140,255,0.16)'
+      ctx.strokeStyle = 'rgba(198,97,63,0.28)'
       ctx.lineWidth = 1
       ctx.stroke()
 
@@ -219,7 +220,7 @@ onMounted(() => {
       const q = proj(arcPoint(a, b, phase, 0.22))
       if (q.z >= -0.15) {
         ctx.globalAlpha = 0.9
-        ctx.fillStyle = '#d7d2ff'
+        ctx.fillStyle = '#c6613f'
         ctx.beginPath()
         ctx.arc(q.x, q.y, 1.7 * q.k, 0, Math.PI * 2)
         ctx.fill()
@@ -234,7 +235,7 @@ onMounted(() => {
       const glow = 0.5 + 0.5 * Math.sin(t * 0.0022 + i * 0.9)
       const r = (front ? 2.1 : 1.2) * q.k
       ctx.globalAlpha = front ? 0.55 + 0.45 * glow : 0.16
-      ctx.fillStyle = front ? '#a99fff' : '#6f68b8'
+      ctx.fillStyle = front ? '#c6613f' : '#a8a294'
       ctx.beginPath()
       ctx.arc(q.x, q.y, r, 0, Math.PI * 2)
       ctx.fill()
@@ -242,7 +243,7 @@ onMounted(() => {
         ctx.globalAlpha = (glow - 0.75) * 0.9
         ctx.beginPath()
         ctx.arc(q.x, q.y, r * 3.2, 0, Math.PI * 2)
-        ctx.fillStyle = '#8a80ff'
+        ctx.fillStyle = '#d97757'
         ctx.fill()
       }
     }

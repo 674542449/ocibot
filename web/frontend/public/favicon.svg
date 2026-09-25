@@ -5,11 +5,12 @@
        浏览器标签页里需要一个实心的轮廓才好找，所以 favicon 带底板；
        侧边栏那个是透明字形（见 AppLayout.vue），两者是有意分开的。 -->
   <style>
-    .tile { fill: #5b51d8 }
-    /* 标签栏用的是浏览器自己的配色，跟应用内的 data-theme 无关，
-       所以这里只能按系统配色微调，让底板在深色标签栏上不发闷。 */
+    /* Claude 陶土橙。白字形 4.05:1。 */
+    .tile { fill: #c6613f }
+    /* 这不是应用的暗色模式（应用已经只有一套配色）：标签栏是浏览器自己画的，
+       系统用深色时底板换成更亮的一档，免得在深色标签栏上发闷。白字形仍有 3.12:1。 */
     @media (prefers-color-scheme: dark) {
-      .tile { fill: #7b73e8 }
+      .tile { fill: #d97757 }
     }
   </style>
   <rect class="tile" width="32" height="32" rx="7"/>

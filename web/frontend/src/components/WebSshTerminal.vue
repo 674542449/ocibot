@@ -129,9 +129,11 @@ async function ensureTerm() {
     cursorBlink: true,
     fontSize: 13,
     fontFamily: 'Consolas, "Courier New", monospace',
+    // 终端刻意保持深底 —— 这不是「暗色模式」：服务器上的程序输出 ANSI 颜色时默认
+    // 背景是深色的，浅底上的黄 / 青字几乎看不见。只是从冷藏青换成和面板同一族的暖黑。
     theme: {
-      background: '#0b1220',
-      foreground: '#e2e8f0',
+      background: '#1f1e1b',
+      foreground: '#f5f4ed',
     },
   })
   fit = new FitAddon()
@@ -277,7 +279,7 @@ onBeforeUnmount(() => {
   min-height: 220px;
   width: 100%;
   max-width: 100%;
-  background: #0d1117;
+  background: #1f1e1b;
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 4px;

@@ -10,22 +10,13 @@
         <span class="title">OCIBot</span>
         <span class="muted small">{{ pageTitle }}</span>
       </div>
-      <button
-        type="button"
-        class="icon-btn"
-        :title="theme === 'light' ? '暗色' : '亮色'"
-        :aria-label="theme === 'light' ? '切换暗色' : '切换亮色'"
-        @click="toggleTheme"
-      >
-        <Icon :name="theme === 'light' ? 'moon' : 'sun'" :size="19" />
-      </button>
     </header>
 
     <aside class="sidebar">
       <div class="brand">
         <!-- 内联而不是 <img src="/logo.svg">：img 里的 currentColor 拿不到外部
              CSS，标记就只能写死一个颜色。内联之后它跟着 --accent 走，
-             亮/暗主题各自都是对的。public/logo.svg 是同一套路径的写死颜色版，
+             改配色只需要改 styles.css 一处。public/logo.svg 是同一套路径的写死颜色版，
              给 apple-touch-icon 那类没有 CSS 上下文的地方用 —— 改一个要改两个。
 
              标记的含义：环 = 一直在转的容量循环，缺口 = 放出来的那个空位，
@@ -125,20 +116,6 @@
         <div v-if="buildLabel" class="muted small build-label rail-label" :title="buildFull">
           v{{ appVersion }} · {{ buildLabel }}
         </div>
-        <button
-          type="button"
-          class="theme-btn-desktop ghost-btn foot-btn"
-          :aria-label="theme === 'light' ? '切换暗色' : '切换亮色'"
-          @click="toggleTheme"
-        >
-          <span class="foot-ico" aria-hidden="true">
-            <Icon :name="theme === 'light' ? 'moon' : 'sun'" :size="18" />
-          </span>
-          <span class="rail-label">{{ theme === 'light' ? '切换暗色' : '切换亮色' }}</span>
-          <span class="rail-tip" aria-hidden="true">
-            {{ theme === 'light' ? '切换暗色' : '切换亮色' }}
-          </span>
-        </button>
         <button type="button" class="ghost-btn foot-btn" aria-label="退出登录" @click="onLogout">
           <span class="foot-ico" aria-hidden="true"><Icon name="logout" :size="18" /></span>
           <span class="rail-label">退出登录</span>
@@ -238,19 +215,6 @@ const accountFull = computed(
 )
 const appVersion = ref('')
 let timer: number | undefined
-
-// Default light (ByteDance console style); respect saved preference.
-const theme = ref(localStorage.getItem('ocibot_theme') || 'dark')
-
-function applyTheme() {
-  document.documentElement.setAttribute('data-theme', theme.value)
-}
-
-function toggleTheme() {
-  theme.value = theme.value === 'light' ? 'dark' : 'light'
-  localStorage.setItem('ocibot_theme', theme.value)
-  applyTheme()
-}
 
 async function checkWorker() {
   try {
@@ -381,7 +345,6 @@ function prefetchRoutes() {
 }
 
 onMounted(() => {
-  applyTheme()
   checkWorker()
   timer = window.setInterval(checkWorker, 30_000)
   window.addEventListener('resize', onResize)
@@ -479,7 +442,7 @@ onBeforeUnmount(() => {
 }
 
 /* 标记本身就是品牌，旁边不再有文字，所以它得自己撑住这块区域。
-   跟着 --accent 走：亮色主题是深靛，暗色是淡紫，两边都是 AA 以上对比度。
+   跟着 --accent 走：陶土橙，在象牙白底色上 4.8:1。
    不加投影 —— 这是个透明字形不是贴纸，投影只会让它显得像贴上去的。 */
 .brand-mark {
   width: 34px;
@@ -644,7 +607,11 @@ onBeforeUnmount(() => {
   padding-bottom: max(var(--page-pad), env(safe-area-inset-bottom));
 }
 
-.sidebar-close {
+/* 两个类一起写，不能只写 .sidebar-close：它同时也是 .icon-btn，而 .icon-btn
+   的 `display: inline-grid` 写在本规则**后面**、优先级相同 —— 后写的赢，于是这个
+   只该在手机抽屉里出现的关闭按钮一直挂在宽屏侧边栏 logo 旁边，点了什么也不做
+   （宽屏下抽屉本来就是开着的）。下面手机断点里那条也要用同样的优先级。 */
+.icon-btn.sidebar-close {
   display: none;
   /* 标题文字去掉之后 .brand 里只剩标记和这个关闭按钮，没有东西再把它推到右边，
      它会紧贴着标记。原来那个 flex:1 的 .brand-text 一直在做这件事。 */
@@ -713,7 +680,7 @@ onBeforeUnmount(() => {
     display: block;
     position: fixed;
     inset: 0;
-    background: rgba(29, 33, 41, 0.45);
+    background: rgba(31, 30, 27, 0.4);
     z-index: 50;
   }
 
@@ -733,8 +700,8 @@ onBeforeUnmount(() => {
     /* Opaque. On desktop the sidebar is a column of the page field and stays
        transparent, but here it is a drawer floating over the content — with no
        background of its own the labels rendered straight onto the page and the
-       scrim behind it, which in light theme left dark text on a dark backdrop
-       at 1.05:1. Effectively invisible. */
+       scrim behind it, which left dark text on a dark backdrop at 1.05:1.
+       Effectively invisible. */
     background: var(--panel);
     box-shadow: var(--shadow-md);
   }
@@ -743,12 +710,8 @@ onBeforeUnmount(() => {
     transform: translateX(0);
   }
 
-  .sidebar-close {
+  .icon-btn.sidebar-close {
     display: inline-grid;
-  }
-
-  .theme-btn-desktop {
-    display: none;
   }
 
   .main {

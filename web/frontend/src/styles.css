@@ -1,56 +1,54 @@
-/* Soft glass console tokens (Feishu base + iOS-like frosted surfaces) */
-
-/* 表面亮度阶梯（亮色）
+/* Claude 风格配色（0.4.119 起唯一的主题，暗色模式已移除）
  *
- * 主工作区原本是纯白 #ffffff —— 感知亮度 L*100，且它占满大半个视口，是屏幕上
- * 最亮的一块。长时间盯着看会累，这也是电子书「阅读模式」不用纯白的原因。
- * 现在降到 L*95，仍然读得出是「纸」，但不再是最高亮度。
+ * 暖色的「纸」：象牙白底 + 近黑的暖灰文字 + 陶土橙强调色，取自 Claude 的视觉语言。
  *
- *   bg        L* 87.7   页面底色
- *   panel     L* 95.1   主工作区（原 100）
- *   panel-2   L* 92.6   表头等次级面
- *   input-bg  L* 96.6   输入框仍比面板亮一点，保住「这里可以输入」的可供性
+ *   bg        #F5F4ED   页面底色 / 侧边栏（侧边栏是透明的，直接落在它上面）
+ *   panel     #FAF9F5   卡片、表格 —— 比底色亮一档，靠细边框而不是投影区分
+ *   panel-2   #EFEDE4   表头、分段按钮底等次级面
+ *   input-bg  #FFFFFF   输入框最亮，保住「这里可以输入」的可供性
  *
- * 降亮度不能靠降对比换来：正文 11.52:1、次要文字 6.13:1，都远高于 AA 的 4.5:1。
- * 每一对（含非文本的 3:1）都在 scratchpad 的 palette.py 里算过，23 项全过。
+ * 强调色刻意比 Claude 招牌的 #D97757 深：那个颜色上的白字只有 3.0:1，当链接文字
+ * 用在底色上也不到 4.5:1。#AE4F2B 上白字 5.31:1，作为文字在底色 / 面板 / 表头 /
+ * 自身浅底上都 ≥ 4.5:1。品牌标记（favicon、logo 底板）是图形不是文字，用更亮的
+ * #C6613F。所有组合（正文、次要文字、弱化文字、强调色、状态色，以及控件边框和
+ * 焦点环的非文本 3:1）都用 scratchpad 里的 palette.py 算过，全部达标。
  */
 :root {
   color-scheme: light;
-  --bg: #d7dce6;
+  --bg: #f5f4ed;
   --bg-glow-1: transparent;
   --bg-glow-2: transparent;
-  --panel: #eef1f6;
-  --panel-solid: #eef1f6;
-  --panel-2: #e3e8f0;
-  --border: #c8cfd9;
-  /* 提到 3:1 以上 —— 之前 #91959c 在页面底色上只有 2.31:1，直接落在页面背景上的
-   * 按钮/输入框边框达不到 WCAG 1.4.11 的非文本对比度。现在 panel 上 3.72、
-   * bg 上 3.06。 */
-  --border-strong: #767c85;
-  --glass-border: #c8cfd9;
+  --panel: #faf9f5;
+  --panel-solid: #faf9f5;
+  --panel-2: #efede4;
+  --border: #e3e0d5;
+  /* 控件边框要过 WCAG 1.4.11 的非文本 3:1：底色上 3.17、面板上 3.32、输入框上 3.50。
+   * 发丝线级别的暖灰（Claude 自己用的那种）只有 1.5:1 左右，按钮会「看不见边」。 */
+  --border-strong: #8c897f;
+  --glass-border: #e3e0d5;
   --glass-highlight: 0 0 transparent;
-  --text: #2f3134;
-  --muted: #565a60;
-  --text-secondary: #565a60;
-  --accent: #4a41c0;
-  --accent-hover: #3b34a0;
-  --accent-soft: #eceafb;
-  --accent-soft-2: #c3bfee;
-  --danger: #c8242b;
-  --danger-soft: #fdecec;
-  --ok: #0a7f28;
-  --ok-soft: #e7f6ec;
-  --warn: #9a5800;
-  --warn-soft: #fbf1e2;
+  --text: #1f1e1b;
+  --muted: #67655d;
+  --text-secondary: #3d3c37;
+  --accent: #ae4f2b;
+  --accent-hover: #943f20;
+  --accent-soft: #f9ece5;
+  --accent-soft-2: #e8c3b1;
+  --danger: #b3261e;
+  --danger-soft: #fbe8e5;
+  --ok: #3e6a28;
+  --ok-soft: #e7eedc;
+  --warn: #855600;
+  --warn-soft: #f5e9cf;
   /* 只声明一次：这两个键原本在本块里各写了两遍，后一份覆盖前一份，
    * 改前一份不会有任何效果 —— 是个专门用来浪费一轮排查的写法。 */
-  --input-bg: #f6f8fb;
-  --row-hover: #e6ebf2;
+  --input-bg: #ffffff;
+  --row-hover: #f1efe7;
   /* Effects */
-  --radius: 6px;
-  --radius-lg: 10px;
-  --shadow-sm: 0 1px 2px rgba(20, 26, 40, 0.05);
-  --shadow-md: 0 6px 20px rgba(20, 26, 40, 0.09);
+  --radius: 8px;
+  --radius-lg: 12px;
+  --shadow-sm: 0 1px 2px rgba(31, 30, 27, 0.05);
+  --shadow-md: 0 8px 24px rgba(31, 30, 27, 0.08);
   --blur: 0px;
   /* Labelled sidebar: an icon alone does not name a destination. */
   --sidebar-w: 240px;
@@ -66,52 +64,6 @@
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;
   font-feature-settings: "kern";
-}
-
-/* 表面亮度阶梯（暗色）
- *
- * 暗色的刺眼来源和亮色相反：底色原本是 #141415（L*6.4，已经很接近纯黑），
- * 亮字压在近黑底上会产生光晕（halation），散光的人尤其明显，而且 bg 到 panel
- * 之间跨了 11.6 个 L*，一眼扫过去明暗落差很大。
- *
- * 现在把地板抬起来、把落差压平：
- *   bg      L*  6.4 → 10.8   离开近黑
- *   panel   L* 18.0 → 16.1
- *   两者相差 11.6 → 5.3 个 L*
- *
- * 正文同时从 #d5dbe5 降到 #cbd1dc：暗色下过亮的字本身就是眩光源。
- * 降完仍有 9.63:1，远高于 AA。
- */
-html[data-theme='dark'] {
-  color-scheme: dark;
-  --bg: #1c1d20;
-  --bg-glow-1: transparent;
-  --bg-glow-2: transparent;
-  --panel: #26282c;
-  --panel-solid: #26282c;
-  --panel-2: #2f3236;
-  --border: #3c3f45;
-  /* 原 #71757a 在输入框底色上只有 2.49:1，达不到非文本的 3:1；现在 3.16。 */
-  --border-strong: #787d86;
-  --glass-border: #3c3f45;
-  --glass-highlight: 0 0 transparent;
-  --text: #cbd1dc;
-  --muted: #969ca5;
-  --text-secondary: #b2b8c2;
-  --accent: #8a97ff;
-  --accent-hover: #a3adff;
-  --accent-soft: #2c2f4d;
-  --accent-soft-2: #454a78;
-  --danger: #ff7b76;
-  --danger-soft: #3a2325;
-  --ok: #4ade80;
-  --ok-soft: #1d3327;
-  --warn: #fbbf24;
-  --warn-soft: #39301c;
-  --input-bg: #2e3135;
-  --row-hover: #2a2c31;
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
-  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.45);
 }
 
 * {
@@ -168,26 +120,11 @@ button {
   font-size: 13px;
 }
 
+/* 只写一次。以前这里还有第二条 `background: rgba(255,255,255,0.82)` 把它盖掉 ——
+   冷白的悬停色落在暖色的纸面上会显得发青。 */
 button:hover:not(:disabled) {
   background: var(--row-hover);
   border-color: var(--accent-soft-2);
-}
-
-html[data-theme='dark'] button:not(.primary):not(.danger):not(.ghost) {
-  background: rgba(255, 255, 255, 0.08);
-  border-color: var(--border-strong);
-  color: var(--text);
-}
-
-button:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.82);
-  border-color: var(--accent-soft-2);
-}
-
-html[data-theme='dark'] button:hover:not(:disabled):not(.primary):not(.danger):not(.ghost) {
-  background: rgba(255, 255, 255, 0.14);
-  border-color: var(--accent-soft-2);
-  color: var(--text);
 }
 
 button.primary {
@@ -203,19 +140,6 @@ button.primary:hover:not(:disabled) {
   color: #fff;
 }
 
-html[data-theme='dark'] button.primary {
-  color: #14121f;
-  background: var(--accent);
-  border-color: transparent;
-  font-weight: 600;
-}
-
-html[data-theme='dark'] button.primary:hover:not(:disabled) {
-  background: var(--accent-hover);
-  border-color: transparent;
-  color: #14121f;
-}
-
 button.danger {
   background: var(--danger-soft);
   border-color: transparent;
@@ -229,18 +153,6 @@ button.danger:hover:not(:disabled) {
   border-color: var(--danger);
 }
 
-html[data-theme='dark'] button.danger {
-  color: #ffb0ad;
-  background: var(--danger-soft);
-  border-color: transparent;
-}
-
-html[data-theme='dark'] button.danger:hover:not(:disabled) {
-  background: var(--danger);
-  color: #fff;
-  border-color: var(--danger);
-}
-
 button.ghost {
   background: transparent;
   border-color: transparent;
@@ -249,17 +161,6 @@ button.ghost {
 }
 
 button.ghost:hover:not(:disabled) {
-  background: var(--panel-2);
-  color: var(--text);
-}
-
-html[data-theme='dark'] button.ghost {
-  background: transparent;
-  border-color: transparent;
-  color: var(--text-secondary);
-}
-
-html[data-theme='dark'] button.ghost:hover:not(:disabled) {
   background: var(--panel-2);
   color: var(--text);
 }
@@ -310,12 +211,6 @@ input::placeholder,
 textarea::placeholder {
   color: var(--muted);
   opacity: 1;
-}
-
-/* Native <select> menus: force readable option colors in dark mode. */
-html[data-theme='dark'] option {
-  background: var(--panel-solid);
-  color: var(--text);
 }
 
 .card {
@@ -465,11 +360,6 @@ th {
   border-bottom: 1px solid var(--border-strong);
 }
 
-html[data-theme='dark'] th {
-  background: rgba(24, 25, 30, 0.94);
-  color: var(--text-secondary);
-}
-
 tr:last-child td {
   border-bottom: none;
 }
@@ -489,15 +379,9 @@ tr:hover td {
   border: 1px solid transparent;
   max-width: 100%;
   word-break: break-word;
-  background: rgba(247, 248, 250, 0.85);
+  background: var(--panel-2);
   color: var(--text-secondary);
   box-shadow: var(--glass-highlight);
-}
-
-html[data-theme='dark'] .badge {
-  background: rgba(255, 255, 255, 0.08);
-  color: var(--text-secondary);
-  border-color: rgba(255, 255, 255, 0.08);
 }
 
 .badge.running {
@@ -515,26 +399,6 @@ html[data-theme='dark'] .badge {
 .badge.err {
   color: var(--danger);
   background: var(--danger-soft);
-}
-
-html[data-theme='dark'] .badge.running {
-  color: #7dffa8;
-  background: rgba(28, 78, 52, 0.85);
-  border-color: rgba(61, 214, 140, 0.28);
-}
-html[data-theme='dark'] .badge.stopped {
-  color: var(--text-secondary);
-  background: rgba(255, 255, 255, 0.08);
-}
-html[data-theme='dark'] .badge.warn {
-  color: #ffd27a;
-  background: rgba(90, 64, 20, 0.85);
-  border-color: rgba(245, 185, 66, 0.28);
-}
-html[data-theme='dark'] .badge.err {
-  color: #ffb0ad;
-  background: rgba(96, 40, 38, 0.85);
-  border-color: rgba(255, 123, 118, 0.28);
 }
 
 /* 换行必须保留。后端有几条诊断是分条写的（哪一项没权限、该加哪条 IAM 策略、
@@ -557,7 +421,7 @@ html[data-theme='dark'] .badge.err {
 .error-box {
   white-space: pre-line;
   background: var(--danger-soft);
-  border: 1px solid rgba(245, 63, 63, 0.12);
+  border: 1px solid rgba(179, 38, 30, 0.14);
   color: var(--danger);
   padding: 0.7rem 0.9rem;
   border-radius: var(--radius-lg);
@@ -569,23 +433,13 @@ html[data-theme='dark'] .badge.err {
 .success-box {
   white-space: pre-line;
   background: var(--ok-soft);
-  border: 1px solid rgba(0, 180, 42, 0.12);
-  color: #0a6e22;
+  border: 1px solid rgba(62, 106, 40, 0.16);
+  color: var(--ok);
   padding: 0.7rem 0.9rem;
   border-radius: var(--radius-lg);
   word-break: break-word;
   overflow-wrap: anywhere;
   box-shadow: var(--glass-highlight);
-}
-
-html[data-theme='dark'] .success-box {
-  color: #7dffa8;
-  border-color: rgba(61, 214, 140, 0.22);
-}
-
-html[data-theme='dark'] .error-box {
-  color: #ffb0ad;
-  border-color: rgba(255, 123, 118, 0.22);
 }
 
 .field label {
@@ -744,13 +598,6 @@ label.choice.muted,
   border: 1px solid var(--border);
 }
 
-html[data-theme='dark'] .tab-row > button.primary,
-html[data-theme='dark'] .scroll-x > button.primary {
-  background: rgba(255, 255, 255, 0.1);
-  color: #9ec0ff;
-  border-color: var(--border-strong);
-}
-
 .actions-row {
   display: flex;
   flex-wrap: wrap;
@@ -782,14 +629,9 @@ html[data-theme='dark'] .scroll-x > button.primary {
   align-items: center;
   padding: 0.18rem;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.38);
+  background: var(--panel);
   border: 1px solid var(--glass-border);
   box-shadow: var(--glass-highlight);
-}
-
-html[data-theme='dark'] .btn-group {
-  background: rgba(255, 255, 255, 0.06);
-  border-color: var(--border);
 }
 
 .btn-group button {
@@ -818,11 +660,6 @@ code {
   padding: 0.1rem 0.35rem;
   border-radius: 4px;
   color: var(--text);
-}
-
-html[data-theme='dark'] code {
-  background: rgba(255, 255, 255, 0.08);
-  color: var(--text-secondary);
 }
 
 img,
@@ -918,8 +755,9 @@ h3 {
 
 /* Keyboard focus was visible on exactly one class before this. Anyone driving
    the panel from the keyboard — which is how you use a terminal-adjacent tool —
-   had no idea what was selected. Indigo reads clearly on both themes and is not
-   used for any machine state, so a focus ring can never be mistaken for status. */
+   had no idea what was selected. The terracotta accent (4.8:1 or better on every
+   surface) is not used for any machine state — warn is a distinctly yellower
+   amber — so a focus ring can never be mistaken for status. */
 :where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;

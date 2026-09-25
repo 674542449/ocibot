@@ -351,19 +351,6 @@
   background: var(--row-hover);
 }
 
-/* 深色下表头用的是半透明底（styles.css 里的 `html[data-theme='dark'] th`，
-   rgba(24,25,30,.94)），吸附的格子不能半透明，换成叠加后的同色实色，
-   免得右上角和表头其余部分差出一块。
-
-   这里**不要**写成 `:global(html[data-theme='dark']) .table-wrap …`：
-   Vue 编译这种「:global 开头 + 后代」的写法会把后代部分整个丢掉，只剩下
-   `html[data-theme=dark]{…}`，等于把样式糊到 <html> 上（本项目另有 9 处
-   老代码踩了这个坑）。作用的元素本来就在本组件里，直接写祖先选择器即可，
-   scope 属性会挂在最后一段上。 */
-html[data-theme='dark'] .table-wrap th.action-col {
-  background: #191a1e;
-}
-
 /* 定宽等宽字体 + 不换行：秒级时间戳在窄屏上会被折成两行，同一列的数字就
    对不齐了，扫一眼比较先后的用途也就没了。表格外层是 .table-wrap，横向
    滚动本来就有。 */

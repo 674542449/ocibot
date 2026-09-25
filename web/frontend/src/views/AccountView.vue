@@ -310,11 +310,11 @@
               :y="barY(pt.amount)"
               :width="barW"
               :height="Math.max(0, barBaseY - barY(pt.amount))"
-              fill="#3b82f6"
+              fill="#c6613f"
               opacity="0.85"
             />
           </g>
-          <line x1="0" :y1="barBaseY" :x2="svgW" :y2="barBaseY" stroke="#334155" />
+          <line x1="0" :y1="barBaseY" :x2="svgW" :y2="barBaseY" stroke="#8c897f" />
         </svg>
         <div class="row muted" style="font-size: 11px; justify-content: space-between">
           <span>{{ usage.daily[0]?.date }}</span>
@@ -788,8 +788,10 @@ onMounted(async () => {
 .st-warn {
   background: var(--warn);
 }
+/* 介于 warn（琥珀）和 over（红）之间，而且不能和陶土橙的强调色撞色 —— 用覆盆子红。
+   白字 6.4:1。 */
 .st-critical {
-  background: #f5319d;
+  background: #a3365a;
 }
 .st-over {
   background: var(--danger);
@@ -811,19 +813,5 @@ onMounted(async () => {
   background: var(--danger-soft);
   color: var(--danger);
   border-color: transparent;
-}
-:global(html[data-theme='dark']) .badge.st-ok,
-:global(html[data-theme='dark']) .badge.st-full {
-  color: #7dffa8;
-  background: rgba(28, 78, 52, 0.85);
-}
-:global(html[data-theme='dark']) .badge.st-warn {
-  color: #ffd27a;
-  background: rgba(90, 64, 20, 0.85);
-}
-:global(html[data-theme='dark']) .badge.st-critical,
-:global(html[data-theme='dark']) .badge.st-over {
-  color: #ffb0ad;
-  background: rgba(96, 40, 38, 0.85);
 }
 </style>

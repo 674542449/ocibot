@@ -45,8 +45,8 @@ TILE_R = 7.0                      # 底板圆角
 # 带底板时字形收到 88%：贴着圆角边缘的图标在标签栏里显得又挤又糊。
 GLYPH_INSET = 0.88
 
-BRAND = (0x5B, 0x51, 0xD8)        # 亮色 #4a41c0 与暗色 #8a97ff 之间取值，
-WHITE = (0xFF, 0xFF, 0xFF)        # 深浅两种标签栏上都够对比度（白字 5.7:1）
+BRAND = (0xC6, 0x61, 0x3F)        # Claude 陶土橙 #c6613f，与 favicon.svg / logo.svg
+WHITE = (0xFF, 0xFF, 0xFF)        # 的底板同色；白字形 4.05:1
 SIZES = (16, 32, 48, 64)
 
 _OUT = pathlib.Path(__file__).resolve().parents[1] / "web/frontend/public/favicon.ico"

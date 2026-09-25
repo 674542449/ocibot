@@ -134,3 +134,21 @@ def test_the_ico_is_a_valid_multi_size_icon():
         assert blob[:8] == b"\x89PNG\r\n\x1a\n", f"第 {i} 项不是 PNG"
         seen.append(w or 256)
     assert 16 in seen and 32 in seen, seen
+
+
+def test_the_drawer_close_button_is_hidden_on_desktop():
+    """宽屏下 logo 旁边曾经一直挂着一个点了没反应的「×」。
+
+    .sidebar-close 同时也是 .icon-btn，而 .icon-btn 的 display 写在后面、优先级
+    相同，单写 `.sidebar-close { display: none }` 会被它盖掉。隐藏和手机断点里的
+    显示都得用两个类，才不依赖规则的先后顺序。
+    """
+    src = _read(LAYOUT)
+    style = src.split("<style", 1)[1]
+    hide = style.split(".icon-btn.sidebar-close {", 1)
+    assert len(hide) == 2, "隐藏规则必须写成 .icon-btn.sidebar-close"
+    assert "display: none" in hide[1].split("}", 1)[0]
+    mobile = style.split("@media (max-width: 900px)", 1)[1]
+    show = mobile.split(".icon-btn.sidebar-close {", 1)
+    assert len(show) == 2, "手机断点里的显示规则也要同样的优先级，否则抽屉关不掉"
+    assert "display: inline-grid" in show[1].split("}", 1)[0]

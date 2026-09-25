@@ -1159,18 +1159,12 @@ onMounted(async () => {
 .parse-box.ok {
   background: var(--ok-soft);
   border-color: transparent;
-  color: #0a6e22;
+  color: var(--ok);
 }
 .parse-box.bad {
   background: var(--danger-soft);
   border-color: transparent;
   color: var(--danger);
-}
-:global(html[data-theme='dark']) .parse-box.ok {
-  color: #7dffa8;
-}
-:global(html[data-theme='dark']) .parse-box.bad {
-  color: #ffb0ad;
 }
 .manual-block {
   border-top: 1px solid var(--border);
@@ -1236,14 +1230,6 @@ onMounted(async () => {
   background: var(--accent-soft);
   /* 徽章之间可以换行，徽章自己不能从中间断成「删除 / 保护」两行。 */
   white-space: nowrap;
-}
-/* 全局的 html[data-theme='dark'] .badge 优先级更高，会把颜色压回灰色。
-   不能写成 :global(html[data-theme='dark']) .protect-badge —— Vue 的 :global()
-   会吞掉后半截，编译出来是一条裸的 html[data-theme="dark"] 规则。普通后代选择器
-   在 scoped 样式里只会给最后一段加 data-v 属性，正好是想要的。 */
-html[data-theme='dark'] .protect-badge {
-  color: var(--accent);
-  background: var(--accent-soft);
 }
 code {
   font-size: 12px;

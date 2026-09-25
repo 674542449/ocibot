@@ -1315,13 +1315,15 @@ function metricLabel(k: string) {
     } as Record<string, string>
   )[k]
 }
+/** 四条曲线用 Claude 那套暖色系里互相分得开的四个色相（陶土、钢蓝、橄榄、赭石），
+ *  每个在面板底色上都 ≥ 3:1（图形的非文本对比度）。 */
 function metricColor(k: string) {
   return (
     {
-      cpu: '#3370ff',
-      memory: '#6b4eff',
-      net_in: '#00b42a',
-      net_out: '#ff7d00',
+      cpu: '#c6613f',
+      memory: '#4f7fb0',
+      net_in: '#5e7a45',
+      net_out: '#9c7424',
     } as Record<string, string>
   )[k]
 }
@@ -2570,7 +2572,7 @@ watch([tenantId, instanceId], async () => {
   z-index: 2;
   padding: 0.3rem 0.5rem;
   border-radius: 10px;
-  background: rgb(20, 22, 28);
+  background: var(--text);
   color: #fff;
   border: 1px solid rgba(255, 255, 255, 0.16);
   box-shadow: var(--shadow-md);

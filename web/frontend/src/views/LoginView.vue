@@ -4,7 +4,6 @@
     <div class="stage" aria-hidden="true">
       <GlobeField />
       <div class="vignette"></div>
-      <div class="scanline"></div>
     </div>
 
     <header class="brand" aria-hidden="true">
@@ -177,15 +176,17 @@ async function submit() {
 </script>
 
 <style scoped>
-/* The sign-in page commits to one look in either theme: it is the threshold
-   into the panel, not a page that inherits whatever is set inside it. */
+/* The sign-in page uses the same Claude-style paper as the panel behind it:
+   ivory field, warm near-black type, terracotta for the one thing to act on.
+   Colours come from the tokens in styles.css so the threshold and the room
+   cannot drift apart again. */
 .login-page {
   position: relative;
   min-height: 100vh;
   min-height: 100dvh;
   overflow: hidden;
-  background: #05060c;
-  color: #eceefb;
+  background: var(--bg);
+  color: var(--text);
   display: grid;
   grid-template-rows: auto 1fr auto;
 }
@@ -198,24 +199,14 @@ async function submit() {
   pointer-events: none;
 }
 
-/* Darkens the edges so the form always has a quiet field to sit on, whatever
-   the globe is doing behind it. */
+/* Fades the globe into the paper at the edges and behind the form, so the form
+   always has a quiet field to sit on whatever the globe is doing behind it. */
 .vignette {
   position: absolute;
   inset: 0;
   background:
-    radial-gradient(120% 80% at 50% 45%, transparent 30%, rgba(5, 6, 12, 0.82) 78%),
-    linear-gradient(90deg, rgba(5, 6, 12, 0.55) 0%, transparent 35%, transparent 55%, rgba(5, 6, 12, 0.92) 88%);
-}
-
-.scanline {
-  position: absolute;
-  inset: 0;
-  background: repeating-linear-gradient(
-    to bottom,
-    rgba(255, 255, 255, 0.018) 0 1px,
-    transparent 1px 3px
-  );
+    radial-gradient(120% 80% at 50% 45%, transparent 30%, rgba(245, 244, 237, 0.85) 78%),
+    linear-gradient(90deg, rgba(245, 244, 237, 0.5) 0%, transparent 35%, transparent 55%, rgba(245, 244, 237, 0.92) 88%);
 }
 
 /* ------------------------------------------------------------------ chrome */
@@ -238,7 +229,7 @@ async function submit() {
   font-family: var(--font-mono);
   font-size: 13px;
   letter-spacing: 0.22em;
-  color: rgba(236, 238, 251, 0.72);
+  color: var(--text-secondary);
 }
 
 .stack-area {
@@ -265,12 +256,13 @@ async function submit() {
 
 .line {
   display: block;
-  color: #f4f5ff;
+  color: var(--text);
 }
 
 .line.accent {
-  /* The one gradient on the page, on the one phrase that carries the idea. */
-  background: linear-gradient(96deg, #8f86ff 0%, #c9c2ff 46%, #6f7bff 100%);
+  /* The one gradient on the page, on the one phrase that carries the idea.
+     Both ends stay at 3:1 or better on the paper (large-text threshold). */
+  background: linear-gradient(96deg, #ae4f2b 0%, #c6613f 46%, #943f20 100%);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
@@ -281,12 +273,12 @@ async function submit() {
   font-family: var(--font-mono);
   font-size: 12px;
   letter-spacing: 0.04em;
-  color: rgba(236, 238, 251, 0.5);
+  color: var(--muted);
 }
 
 .dot.down {
-  background: #ff6b6b;
-  box-shadow: 0 0 0 3px rgba(255, 107, 107, 0.16);
+  background: var(--danger);
+  box-shadow: 0 0 0 3px rgba(179, 38, 30, 0.16);
 }
 
 .lede {
@@ -294,7 +286,7 @@ async function submit() {
   max-width: 26ch;
   font-size: clamp(0.95rem, 1.5vw, 1.15rem);
   line-height: 1.65;
-  color: rgba(236, 238, 251, 0.68);
+  color: var(--text-secondary);
 }
 
 /* ------------------------------------------------------------------- panel */
@@ -302,11 +294,11 @@ async function submit() {
 .panel {
   /* Solid, never translucent: the form is the one thing on this page that has
      to stay readable no matter what is rotating behind it. */
-  background: #111320;
-  border: 1px solid rgba(143, 134, 255, 0.22);
+  background: var(--panel);
+  border: 1px solid var(--border);
   border-radius: 16px;
   padding: clamp(1.25rem, 2.5vw, 1.9rem);
-  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55);
+  box-shadow: 0 24px 60px rgba(31, 30, 27, 0.1);
 }
 
 .form-head h2 {
@@ -314,27 +306,17 @@ async function submit() {
   font-size: 1.45rem;
   font-weight: 650;
   letter-spacing: -0.02em;
-  color: #f2f3ff;
+  color: var(--text);
 }
 
 .form-head p {
   margin: 0.3rem 0 0;
   font-size: 13px;
-  color: rgba(236, 238, 251, 0.6);
+  color: var(--muted);
 }
 
 .panel :deep(label) {
-  color: rgba(236, 238, 251, 0.72);
-}
-
-.panel :deep(input) {
-  background: #0a0b14;
-  border-color: rgba(143, 134, 255, 0.24);
-  color: #f2f3ff;
-}
-
-.panel :deep(input:focus) {
-  border-color: #8f86ff;
+  color: var(--text-secondary);
 }
 
 .mode-tabs {
@@ -342,23 +324,24 @@ async function submit() {
   grid-template-columns: 1fr 1fr;
   gap: 0.25rem;
   padding: 0.25rem;
-  background: #0a0b14;
+  background: var(--panel-2);
   border-radius: 10px;
-  border: 1px solid rgba(143, 134, 255, 0.18);
+  border: 1px solid var(--border);
 }
 
 .mode-tabs button {
   border: none;
   box-shadow: none;
   background: transparent;
-  color: rgba(236, 238, 251, 0.62);
+  color: var(--muted);
   min-height: 34px;
   font-weight: 560;
 }
 
 .mode-tabs button.active {
-  background: rgba(143, 134, 255, 0.16);
-  color: #cfc9ff;
+  background: var(--input-bg);
+  color: var(--accent);
+  box-shadow: var(--shadow-sm);
 }
 
 /* A six-digit code is read back a digit at a time — space it like a keypad. */
@@ -373,20 +356,20 @@ async function submit() {
   width: 100%;
   min-height: 44px;
   font-weight: 600;
-  background: #8f86ff;
+  background: var(--accent);
   border-color: transparent;
-  color: #14121f;
+  color: #fff;
 }
 
 .submit:hover:not(:disabled) {
-  background: #a79fff;
+  background: var(--accent-hover);
 }
 
 .tip {
   margin: 0;
   font-size: 12px;
   line-height: 1.55;
-  color: rgba(236, 238, 251, 0.55);
+  color: var(--muted);
 }
 
 /* ----------------------------------------------------------------- readout */
@@ -407,7 +390,7 @@ async function submit() {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
   font-size: 12px;
-  color: rgba(236, 238, 251, 0.9);
+  color: var(--text-secondary);
 }
 
 .ro-k {
@@ -415,7 +398,7 @@ async function submit() {
   font-size: 10px;
   letter-spacing: 0.16em;
   text-transform: uppercase;
-  color: rgba(236, 238, 251, 0.55);
+  color: var(--muted);
 }
 
 .ro b {
@@ -429,8 +412,8 @@ async function submit() {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: #4ade80;
-  box-shadow: 0 0 0 3px rgba(74, 222, 128, 0.16);
+  background: var(--ok);
+  box-shadow: 0 0 0 3px rgba(62, 106, 40, 0.16);
 }
 
 /* -------------------------------------------------------------- responsive */
@@ -459,10 +442,4 @@ async function submit() {
   }
 }
 
-/* The globe holds a single frame; the scanline is pure ambience and goes. */
-@media (prefers-reduced-motion: reduce) {
-  .scanline {
-    display: none;
-  }
-}
 </style>
