@@ -18,6 +18,7 @@ from app.oci_client import (
     POWER_ACTIONS,
     TERMINATE_PROTECT_TAG,
     is_capacity_message,
+    normalize_ipv6_prefix_length,
 )
 from web.backend.audit import write_audit
 from web.backend.auth import get_current_user
@@ -54,6 +55,7 @@ from web.backend.quota_guard import (
 )
 from web.backend.schemas import (
     InstanceOut,
+    Ipv6AssignRequest,
     LaunchInstanceRequest,
     LaunchInstanceResult,
     PowerActionRequest,
@@ -469,12 +471,39 @@ def assign_ipv6(
     instance_id: str,
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
+    body: Ipv6AssignRequest | None = None,
 ) -> PowerActionResult:
+    """Assign a public IPv6, or with ``prefix_length`` < 128 an IPv6 CIDR range.
+
+    The body is optional so the original bodiless call keeps meaning "one address".
+    """
     row = _tenant_or_404(db, user.id, tenant_id)
+    prefix = int(body.prefix_length) if body is not None else 128
+    try:
+        normalize_ipv6_prefix_length(prefix)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=safe_error_text(exc)) from exc
     try:
         session = get_session_for_row(row)
         info = session.get_instance(instance_id, resolve_ips=False)
-        result = session.assign_public_ipv6(instance_id, info.compartment_id)
+        if prefix == 128:
+            result = session.assign_public_ipv6(instance_id, info.compartment_id)
+            return PowerActionResult(**op_result_dict(result))
+        result = session.assign_ipv6_prefix(instance_id, info.compartment_id, prefix)
+        write_audit(
+            db,
+            owner_id=user.id,
+            action="instance.ipv6.prefix",
+            target=instance_id,
+            detail={
+                "tenant_id": tenant_id,
+                "ok": result.ok,
+                "message": result.message,
+                "prefix_length": prefix,
+                "cidr": (result.data or {}).get("cidr", "") if isinstance(result.data, dict) else "",
+                "trigger": "manual",
+            },
+        )
         return PowerActionResult(**op_result_dict(result))
     except OCIClientError as exc:
         raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
@@ -903,6 +932,7 @@ def launch_instance(
     # 混进去的密码字段直接打回)。密钥模式这里是空串。
     job_root_password = str(built.get("root_password") or "")
     boot_vpu = int(payload.get("boot_volume_vpus_per_gb") or 10)
+    ipv6_prefix = int(payload.get("ipv6_prefix_length") or 128)
 
     count = max(1, int(body.count or 1))
     if count > 1 and built["as_retry"]:
@@ -1147,6 +1177,9 @@ def launch_instance(
                 instance_id=instance_id,
                 compartment_id=str(item_payload.get("compartment_id") or ""),
                 boot_vpu=boot_vpu,
+                ipv6_prefix_length=ipv6_prefix,
+                owner_id=user.id,
+                tenant_id=row.id,
             )
             created.append(
                 {
@@ -1205,6 +1238,11 @@ def launch_instance(
         msg = (
             f"已创建 {len(created)}/{count} 台，第 {len(created) + 1} 台起停止："
             f"{failure_message or '创建失败'}"
+        )
+    if ipv6_prefix < 128:
+        msg += (
+            f"；IPv6 /{ipv6_prefix} 地址段将在实例网卡就绪后由后台自动分配"
+            "（结果见「审计」页；失败可在实例详情里重新分配）"
         )
     if boot_vpu != 10:
         msg += f"；引导卷性能 {boot_vpu} VPUs/GB 将在后台自动调整（hydration 完成后）"

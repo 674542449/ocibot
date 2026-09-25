@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.4.116 — 2026-09-26
+
+租户列表支持多选批量删除和「删除保护」；创建实例时可以选 IPv6 地址段（/120、/116、/112 …）。
+
+### 功能
+
+- **租户多选 + 批量删除。**
+
+  租户表最左侧加了勾选框（表头可全选），页头「删除所选（N）」一次删多个。
+  新接口 `POST /api/tenants/batch-delete {ids: [...]}`：逐个判定、能删的删、不能删的
+  逐条回报原因，**一个受保护的租户不会让整批失败**。规则与单个删除一致 —— 主租户
+  连带删除它的副区；主租户被勾上时，副区在表格里显示为「已选且锁定」，删掉哪些在点
+  按钮之前就看得见。别人的租户和不存在的租户回报同一句「租户不存在」。整批写一条
+  `tenant.batch_delete` 审计。
+
+  批量按钮放在页头而不是表格上方弹出一条操作栏：那条栏一出现会把整张表往下推，
+  刚勾选的那一行会从鼠标底下滑走。
+
+- **删除保护（Deletion Protection）。**
+
+  每行新增「删除保护 / 解除保护」按钮，状态列显示「删除保护」徽章。开启后：
+  单个删除返回 409、批量删除跳过它、勾选框和删除按钮变灰。**只挡删除**，编辑、测试
+  连接等照常可用。
+
+  副区跟着主租户一起删，所以**任一副区开着保护，主租户也删不了** —— 否则删主租户
+  就成了绕过副区保护的后门。开关走单独的 `POST /api/tenants/{id}/delete-protection`，
+  不是 PATCH 的一个字段：编辑表单每次提交整份字段，混进去的话改个备注都可能顺手把
+  保护关掉。开 / 关各写一条 `tenant.protect` / `tenant.unprotect` 审计。备份导出 / 导入
+  会带上这个标记（老备份没有这个键 → 未保护）。
+
+- **创建实例时可选 IPv6 地址段。**
+
+  勾选「分配 IPv6」后多出一个「IPv6 地址段」下拉：/128（单个地址，默认，原行为）或
+  /124、/120、/116、/112 … /80。依据 OCI 文档「IPv6 Addresses → Assignment of IPv6
+  Addresses to a VNIC」：地址段通过 `CreateIpv6` 的 `cidrPrefixLength` 分配，前缀必须在
+  80–128 之间且能被 4 整除，并且必须是 VNIC 上的 secondary IP。
+
+  `LaunchInstance` 的 `CreateVnicDetails` 没有前缀长度字段（SDK 里
+  `Ipv6AddressIpv6SubnetCidrPairDetails` 只有 `ipv6_address` / `ipv6_id` /
+  `ipv6_subnet_cidr`），所以做法是：开机时照常分配一个 /128，实例网卡挂好之后由后台
+  线程调 `CreateIpv6(cidrPrefixLength=N)` 再加一整段。结果（拿到的是哪一段、或者为什么
+  失败）写进「审计」页的 `instance.ipv6.prefix`；即时创建和容量重试抢到机器两条路径
+  都会执行，抢机成功的通知里也会提一句。
+
+  实例详情的「分配 IPv6」旁边加了同样的下拉，可以给已有实例补一段，也是后台失败时的
+  重试入口。已有同长度地址段时直接报「已有」，不会重复分配。Oracle 拒绝时附带提示：
+  子网的 IPv6 前缀若是在该功能 GA 之前创建的，需要提工单开通（文档原文要求）。
+
+### 维护
+
+- `tenants` 表新增 `delete_protected`（`DEFAULT 0 NOT NULL`，`_ensure_schema` 自动补列，
+  升级后所有已有租户都是未保护）。
+- `assign_public_ipv6` 里「多前缀子网挑 GUA 前缀」那段抽成 `_ipv6_subnet_cidr_kwargs`，
+  地址段分配复用同一套逻辑。
+- 前后端各有一份前缀清单（`app/oci_client.py::IPV6_PREFIX_LENGTHS` /
+  `web/frontend/src/utils/ipv6.ts`），测试逐项比对，防止前端多出一个服务端必然 400 的选项。
+- 新增 `tests/test_tenant_delete_protection.py`（11 条）、`tests/test_ipv6_prefix.py`
+  （29 条）；`tests/test_endpoint_smoke.py` 覆盖三个新路由 / 新参数。
+
+### 升级
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.116
+```
+
 ## 0.4.115 — 2026-09-12
 
 root + 密码模式也能自动重试抢 ARM 机了。

@@ -183,6 +183,7 @@ def export_encrypted_zip(
                 "password_expiry_days": int(row.password_expiry_days or 0),
                 "account_tier": row.account_tier or "",
                 "free_only_mode": bool(getattr(row, "free_only_mode", True)),
+                "delete_protected": bool(getattr(row, "delete_protected", False)),
                 # 副区 link. Ids are reissued on restore, so it is remapped there
                 # via the exported "id" above.
                 "parent_tenant_id": getattr(row, "parent_tenant_id", "") or "",
@@ -431,6 +432,8 @@ def import_encrypted_zip(
             # Default ON when absent (older archives) so a restore never
             # silently loses the free-tier protection.
             free_only_mode=bool(item.get("free_only_mode", True)),
+            # Older archives have no key → unprotected, which is what they were.
+            delete_protected=bool(item.get("delete_protected", False)),
         )
         # SAVEPOINT per row. A bare db.flush() here shares one transaction with
         # every row before it, so a single rejected INSERT rolled back the whole

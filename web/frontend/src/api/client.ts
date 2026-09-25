@@ -210,6 +210,8 @@ export type Tenant = {
   has_private_key: boolean
   account_tier: string
   free_only_mode: boolean
+  /** 删除保护：开启后单个 / 批量删除都会被服务端拒绝。 */
+  delete_protected: boolean
   /** '' on a primary tenant; the primary's id on a 副区 (secondary region) row. */
   parent_tenant_id: string
   /** Localized region name, e.g. 大阪. */

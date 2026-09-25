@@ -8,6 +8,22 @@
         </p>
       </div>
       <div class="page-tools">
+        <!-- 批量删除放在页头而不是表格上方弹出一条操作栏：那条栏一出现就把整张表
+             往下推，刚勾选的那一行会从鼠标底下滑走（同 showToast 那段注释）。 -->
+        <button
+          class="danger"
+          :disabled="doomedTenants.length === 0 || batchBusy"
+          :title="doomedTenants.length ? '' : '先在表格左侧勾选要删除的租户'"
+          @click="removeSelected"
+        >
+          {{
+            batchBusy
+              ? '删除中…'
+              : doomedTenants.length
+                ? `删除所选（${doomedTenants.length}）`
+                : '批量删除'
+          }}
+        </button>
         <button class="primary" @click="openCreate">添加租户</button>
       </div>
     </div>
@@ -18,6 +34,16 @@
       <table>
         <thead>
           <tr>
+            <th class="sel-col">
+              <input
+                type="checkbox"
+                :checked="allSelected"
+                :indeterminate="someSelected"
+                :disabled="selectableTenants.length === 0 || batchBusy"
+                title="全选（已开启删除保护的租户不会被选中）"
+                @change="toggleSelectAll"
+              />
+            </th>
             <th>名称</th>
             <th>区域</th>
             <th>等级</th>
@@ -29,9 +55,26 @@
         </thead>
         <tbody>
           <tr v-if="tenants.length === 0">
-            <td colspan="7" class="muted empty">还没有租户，点击右上角添加，或粘贴原始 API 配置。</td>
+            <td colspan="8" class="muted empty">还没有租户，点击右上角添加，或粘贴原始 API 配置。</td>
           </tr>
           <tr v-for="t in orderedTenants" :key="t.id" :class="{ 'sub-row': !!t.parent_tenant_id }">
+            <td class="sel-col">
+              <!-- 副区跟着主租户一起删，所以主租户被勾上时副区显示为已选且锁定，
+                   让「会删掉哪些」在点按钮之前就看得见。 -->
+              <input
+                type="checkbox"
+                :checked="selected.has(t.id) || selectedViaParent(t)"
+                :disabled="!!deleteBlockReason(t) || selectedViaParent(t) || batchBusy"
+                :title="
+                  deleteBlockReason(t)
+                    ? deleteBlockReason(t) + '，不能删除'
+                    : selectedViaParent(t)
+                      ? '主租户已选中，副区会随它一起删除'
+                      : '选择'
+                "
+                @change="toggleSelect(t)"
+              />
+            </td>
             <td class="name-cell">
               <span v-if="t.parent_tenant_id" class="muted sub-tree">└</span>
               <span class="dot" :style="{ background: t.color }"></span>
@@ -86,6 +129,13 @@
               <span v-if="!t.free_only_mode" class="badge warn" title="超出 Always Free 不再拦截">
                 允许计费
               </span>
+              <span
+                v-if="t.delete_protected"
+                class="badge protect-badge"
+                title="已开启删除保护：单个删除、批量删除都会被拒绝，需先解除"
+              >
+                删除保护
+              </span>
             </td>
             <td>
               <div class="row row-actions">
@@ -120,7 +170,26 @@
                   密码到期查询
                 </button>
                 <button :disabled="busy === t.id" @click="openEdit(t)">编辑</button>
-                <button class="danger" :disabled="busy === t.id" @click="remove(t)">删除</button>
+                <!-- 两种状态的文案字数相同，切换不会改变按钮宽度（见 .row-actions 的说明）。 -->
+                <button
+                  :disabled="busy === t.id"
+                  :title="
+                    t.delete_protected
+                      ? '解除后才能删除该租户'
+                      : '开启后该租户无法被删除（单个删除、批量删除都会被拒绝）'
+                  "
+                  @click="toggleProtect(t)"
+                >
+                  {{ t.delete_protected ? '解除保护' : '删除保护' }}
+                </button>
+                <button
+                  class="danger"
+                  :disabled="busy === t.id || !!deleteBlockReason(t)"
+                  :title="deleteBlockReason(t) ? deleteBlockReason(t) + '，请先解除' : ''"
+                  @click="remove(t)"
+                >
+                  删除
+                </button>
               </div>
             </td>
           </tr>
@@ -495,6 +564,131 @@ const orderedTenants = computed(() => {
   return out
 })
 
+// ---- 多选 / 批量删除 / 删除保护 ----
+
+/** 用户**亲手**勾选的租户 id。副区随主租户删除的那部分不在这里，见 selectedViaParent。 */
+const selected = reactive(new Set<string>())
+const batchBusy = ref(false)
+
+type BatchDeleteResult = {
+  message: string
+  deleted: string[]
+  skipped: { id: string; name: string; reason: string }[]
+}
+
+/**
+ * 这一行现在为什么不能删（'' = 可以删）。和服务端 _delete_block_reason 同一套规则：
+ * 副区跟着主租户一起删，所以任何一个副区开了保护，主租户也删不了 —— 否则删主租户
+ * 就成了绕过副区保护的后门。服务端会再判一次，这里只是让按钮提前变灰。
+ */
+function deleteBlockReason(t: Tenant): string {
+  if (t.delete_protected) return '已开启删除保护'
+  const guarded = tenants.value.filter((c) => c.parent_tenant_id === t.id && c.delete_protected)
+  if (guarded.length) return `副区「${guarded.map((c) => c.name).join('、')}」已开启删除保护`
+  return ''
+}
+
+function selectedViaParent(t: Tenant): boolean {
+  return !!t.parent_tenant_id && selected.has(t.parent_tenant_id)
+}
+
+const selectableTenants = computed(() => orderedTenants.value.filter((t) => !deleteBlockReason(t)))
+
+/** 点「删除所选」后真正会被删掉的行：勾选的 + 随被勾选主租户一起走的副区。 */
+const doomedTenants = computed(() =>
+  orderedTenants.value.filter((t) => selected.has(t.id) || selectedViaParent(t)),
+)
+
+const allSelected = computed(
+  () =>
+    selectableTenants.value.length > 0 &&
+    selectableTenants.value.every((t) => selected.has(t.id) || selectedViaParent(t)),
+)
+const someSelected = computed(() => doomedTenants.value.length > 0 && !allSelected.value)
+
+function toggleSelect(t: Tenant) {
+  if (selected.has(t.id)) selected.delete(t.id)
+  else if (!deleteBlockReason(t)) selected.add(t.id)
+}
+
+function toggleSelectAll() {
+  if (allSelected.value) {
+    selected.clear()
+    return
+  }
+  for (const t of selectableTenants.value) selected.add(t.id)
+}
+
+/**
+ * 丢掉已经不存在、或者已经变成不可删的选择。列表重载、开启保护之后都要跑一次，
+ * 否则「删除所选（N）」里会数进一个服务端必然拒绝的租户。
+ */
+function pruneSelection() {
+  for (const id of [...selected]) {
+    const t = tenants.value.find((x) => x.id === id)
+    if (!t || deleteBlockReason(t)) selected.delete(id)
+  }
+}
+
+async function toggleProtect(t: Tenant) {
+  const next = !t.delete_protected
+  if (!next && !confirm(`解除「${t.name}」的删除保护？\n\n解除后即可删除该租户。`)) return
+  busy.value = t.id
+  try {
+    const { data } = await api.post<Tenant>(`/tenants/${t.id}/delete-protection`, {
+      protected: next,
+    })
+    replaceTenant(data)
+    pruneSelection()
+    showToast(next ? `已为「${t.name}」开启删除保护` : `已解除「${t.name}」的删除保护`)
+  } catch (e: any) {
+    showToast(e?.message || '操作失败', 'err', 5000)
+  } finally {
+    busy.value = ''
+  }
+}
+
+async function removeSelected() {
+  const doomed = doomedTenants.value
+  if (!doomed.length) return
+  // 只发亲手勾选的 id：副区由服务端跟着主租户删，重复发也会被去重，但没必要。
+  const ids = orderedTenants.value.filter((t) => selected.has(t.id)).map((t) => t.id)
+  const viaParent = doomed.filter((t) => !selected.has(t.id))
+  const lines = doomed
+    .slice(0, 15)
+    .map((t) => `· ${t.name}（${t.region}）${t.parent_tenant_id ? ' [副区]' : ''}`)
+  if (doomed.length > 15) lines.push(`… 另有 ${doomed.length - 15} 个`)
+  const extra = viaParent.length ? `\n\n其中 ${viaParent.length} 个副区会随主租户一起删除。` : ''
+  if (
+    !confirm(
+      `批量删除以下 ${doomed.length} 个租户？\n\n${lines.join('\n')}${extra}\n\n` +
+        '（仅移出面板，不会删除 Oracle 上的区域订阅或实例）',
+    )
+  ) {
+    return
+  }
+  batchBusy.value = true
+  try {
+    const { data } = await api.post<BatchDeleteResult>('/tenants/batch-delete', { ids })
+    for (const id of data.deleted) selected.delete(id)
+    if (regionsFor.value && data.deleted.includes(regionsFor.value.id)) closeRegions()
+    // 正在编辑的租户被删了，表单再保存只会得到一个 404。
+    if (editingId.value && data.deleted.includes(editingId.value)) showForm.value = false
+    if (data.skipped.length) {
+      // 界面上已经不让勾选受保护的租户，走到这里说明别处（另一个标签页）刚改过保护状态。
+      const why = data.skipped.map((s) => `${s.name || s.id}：${s.reason}`).join('；')
+      showToast(`${data.message}。${why}`, 'err', 8000)
+    } else {
+      showToast(data.message)
+    }
+    await load()
+  } catch (e: any) {
+    showToast(e?.message || '批量删除失败', 'err', 5000)
+  } finally {
+    batchBusy.value = false
+  }
+}
+
 /** 每个租户的 defaultPasswordPolicy 到期天数（0 = 未设置 = 永不过期）。 */
 type PwdStatus = { days: number }
 const pwdStatus = reactive<Record<string, PwdStatus>>({})
@@ -646,6 +840,7 @@ function openEdit(t: Tenant) {
 async function load() {
   const { data } = await api.get<Tenant[]>('/tenants')
   tenants.value = data
+  pruneSelection()
   // This page lists every tenant instead of picking one, so pickTenantId never
   // runs here and the sidebar chip would show a lock with no name after a fresh
   // sign-in — the session carries the id, not the name.
@@ -908,6 +1103,7 @@ async function remove(t: Tenant) {
   try {
     const { data } = await api.delete<{ message: string }>(`/tenants/${t.id}`)
     showToast(data?.message || '已删除')
+    selected.delete(t.id)
     if (regionsFor.value?.id === t.id) closeRegions()
     await load()
   } catch (e: any) {
@@ -1005,6 +1201,29 @@ onMounted(async () => {
 }
 .row-actions button {
   white-space: nowrap;
+}
+.sel-col {
+  width: 34px;
+}
+/* 勾选列和「删除保护」按钮让表格又宽了一截。没有下限的话，表格一挤，中文名称
+   会被压到按字折行（一格两三个字、行高翻倍）；给个下限，宁可让表格横向滚动。
+   状态列反过来**不要** nowrap：三个徽章排一行有 200px，正是它把表格挤爆的。 */
+.name-cell {
+  min-width: 8rem;
+}
+.protect-badge {
+  color: var(--accent);
+  background: var(--accent-soft);
+  /* 徽章之间可以换行，徽章自己不能从中间断成「删除 / 保护」两行。 */
+  white-space: nowrap;
+}
+/* 全局的 html[data-theme='dark'] .badge 优先级更高，会把颜色压回灰色。
+   不能写成 :global(html[data-theme='dark']) .protect-badge —— Vue 的 :global()
+   会吞掉后半截，编译出来是一条裸的 html[data-theme="dark"] 规则。普通后代选择器
+   在 scoped 样式里只会给最后一段加 data-v 属性，正好是想要的。 */
+html[data-theme='dark'] .protect-badge {
+  color: var(--accent);
+  background: var(--accent-soft);
 }
 code {
   font-size: 12px;

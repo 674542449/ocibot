@@ -171,6 +171,8 @@ class TenantOut(BaseModel):
     has_private_key: bool
     account_tier: str
     free_only_mode: bool = True
+    # 删除保护：True 时单个 / 批量删除都会拒绝这个租户。
+    delete_protected: bool = False
     # Empty on a primary tenant; the primary's id on a 副区 (secondary region) row.
     parent_tenant_id: str = ""
     region_label: str = ""
@@ -178,6 +180,30 @@ class TenantOut(BaseModel):
     updated_at: UtcDatetime
 
     model_config = {"from_attributes": True}
+
+
+class TenantDeleteProtectionRequest(BaseModel):
+    protected: bool
+
+
+class TenantBatchDeleteRequest(BaseModel):
+    # 上限只是防呆：一次请求删几百行没有意义，也让请求体有界。
+    ids: list[Annotated[str, Field(min_length=1, max_length=36)]] = Field(
+        min_length=1, max_length=200
+    )
+
+
+class TenantBatchDeleteSkipped(BaseModel):
+    id: str
+    name: str = ""
+    reason: str
+
+
+class TenantBatchDeleteResult(BaseModel):
+    message: str
+    # 实际删掉的行 id —— 含随主租户一起删掉的副区行，前端据此清理选择状态。
+    deleted: list[str] = Field(default_factory=list)
+    skipped: list[TenantBatchDeleteSkipped] = Field(default_factory=list)
 
 
 # ---- Regions (副区) ----
@@ -274,6 +300,12 @@ class PowerActionResult(BaseModel):
     ok: bool
     message: str
     work_request_id: str = ""
+
+
+class Ipv6AssignRequest(BaseModel):
+    """实例详情「分配 IPv6」。128 = 单个地址（原行为）；80–124 且能被 4 整除 = 地址段。"""
+
+    prefix_length: int = Field(default=128, ge=80, le=128)
 
 
 class TightenSecurityListResult(PowerActionResult):
@@ -431,6 +463,9 @@ class LaunchInstanceRequest(BaseModel):
     count: int = Field(default=1, ge=1, le=8)
     assign_public_ip: bool = True
     assign_ipv6_ip: bool = False
+    # IPv6 地址段前缀长度：128 = 单个地址；80–124（能被 4 整除）= 开机后给 VNIC
+    # 分配一整段，例如 120 = 256 个地址。「能被 4 整除」在 sanitize_launch_payload 里校验。
+    ipv6_prefix_length: int = Field(default=128, ge=80, le=128)
     open_guest_firewall: bool = True
     # Optional first-boot shell script merged into cloud-init (never persisted
     # in plaintext; encrypted on the job row for capacity retries).

@@ -27,7 +27,11 @@ from web.backend.schemas import (
     OciPasswordPolicyOut,
     RegionSubscribeRequest,
     RegionSubscribeResult,
+    TenantBatchDeleteRequest,
+    TenantBatchDeleteResult,
+    TenantBatchDeleteSkipped,
     TenantCreate,
+    TenantDeleteProtectionRequest,
     TenantOut,
     TenantParseResult,
     TenantPasteImport,
@@ -87,6 +91,7 @@ def _to_out(row: Tenant) -> TenantOut:
         has_private_key=bool(row.private_key_encrypted),
         account_tier=row.account_tier or "",
         free_only_mode=bool(getattr(row, "free_only_mode", True)),
+        delete_protected=bool(getattr(row, "delete_protected", False)),
         parent_tenant_id=getattr(row, "parent_tenant_id", "") or "",
         region_label=region_area(row.region or ""),
         created_at=row.created_at,
@@ -664,6 +669,149 @@ def disable_oci_password_expiry(
     )
 
 
+def _children_of(db: Session, owner_id: str, row: Tenant) -> list[Tenant]:
+    """副区 rows hanging off this primary (empty for a 副区 row itself)."""
+    return list(
+        db.scalars(
+            select(Tenant).where(
+                Tenant.owner_id == owner_id,
+                Tenant.parent_tenant_id == row.id,
+            )
+        ).all()
+    )
+
+
+def _delete_block_reason(row: Tenant, children: list[Tenant]) -> str:
+    """Why this row may not be deleted right now; "" when it may.
+
+    副区 rows are deleted together with their primary, so a protected 副区 has to
+    block the primary too — otherwise deleting the parent would be a way around
+    the child's protection.
+    """
+    if getattr(row, "delete_protected", False):
+        return f"「{row.name}」已开启删除保护"
+    guarded = [c for c in children if getattr(c, "delete_protected", False)]
+    if guarded:
+        names = "、".join(f"「{c.name}」" for c in guarded)
+        return f"它的副区 {names} 已开启删除保护（删除主租户会连带删除副区）"
+    return ""
+
+
+def _purge_tenants(db: Session, user: User, targets: list[Tenant]) -> None:
+    """Delete rows, clear a default pointing at them, then evict their caches."""
+    # A default pointing at a deleted tenant would keep every page falling through
+    # to "first tenant" with nothing in the UI explaining why.
+    doomed = {target.id for target in targets}
+    if user.locked_tenant_id in doomed:
+        user.locked_tenant_id = ""
+    for target in targets:
+        db.delete(target)
+    db.commit()
+    # After the commit, for the same reason as update_tenant: a concurrent request
+    # could otherwise rebuild and re-cache a session for a row that is going away.
+    for target_id in doomed:
+        drop_session(target_id)
+        # The launch-meta cache keyed on this tenant would otherwise be retained until
+        # its TTL expired (clear_launch_meta_cache had no callers at all).
+        clear_launch_meta_cache(target_id)
+
+
+@router.post("/{tenant_id}/delete-protection", response_model=TenantOut)
+def set_tenant_delete_protection(
+    tenant_id: str,
+    body: TenantDeleteProtectionRequest,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> TenantOut:
+    """开启 / 解除删除保护。
+
+    单独一条路由而不是 PATCH 的一个字段：编辑表单提交的是整份字段，混进去的话
+    改个备注都可能顺手把保护关掉。这里只动这一个开关，并单独留审计。
+    """
+    try:
+        row = get_owned_tenant(db, user.id, tenant_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=safe_error_text(exc)) from exc
+    row.delete_protected = bool(body.protected)
+    db.commit()
+    db.refresh(row)
+    write_audit(
+        db,
+        owner_id=user.id,
+        action="tenant.protect" if body.protected else "tenant.unprotect",
+        target=row.name,
+        detail={"tenant_id": row.id},
+    )
+    return _to_out(row)
+
+
+@router.post("/batch-delete", response_model=TenantBatchDeleteResult)
+def batch_delete_tenants(
+    body: TenantBatchDeleteRequest,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> TenantBatchDeleteResult:
+    """Delete several tenants in one go; protected ones are skipped, not fatal.
+
+    Same rules as the single delete: each primary takes its 副区 rows with it, and
+    a protected row (or a primary with a protected 副区) is refused. Refusals are
+    reported per row so one protected tenant does not stop the rest of the batch.
+    Only removes panel rows — nothing at Oracle is touched.
+    """
+    wanted = list(dict.fromkeys(i.strip() for i in body.ids if i and i.strip()))
+    rows = {
+        r.id: r
+        for r in db.scalars(
+            select(Tenant).where(Tenant.owner_id == user.id, Tenant.id.in_(wanted))
+        ).all()
+    }
+    doomed: dict[str, Tenant] = {}
+    skipped: list[TenantBatchDeleteSkipped] = []
+    for tid in wanted:
+        row = rows.get(tid)
+        if row is None:
+            # Unknown and not-owned look identical on purpose, as everywhere else.
+            skipped.append(TenantBatchDeleteSkipped(id=tid, reason="租户不存在"))
+            continue
+        if tid in doomed:
+            # Already going as the 副区 of a primary selected earlier in the list.
+            continue
+        children = _children_of(db, user.id, row)
+        reason = _delete_block_reason(row, children)
+        if reason:
+            skipped.append(TenantBatchDeleteSkipped(id=row.id, name=row.name, reason=reason))
+            continue
+        doomed[row.id] = row
+        for child in children:
+            doomed.setdefault(child.id, child)
+
+    targets = list(doomed.values())
+    if targets:
+        _purge_tenants(db, user, targets)
+    selected = sum(1 for tid in wanted if tid in doomed)
+    extra = len(targets) - selected
+    message = f"已删除 {selected} 个租户" if targets else "没有删除任何租户"
+    if extra:
+        message += f"（另含 {extra} 个随主租户一起删除的副区）"
+    if skipped:
+        message += f"；{len(skipped)} 个未删除"
+    write_audit(
+        db,
+        owner_id=user.id,
+        action="tenant.batch_delete",
+        target=f"{len(targets)} tenants",
+        detail={
+            "deleted": [{"id": t.id, "name": t.name} for t in targets],
+            "skipped": [s.model_dump() for s in skipped],
+        },
+    )
+    return TenantBatchDeleteResult(
+        message=message,
+        deleted=[t.id for t in targets],
+        skipped=skipped,
+    )
+
+
 @router.delete("/{tenant_id}")
 def delete_tenant(
     tenant_id: str,
@@ -676,29 +824,11 @@ def delete_tenant(
         raise HTTPException(status_code=404, detail=safe_error_text(exc)) from exc
     # 副区 rows share this row's credentials and would be left pointing at a tenant
     # the user can no longer edit, so they go with it.
-    children = list(
-        db.scalars(
-            select(Tenant).where(
-                Tenant.owner_id == user.id,
-                Tenant.parent_tenant_id == row.id,
-            )
-        ).all()
-    )
-    # A default pointing at a deleted tenant would keep every page falling through
-    # to "first tenant" with nothing in the UI explaining why.
-    doomed = {target.id for target in [*children, row]}
-    if user.locked_tenant_id in doomed:
-        user.locked_tenant_id = ""
-    for target in [*children, row]:
-        db.delete(target)
-    db.commit()
-    # After the commit, for the same reason as update_tenant: a concurrent request
-    # could otherwise rebuild and re-cache a session for a row that is going away.
-    for target in [*children, row]:
-        drop_session(target.id)
-        # The launch-meta cache keyed on this tenant would otherwise be retained until
-        # its TTL expired (clear_launch_meta_cache had no callers at all).
-        clear_launch_meta_cache(target.id)
+    children = _children_of(db, user.id, row)
+    reason = _delete_block_reason(row, children)
+    if reason:
+        raise HTTPException(status_code=409, detail=f"{reason}，请先解除保护再删除")
+    _purge_tenants(db, user, [*children, row])
     if children:
         return {"message": f"已删除（含 {len(children)} 个副区）"}
     return {"message": "已删除"}

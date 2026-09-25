@@ -85,6 +85,11 @@ class Tenant(Base):
     # meant a paid account got a mere warning while exceeding the free tier.
     # Turn it off per tenant to deliberately use billable resources.
     free_only_mode: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # 删除保护（Deletion Protection）：开启后单个删除、批量删除都会拒绝这一行，
+    # 连带删除它的主租户也会被拒 —— 副区行跟着主租户一起删，保护不能被这条路绕过。
+    # 只挡删除，编辑 / 测试连接等照常可用。default=False 让 _ensure_schema 给老库
+    # 生成 DEFAULT 0 NOT NULL，升级后所有已有租户都是「未保护」。
+    delete_protected: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     # Legacy: last local password-expiry notify day (unused).
     pwd_expiry_notified_on: Mapped[str] = mapped_column(String(16), default="", nullable=False)
     # Budget alerts and the daily egress check were removed in 0.4.36, but these

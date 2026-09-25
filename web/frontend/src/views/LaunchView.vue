@@ -402,6 +402,20 @@
         </p>
       </div>
 
+      <div v-if="form.assign_ipv6_ip" class="field">
+        <label>IPv6 地址段</label>
+        <select v-model.number="form.ipv6_prefix_length" style="max-width: 22rem">
+          <option v-for="p in IPV6_PREFIX_OPTIONS" :key="p" :value="p">{{ ipv6PrefixLabel(p) }}</option>
+        </select>
+        <p class="field-hint">
+          选 /128 以外的值时，实例开机、网卡就绪后会由后台再给它分配一整段 IPv6
+          （Oracle <code>CreateIpv6</code> 的 <code>cidrPrefixLength</code>，前缀 /80–/124 且能被 4 整除），
+          结果记在「审计」页，失败也可以在实例详情里重新分配。
+          注意：子网的 IPv6 前缀若是 Oracle 支持地址段之前创建的，需要提工单开通；
+          地址段只是路由到这台机器，系统里还需自行配置要用的地址。
+        </p>
+      </div>
+
       <details>
         <summary class="muted" style="cursor: pointer; font-size: 13px">高级：首次启动脚本（cloud-init）</summary>
         <div class="field" style="margin-top: 0.5rem">
@@ -481,6 +495,7 @@ import { useRoute, useRouter } from 'vue-router'
 import api, { type Tenant } from '@/api/client'
 import { pickTenantId } from '@/stores/tenantLock'
 import { pickAndReadTextFile } from '@/utils/file'
+import { IPV6_PREFIX_OPTIONS, ipv6PrefixLabel } from '@/utils/ipv6'
 import { copyText } from '@/utils/toast'
 
 type ShapeInfo = {
@@ -699,6 +714,8 @@ const form = reactive({
   count: 1,
   assign_public_ip: true,
   assign_ipv6_ip: false,
+  /** 128 = 单个 IPv6 地址；更小的值 = 开机后再分配一整段（见 IPV6_PREFIX_OPTIONS）。 */
+  ipv6_prefix_length: 128,
   open_guest_firewall: true,
   user_data: '',
   as_retry: false,
@@ -1093,7 +1110,7 @@ const confirmRows = computed(() => {
     ['Boot', `${boot} · ${form.boot_volume_vpus_per_gb} VPUs/GB`],
     ['登录', auth],
     ['公网 IPv4', form.assign_public_ip ? '是' : '否'],
-    ['IPv6', form.assign_ipv6_ip ? '是' : '否'],
+    ['IPv6', form.assign_ipv6_ip ? `是 · ${ipv6PrefixLabel(form.ipv6_prefix_length)}` : '否'],
     ['允许外网直接访问', form.open_guest_firewall ? '是' : '否'],
     [
       '容量重试',
@@ -1310,6 +1327,7 @@ async function doLaunch() {
       count: batchCount.value,
       assign_public_ip: form.assign_public_ip,
       assign_ipv6_ip: form.assign_ipv6_ip,
+      ipv6_prefix_length: form.assign_ipv6_ip ? form.ipv6_prefix_length : 128,
       open_guest_firewall: form.open_guest_firewall,
       user_data: form.user_data.trim(),
       as_retry: form.as_retry,

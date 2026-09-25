@@ -557,11 +557,15 @@ def test_ipv6_allocation_passes_the_subnet_cidr_when_ambiguous():
     on the subnet"。自带地址或 GUA+ULA 并存的子网就是这种情况。"""
     import inspect
 
-    src = inspect.getsource(TenantSession.assign_public_ipv6)
+    # 0.4.116 起这段挑前缀的逻辑抽成了 _ipv6_subnet_cidr_kwargs，单个地址和地址段
+    # （assign_ipv6_prefix）共用 —— 两个调用方都必须经过它。
+    src = inspect.getsource(TenantSession._ipv6_subnet_cidr_kwargs)
 
     assert "ipv6_subnet_cidr" in src
     assert "len(blocks) > 1" in src, "只在多前缀时传，别给单前缀子网引入新失败面"
     assert '("fc", "fd")' in src, "要挑 GUA，ULA(fc00::/7) 出不了公网"
+    for caller in (TenantSession.assign_public_ipv6, TenantSession.assign_ipv6_prefix):
+        assert "_ipv6_subnet_cidr_kwargs" in inspect.getsource(caller), caller.__name__
 
 
 def test_ipv6_also_gets_security_rules():
