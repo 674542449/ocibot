@@ -724,10 +724,7 @@ class Worker:
             # Apply Always-Free boot VPU (fire-and-forget so the worker isn't blocked
             # by hydration). Previously only the API immediate-attempt did this.
             boot_vpu = int(payload.get("boot_volume_vpus_per_gb") or 10)
-            # 创建向导里选的 IPv6 地址段同样要在开机后补上 —— 抢机任务的 payload
-            # 里存着它（老任务没有这个键，按 128 = 单个地址处理）。
-            ipv6_prefix = int(payload.get("ipv6_prefix_length") or 128)
-            if inst_id and (boot_vpu != 10 or ipv6_prefix < 128):
+            if inst_id and boot_vpu != 10:
                 try:
                     from web.backend.launch_service import schedule_post_launch_adjustments
 
@@ -736,12 +733,9 @@ class Worker:
                         instance_id=inst_id,
                         compartment_id=str(payload.get("compartment_id") or ""),
                         boot_vpu=boot_vpu,
-                        ipv6_prefix_length=ipv6_prefix,
-                        owner_id=str(job.owner_id or ""),
-                        tenant_id=str(job.tenant_id or ""),
                     )
                 except Exception:  # noqa: BLE001
-                    log.exception("schedule post-launch steps failed job=%s", job.id)
+                    log.exception("schedule boot vpu failed job=%s", job.id)
             display_name = str(payload.get("display_name") or "instance")
             shape = str(payload.get("shape") or "")
             # 先落库，再发通知 —— 顺序不能反。
@@ -783,11 +777,6 @@ class Worker:
                         # 列表页读的就是它。不写进通知正文:推送渠道不可信。
                         "root 密码：面板实例列表里点该机器的「root 密码」查看。\n"
                         if root_password
-                        else ""
-                    )
-                    + (
-                        f"IPv6 /{ipv6_prefix} 地址段正在后台分配，结果见面板「审计」页。\n"
-                        if ipv6_prefix < 128
                         else ""
                     )
                     + "公网 IP 请稍后在面板实例列表查看。"

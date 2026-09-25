@@ -700,9 +700,6 @@ def build_launch_request(
 
     assign_public_ip = bool(body.get("assign_public_ip", True))
     assign_ipv6_ip = bool(body.get("assign_ipv6_ip", False))
-    # 128 = 单个地址（原有行为）；更小的值在开机后由 schedule_post_launch_adjustments
-    # 通过 CreateIpv6.cidrPrefixLength 分配。校验在 sanitize_launch_payload 里。
-    ipv6_prefix_length = body.get("ipv6_prefix_length")
     open_guest_firewall = bool(body.get("open_guest_firewall", True))
     as_retry = bool(body.get("as_retry", False))
     retry_all_ads = bool(body.get("retry_all_ads", False))
@@ -734,7 +731,6 @@ def build_launch_request(
             "memory_in_gbs": memory,
             "assign_public_ip": assign_public_ip,
             "assign_ipv6_ip": assign_ipv6_ip,
-            "ipv6_prefix_length": ipv6_prefix_length,
             "boot_volume_size_in_gbs": boot_gb,
             "boot_volume_vpus_per_gb": boot_vpu,
             "nsg_ids": body.get("nsg_ids") or [],
@@ -890,103 +886,23 @@ def post_launch_adjustments(
     return notes
 
 
-# 开机后等 VNIC 挂载的上限。A1 抢到机器后通常一两分钟就 RUNNING，给足余量；
-# 超时只是这一步失败（写进审计），用户还能在实例详情里手动再分配一次。
-IPV6_PREFIX_VNIC_WAIT_SEC = 900
-
-
-def post_launch_ipv6_prefix(
-    session: TenantSession,
-    *,
-    instance_id: str,
-    compartment_id: str,
-    prefix_length: int,
-    owner_id: str = "",
-    tenant_id: str = "",
-) -> str:
-    """Assign the IPv6 CIDR chosen in the launch form once the VNIC exists.
-
-    LaunchInstance cannot do this itself — CreateVnicDetails has no prefix-length
-    field; OCI only assigns an IPv6 CIDR through CreateIpv6.cidrPrefixLength, on a
-    VNIC that already exists. The outcome is written to the audit log because
-    nobody is watching a background thread: that is where the operator finds the
-    range they got, or why it failed.
-    """
-    result = session.assign_ipv6_prefix(
-        instance_id,
-        compartment_id,
-        prefix_length,
-        wait_for_vnic_sec=IPV6_PREFIX_VNIC_WAIT_SEC,
-    )
-    if owner_id:
-        try:
-            from web.backend.audit import write_audit
-            from web.backend.db import SessionLocal
-
-            with SessionLocal() as db:
-                write_audit(
-                    db,
-                    owner_id=owner_id,
-                    action="instance.ipv6.prefix",
-                    target=instance_id,
-                    detail={
-                        "tenant_id": tenant_id,
-                        "ok": bool(result.ok),
-                        "message": result.message,
-                        "prefix_length": int(prefix_length),
-                        "cidr": (result.data or {}).get("cidr", "")
-                        if isinstance(result.data, dict)
-                        else "",
-                        "trigger": "launch",
-                    },
-                )
-        except Exception:  # noqa: BLE001
-            pass
-    return result.message or ""
-
-
 def schedule_post_launch_adjustments(
     session: TenantSession,
     *,
     instance_id: str,
     compartment_id: str,
     boot_vpu: int,
-    ipv6_prefix_length: int = 128,
-    owner_id: str = "",
-    tenant_id: str = "",
 ) -> None:
-    """Fire-and-forget post-launch steps so the HTTP launch response is not blocked.
-
-    IPv6 CIDR first, boot VPU second: the VPU change waits for hydration (minutes),
-    while the address range only needs the VNIC attached — and it is the one the
-    operator is waiting to use.
-    """
+    """Fire-and-forget VPU adjust so the HTTP launch response is not blocked."""
     import logging
     import threading
 
     log = logging.getLogger("ocibot.launch")
     vpu = int(boot_vpu or 10)
-    prefix = int(ipv6_prefix_length or 128)
-    want_prefix = prefix < 128
-    if not instance_id or (vpu == 10 and not want_prefix):
+    if not instance_id or vpu == 10:
         return
 
     def _run() -> None:
-        if want_prefix:
-            try:
-                note = post_launch_ipv6_prefix(
-                    session,
-                    instance_id=instance_id,
-                    compartment_id=compartment_id,
-                    prefix_length=prefix,
-                    owner_id=owner_id,
-                    tenant_id=tenant_id,
-                )
-                log.info("post-launch %s: %s", instance_id, note)
-            except Exception:  # noqa: BLE001
-                log.exception("post-launch IPv6 prefix failed for %s", instance_id)
-        if vpu == 10:
-            return
         try:
             notes = post_launch_adjustments(
                 session,
@@ -999,4 +915,4 @@ def schedule_post_launch_adjustments(
         except Exception:  # noqa: BLE001
             log.exception("post-launch adjustment failed for %s", instance_id)
 
-    threading.Thread(target=_run, name=f"post-launch-{instance_id[-8:]}", daemon=True).start()
+    threading.Thread(target=_run, name=f"boot-vpu-{instance_id[-8:]}", daemon=True).start()

@@ -87,19 +87,7 @@
         <button :disabled="acting" @click="power('SOFTRESET')">重启</button>
         <button :disabled="acting" @click="doRename">重命名</button>
         <button :disabled="acting" @click="doReplaceIp">换公网IP</button>
-        <!-- 选 /128 就是原来的「分配一个地址」；更短的前缀给主 VNIC 再加一整段
-             （CreateIpv6.cidrPrefixLength），没有 IPv6 的实例会先分配一个普通地址。 -->
-        <select
-          v-model.number="ipv6Prefix"
-          class="ipv6-prefix-select"
-          :disabled="acting"
-          title="选择要分配的 IPv6 地址段大小"
-        >
-          <option v-for="p in IPV6_PREFIX_OPTIONS" :key="p" :value="p">{{ ipv6PrefixLabel(p) }}</option>
-        </select>
-        <button :disabled="acting" @click="doIpv6">
-          {{ ipv6Prefix !== 128 ? `分配 IPv6 /${ipv6Prefix}` : '分配 IPv6' }}
-        </button>
+        <button :disabled="acting" @click="doIpv6">分配 IPv6</button>
         <!-- Only offered when there is something to remove: a button that always
              answers "该实例没有 IPv6" is noise on every instance that never had one. -->
         <button
@@ -934,7 +922,6 @@ import { computed, defineAsyncComponent, onMounted, reactive, ref, watch } from 
 import { useRoute, useRouter } from 'vue-router'
 import api, { type Instance } from '@/api/client'
 import { pickAndReadTextFile } from '@/utils/file'
-import { IPV6_PREFIX_OPTIONS, ipv6PrefixLabel } from '@/utils/ipv6'
 import { copyText } from '@/utils/toast'
 // Loaded only when the WebSSH tab is actually opened. Imported statically it
 // pulled xterm.js (~250 kB) into this page's chunk, so every visit that just
@@ -2215,16 +2202,12 @@ async function doReplaceIp() {
     acting.value = false
   }
 }
-/** 「分配 IPv6」的地址段大小；128 = 单个地址（原行为）。 */
-const ipv6Prefix = ref(128)
 async function doIpv6() {
   // 分配地址是增量操作，不删不断，不加确认。
   const act = beginAction()
   acting.value = true
   try {
-    const { data } = await api.post(`/tenants/${act.tenant}/instances/${act.target}/ipv6`, {
-      prefix_length: ipv6Prefix.value,
-    })
+    const { data } = await api.post(`/tenants/${act.tenant}/instances/${act.target}/ipv6`)
     if (act.moved()) return
     if (data.ok) msg.value = data.message
     else error.value = data.message
@@ -2656,14 +2639,6 @@ watch([tenantId, instanceId], async () => {
   margin-left: 0;
   margin-top: 0;
   font-size: 12px;
-}
-/* 全局 select 是 width: 100%，放进按钮行会独占一整行。 */
-.ipv6-prefix-select {
-  width: auto;
-  flex: 0 0 auto;
-  min-height: 30px;
-  padding-top: 0.2rem;
-  padding-bottom: 0.2rem;
 }
 .boot-status {
   background: var(--input-bg);

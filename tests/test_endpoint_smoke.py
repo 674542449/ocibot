@@ -101,9 +101,6 @@ def make_session():
     s.update_instance_shape.return_value = R(True, "已提交")
     s.replace_ephemeral_public_ip.return_value = R(True, "已更换", {"new_ip": "1.2.3.4"})
     s.assign_public_ipv6.return_value = R(True, "ok", {})
-    s.assign_ipv6_prefix.return_value = R(
-        True, "已分配 IPv6 地址段", {"cidr": "2603:c020::1:0/120", "prefix_length": 120}
-    )
     s.remove_public_ipv6.return_value = R(True, "已取消 IPv6", {"removed": ["2603::1"]})
     s.get_instance_metrics.return_value = R(True, "", {"cpu": [], "network": []})
     s.get_account_status.return_value = R(True, "", {"tier_code": "free", "tier": "Always Free"})
@@ -366,7 +363,6 @@ def test_every_endpoint_is_wired() -> None:
             (f"/api/tenants/{tid}/instances/{iid}/shape", {"ocpus": 2, "memory_in_gbs": 12}),
             (f"/api/tenants/{tid}/instances/{iid}/public-ip/replace", None),
             (f"/api/tenants/{tid}/instances/{iid}/ipv6", None),
-            (f"/api/tenants/{tid}/instances/{iid}/ipv6", {"prefix_length": 120}),
             (f"/api/tenants/{tid}/delete-protection", {"protected": True}),
             (f"/api/tenants/{tid}/delete-protection", {"protected": False}),
             # 不存在的 id：走完整条批量路径（查询、判定、审计）但不删掉后面还要用的租户。
@@ -450,10 +446,6 @@ def test_every_endpoint_is_wired() -> None:
              {"shape": "VM.Standard.A1.Flex", "image_id": "ocid1.image.oc1..img", "auth_mode": "key",
               "ssh_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIfake", "ocpus": 2,
               "memory_in_gbs": 12}),
-            (f"/api/tenants/{tid}/launch",
-             {"shape": "VM.Standard.A1.Flex", "image_id": "ocid1.image.oc1..img", "auth_mode": "key",
-              "ssh_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIfake", "ocpus": 2,
-              "memory_in_gbs": 12, "assign_ipv6_ip": True, "ipv6_prefix_length": 120}),
         ]
         for p, body in posts:
             check("POST", p, c.post(p, json=body) if body is not None else c.post(p))

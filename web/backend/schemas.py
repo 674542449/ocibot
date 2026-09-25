@@ -304,12 +304,6 @@ class PowerActionResult(BaseModel):
     work_request_id: str = ""
 
 
-class Ipv6AssignRequest(BaseModel):
-    """实例详情「分配 IPv6」。128 = 单个地址（原行为）；80–124 且能被 4 整除 = 地址段。"""
-
-    prefix_length: int = Field(default=128, ge=80, le=128)
-
-
 class TightenSecurityListResult(PowerActionResult):
     """收紧子网安全列表的返回值 —— 比 PowerActionResult 多一个 ``data``。
 
@@ -465,9 +459,6 @@ class LaunchInstanceRequest(BaseModel):
     count: int = Field(default=1, ge=1, le=8)
     assign_public_ip: bool = True
     assign_ipv6_ip: bool = False
-    # IPv6 地址段前缀长度：128 = 单个地址；80–124（能被 4 整除）= 开机后给 VNIC
-    # 分配一整段，例如 120 = 256 个地址。「能被 4 整除」在 sanitize_launch_payload 里校验。
-    ipv6_prefix_length: int = Field(default=128, ge=80, le=128)
     open_guest_firewall: bool = True
     # Optional first-boot shell script merged into cloud-init (never persisted
     # in plaintext; encrypted on the job row for capacity retries).

@@ -721,7 +721,6 @@ SAFE_LAUNCH_FIELDS = {
     "memory_in_gbs",
     "assign_public_ip",
     "assign_ipv6_ip",
-    "ipv6_prefix_length",
     "boot_volume_size_in_gbs",
     "boot_volume_vpus_per_gb",
     "nsg_ids",
@@ -729,72 +728,6 @@ SAFE_LAUNCH_FIELDS = {
     "launch_token",
     "open_guest_firewall",
 }
-
-
-# 给 VNIC 分配 IPv6 地址段（IPv6 CIDR）时允许的前缀长度。依据 OCI 文档
-# 「IPv6 Addresses → Assignment of IPv6 Addresses to a VNIC」：
-#   "By using the CreateIpv6 API with the cidrPrefixLength attribute, you can
-#    allocate a contiguous range of host IP addresses within a subnet to a VNIC"
-#   "The mask value must be within the range of 80-128."
-#   "The mask value must be divisible by 4 without any remainder."
-# 128 就是普通的单个地址（面板一直以来的行为），也是缺省值。
-IPV6_PREFIX_LENGTHS = tuple(range(80, 129, 4))
-IPV6_SINGLE_ADDRESS_PREFIX = 128
-
-# VCN 服务限额：每个 VCN 能挂多少个 IPv6 地址段（CIDR）。文档里没写它的名字和
-# 默认值，是从真实账号的报错里拿到的（CreateIpv6 → 400 LimitExceeded，ap-singapore-2）：
-#   "Limit for ipv6-flexible-cidrs-allowed-count-per-vcn of 0 has been already reached."
-# 值为 0 就是 Oracle 没给这个账号开放地址段，只能去控制台申请提高限额。
-IPV6_CIDR_LIMIT_SERVICE = "vcn"
-IPV6_CIDR_LIMIT_NAME = "ipv6-flexible-cidrs-allowed-count-per-vcn"
-IPV6_CIDR_LIMIT_ZERO_MESSAGE = (
-    "该账号在当前区域的 VCN 服务限额「"
-    + IPV6_CIDR_LIMIT_NAME
-    + "」（每个 VCN 可分配的 IPv6 地址段数量）为 0，也就是 Oracle 还没给这个账号开放 IPv6 地址段，"
-    "面板这边无法绕过。需要在 Oracle 控制台「治理与管理 → 限制、配额和使用情况」里申请提高该限额"
-    "（服务选 Virtual Cloud Network / VCN），或提支持工单；免费账号通常要先升级为按量付费才能申请。"
-    "在此之前只能分配单个 IPv6 地址（/128）"
-)
-
-_LIMIT_EXCEEDED_RE = re.compile(r"Limit for ([\w.-]+) of (\d+)")
-
-
-def _ipv6_cidr_error_text(exc: "ServiceError") -> str:
-    """Explain a failed CreateIpv6(cidrPrefixLength); Oracle's own text goes last."""
-    raw = _format_service_error(exc)
-    code = str(getattr(exc, "code", "") or "")
-    match = _LIMIT_EXCEEDED_RE.search(str(getattr(exc, "message", "") or ""))
-    if match and match.group(1) == IPV6_CIDR_LIMIT_NAME and int(match.group(2)) == 0:
-        return f"{IPV6_CIDR_LIMIT_ZERO_MESSAGE}。（Oracle 原文：{raw}）"
-    if match or code == "LimitExceeded":
-        name, value = (match.group(1), match.group(2)) if match else ("?", "?")
-        return (
-            f"已达到 Oracle 服务限额 {name} = {value}：这个 VCN 上的 IPv6 地址段数量已用满。"
-            "可以先删掉不用的地址段，或在控制台「限制、配额和使用情况」里申请提高该限额。"
-            f"（Oracle 原文：{raw}）"
-        )
-    if int(getattr(exc, "status", 0) or 0) in (400, 409):
-        return (
-            f"{raw}。可能原因：子网的 IPv6 前缀是在 Oracle 支持地址段（2025-08）之前创建的，"
-            "需要提工单为该前缀开通，或给子网新加一个 IPv6 前缀；也可能是子网里剩余的连续地址"
-            "不够这么大的地址段，可以换一个更小的（如 /120）"
-        )
-    return raw
-
-
-def normalize_ipv6_prefix_length(value: Any) -> int:
-    """Validate a requested IPv6 CIDR prefix length; None/"" mean a single /128."""
-    if value is None or value == "":
-        return IPV6_SINGLE_ADDRESS_PREFIX
-    if isinstance(value, bool):
-        raise ValueError("IPv6 地址段前缀长度无效")
-    try:
-        prefix = int(str(value).strip().lstrip("/"))
-    except (TypeError, ValueError):
-        raise ValueError("IPv6 地址段前缀长度无效") from None
-    if prefix not in IPV6_PREFIX_LENGTHS:
-        raise ValueError("IPv6 地址段前缀长度必须在 /80–/128 之间且能被 4 整除（如 /112、/116、/120）")
-    return prefix
 
 
 def sanitize_launch_payload(payload: dict, *, for_retry: bool = False) -> dict:
@@ -850,13 +783,6 @@ def sanitize_launch_payload(payload: dict, *, for_retry: bool = False) -> dict:
     clean["boot_volume_vpus_per_gb"] = vpus
     clean["assign_public_ip"] = bool(clean.get("assign_public_ip", True))
     clean["assign_ipv6_ip"] = bool(clean.get("assign_ipv6_ip", False))
-    # 地址段只在分配 IPv6 时有意义；没勾 IPv6 却带着 /120 的 payload 归一成 128，
-    # 免得开机后的后台步骤去给一台不要 IPv6 的机器建地址段。老任务里没有这个键 → 128。
-    clean["ipv6_prefix_length"] = (
-        normalize_ipv6_prefix_length(clean.get("ipv6_prefix_length"))
-        if clean["assign_ipv6_ip"]
-        else IPV6_SINGLE_ADDRESS_PREFIX
-    )
     clean["open_guest_firewall"] = bool(clean.get("open_guest_firewall", True))
     clean["nsg_ids"] = [str(value) for value in (clean.get("nsg_ids") or []) if value]
     return clean
@@ -7237,8 +7163,28 @@ class TenantSession:
                     message=f"实例已有 IPv6：{address}{suffix}",
                     data={"ipv6": network.ipv6_addresses, "route_ok": route.ok, "enabled": enable.data},
                 )
+            # 子网上有**多个** IPv6 前缀时 ipv6_subnet_cidr 是必填的（文档：
+            # "Required if the subnet has multiple IPv6 prefixes"）。自带地址
+            # （BYOIPv6）或同时有 GUA + ULA 的子网就是这种情况，不传会直接失败。
+            # 只有一个前缀时不传 —— 别给单前缀子网引入一个新的失败面。
+            ipv6_kwargs: dict[str, Any] = {}
+            try:
+                subnet = self.network.get_subnet(network.subnet_id).data
+                blocks = self._subnet_ipv6_blocks(subnet)
+                if len(blocks) > 1:
+                    # 挑一个全球单播（GUA）前缀：ULA 是 fc00::/7，也就是首字节
+                    # 落在 fc/fd 的那些，它出不了公网。
+                    gua = [
+                        b
+                        for b in blocks
+                        if not str(b).lower().lstrip().startswith(("fc", "fd"))
+                    ]
+                    ipv6_kwargs["ipv6_subnet_cidr"] = (gua or blocks)[0]
+            except Exception:  # noqa: BLE001
+                # 读不到子网不该让分配直接失败 —— 退回不传，单前缀子网照样能过。
+                pass
             details = oci.core.models.CreateIpv6Details(
-                vnic_id=network.vnic_id, **self._ipv6_subnet_cidr_kwargs(network.subnet_id)
+                vnic_id=network.vnic_id, **ipv6_kwargs
             )
             ipv6 = self.network.create_ipv6(details).data
             address = getattr(ipv6, "ip_address", "") or ""
@@ -7264,188 +7210,6 @@ class TenantSession:
             )
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
-        except Exception as exc:  # noqa: BLE001
-            return OperationResult(ok=False, message=safe_error_text(exc))
-
-    def _ipv6_subnet_cidr_kwargs(self, subnet_id: str) -> dict[str, Any]:
-        """``ipv6_subnet_cidr`` for CreateIpv6Details when the subnet needs one.
-
-        子网上有**多个** IPv6 前缀时 ipv6_subnet_cidr 是必填的（文档：
-        "Required if the subnet has multiple IPv6 prefixes"）。自带地址
-        （BYOIPv6）或同时有 GUA + ULA 的子网就是这种情况，不传会直接失败。
-        只有一个前缀时不传 —— 别给单前缀子网引入一个新的失败面。
-        """
-        try:
-            subnet = self.network.get_subnet(subnet_id).data
-            blocks = self._subnet_ipv6_blocks(subnet)
-            if len(blocks) > 1:
-                # 挑一个全球单播（GUA）前缀：ULA 是 fc00::/7，也就是首字节
-                # 落在 fc/fd 的那些，它出不了公网。
-                gua = [
-                    b
-                    for b in blocks
-                    if not str(b).lower().lstrip().startswith(("fc", "fd"))
-                ]
-                return {"ipv6_subnet_cidr": (gua or blocks)[0]}
-        except Exception:  # noqa: BLE001
-            # 读不到子网不该让分配直接失败 —— 退回不传，单前缀子网照样能过。
-            pass
-        return {}
-
-    def ipv6_cidr_limit_value(self) -> Optional[int]:
-        """This tenancy's IPv6-CIDR-per-VCN service limit, or None when unknown.
-
-        One ListLimitValues call filtered to that single limit name. None — not 0 —
-        whenever the value cannot be read (no permission, the Limits service does
-        not publish this name in the region, a network error): callers only refuse
-        on a positively read 0 and otherwise let CreateIpv6 decide, so a failed
-        read never blocks a tenancy that does have the feature.
-        """
-        try:
-            values = oci.pagination.list_call_get_all_results(
-                self.limits.list_limit_values,
-                self.tenant.tenancy_ocid,
-                service_name=IPV6_CIDR_LIMIT_SERVICE,
-                name=IPV6_CIDR_LIMIT_NAME,
-                retry_strategy=sdk_bounded_paged_retry_strategy(),
-            ).data or []
-        except Exception:  # noqa: BLE001
-            return None
-        numbers: list[int] = []
-        for item in values:
-            if str(getattr(item, "name", "") or "") != IPV6_CIDR_LIMIT_NAME:
-                continue
-            try:
-                numbers.append(int(getattr(item, "value", None)))
-            except (TypeError, ValueError):
-                continue
-        return max(numbers) if numbers else None
-
-    def _wait_primary_vnic_attached(
-        self, instance_id: str, compartment_id: str, *, timeout: float, interval: float = 15
-    ) -> None:
-        """Block until the instance's VNIC attachment is ATTACHED.
-
-        刚 LaunchInstance 完的实例还在 PROVISIONING，VNIC 要等挂载完成才能往上加
-        IPv6。轮询间隔刻意放宽到 15s：这是后台步骤，没人在等它，而每次 list 都在
-        和抢机循环抢同一份限流额度。
-        """
-        deadline = time.monotonic() + timeout
-        while True:
-            attachments = oci.pagination.list_call_get_all_results(
-                self.compute.list_vnic_attachments,
-                compartment_id=compartment_id,
-                instance_id=instance_id,
-                retry_strategy=sdk_bounded_paged_retry_strategy(),
-            ).data or []
-            if any(getattr(a, "lifecycle_state", "") == "ATTACHED" for a in attachments):
-                return
-            try:
-                state = str(getattr(self.compute.get_instance(instance_id).data, "lifecycle_state", "") or "")
-            except Exception:  # noqa: BLE001
-                state = ""
-            if state in ("TERMINATING", "TERMINATED"):
-                raise OCIClientError(f"实例已{'终止' if state == 'TERMINATED' else '在终止中'}，不再分配 IPv6 地址段")
-            if time.monotonic() >= deadline:
-                raise OCIClientError("等待实例网卡（VNIC）挂载超时，可稍后在实例详情里手动分配 IPv6 地址段")
-            time.sleep(interval)
-
-    def assign_ipv6_prefix(
-        self,
-        instance_id: str,
-        compartment_id: str,
-        prefix_length: Any,
-        *,
-        wait_for_vnic_sec: float = 0,
-    ) -> OperationResult:
-        """Give the instance's primary VNIC an IPv6 CIDR (e.g. /120 = 256 addresses).
-
-        Uses ``CreateIpv6`` with ``cidrPrefixLength`` — the only API that assigns an
-        IPv6 CIDR; LaunchInstance's CreateVnicDetails has no such field, which is why
-        the launch flow calls this after the instance is up. Requirements from the
-        OCI doc (IPv6 Addresses → Assignment of IPv6 Addresses to a VNIC):
-
-        * "The IP address mask must be assigned as a secondary IP address to the
-          VNIC" — so a plain /128 is ensured first (assign_public_ipv6, which also
-          enables the subnet prefix, the ``::/0`` route and IPv6 NSG rules).
-        * mask 80–128, divisible by 4 — normalize_ipv6_prefix_length.
-        * "the first and last /80 of the subnet prefix are reserved for ephemeral
-          host IPs" — no address is passed, so Oracle picks a valid block itself.
-        * Prefixes created before the feature went GA need a support request —
-          surfaced as a hint when Oracle refuses.
-
-        Idempotent: a VNIC that already holds a CIDR of this length reports it
-        instead of allocating a second one (the post-launch step can be re-run).
-        """
-        try:
-            prefix = normalize_ipv6_prefix_length(prefix_length)
-        except ValueError as exc:
-            return OperationResult(ok=False, message=str(exc))
-        if prefix == IPV6_SINGLE_ADDRESS_PREFIX:
-            return self.assign_public_ipv6(instance_id, compartment_id)
-        # 限额为 0 时 CreateIpv6 必然 400。先查一次再动手：否则没有 IPv6 的实例会先被
-        # 分配一个普通地址（下面那步），然后地址段失败 —— 用户没要的东西反倒留下了。
-        if self.ipv6_cidr_limit_value() == 0:
-            return OperationResult(ok=False, message=IPV6_CIDR_LIMIT_ZERO_MESSAGE)
-        try:
-            if wait_for_vnic_sec > 0:
-                self._wait_primary_vnic_attached(
-                    instance_id, compartment_id, timeout=wait_for_vnic_sec
-                )
-            network = self.resolve_primary_network(instance_id, compartment_id)
-            existing = oci.pagination.list_call_get_all_results(
-                self.network.list_ipv6s,
-                vnic_id=network.vnic_id,
-                retry_strategy=sdk_bounded_paged_retry_strategy(),
-            ).data or []
-            for entry in existing:
-                if int(getattr(entry, "cidr_prefix_length", 0) or 0) == prefix:
-                    cidr = f"{getattr(entry, 'ip_address', '') or ''}/{prefix}"
-                    return OperationResult(
-                        ok=True,
-                        message=f"实例已有 IPv6 地址段：{cidr}",
-                        data={"cidr": cidr, "prefix_length": prefix, "already": True},
-                    )
-
-            notes: list[str] = []
-            # 先保证 VNIC 上有一个普通地址（文档要求地址段是「secondary」），顺带把
-            # 子网前缀、::/0 路由、托管 NSG 的 IPv6 规则都备齐 —— 开机时勾了 IPv6
-            # 的话这些早已就绪，assign_public_ipv6 只会报「已有」而不重复创建。
-            if not existing:
-                base = self.assign_public_ipv6(instance_id, compartment_id)
-                if not base.ok:
-                    return OperationResult(
-                        ok=False, message="分配 IPv6 地址段前需要先有一个 IPv6 地址，但分配失败：" + base.message
-                    )
-                notes.append(base.message)
-                network = self.resolve_primary_network(instance_id, compartment_id)
-
-            details = oci.core.models.CreateIpv6Details(
-                vnic_id=network.vnic_id,
-                cidr_prefix_length=prefix,
-                **self._ipv6_subnet_cidr_kwargs(network.subnet_id),
-            )
-            ipv6 = self.network.create_ipv6(details).data
-            address = str(getattr(ipv6, "ip_address", "") or "")
-            cidr = f"{address}/{prefix}"
-            count = 2 ** (128 - prefix)
-            message = f"已分配 IPv6 地址段：{cidr}（{count:,} 个地址）"
-            if existing:
-                # 开机时已有地址，路由在创建前就补过了；这里只核对一次，失败要说出来。
-                route = self.ensure_ipv6_internet_access(network.subnet_id, compartment_id)
-                if not route.ok:
-                    notes.append(f"⚠ 公网路由设置失败，可能仅内网可用：{route.message}")
-            if notes:
-                message += "；" + "；".join(notes)
-            return OperationResult(
-                ok=True,
-                message=message,
-                data={"cidr": cidr, "prefix_length": prefix, "address": address, "count": count},
-            )
-        except ServiceError as exc:
-            return OperationResult(ok=False, message=_ipv6_cidr_error_text(exc))
-        except OCIClientError as exc:
-            return OperationResult(ok=False, message=safe_error_text(exc))
         except Exception as exc:  # noqa: BLE001
             return OperationResult(ok=False, message=safe_error_text(exc))
 

@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.4.118 — 2026-09-26
+
+移除 0.4.116 / 0.4.117 的「IPv6 地址段（/120、/116 …）」功能。租户多选删除、删除保护、
+保护排序、「升级」文字都保留。
+
+### 变更
+
+- **撤掉创建实例页的「IPv6 地址段」下拉和实例详情「分配 IPv6」旁边的下拉。** 分配 IPv6
+  回到 0.4.115 的行为：勾「分配 IPv6」就是一个地址；实例详情里一次一个地址，按钮叫
+  「分配 IPv6」。
+- 原因：地址段依赖 Oracle 服务限额 `ipv6-flexible-cidrs-allowed-count-per-vcn`，操作者的
+  账号上它是 0，功能用不上。这和 0.4.100 撤掉 0.4.99 的「分配一整块 IPv6」是同一个结论。
+- 后端一并移除：`assign_ipv6_prefix`、开机后分配地址段的后台步骤、限额查询
+  `ipv6_cidr_limit_value` 及创建前的限额拦截、`LaunchInstanceRequest.ipv6_prefix_length`、
+  `Ipv6AssignRequest`（`POST .../ipv6` 恢复成不接收请求体）、launch payload 里的
+  `ipv6_prefix_length`。`app/oci_client.py`、`launch_service.py`、`worker.py`、
+  `routers/instances.py`、`LaunchView.vue`、`InstanceDetailView.vue` 恢复到 0.4.115 的内容。
+
+### 兼容性
+
+- **不涉及数据库结构**：地址段功能没有加过列，只在抢机任务的 `launch_payload`（JSON）里
+  多存过一个 `ipv6_prefix_length` 键。`sanitize_launch_payload` 只保留白名单字段，老任务里
+  的这个键会被直接丢掉 —— 这些任务照常重试，抢到后按单个 IPv6 地址处理。
+- 更新后还开着旧页面的浏览器会继续发 `ipv6_prefix_length` / `prefix_length`，服务端忽略
+  这两个字段，行为等同于单个地址，不会报错。刷新一下页面即可。
+- 如果在 0.4.116 / 0.4.117 期间真的分配成功过地址段，它仍在 Oracle 那边；实例详情的
+  「取消 IPv6」会删掉该 VNIC 上的全部 IPv6 对象，包括地址段。
+
+### 维护
+
+- 删除 `tests/test_ipv6_prefix.py`、`tests/test_ipv6_cidr_limit.py`、
+  `web/frontend/src/utils/ipv6.ts`；`tests/test_endpoint_smoke.py` 去掉地址段的三处调用，
+  `tests/test_oci_api_conformance.py` 恢复到 0.4.115。
+
+### 升级
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.118
+```
+
 ## 0.4.117 — 2026-09-26
 
 受保护的租户排到最前；等级「已升级」改叫「升级」；IPv6 地址段报 LimitExceeded 时说对原因，
