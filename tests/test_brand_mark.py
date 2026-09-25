@@ -1,6 +1,6 @@
 """品牌标记的几何分散在四个地方，这条测试保证它们不会走散。
 
-标记（环 + 缺口 + 落位方块）同一套路径存在于：
+标记（0.4.121 起是「环与核心」：同心的圆环 + 实心圆点）同一套几何存在于：
 
   1. web/frontend/src/layouts/AppLayout.vue —— 侧边栏内联的那份。必须内联，
      因为 `<img src="...">` 里的 currentColor 拿不到外部 CSS，标记就没法跟着
@@ -28,10 +28,14 @@ FAVICON = FRONTEND / "public/favicon.svg"
 ICO = FRONTEND / "public/favicon.ico"
 GENERATOR = pathlib.Path("scripts/make_favicon.py")
 
-# 圆弧路径就是那个「一直在转、开了个口」的环 —— 标记的主体。
-_ARC = re.compile(r"M\s*25\.56\s+15\.16A9\.6\s+9\.6\s+0\s+1\s+1\s+16\.84\s+6\.44")
-# 落位方块。
-_NODE = re.compile(r'x="18\.79"\s+y="5\.21"\s+width="8"\s+height="8"\s+rx="2\.2"')
+# 圆环：中线半径 11、线宽 4.2，不填充 —— 标记的主体。
+_RING = re.compile(
+    r'<circle\s+cx="16"\s+cy="16"\s+r="11"\s+fill="none"\s+stroke="[^"]+"\s+stroke-width="4\.2"'
+)
+# 同心的实心核心，半径与环的线宽相同，粗细一致。
+_CORE = re.compile(r'<circle\s+cx="16"\s+cy="16"\s+r="4\.2"\s+fill="[^"]+"')
+# 带底板的两份把字形收到 78% 并居中：16 - 16*0.78 = 3.52。
+_INSET = re.compile(r'translate\(3\.52 3\.52\)\s*scale\(0\.78\)')
 
 
 def _read(p: pathlib.Path) -> str:
@@ -39,33 +43,31 @@ def _read(p: pathlib.Path) -> str:
     return p.read_text(encoding="utf-8")
 
 
-def test_all_four_copies_share_the_same_path():
+def test_all_four_copies_share_the_same_geometry():
     for path in (LAYOUT, LOGO, FAVICON):
         src = _read(path)
-        assert _ARC.search(src), f"{path} 里的圆弧路径和其它几处对不上"
-        assert _NODE.search(src), f"{path} 里的方块和其它几处对不上"
+        assert _RING.search(src), f"{path} 里的圆环和其它几处对不上"
+        assert _CORE.search(src), f"{path} 里的核心圆点和其它几处对不上"
+    for path in (LOGO, FAVICON):
+        assert _INSET.search(_read(path)), f"{path} 的底板内缩和 make_favicon.py 对不上"
 
 
-def test_the_generator_reproduces_that_same_arc():
-    """脚本里存的是参数不是路径字符串，所以这里现算一遍再比对。"""
+def test_the_generator_uses_that_same_geometry():
+    """脚本里存的是参数不是 SVG 字符串，所以这里取出常量逐个比对。"""
     src = _read(GENERATOR)
     ns: dict = {}
     # 只取常量段：再往下有 pathlib 之类的东西，exec 起来要多喂一堆依赖。
     head = src.split("_OUT =")[0]
     exec(compile(head, "gen", "exec"), {"math": math}, ns)
 
-    def pt(angle: float) -> tuple[float, float]:
-        t = math.radians(angle)
-        return (ns["CX"] + ns["R"] * math.cos(t), ns["CY"] + ns["R"] * math.sin(t))
-
-    sx, sy = pt(ns["GAP_CENTER"] + ns["GAP_HALF"])
-    ex, ey = pt(ns["GAP_CENTER"] - ns["GAP_HALF"] + 360)
-    assert (round(sx, 2), round(sy, 2)) == (25.56, 15.16), (sx, sy)
-    assert (round(ex, 2), round(ey, 2)) == (16.84, 6.44), (ex, ey)
-
-    nx, ny = pt(ns["NODE_ANG"])
-    half = ns["NODE_SIZE"] / 2
-    assert (round(nx - half, 2), round(ny - half, 2)) == (18.79, 5.21)
+    assert (ns["CX"], ns["CY"], ns["R"]) == (16.0, 16.0, 11.0)
+    assert ns["SW"] == 4.2
+    assert ns["CORE_R"] == 4.2
+    assert ns["GLYPH_INSET"] == 0.78
+    assert round(16 - 16 * ns["GLYPH_INSET"], 2) == 3.52
+    # 旧标记（缺口 + 方块）的参数不能残留：残留说明有人只改了一半。
+    for stale in ("GAP_CENTER", "GAP_HALF", "NODE_ANG", "NODE_SIZE"):
+        assert stale not in ns, stale
 
 
 def test_the_sidebar_mark_follows_the_theme():

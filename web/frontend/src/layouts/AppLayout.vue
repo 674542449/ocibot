@@ -16,24 +16,19 @@
       <div class="brand">
         <!-- 内联而不是 <img src="/logo.svg">：img 里的 currentColor 拿不到外部
              CSS，标记就只能写死一个颜色。内联之后它跟着 --accent 走，
-             改配色只需要改 styles.css 一处。public/logo.svg 是同一套路径的写死颜色版，
-             给 apple-touch-icon 那类没有 CSS 上下文的地方用 —— 改一个要改两个。
+             改配色只需要改 styles.css 一处。public/logo.svg 是同一套几何的写死颜色版，
+             给 apple-touch-icon 那类没有 CSS 上下文的地方用 —— 改一个要改全部
+             （还有 favicon.svg 和 scripts/make_favicon.py，tests/test_brand_mark.py 钉着）。
 
-             标记的含义：环 = 一直在转的容量循环，缺口 = 放出来的那个空位，
-             方块 = 抢到并落位的实例。 -->
+             标记「环与核心」：环 = 云上的资源池，核心 = 面板管着的那台机器。 -->
         <svg
           class="brand-mark"
           viewBox="0 0 32 32"
           role="img"
           aria-label="OCIBot"
         >
-          <path
-            d="M25.56 15.16A9.6 9.6 0 1 1 16.84 6.44"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="4.6"
-          />
-          <rect x="18.79" y="5.21" width="8" height="8" rx="2.2" fill="currentColor" />
+          <circle cx="16" cy="16" r="11" fill="none" stroke="currentColor" stroke-width="4.2" />
+          <circle cx="16" cy="16" r="4.2" fill="currentColor" />
         </svg>
         <button
           type="button"

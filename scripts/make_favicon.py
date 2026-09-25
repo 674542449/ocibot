@@ -12,7 +12,7 @@ favicon.ico 是二进制的，改了看不出 diff。把生成它的几何参数
 ## 为什么自己光栅化
 
 这个环境里没有 Pillow / cairosvg，而为了一个图标去加运行时依赖不值当。
-标记本身只有三个形状（圆角底板、带缺口的圆环、圆角方块），用有向距离场
+标记本身只有三个形状（圆角底板、圆环、实心圆），用有向距离场
 （SDF）+ 超采样直接算覆盖率就够了，输出质量和正经光栅化器没有区别。
 
 PNG 和 ICO 也是手写的：PNG 只需要 IHDR/IDAT/IEND 三个块，ICO 允许直接内嵌
@@ -25,8 +25,8 @@ PNG（Vista 以后所有浏览器都认），加起来比引一个库还短。
 侧边栏那份还内联在 web/frontend/src/layouts/AppLayout.vue 里（它用
 currentColor 跟随主题），一共三处。
 
-标记的含义：环 = 一直在转的容量循环，缺口 = 放出来的那个空位，
-方块 = 抢到并落位的实例。
+标记（0.4.121 起，「环与核心」）：一个圆环 + 同心的实心圆点。环 = 云上的资源池，
+核心 = 面板管着的那台机器。完全对称、只有两个形状，16px 标签页里也分得清。
 """
 
 from __future__ import annotations
@@ -37,13 +37,14 @@ import struct
 import zlib
 
 # --- 32 单位网格上的几何（与两个 SVG 逐字对应） ---------------------------
-CX, CY, R = 16.0, 16.0, 9.6
-SW = 4.6                          # 圆环线宽
-GAP_CENTER, GAP_HALF = -45.0, 40.0   # 缺口中心角与半角（度，y 向下）
-NODE_ANG, NODE_SIZE, NODE_R = -45.0, 8.0, 2.2
+CX, CY, R = 16.0, 16.0, 11.0      # 圆环中心与半径（线宽中线）
+SW = 4.2                          # 圆环线宽
+CORE_R = 4.2                      # 中心实心圆半径（与线宽相同，粗细一致）
 TILE_R = 7.0                      # 底板圆角
-# 带底板时字形收到 88%：贴着圆角边缘的图标在标签栏里显得又挤又糊。
-GLYPH_INSET = 0.88
+# 带底板时字形收到 78%：圆环外径 26.2，不收的话贴着圆角底板的边，在标签栏里
+# 显得又挤又糊。16 - 16*0.78 = 3.52，所以 SVG 里平移 3.52 保持居中。
+# 侧边栏那个裸字形**不收** —— 没有底板，本来就该填满自己的盒子。
+GLYPH_INSET = 0.78
 
 BRAND = (0xC6, 0x61, 0x3F)        # Claude 陶土橙 #c6613f，与 favicon.svg / logo.svg
 WHITE = (0xFF, 0xFF, 0xFF)        # 的底板同色；白字形 4.05:1
@@ -59,22 +60,13 @@ def _rrect_sdf(px, py, cx, cy, hw, hh, r):
 
 
 def _ring_sdf(px, py):
-    """圆环，挖掉一个角度楔形（缺口）。"""
-    dx, dy = px - CX, py - CY
-    d = abs(math.hypot(dx, dy) - R) - SW / 2.0
-    delta = (math.degrees(math.atan2(dy, dx)) - GAP_CENTER + 180.0) % 360.0 - 180.0
-    if abs(delta) < GAP_HALF:
-        # 缺口内：把距离推出去，同时让弧的两端是平切的而不是渗进缺口。
-        return max(d, (GAP_HALF - abs(delta)) * math.pi / 180.0 * R)
-    return d
+    """完整圆环（线宽 SW，中线半径 R）。"""
+    return abs(math.hypot(px - CX, py - CY) - R) - SW / 2.0
 
 
-def _node_sdf(px, py):
-    t = math.radians(NODE_ANG)
-    return _rrect_sdf(
-        px, py, CX + R * math.cos(t), CY + R * math.sin(t),
-        NODE_SIZE / 2, NODE_SIZE / 2, NODE_R,
-    )
+def _core_sdf(px, py):
+    """中心实心圆。"""
+    return math.hypot(px - CX, py - CY) - CORE_R
 
 
 def render(size: int, ss: int = 4) -> list[list[tuple[int, int, int, int]]]:
@@ -93,7 +85,7 @@ def render(size: int, ss: int = 4) -> list[list[tuple[int, int, int, int]]]:
                         tile_a += 1
                     gx = 16 + (ux - 16) / GLYPH_INSET
                     gy = 16 + (uy - 16) / GLYPH_INSET
-                    if min(_ring_sdf(gx, gy), _node_sdf(gx, gy)) <= 0:
+                    if min(_ring_sdf(gx, gy), _core_sdf(gx, gy)) <= 0:
                         glyph_a += 1
             n = ss * ss
             a, mix = tile_a / n, glyph_a / n
