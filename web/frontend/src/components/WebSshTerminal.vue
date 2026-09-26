@@ -189,6 +189,16 @@ async function connect() {
     error.value = '请输入 SSH 密码'
     return
   }
+  // 还挂着一个旧连接就先关掉：否则它会一直占着服务端的 SSH 会话，直到超时。
+  if (socket) {
+    const old = socket
+    socket = null
+    try {
+      old.close()
+    } catch {
+      /* ignore */
+    }
+  }
   busy.value = true
   phase.value = 'connecting'
   await nextTick()
@@ -198,8 +208,14 @@ async function connect() {
   const ws = new WebSocket(url)
   socket = ws
   ws.binaryType = 'arraybuffer'
+  // 旧连接的事件可能在新连接建立之后才到（点「断开」后马上「连接」、或重置主机密钥
+  // 后自动重连）：close 事件是异步的。下面的处理器改的都是模块级的 socket / term，
+  // 不先确认「这还是当前那个连接」，旧 socket 迟到的 onclose 就会把新 socket 置空、
+  // 把新终端销毁 —— 新会话从此收不到输入，服务端那条 SSH 连接也成了孤儿。
+  const current = () => socket === ws
 
   ws.onmessage = (ev) => {
+    if (!current()) return
     if (typeof ev.data === 'string') {
       if (ev.data.startsWith('{') && ev.data.endsWith('}')) {
         try {
@@ -252,12 +268,14 @@ async function connect() {
   }
 
   ws.onerror = () => {
+    if (!current()) return
     error.value = 'WebSocket 错误'
     busy.value = false
     phase.value = 'form'
     disposeTerm()
   }
   ws.onclose = () => {
+    if (!current()) return
     busy.value = false
     if (phase.value === 'live') status.value = '连接已关闭'
     phase.value = 'form'

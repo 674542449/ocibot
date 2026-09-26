@@ -1286,6 +1286,28 @@ function newIdempotencyKey(): string {
   }
 }
 
+/**
+ * Every created instance's password, not just the first. `instances` is the
+ * authoritative list; the scalar `root_password` only ever carried the head
+ * entry, which is why a batch used to lose the rest. On a failed launch the list
+ * is empty (or holds only the machines a partial batch did create), so this
+ * never invents a password for an instance that does not exist.
+ */
+function createdPasswords(data: any): Array<{ name: string; password: string }> {
+  const created: Array<{ display_name?: string; root_password?: string }> =
+    Array.isArray(data?.instances) && data.instances.length
+      ? data.instances
+      : data?.ok
+        ? [{ display_name: form.display_name, root_password: data.root_password }]
+        : []
+  return created
+    .filter((c) => !!c.root_password)
+    .map((c, i) => ({
+      name: String(c.display_name || form.display_name || `实例 ${i + 1}`),
+      password: String(c.root_password),
+    }))
+}
+
 async function doLaunch() {
   error.value = ''
   msg.value = ''
@@ -1357,19 +1379,7 @@ async function doLaunch() {
       if (data.capacity_job_id) msg.value += ` · 任务 ${data.capacity_job_id.slice(0, 8)}…`
       // A queued capacity-retry job (no instance yet) → task centre; else the list.
       const queuedRetry = !!data.capacity_job_id && !data.instance_id
-      // Every created instance's password, not just the first. `instances` is
-      // the authoritative list; the scalar `root_password` only ever carried the
-      // head entry, which is why a batch used to lose the rest here.
-      const created: Array<{ display_name?: string; root_password?: string }> =
-        Array.isArray(data.instances) && data.instances.length
-          ? data.instances
-          : [{ display_name: form.display_name, root_password: data.root_password }]
-      pendingPasswords.value = created
-        .filter((c) => !!c.root_password)
-        .map((c, i) => ({
-          name: String(c.display_name || form.display_name || `实例 ${i + 1}`),
-          password: String(c.root_password),
-        }))
+      pendingPasswords.value = createdPasswords(data)
       if (pendingPasswords.value.length) {
         // Auto-navigating unmounted this view 800ms later and destroyed the only
         // on-screen copy, so hold here and let the user leave once they have
@@ -1391,6 +1401,10 @@ async function doLaunch() {
       }, 800)
     } else {
       error.value = data.message || '创建失败'
+      // 批量创建只成功了一部分时，后端回 ok=false，但 instances 里是**已经开出来**
+      // 的机器和它们各自生成的 root 密码。只显示报错的话，这几个密码从来没在屏幕上
+      // 出现过。
+      pendingPasswords.value = createdPasswords(data)
     }
   } catch (e: any) {
     const status = Number(e?.response?.status || 0)

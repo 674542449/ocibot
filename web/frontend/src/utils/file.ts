@@ -1,3 +1,22 @@
+/**
+ * 把一个 Blob 作为文件下载。
+ *
+ * 链接要先挂到文档上再点，URL 也要晚一点再回收：游离的 <a> 在部分 Firefox 版本里
+ * 点了没反应，而同步 revokeObjectURL 在 Safari 上可能赶在下载真正开始之前就把
+ * 地址作废。实例 CSV 和加密备份两处下载共用这一个实现。
+ */
+export function downloadBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.style.display = 'none'
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  window.setTimeout(() => URL.revokeObjectURL(url), 10_000)
+}
+
 /** Read a local text file picked by the user into a string. */
 export function readTextFile(file: File): Promise<string> {
   return new Promise((resolve, reject) => {

@@ -2361,7 +2361,10 @@ async function doTerminate() {
       return
     }
     msg.value = data.message
-    setTimeout(() => router.push('/'), 800)
+    // 800ms 内用户若已经点去了别的实例 / 页面，就别再把他拽回列表。
+    setTimeout(() => {
+      if (!act.moved() && route.name === 'instance-detail') router.push('/')
+    }, 800)
   } catch (e: any) {
     if (act.moved()) return
     error.value = e?.message || '失败'
@@ -2382,25 +2385,38 @@ async function loadCurrentTab() {
   }
 }
 
-async function refreshAll() {
+/**
+ * 页面级加载：实例摘要 + 当前标签页。进入页面、「刷新全部」、切换实例三处共用。
+ *
+ * Only the instance summary is required to open the page. Metrics / console /
+ * firewall / volume load when the user opens that tab (or clicks 刷新全部), to
+ * avoid background Oracle polling.
+ *
+ * 并发：每个 tab 的加载函数都用路由上的 tenantId/instanceId 拼 URL，没有一个读
+ * instance.value —— 所以不必等实例详情先回来。（唯一真有依赖的是备份列表，它在
+ * loadCurrentTab 内部串在 loadBoot 之后。）beginLoad/stale 保护按加载器各自算。
+ *
+ * 以前这段在三处各抄一份，连注释都是复制的；spinner 的规则改一处就得记得改三处。
+ */
+async function loadPage() {
   const guard = beginLoad('page')
   loading.value = true
-  error.value = ''
   try {
-    // 并发：每个 tab 的加载函数都用路由上的 tenantId/instanceId 拼 URL，
-    // 没有一个读 instance.value —— 所以不必等实例详情先回来。
-    // （唯一真有依赖的是备份列表，它在 loadCurrentTab 内部串在 loadBoot 之后，
-    //  那一处保持不变。）beginLoad/stale 保护是按加载器各自算的，不受影响。
     await Promise.all([loadInstance(), loadCurrentTab()])
   } catch (e: any) {
     if (guard.stale()) return
     error.value = e?.message || '加载失败'
   } finally {
-    // spinner 只归序号管：刷新途中切实例时，若这里还带上 id 判断，本次不关、
+    // spinner 只归序号管：加载途中切实例时，若这里还带上 id 判断，本次不关、
     // 而接管的是路由 watch 里同 key 的那一次 —— 它会关。但反过来，一旦把
     // id 判断写进来，任何没有后继者的场景都会让「刷新」按钮永久 disabled。
     if (!guard.superseded()) loading.value = false
   }
+}
+
+async function refreshAll() {
+  error.value = ''
+  await loadPage()
 }
 
 watch(tab, async () => {
@@ -2411,25 +2427,7 @@ watch(tab, async () => {
   }
 })
 
-onMounted(async () => {
-  const guard = beginLoad('page')
-  loading.value = true
-  try {
-    // Only the instance summary is required to open the page.
-    // Metrics / console / firewall / volume load when the user opens that tab
-    // (or clicks 刷新全部), to avoid background Oracle polling.
-    // 并发：每个 tab 的加载函数都用路由上的 tenantId/instanceId 拼 URL，
-    // 没有一个读 instance.value —— 所以不必等实例详情先回来。
-    // （唯一真有依赖的是备份列表，它在 loadCurrentTab 内部串在 loadBoot 之后，
-    //  那一处保持不变。）beginLoad/stale 保护是按加载器各自算的，不受影响。
-    await Promise.all([loadInstance(), loadCurrentTab()])
-  } catch (e: any) {
-    if (guard.stale()) return
-    error.value = e?.message || '加载失败'
-  } finally {
-    if (!guard.superseded()) loading.value = false
-  }
-})
+onMounted(loadPage)
 
 /**
  * 换实例前先清空本实例的所有数据。
@@ -2486,20 +2484,7 @@ function resetInstanceState() {
 // sitting on the firewall tab spent a Monitoring query nobody asked for.
 watch([tenantId, instanceId], async () => {
   resetInstanceState()
-  const guard = beginLoad('page')
-  loading.value = true
-  try {
-    // 并发：每个 tab 的加载函数都用路由上的 tenantId/instanceId 拼 URL，
-    // 没有一个读 instance.value —— 所以不必等实例详情先回来。
-    // （唯一真有依赖的是备份列表，它在 loadCurrentTab 内部串在 loadBoot 之后，
-    //  那一处保持不变。）beginLoad/stale 保护是按加载器各自算的，不受影响。
-    await Promise.all([loadInstance(), loadCurrentTab()])
-  } catch (e: any) {
-    if (guard.stale()) return
-    error.value = e?.message || '加载失败'
-  } finally {
-    if (!guard.superseded()) loading.value = false
-  }
+  await loadPage()
 })
 </script>
 

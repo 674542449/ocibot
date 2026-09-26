@@ -421,6 +421,7 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import api, { type Instance, type Tenant } from '@/api/client'
 import { pickTenantId } from '@/stores/tenantLock'
+import { downloadBlob } from '@/utils/file'
 import { copyText, showToast } from '@/utils/toast'
 
 const route = useRoute()
@@ -610,13 +611,10 @@ function exportCsv() {
     ].map((v) => `"${String(v ?? '').replace(/"/g, '""')}"`)
     lines.push(vals.join(','))
   }
-  const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = `ocibot-instances-${new Date().toISOString().slice(0, 10)}.csv`
-  a.click()
-  URL.revokeObjectURL(url)
+  // 开头的 BOM 不能省：Windows 上的 Excel 没有它就按 ANSI 读，
+  // 中文的实例名 / 租户名全部乱码。
+  const blob = new Blob(['﻿' + lines.join('\n')], { type: 'text/csv;charset=utf-8' })
+  downloadBlob(blob, `ocibot-instances-${new Date().toISOString().slice(0, 10)}.csv`)
   showToast(`已导出 ${rows.length} 行`, 'ok')
 }
 
@@ -854,6 +852,9 @@ watch(tenantId, (id) => {
   instances.value = []
   loadedOnce.value = false
   selected.clear()
+  // 「列表不完整」说的是上一个租户的那次读取；不清的话换过来的新租户什么都还没读，
+  // 就先挂着一条指向别人 compartment 的权限警告。
+  partialWarn.value = ''
   if (!id && !tenants.value.length) {
     error.value = '还没有租户。请先到「租户」页添加 API 配置。'
   } else {

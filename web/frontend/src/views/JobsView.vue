@@ -120,9 +120,6 @@ type Attempt = {
   created_at: string
 }
 
-
-const WEEKDAYS = ['一', '二', '三', '四', '五', '六', '日']
-
 const capacityJobs = ref<CapacityJob[]>([])
 const tenants = ref<Tenant[]>([])
 const attempts = ref<Record<string, Attempt[]>>({})
@@ -142,13 +139,7 @@ async function checkBackground() {
 const autoRefresh = ref(false)
 const error = ref('')
 const msg = ref('')
-const saving = ref(false)
 let timer: number | undefined
-
-
-function wd(i: number) {
-  return WEEKDAYS[i] ?? String(i)
-}
 
 function jobBadge(status: string) {
   if (status === 'success') return 'running'

@@ -387,9 +387,17 @@ async function testChannel(c: Channel) {
   msg.value = ''
   testing.value = c.id
   try {
-    const { data } = await api.post(`/notifications/${c.id}/test`)
-    if (data.ok) msg.value = `测试消息已发送到「${c.name}」，请查收`
-    else error.value = `发送失败：${data.detail}`
+    const { data } = await api.post<{ ok: boolean; detail?: string }>(
+      `/notifications/${c.id}/test`,
+    )
+    if (data.ok) {
+      // 成功时 detail 也要显示：渠道被停用、或没订阅任何事件时，后端会在这里附上
+      // 「实际事件不会推送到这里」—— 测试能收到不代表抢机结果能收到。
+      const note = String(data.detail || '').includes('实际事件不会推送') ? `\n${data.detail}` : ''
+      msg.value = `测试消息已发送到「${c.name}」，请查收${note}`
+    } else {
+      error.value = `发送失败：${data.detail || '未知原因'}`
+    }
   } catch (e: any) {
     error.value = e?.message || '测试失败'
   } finally {

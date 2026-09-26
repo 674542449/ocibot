@@ -115,7 +115,12 @@ async function request<T = any>(
 
   if (body instanceof FormData) {
     // **不要**设 Content-Type：浏览器要自己加上 multipart 的 boundary，
-    // 手写一个没有 boundary 的头会让后端解析不出任何字段。
+    // 手写一个没有 boundary 的头会让后端解析不出任何字段。调用方传进来的也要删掉 ——
+    // axios 时代会自动覆盖它，换成 fetch 后 BackupView 的导入就因为一个显式的
+    // `multipart/form-data` 头整体失效过。规则放在这里强制，而不是只写在注释里。
+    for (const key of Object.keys(headers)) {
+      if (key.toLowerCase() === 'content-type') delete headers[key]
+    }
     payload = body
   } else if (body !== undefined && body !== null) {
     headers['Content-Type'] = 'application/json'

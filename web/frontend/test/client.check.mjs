@@ -163,6 +163,16 @@ function check(name, cond, extra = '') {
   const r = await api.delete('/nocontent')
   check('204 不抛', r.status === 204 && r.data === null)
 }
+// 12. FormData 的 Content-Type 必须由浏览器生成（带 boundary），调用方显式传的要被丢掉。
+//     BackupView 的导入曾经传了 `multipart/form-data` 而没有 boundary，后端一个字段都
+//     解析不出来，恢复备份整体失效。
+{
+  const fd = new FormData()
+  fd.append('password', 'secret')
+  await api.post('/echo', fd, { headers: { 'Content-Type': 'multipart/form-data' } })
+  const ct = String(seen[seen.length - 1].headers['content-type'] || '')
+  check('FormData 带上 boundary', /multipart\/form-data;\s*boundary=/i.test(ct), ct)
+}
 
 server.close()
 console.log(`\n${pass} 通过 / ${fail} 失败`)

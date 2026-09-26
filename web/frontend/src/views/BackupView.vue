@@ -41,6 +41,7 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import api from '@/api/client'
+import { downloadBlob } from '@/utils/file'
 
 const exportPassword = ref('')
 const importPassword = ref('')
@@ -69,12 +70,10 @@ async function doExport() {
       { responseType: 'blob' },
     )
     const blob = new Blob([res.data], { type: 'application/zip' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `ocibot-backup-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.zip`
-    a.click()
-    URL.revokeObjectURL(url)
+    downloadBlob(
+      blob,
+      `ocibot-backup-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.zip`,
+    )
     // 服务端会把「哪些租户没能导出」放在 X-OCIBot-Backup-Notice 里（百分号编码的
     // JSON，因为 HTTP 头只能是 latin-1）。这里以前不读它，于是主密钥轮换后备份
     // 悄悄少了几个租户，界面依旧只说一句「备份已下载」—— 等到需要恢复时才发现。
@@ -132,9 +131,8 @@ async function doImport() {
     const fd = new FormData()
     fd.append('password', importPassword.value)
     fd.append('file', file.value)
-    const { data } = await api.post('/backup/import', fd, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-    })
+    // 不要自己设 Content-Type：multipart 的 boundary 必须由浏览器生成。
+    const { data } = await api.post('/backup/import', fd)
     msg.value = data.message || `已导入 ${data.imported} 个租户`
   } catch (e: any) {
     error.value = e?.message || '导入失败'

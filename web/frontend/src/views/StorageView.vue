@@ -671,6 +671,11 @@ function onTenantChange() {
   blockVolumes.value = []
   buckets.value = []
   quota.value = null
+  // 「部分读取失败」是上一个租户的读取结果，同 InstancesView 的 partialWarn。
+  bootPartial.value = ''
+  blockPartial.value = ''
+  objectNs.value = ''
+  objectsNextStart.value = ''
   // 创建块卷的表单也归零。AD 名字带 tenancy 前缀（kZpB:US-ASHBURN-AD-1），
   // 换租户后 loadBlock 的预填是 `if (!availability_domain)`，不会覆盖旧值，
   // 于是把 A 的 AD 提给 B —— Oracle 只回一句看不懂的错误，而输入框看上去
