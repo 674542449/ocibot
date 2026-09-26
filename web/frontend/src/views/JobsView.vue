@@ -57,7 +57,10 @@
                 <td>
                   <span class="badge" :class="jobBadge(j.status)">{{ statusLabel(j.status) }}</span>
                 </td>
-                <td>{{ j.attempts }} / {{ j.max_attempts }} · {{ j.interval_sec }}s</td>
+                <td>
+                  <div v-if="(j.target_count || 1) > 1">已开 {{ j.created_count || 0 }} / {{ j.target_count }} 台</div>
+                  {{ j.attempts }} / {{ j.max_attempts }} · {{ j.interval_sec }}s
+                </td>
                 <td class="muted" style="font-size: 12px">
                   {{ configSummary(j) }}
                 </td>

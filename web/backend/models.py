@@ -148,6 +148,11 @@ class CapacityJob(Base):
     cooldown_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     consecutive_rate_limits: Mapped[int] = mapped_column(Integer, default=0)
     success_instance_id: Mapped[str] = mapped_column(String(128), default="")
+    # 一个任务要开几台、已经开了几台。开出一台后任务不结束，隔一个间隔继续抢，
+    # 直到 created_count >= target_count。老任务升级后是 1 / 0，行为不变。
+    # default 用字面量，_ensure_schema 才会生成 DEFAULT … NOT NULL。
+    target_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    created_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     locked_by: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     locked_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

@@ -176,3 +176,137 @@ def test_success_marks_job_done():
     assert job.enabled is False
     assert job.success_instance_id.startswith("ocid1.instance.")
     assert job.next_run_at is None
+
+
+# ---------------------------------------------------------------------------
+# 多台抢机：开出一台不能让任务收工
+# ---------------------------------------------------------------------------
+
+
+class _RecordingSession(_FakeSession):
+    """每次开机都成功，并记下这次的名字和幂等 token。"""
+
+    def __init__(self, calls: list, on_launch=None):
+        super().__init__(_Result(True, ""))
+        self._calls = calls
+        self._on_launch = on_launch
+
+    def launch_from_payload(self, payload, root_password="", custom_user_data="", idempotency_key=""):
+        self._calls.append((payload.get("display_name"), idempotency_key))
+        if self._on_launch:
+            self._on_launch()
+        n = len(self._calls)
+        return _Result(True, "创建成功", data={"instance_id": f"ocid1.instance.oc1..n{n}"})
+
+
+def _tick(sessions, job_id, *, rewind: bool = False) -> CapacityJob:
+    """跑一轮 worker。rewind=True 时先把间隔拨过去，模拟「等了一个间隔」。"""
+    if rewind:
+        long_ago = datetime.now(timezone.utc) - timedelta(hours=1)
+        with SessionLocal() as db:
+            row = db.get(CapacityJob, job_id)
+            row.next_run_at = long_ago
+            row.last_attempt_at = long_ago
+            db.commit()
+    worker = Worker()
+    worker.sessions = sessions
+    with SessionLocal() as db:
+        worker.tick_capacity(db)
+    with SessionLocal() as db:
+        return db.get(CapacityJob, job_id)
+
+
+def test_a_two_instance_job_keeps_going_after_the_first_success(monkeypatch):
+    """用户报的 bug：开 2 台 AMD，抢到 1 台任务就结束了。"""
+    import web.backend.worker as worker_mod
+
+    notes: list[str] = []
+    monkeypatch.setattr(worker_mod, "notify_user", lambda db, uid, ev, title, body: notes.append(title + "\n" + body) or [])
+
+    calls: list = []
+
+    class _Sessions:
+        def get(self, _cfg):
+            return _RecordingSession(calls)
+
+    with SessionLocal() as db:
+        owner_id, tenant_id = _seed(db)
+        db.commit()
+        job_id = _make_job(db, owner_id, tenant_id, target_count=2, created_count=0)
+
+    job = _tick(_Sessions(), job_id)
+    assert job.created_count == 1
+    assert job.enabled is True, "开出第 1 台后任务被停掉了"
+    assert job.status == "idle"
+    # 下一台要隔一个完整间隔，不能在下个轮询周期就冲出去。
+    assert job.next_run_at is not None
+    wait = (job.next_run_at.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).total_seconds()
+    assert wait > 150, wait
+    assert "1/2" in notes[-1]
+
+    # 间隔没到：再跑一轮什么也不发生。
+    _tick(_Sessions(), job_id)
+    assert len(calls) == 1
+
+    job = _tick(_Sessions(), job_id, rewind=True)
+    assert job.created_count == 2
+    assert job.status == "success"
+    assert job.enabled is False
+    assert job.next_run_at is None
+    assert job.success_instance_id == "ocid1.instance.oc1..n2"
+    assert "2/2" in notes[-1]
+
+    # 和直接批量创建同样的命名；每台一个不同的幂等 token，不会被 Oracle 当成重放。
+    assert [name for name, _ in calls] == ["i-1", "i-2"]
+    assert calls[0][1] != calls[1][1]
+    with SessionLocal() as db:
+        assert db.get(CapacityJob, job_id).launch_payload["display_name"] == "i"
+
+    # 开够了就不再动。
+    _tick(_Sessions(), job_id, rewind=True)
+    assert len(calls) == 2
+
+
+def test_a_single_instance_job_keeps_its_exact_name():
+    calls: list = []
+
+    class _Sessions:
+        def get(self, _cfg):
+            return _RecordingSession(calls)
+
+    with SessionLocal() as db:
+        owner_id, tenant_id = _seed(db)
+        db.commit()
+        job_id = _make_job(db, owner_id, tenant_id)
+
+    job = _tick(_Sessions(), job_id)
+    assert (job.status, job.created_count, job.target_count) == ("success", 1, 1)
+    assert calls[0][0] == "i"
+
+
+def test_stop_during_a_partial_success_stays_stopped():
+    """第 1/2 台开出来的同时用户点了「停止」：这台要记上，任务不能被写回「等待中」。"""
+    calls: list = []
+    holder: dict = {}
+
+    def _user_presses_stop():
+        with SessionLocal() as other:
+            row = other.get(CapacityJob, holder["id"])
+            row.enabled = False
+            row.status = "stopped"
+            other.commit()
+
+    class _Sessions:
+        def get(self, _cfg):
+            return _RecordingSession(calls, on_launch=_user_presses_stop)
+
+    with SessionLocal() as db:
+        owner_id, tenant_id = _seed(db)
+        db.commit()
+        holder["id"] = _make_job(db, owner_id, tenant_id, target_count=2)
+
+    job = _tick(_Sessions(), holder["id"])
+    assert job.created_count == 1
+    assert job.enabled is False
+    assert job.status == "stopped"
+    assert job.next_run_at is None

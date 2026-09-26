@@ -334,14 +334,14 @@
             type="number"
             min="1"
             max="8"
-            :disabled="form.as_retry"
-            :title="form.as_retry ? '容量重试每次只抢 1 台' : '一次创建多台相同配置的实例，名称自动加 -1 -2 …'"
+            title="一次创建多台相同配置的实例，名称自动加 -1 -2 …"
           />
           <p class="muted" style="margin: 0.2rem 0 0; font-size: 12px">
-            <template v-if="form.as_retry">容量重试每次只抢 1 台</template>
-            <template v-else-if="form.count > 1">
-              将创建 {{ form.count }} 台，名称 {{ form.display_name || 'instance' }}-1 …
-              {{ form.display_name || 'instance' }}-{{ form.count }}；额度按总量校验
+            <template v-if="batchCount > 1">
+              {{ form.as_retry ? '抢够' : '将创建' }} {{ batchCount }} 台，名称
+              {{ form.display_name || 'instance' }}-1 … {{ form.display_name || 'instance' }}-{{ batchCount }}；额度按总量校验{{
+                form.as_retry ? '；开出一台后继续抢下一台，开够才结束' : ''
+              }}
             </template>
             <template v-else>默认 1 台</template>
           </p>
@@ -626,7 +626,6 @@ function quotaStatusLabel(status: string): string {
  *  「已用 — / —」 just looks broken. */
 const batchCount = computed(() => {
   const n = Math.floor(Number(form.count) || 1)
-  if (form.as_retry) return 1
   return Math.min(8, Math.max(1, n))
 })
 
@@ -1086,6 +1085,14 @@ const confirmRows = computed(() => {
         : '—',
     ],
     ['显示名称', form.display_name || '—'],
+    ...(batchCount.value > 1
+      ? ([
+          [
+            '数量',
+            `${batchCount.value} 台（${form.display_name || 'instance'}-1 … -${batchCount.value}）`,
+          ],
+        ] as [string, string][])
+      : []),
     ['AD', form.availability_domain || '—'],
     ['镜像', img?.label || img?.display_name || form.image_id || '—'],
     ['Shape', form.shape || '—'],
@@ -1099,6 +1106,8 @@ const confirmRows = computed(() => {
       '容量重试',
       form.as_retry
         ? `是 · 间隔 ${form.retry_interval_sec}s · 最多 ${form.retry_max_attempts} 次${
+            batchCount.value > 1 ? ` · 开够 ${batchCount.value} 台为止` : ''
+          }${
             form.retry_all_ads ? ' · 轮询全部 AD' : ''
           }${
             fallbacks.value.length

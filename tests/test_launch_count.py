@@ -295,14 +295,45 @@ def test_an_operator_supplied_password_is_reused(client, monkeypatch):
     assert {x["root_password"] for x in calls} == {"MyOwnPass123!"}
 
 
-def test_capacity_retry_refuses_a_batch(client, monkeypatch):
-    """One job per tenant, one machine per job — creating a single instance
-    silently would look like the count field was ignored."""
+def test_capacity_retry_accepts_a_batch(client, monkeypatch):
+    """要 2 台 AMD 的人以前只能拿到 1 台：这里 400、前端又把数量锁成 1。
+    现在是一个任务带着 target_count 入队，额度按总量校验，开机全交给 worker。"""
     c, tid = client
-    _stub_launch(monkeypatch)
-    r = c.post(f"/api/tenants/{tid}/launch", json=_body(count=3, as_retry=True))
-    assert r.status_code == 400, r.text
-    assert "1 台" in r.json()["detail"]
+    calls = _stub_launch(monkeypatch)
+    stubbed_build = instances_router.build_launch_request
+    monkeypatch.setattr(
+        instances_router,
+        "build_launch_request",
+        lambda body, meta=None: {
+            **stubbed_build(body, meta),
+            "retry_interval_sec": 120,
+            "retry_max_attempts": 50,
+            "availability_domains": [],
+        },
+    )
+    guard_counts: list[int] = []
+    monkeypatch.setattr(
+        instances_router,
+        "enforce_launch_quota",
+        lambda *a, **k: guard_counts.append(k.get("count")),
+    )
+    r = c.post(f"/api/tenants/{tid}/launch", json=_body(count=2, as_retry=True))
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["ok"] is True and d["capacity_job_id"], d
+    assert "2 台" in d["message"]
+    assert calls == [], "入队路径不能自己发 LaunchInstance，那是 worker 的事"
+    assert guard_counts == [2], "额度必须按两台的总量校验"
+
+    from web.backend.models import CapacityJob
+
+    with SessionLocal() as db:
+        job = db.get(CapacityJob, d["capacity_job_id"])
+        assert (job.target_count, job.created_count) == (2, 0)
+        # 存的是原名，编号由 worker 每次开机时加。
+        assert job.launch_payload["display_name"] == "web"
+        db.delete(job)
+        db.commit()
 
 
 def test_count_is_bounded(client, monkeypatch):

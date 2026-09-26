@@ -298,6 +298,9 @@ export type CapacityJob = {
   cooldown_until: string | null
   consecutive_rate_limits: number
   success_instance_id: string
+  /** 多台抢机：目标台数 / 已开出台数（单台任务是 1 / 0 或 1 / 1）。 */
+  target_count: number
+  created_count: number
   created_at: string
   updated_at: string
   launch_payload: Record<string, unknown>

@@ -62,6 +62,8 @@ def _capacity_out(row: CapacityJob) -> CapacityJobOut:
         cooldown_until=row.cooldown_until,
         consecutive_rate_limits=row.consecutive_rate_limits or 0,
         success_instance_id=row.success_instance_id or "",
+        target_count=max(1, int(row.target_count or 1)),
+        created_count=int(row.created_count or 0),
         created_at=row.created_at,
         updated_at=row.updated_at,
         launch_payload=dict(row.launch_payload or {}),

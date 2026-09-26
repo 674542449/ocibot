@@ -904,15 +904,10 @@ def launch_instance(
     job_root_password = str(built.get("root_password") or "")
     boot_vpu = int(payload.get("boot_volume_vpus_per_gb") or 10)
 
+    # 容量重试也接受 count > 1：还是一个租户一个任务、所有 LaunchInstance 都由
+    # worker 发，只是任务带着 target_count，开出一台后继续抢，直到开够为止。
+    # 以前这里直接 400，前端又把数量框锁成 1 —— 想要 2 台的人只能拿到 1 台。
     count = max(1, int(body.count or 1))
-    if count > 1 and built["as_retry"]:
-        # Capacity retry is one machine per job by design (one active job per
-        # tenant, and the worker owns every LaunchInstance call). Silently
-        # creating one would look like the count field was ignored.
-        raise HTTPException(
-            status_code=400,
-            detail="容量重试每次只能抢 1 台。请把数量改回 1，或关闭「加入容量重试」后再批量创建。",
-        )
 
     # Always Free guard BEFORE network/NSG prep so we don't leave orphan resources.
     timer.mark("pre")
@@ -1036,10 +1031,13 @@ def launch_instance(
                     detail="该租户已有进行中的容量重试任务，请先在任务中心停止或删除后再新建",
                 )
             now = datetime.now(timezone.utc)
+            job_name = f"容量重试 · {payload.get('display_name') or 'instance'}"
+            if count > 1:
+                job_name += f" ×{count}"
             job = CapacityJob(
                 owner_id=user.id,
                 tenant_id=row.id,
-                name=f"容量重试 · {payload.get('display_name') or 'instance'}",
+                name=job_name,
                 enabled=True,
                 status="idle",
                 launch_payload=payload,
@@ -1050,6 +1048,8 @@ def launch_instance(
                 interval_sec=int(built["retry_interval_sec"]),
                 max_attempts=int(built["retry_max_attempts"]),
                 attempts=0,
+                target_count=count,
+                created_count=0,
                 next_run_at=now,
             )
             db.add(job)
@@ -1060,7 +1060,8 @@ def launch_instance(
             _audit_launch(False, "已加入容量重试队列", "", job.id)
             retry_msg = (
                 f"已加入容量重试：后台将每 {job.interval_sec}s 尝试一次"
-                f"（最多 {job.max_attempts} 次）。请在「任务中心」查看进度与日志"
+                + (f"，开够 {count} 台为止" if count > 1 else "")
+                + f"（最多 {job.max_attempts} 次）。请在「任务中心」查看进度与日志"
                 "（需保持 worker 进程运行）。"
             )
             warns = extra_warnings + format_guard_warnings(launch_guard)

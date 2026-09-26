@@ -543,6 +543,9 @@ class CapacityJobOut(BaseModel):
     cooldown_until: Optional[UtcDatetime] = None
     consecutive_rate_limits: int
     success_instance_id: str
+    # 多台抢机：目标台数 / 已开出台数。单台任务是 1 / 0（成功后 1 / 1）。
+    target_count: int = 1
+    created_count: int = 0
     created_at: UtcDatetime
     updated_at: UtcDatetime
     launch_payload: dict[str, Any] = Field(default_factory=dict)

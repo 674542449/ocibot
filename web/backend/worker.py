@@ -435,6 +435,12 @@ class Worker:
 
         interval = clamp_retry_interval(job.interval_sec)
         payload = dict(job.launch_payload or {})
+        # 多台任务：这一次抢的是第 created_count + 1 台。命名和直接批量创建一致
+        # （base-1、base-2 …），只改这一次的副本，launch_payload 里存的还是原名。
+        target_count = max(1, int(job.target_count or 1))
+        if target_count > 1:
+            base_name = str(payload.get("display_name") or "instance")
+            payload["display_name"] = f"{base_name}-{int(job.created_count or 0) + 1}"
         ad, cfg_override, cfg_label = self._attempt_plan(job)
         if ad:
             payload["availability_domain"] = ad
@@ -696,12 +702,27 @@ class Worker:
             self._release_launch_lock()
 
         if result.ok:
-            job.status = "success"
-            job.enabled = False
+            # 开出一台不等于任务结束：target_count > 1 时还要接着抢，直到开够。
+            # 以前这里无条件 success + enabled=False，要 2 台的任务开出第 1 台就收工了。
+            job.created_count = int(job.created_count or 0) + 1
+            finished = job.created_count >= target_count
             job.last_error = ""
             job.consecutive_rate_limits = 0
             job.cooldown_until = None
-            job.next_run_at = None
+            if finished:
+                job.status = "success"
+                job.enabled = False
+                job.next_run_at = None
+            elif self._stopped_during_attempt(job):
+                # 用户在这次尝试进行中点了「停止」：这台照样记上，但不再接着抢。
+                job.enabled = False
+                job.status = "stopped"
+                job.next_run_at = None
+            else:
+                # 还没开够：回到排队，隔一个完整间隔再抢下一台（不加抖动也不缩短，
+                # tick_capacity 那道 last_attempt_at 地板同样兜着）。
+                job.status = "idle"
+                job.next_run_at = _utcnow() + timedelta(seconds=interval)
             data = getattr(result, "data", None)
             inst_id = ""
             if isinstance(data, dict):
@@ -720,7 +741,13 @@ class Worker:
             self._log_attempt(
                 db, job, ok=True, message=attempt_note, ad=ad, config_label=cfg_label
             )
-            log.info("capacity SUCCESS job=%s instance=%s", job.id, inst_id or "?")
+            log.info(
+                "capacity SUCCESS job=%s instance=%s (%s/%s)",
+                job.id,
+                inst_id or "?",
+                job.created_count,
+                target_count,
+            )
             # Apply Always-Free boot VPU (fire-and-forget so the worker isn't blocked
             # by hydration). Previously only the API immediate-attempt did this.
             boot_vpu = int(payload.get("boot_volume_vpus_per_gb") or 10)
@@ -751,18 +778,32 @@ class Worker:
             # 而机器已经开出来了。通知是 best-effort 的，本来就不需要待在事务里。
             owner_id = job.owner_id
             job_name, job_attempts = job.name, job.attempts
+            created_count, job_status = job.created_count, job.status
             # job.id 也要在 commit 之前取：commit 会 expire 这些属性，之后再读
             # job.id 会多打一次 SELECT，而任务如果刚好被删掉还会抛出来。
             job_id = job.id
             db.commit()
+            if target_count <= 1:
+                progress = ""
+            elif finished:
+                progress = f"{target_count} 台已全部开出，任务结束。\n"
+            elif job_status == "stopped":
+                progress = f"已开出 {created_count}/{target_count} 台，任务已被停止。\n"
+            else:
+                progress = (
+                    f"已开出 {created_count}/{target_count} 台，"
+                    f"约 {interval}s 后继续抢下一台。\n"
+                )
             results = notify_user(
                 db,
                 owner_id,
                 "capacity",
-                "🎉 OCIBot 抢机成功",
+                "🎉 OCIBot 抢机成功"
+                + (f"（{created_count}/{target_count}）" if target_count > 1 else ""),
                 (
                     f"任务「{job_name}」第 {job_attempts} 次尝试成功！\n"
-                    f"实例：{display_name}\n"
+                    + progress
+                    + f"实例：{display_name}\n"
                     f"型号：{shape}" + (f"（{cfg_label}）" if cfg_label else "") + "\n"
                     f"可用域：{ad}\n"
                     f"OCID：{inst_id or '待查询'}\n"
@@ -939,6 +980,24 @@ class Worker:
             # 把这次抢机的结果打掉不可以。
             log.exception("record notify failure failed target=%s", target)
 
+    @staticmethod
+    def _stopped_during_attempt(job: CapacityJob) -> bool:
+        """用户是不是在这次尝试进行中点了「停止」。
+
+        LaunchInstance 要跑好几秒，而 job 是尝试开始前读进来的，内存里的 enabled
+        还是 True。调用方接下来要写 status="idle"，不先看一眼库里的真实状态，就会把
+        用户的「已停止」改回「等待中」—— 任务其实不会再跑（enabled 仍是 False），
+        界面却说它在排队。
+
+        用一个**独立的短会话**去读：调用方的会话可能还停在尝试开始前开的那个读事务
+        里，SQLite 的 WAL 快照隔离下它看不到之后才提交的「停止」。
+        """
+        with SessionLocal() as fresh:
+            still_enabled = fresh.scalar(
+                select(CapacityJob.enabled).where(CapacityJob.id == job.id)
+            )
+        return still_enabled is False
+
     def _handle_capacity_error(
         self,
         db: Session,
@@ -951,17 +1010,8 @@ class Worker:
     ) -> None:
         job.last_error = msg[:2000]
         now = _utcnow()
-        # 用户可能在这次尝试进行中点了「停止」：LaunchInstance 要跑好几秒，而 job 是
-        # 尝试开始前读进来的，内存里的 enabled 还是 True。下面每条分支都会写
-        # status="idle"，不先看一眼库里的真实状态，就会把用户的「已停止」改回「等待中」
-        # —— 任务其实不会再跑（enabled 仍是 False），界面却说它在排队。
-        # 用一个**独立的短会话**去读：本会话可能还停在尝试开始前开的那个读事务里，
-        # SQLite 的 WAL 快照隔离下它看不到之后才提交的「停止」。
-        with SessionLocal() as fresh:
-            still_enabled = fresh.scalar(
-                select(CapacityJob.enabled).where(CapacityJob.id == job.id)
-            )
-        if still_enabled is False:
+        # 下面每条分支都会写 status="idle"，先确认用户没有在尝试进行中点「停止」。
+        if self._stopped_during_attempt(job):
             job.enabled = False
             job.status = "stopped"
             job.next_run_at = None
@@ -1093,6 +1143,10 @@ class Worker:
                 f"任务「{job.name}」遇到非容量错误，已停止（第 {job.attempts} 次尝试）。\n"
                 f"错误：{(job.last_error or '')[:400]}"
             )
+        target_count = max(1, int(job.target_count or 1))
+        if target_count > 1:
+            # 多台任务停在半路时，已经开出来的那几台是真机器（占额度或在计费），要说清楚。
+            body += f"\n本任务目标 {target_count} 台，已开出 {int(job.created_count or 0)} 台。"
         results = notify_user(db, job.owner_id, "capacity", title, body)
         # 「任务停了」这条通知没送到，比「抢机成功」没送到还要静默：任务在面板上
         # 只是变成 failed / 停止，操作员不会收到任何提醒，可能一整晚都以为还在跑。
