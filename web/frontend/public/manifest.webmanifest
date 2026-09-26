@@ -1,0 +1,14 @@
+{
+  "name": "OCIBot",
+  "short_name": "OCIBot",
+  "description": "Oracle Cloud 多租户实例管理面板",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f5f4ed",
+  "theme_color": "#f5f4ed",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/logo.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}

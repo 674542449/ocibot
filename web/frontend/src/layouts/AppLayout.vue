@@ -6,6 +6,7 @@
       <button type="button" class="icon-btn" aria-label="打开菜单" @click="navOpen = true">
         <Icon name="menu" :size="20" />
       </button>
+      <img class="mobile-mark" src="/logo.svg" width="26" height="26" alt="" />
       <div class="mobile-brand">
         <span class="title">OCIBot</span>
         <span class="muted small">{{ pageTitle }}</span>
@@ -14,22 +15,11 @@
 
     <aside class="sidebar">
       <div class="brand">
-        <!-- 内联而不是 <img src="/logo.svg">：img 里的 currentColor 拿不到外部
-             CSS，标记就只能写死一个颜色。内联之后它跟着 --accent 走，
-             改配色只需要改 styles.css 一处。public/logo.svg 是同一套几何的写死颜色版，
-             给 apple-touch-icon 那类没有 CSS 上下文的地方用 —— 改一个要改全部
-             （还有 favicon.svg 和 scripts/make_favicon.py，tests/test_brand_mark.py 钉着）。
-
-             标记「环与核心」：环 = 云上的资源池，核心 = 面板管着的那台机器。 -->
-        <svg
-          class="brand-mark"
-          viewBox="0 0 32 32"
-          role="img"
-          aria-label="OCIBot"
-        >
-          <circle cx="16" cy="16" r="11" fill="none" stroke="currentColor" stroke-width="4.2" />
-          <circle cx="16" cy="16" r="4.2" fill="currentColor" />
-        </svg>
+        <!-- 直接引用 /logo.svg，和标签页图标、登录页、主屏图标是同一个文件 ——
+             全站只有这一个标记（底板 + 白色环与核心）。以前这里内联了一份跟随
+             --accent 的无底板字形，结果侧边栏、登录页、favicon 三处长得各不一样。
+             改标记见 scripts/make_favicon.py，tests/test_brand_mark.py 钉着各处。 -->
+        <img class="brand-mark" src="/logo.svg" width="34" height="34" alt="OCIBot" />
         <button
           type="button"
           class="icon-btn sidebar-close"
@@ -437,23 +427,17 @@ onBeforeUnmount(() => {
 }
 
 /* 标记本身就是品牌，旁边不再有文字，所以它得自己撑住这块区域。
-   跟着 --accent 走：陶土橙，在象牙白底色上 4.8:1。
-   不加投影 —— 这是个透明字形不是贴纸，投影只会让它显得像贴上去的。 */
+   就是 /logo.svg 本身（自带陶土橙底板），不加投影、不加悬停变色 —— 全站各处
+   看到的必须是同一个图形。 */
 .brand-mark {
   width: 34px;
   height: 34px;
   flex: 0 0 auto;
   display: block;
-  color: var(--accent);
-  transition: color 160ms ease;
 }
-.brand:hover .brand-mark {
-  color: var(--accent-hover);
-}
-@media (prefers-reduced-motion: reduce) {
-  .brand-mark {
-    transition: none;
-  }
+
+.mobile-mark {
+  display: none;
 }
 
 .account-line {
@@ -657,6 +641,15 @@ onBeforeUnmount(() => {
     border-bottom: 1px solid var(--border);
     padding: 0.4rem 0.55rem;
     padding-top: max(0.4rem, env(safe-area-inset-top));
+  }
+
+  /* 手机顶栏也放同一个标记：以前这里只有「OCIBot」两个字，是全站唯一
+     没有 logo 的入口。 */
+  .mobile-mark {
+    display: block;
+    width: 26px;
+    height: 26px;
+    flex: 0 0 auto;
   }
 
   .mobile-brand {

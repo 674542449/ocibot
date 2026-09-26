@@ -1,10 +1,32 @@
-# 自托管云实例管理面板
+<p align="center">
+  <img src="web/frontend/public/logo.svg" width="88" height="88" alt="OCIBot" />
+</p>
 
-一个部署在自己服务器上的多账号云资源管理面板。
+<h1 align="center">OCIBot</h1>
 
-用于在一处统一管理多个云账号：创建与维护实例、容量不足时自动重试、WebSSH、存储与防火墙规则，以及备份恢复。
+<p align="center">
+  自托管的 Oracle Cloud Infrastructure（OCI）多账号管理面板<br />
+  在一处管理多个 OCI 租户：创建与维护实例、容量不足自动重试、WebSSH、存储与防火墙、备份恢复
+</p>
 
-技术栈为 FastAPI + Vue 3 + PostgreSQL。面板版本以 `/api/health` 的 `version` 与 [CHANGELOG.md](CHANGELOG.md) 为准。
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white" alt="Python 3.12" />
+  <img src="https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white" alt="FastAPI" />
+  <img src="https://img.shields.io/badge/Vue-3-4FC08D?logo=vuedotjs&logoColor=white" alt="Vue 3" />
+  <img src="https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white" alt="PostgreSQL 16" />
+  <img src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white" alt="Docker Compose" />
+</p>
+
+面板部署在你自己的服务器上，OCI API 私钥只在服务端加密保存、不回传浏览器。
+当前版本以 `/api/health` 返回的 `version` 与 [CHANGELOG.md](CHANGELOG.md) 为准。
+
+> 本项目与 Oracle 公司无关，不是 Oracle 官方产品。所有云端操作都通过 Oracle 官方
+> OCI Python SDK 完成。
+
+**文档导航**：[快速安装](#快速安装推荐) · [手动部署](#手动-docker-部署) · [配置说明](#配置说明) ·
+[安全建议](#安全建议上线前) · [本地开发](#本地开发) · [故障排查](#故障排查) ·
+[部署细节](docs/DEPLOY.md) · [访问方式](docs/ACCESS-MODES.md) · [换机重装](docs/REDEPLOY.md) ·
+[NPM 反代](docs/NPM-REVERSE-PROXY.md) · [安全审计](web/AUDIT.md) · [变更记录](CHANGELOG.md)
 
 ---
 
@@ -12,16 +34,18 @@
 
 | 模块 | 能力 |
 |------|------|
-| 账号 | 注册 / 登录、HttpOnly Cookie 会话、可选 TOTP、管理员用户管理 |
-| 租户 | 多组 API 配置、私钥 Fernet 加密存库、连接测试、账号等级识别、开通附加区域（其他国家 / 地区）、多选批量删除、删除保护 |
-| 实例 | 列表 / 详情、电源操作、重命名、监控曲线、公网 IP / IPv6 |
-| 创建 | 免费额度预设、自动默认网络、容量不足自动重试（Worker 执行）、可批量创建、可在附加区域创建 |
-| 终端 | 浏览器 WebSSH；串口 / VNC 控制台连接 |
-| 存储 | 引导卷扩容与备份、块存储、对象存储 |
-| 网络 | NSG 防火墙规则、保留公网 IP |
-| 任务 | 容量重试任务 |
+| 账号 | 注册 / 登录、HttpOnly Cookie 会话、可选 TOTP 两步验证、全设备退出、管理员用户管理 |
+| 租户 | 粘贴 `~/.oci/config` + 私钥导入、私钥 Fernet 加密存库、测试连接、账号等级识别、「锁定默认」租户、多选批量删除、删除保护（受保护的排在最前）、区域显示 Oracle 官方中文名 |
+| 副区 | 查看 / 开通同一账号的其他国家与地区，开通后自动添加同凭据的副区租户 |
+| 实例 | 列表 / 搜索 / 导出 CSV、详情、开关机与重启、重命名、改 Flex 规格、终止保护、root 密码查看、监控曲线、引导日志、「以此为模板创建」 |
+| 创建 | Always Free 额度预设与硬拦截、Ubuntu / Oracle Linux / 已有自定义镜像、自动准备默认网络、root + SSH 公钥 / root + 密码、首次启动脚本（cloud-init）、一次批量创建多台、可在副区创建 |
+| 容量重试 | 容量不足时由 Worker 按合规间隔自动重试、可轮询全部 AD、Flex 降级候选、实时尝试日志、结果推送通知 |
+| 网络 | 更换临时公网 IP、保留公网 IP、分配 / 取消 IPv6、实例安全组（NSG）与子网安全列表规则管理、一键放行 Cloudflare 网段、一键修复 / 收紧 |
+| 终端 | 浏览器 WebSSH（主机密钥按实例校验）；串口 / VNC 控制台连接 |
+| 存储 | 引导卷扩容与性能（VPU）调整（可选自动扩展文件系统）、引导卷备份、块存储、对象存储 |
+| 账号用量 | Always Free 额度仪表盘、近 30 天费用、每月账单 |
 | 通知 | Telegram / Bark / ServerChan / Webhook / SMTP（含 SSRF 防护） |
-| 运维 | 加密租户备份、面板内一键更新（Docker 部署） |
+| 运维 | 审计日志、加密租户备份与恢复、面板内一键更新（Docker 部署，默认关闭） |
 
 ---
 
@@ -267,11 +291,45 @@ npm install
 npm run dev
 ```
 
-测试：
+前端开发服务器默认 `http://127.0.0.1:5173`，会把 `/api` 代理到 8000 端口。
+需要 Node.js 22（与 `web/Dockerfile` 构建用的 `node:22-alpine` 一致）。
+
+### 提交前检查
 
 ```bash
-python -m pytest tests -q
+# 后端：全量测试（并行；用 -n 6，不要用 -n auto，原因见 pytest.ini）
+python -m pytest tests -q -n 6
+
+# 前端：类型检查 + 生产构建（两者都只查类型 / 语法，逻辑要靠自己想清楚）
+cd web/frontend
+npx vue-tsc --noEmit -p tsconfig.json
+npm run build
 ```
+
+`tests/test_endpoint_smoke.py` 会用一个桩 OCI 会话把每个接口都调一遍、任何 5xx 都算失败 ——
+新增接口请把它加进去。
+
+### 发版约定
+
+- **每次改动都要升版本**：`web/backend/config.py` 里的 `app_version` 与 `CHANGELOG.md`
+  最新的 `## X.Y.Z` 标题必须在同一个提交里一起改（`tests/test_version_bump.py` 会检查）。
+  `/api/health` 的版本号是运维确认「更新到底生效没有」的唯一手段
+- **不要删除数据库里还存在的列**：`_ensure_schema()` 只加列不删列，功能下线时保留映射，
+  否则老库的 INSERT 会因 NOT NULL 失败（详见 `CLAUDE.md`）
+- 更多「刻意这样设计、不要改回去」的约定见 [CLAUDE.md](CLAUDE.md)
+
+### 品牌标记与图标
+
+全站只有一个标记，所有位置都来自同一份几何：
+
+| 文件 | 用途 |
+|------|------|
+| `web/frontend/public/logo.svg` | 唯一的矢量源：侧边栏、手机顶栏、登录页、README 顶部都引用它 |
+| `web/frontend/public/favicon.svg` | 标签页图标，与 `logo.svg` 逐字相同 |
+| `favicon.ico` / `apple-touch-icon.png` / `icon-192.png` / `icon-512.png` | 由 `python scripts/make_favicon.py` 生成的位图（标签页兜底、iOS 主屏、Android / PWA） |
+
+要改标记：先改 `scripts/make_favicon.py` 里的几何常量并重跑，再同步两个 SVG；
+`tests/test_brand_mark.py` 会检查它们是否一致。
 
 ---
 
@@ -279,17 +337,28 @@ python -m pytest tests -q
 
 ```
 ocibot/
-├── app/                 # 云 API 业务层（与 Web 共用）
+├── app/                        # OCI 业务层（SDK 调用、额度计算、格式化），与 Web 共用
 ├── web/
-│   ├── backend/         # FastAPI、Worker、认证、通知、自更新
-│   ├── frontend/        # Vue 3 控制台
-│   └── .env.example
+│   ├── backend/                # FastAPI 应用、Worker、认证、通知、自更新
+│   │   └── routers/            # 各页面对应的 API 路由
+│   ├── frontend/               # Vue 3 + Vite + TypeScript 控制台
+│   │   ├── public/             # logo、favicon、PWA 清单与图标
+│   │   └── src/                # 页面（views）、布局、组件、样式
+│   ├── Dockerfile
+│   └── .env.example            # 环境变量模板（密钥项故意留空）
+├── tests/                      # pytest 测试（含接口冒烟、安全回归）
+├── docs/                       # 部署、访问方式、换机重装、反代说明
+├── deploy/Caddyfile            # 域名模式下内置 Caddy 的配置
 ├── scripts/
-│   ├── install.sh       # Linux/macOS 安装与更新
-│   └── install.ps1      # Windows 安装与更新
+│   ├── install.sh              # Linux / macOS 安装、更新、切换访问方式
+│   ├── install.ps1             # Windows 安装与更新
+│   ├── setup-proxy.sh          # 接入已有 Nginx Proxy Manager
+│   ├── make_favicon.py         # 生成全部位图图标
+│   └── trim_oci_sdk.py         # 构建镜像时裁掉用不到的 OCI SDK 模块
 ├── docker-compose.yml
 ├── docker-compose.update.yml   # 可选叠加层：面板内一键更新（docker.sock）
 ├── CHANGELOG.md
+├── CLAUDE.md                   # 维护约定（发版、兼容性、刻意的设计）
 └── README.md
 ```
 
@@ -297,8 +366,14 @@ ocibot/
 
 ## 使用提示
 
-- **实例列表**默认显示第一个租户；可在下拉框切换，不再默认聚合全部租户
-- **密码到期提醒**是面板本地策略（可改天数，`0` 关闭），不会替你修改云控制台密码
+- **各页面不会自动拉取 Oracle 数据**，进入页面后点「刷新 / 加载配置」才发请求 ——
+  这是为了把 API 调用额度留给容量重试，不是 bug
+- **实例列表**一次显示一个租户（默认第一个，或「锁定默认」的那个）；可在下拉框切换，
+  不提供跨租户的聚合列表
+- **密码到期查询**（租户页按钮）读取 Oracle Identity Domain 的 `defaultPasswordPolicy`；
+  若仍设着有效期，会顺手调用 Oracle 接口关闭强制改密，结果以提示条显示
+- **删除保护**只挡删除（单个、批量都会拒绝），编辑、测试连接照常可用；副区随主租户一起删，
+  所以任一副区受保护时，主租户也删不了
 - **容量重试**由 Worker 执行；侧栏会提示 Worker 是否在线。它是唯一会主动发起云 API
   请求的后台功能，且仅在存在任务时运行；`OCIBOT_WORKER_BACKGROUND_OCI=0` 可完全停掉
 - **备份恢复**导出加密 ZIP，导入只创建当前用户名下的新租户，不会覆盖他人数据
@@ -357,7 +432,10 @@ ocibot/
 
 ## 许可证与免责
 
-本项目按仓库内许可证条款提供。请遵守所用云服务商的服务条款与当地法规；容量重试、自动操作等能力由使用者自行配置与承担风险。
+仓库目前尚未附带开源许可证文件（`LICENSE`）。
+
+本项目与 Oracle 公司无关。请遵守 Oracle Cloud 的服务条款与当地法规；容量重试、
+自动操作等能力由使用者自行配置并承担风险。
 
 ---
 

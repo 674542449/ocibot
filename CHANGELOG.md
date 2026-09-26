@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.4.122 — 2026-09-26
+
+全站 LOGO / 网站图标统一成同一个标记；补齐 iOS 与 Android 主屏图标；完善项目文档。
+
+### 变更
+
+- **所有 LOGO 与网站图标统一。** 以前同一个「环与核心」有三种样子：侧边栏是跟随强调色、
+  没有底板的橙色字形（`#AE4F2B`），登录页和标签页是陶土橙底板上的白色字形（`#C6613F`），
+  深色标签栏下 favicon 又换成更亮的一档。现在：
+  - `public/logo.svg` 是唯一的矢量源；侧边栏、**手机顶栏（以前只有文字、没有 logo）**、
+    登录页、README 顶部都直接引用它；
+  - `public/favicon.svg` 与 `logo.svg` 逐字相同，去掉了按系统深浅色换底板颜色的变体；
+  - 位图全部由 `scripts/make_favicon.py` 按同一套几何生成。
+- **补上 iOS 主屏图标。** `apple-touch-icon` 以前指向 `logo.svg`，而 iOS 不认 SVG ——
+  等于没有图标。现在是 180×180 PNG，**不带圆角**（iOS 自己套蒙版，透明四角会被垫成黑色）。
+- **新增 PWA 清单** `manifest.webmanifest`（192 / 512 PNG + SVG 图标、象牙白主题色），
+  Android「添加到主屏幕」有正确的图标和名称。后端给它单独一条路由，固定
+  `Content-Type: application/manifest+json`（不少发行版的 mimetypes 不认 `.webmanifest`）。
+
+### 文档
+
+- **README**：顶部加 LOGO、项目一句话介绍（明确是 Oracle Cloud / OCI 管理面板，且非 Oracle
+  官方项目）、技术栈徽章、文档导航；功能表按现状重写（副区、删除保护、终止保护、防火墙
+  与 Cloudflare 网段、账号用量、审计日志等）；补「提交前检查」「发版约定」「品牌标记与图标」
+  三节；目录结构补全 `tests/`、`docs/`、`deploy/` 和各脚本。
+- **修正过时 / 不实的内容**：
+  - 「密码到期提醒是面板本地策略」—— 该功能早已移除，改为说明现在的「密码到期查询」；
+  - 「按仓库内许可证条款提供」—— 仓库里其实没有 `LICENSE` 文件，改为如实说明；
+  - `docs/DEPLOY.md` 说根目录 compose 默认挂 `docker.sock` 并开启自更新 —— 0.4.80 起
+    已默认关闭、需 `install.sh update-on`；HTTPS 一节补上内置 Caddy 的 `install.sh domain`；
+  - `docs/REDEPLOY.md` 还让人备份「定时开关机任务」—— 该功能 0.4.36 已删除；
+  - `web/README.md` 写着 `OCIBOT_API_WORKERS` 默认 2、密钥有 dev 默认值 —— 实际默认 1、
+    密钥必填；改为只记录 `web/` 目录结构，其余指向根 README；
+  - `web/PARITY.md` 按现有功能重写，删掉已移除的定时开关机、跨租户聚合视图、本地密码提醒，
+    并列出「刻意移除、不要加回来」的功能。
+
+### 维护
+
+- `tests/test_brand_mark.py` 改为钉住「单一来源」：各处都引用 `/logo.svg`、favicon.svg 与之
+  逐字相同、生成脚本几何与颜色一致、PNG 尺寸正确且 iOS 图标四角不透明、清单里的图标都存在、
+  后端以正确类型提供清单与 PNG。
+
+### 升级
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.122
+```
+
+浏览器会缓存标签页图标，没变的话硬刷新（Ctrl+F5）一次；已添加到手机主屏的需要删掉重新添加。
+
 ## 0.4.121 — 2026-09-26
 
 新 LOGO：「环与核心」。

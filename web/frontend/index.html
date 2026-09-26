@@ -9,11 +9,14 @@
     <meta name="theme-color" content="#f5f4ed" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="description" content="OCIBot — Oracle Cloud 多租户实例管理面板" />
-    <!-- SVG 优先（清晰、跟随系统配色），.ico 兜底：Safari 老版本和一些抓取
-         网站图标的工具只认 /favicon.ico，没有它那边就是一个空白方块。 -->
+    <!-- 所有图标都是同一个标记（public/logo.svg，位图由 scripts/make_favicon.py 生成）。
+         SVG 优先（清晰），.ico 兜底：Safari 老版本和一些抓取网站图标的工具只认
+         /favicon.ico，没有它那边就是一个空白方块。apple-touch-icon 必须是 PNG ——
+         iOS 不认 SVG，以前指向 logo.svg 等于没有主屏图标。 -->
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="icon" sizes="16x16 32x32 48x48 64x64" href="/favicon.ico" />
-    <link rel="apple-touch-icon" href="/logo.svg" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/manifest.webmanifest" />
     <title>OCIBot</title>
     <script>
       // 会话探测提前到这里发，别等 JS 跑起来。

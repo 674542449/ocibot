@@ -36,18 +36,27 @@ Docker Compose 固定使用 **PostgreSQL 16**（服务名 `db`）。
 
 ### 网页（管理员）
 
-打开 **用户管理 → 系统更新**：
+**默认关闭**，需要先在宿主机上打开：
+
+```bash
+./scripts/install.sh update-on    # 打开
+./scripts/install.sh update-off   # 关掉
+```
+
+打开后在 **用户管理 → 系统更新**：
 
 1. **检查更新** — 查询 GitHub 最新 commit  
 2. **一键更新** — 宿主机 `git pull` + `docker compose up -d --build`  
 
-`install.sh` / 根目录 compose 默认已挂载：
+`update-on` 会叠加 `docker-compose.update.yml`，只有这时才挂载：
 
-- 宿主机仓库 → 容器 `/host/ocibot`  
+- 宿主机仓库（可写）→ 容器 `/host/ocibot`  
 - `/var/run/docker.sock`  
 - `OCIBOT_UPDATE_ENABLED=1`  
 
-接口仅管理员可调用；公网请配合强密码 / TOTP / HTTPS。
+代价：**任何一个管理员会话，或 API 进程里任何一处代码执行，都等于宿主机 root**。
+接口仅管理员可调用；多管理员或管理员不完全可信的安装请保持关闭，用上面的 SSH 方式更新。
+（0.4.80 之前这些挂载是无条件的，详见根目录 README「更新」一节。）
 
 ## 性能相关
 
@@ -80,7 +89,11 @@ OCIBOT_DB_MAX_OVERFLOW=40
 
 ## HTTPS
 
-前面加 Caddy / Nginx / Cloudflare Tunnel，并设置：
+**推荐用面板自带的**：`./scripts/install.sh domain panel.example.com` 会启用内置 Caddy
+自动签发 / 续期证书，并成组改好 Cookie、限流、端口绑定（见 [ACCESS-MODES.md](ACCESS-MODES.md)）。
+
+已经有自己的反代（Nginx / Nginx Proxy Manager / Cloudflare Tunnel）时，放在它后面并设置
+（NPM 见 [NPM-REVERSE-PROXY.md](NPM-REVERSE-PROXY.md)）：
 
 ```
 OCIBOT_COOKIE_SECURE=1

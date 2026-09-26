@@ -386,6 +386,15 @@ def create_app() -> FastAPI:
                 return FileResponse(path, media_type="image/svg+xml")
             return JSONResponse({"detail": "Not Found"}, status_code=404)
 
+        # 显式给类型：Python 的 mimetypes 在一些发行版上不认识 .webmanifest，
+        # 交给下面的通配路由会被猜成 text/plain 或 octet-stream。
+        @app.get("/manifest.webmanifest", include_in_schema=False)
+        def web_manifest() -> Response:
+            path = _DIST_DIR / "manifest.webmanifest"
+            if path.is_file():
+                return FileResponse(path, media_type="application/manifest+json")
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
+
         @app.get("/{full_path:path}", include_in_schema=False)
         def spa(full_path: str) -> Response:
             # Unknown API paths must return JSON 404, not the SPA shell — otherwise
