@@ -1045,6 +1045,9 @@ def launch_instance(
                 fallback_configs=list(built.get("fallback_configs") or []),
                 user_data_encrypted=encrypt_text(custom_user_data) if custom_user_data else "",
                 root_password_encrypted=encrypt_text(job_root_password) if job_root_password else "",
+                # 用户没填、是面板生成的 —— 多台任务里 worker 会给每台换一个新的。
+                root_password_generated=bool(job_root_password)
+                and not str(body.root_password or "").strip(),
                 interval_sec=int(built["retry_interval_sec"]),
                 max_attempts=int(built["retry_max_attempts"]),
                 attempts=0,

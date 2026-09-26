@@ -310,3 +310,90 @@ def test_stop_during_a_partial_success_stays_stopped():
     assert job.enabled is False
     assert job.status == "stopped"
     assert job.next_run_at is None
+
+
+# ---------------------------------------------------------------------------
+# 多台 + 密码模式：自动生成的密码每台一个
+# ---------------------------------------------------------------------------
+
+
+class _PasswordSession(_FakeSession):
+    """按脚本返回成功 / 容量不足，并记下每次开机用的 root 密码。"""
+
+    def __init__(self, calls: list, script: list):
+        super().__init__(_Result(True, ""))
+        self._calls = calls
+        self._script = script
+
+    def launch_from_payload(self, payload, root_password="", custom_user_data="", idempotency_key=""):
+        self._calls.append(root_password)
+        if self._script.pop(0):
+            return _Result(True, "创建成功", data={"instance_id": f"ocid1.instance.oc1..p{len(self._calls)}"})
+        return _Result(False, "Out of host capacity.")
+
+
+def _password_job(*, generated: bool) -> str:
+    from web.backend.crypto_util import encrypt_text
+
+    with SessionLocal() as db:
+        owner_id, tenant_id = _seed(db)
+        db.commit()
+        return _make_job(
+            db,
+            owner_id,
+            tenant_id,
+            target_count=2,
+            launch_payload={
+                "display_name": "pw",
+                "shape": "VM.Standard.A1.Flex",
+                "ocpus": 1,
+                "memory_in_gbs": 6,
+                "boot_volume_size_in_gbs": 50,
+                "nsg_ids": ["nsg1"],
+                "auth_mode": "password",
+            },
+            root_password_encrypted=encrypt_text("First-Pass-2345"),
+            root_password_generated=generated,
+        )
+
+
+def test_generated_passwords_differ_per_instance_and_stay_stable_across_attempts():
+    """一台的密码泄露不该连带另一台；而同一台的多次尝试必须用同一个密码 ——
+    否则崩溃后用同一个 retry token 重放时，请求体对不上。"""
+    from web.backend.crypto_util import decrypt_text
+
+    calls: list = []
+    # 第 1 台成功 → 第 2 台容量不足一次 → 第 2 台成功
+    script = [True, False, True]
+
+    class _Sessions:
+        def get(self, _cfg):
+            return _PasswordSession(calls, script)
+
+    job_id = _password_job(generated=True)
+    _tick(_Sessions(), job_id)
+    with SessionLocal() as db:
+        next_pw = decrypt_text(db.get(CapacityJob, job_id).root_password_encrypted)
+    _tick(_Sessions(), job_id, rewind=True)
+    job = _tick(_Sessions(), job_id, rewind=True)
+
+    assert job.status == "success" and job.created_count == 2
+    first, miss, second = calls
+    assert first == "First-Pass-2345"
+    assert second != first, "两台用了同一个自动生成的密码"
+    assert miss == second == next_pw, "同一台的几次尝试用了不同的密码"
+    assert len(second) >= 12
+
+
+def test_an_operator_supplied_password_is_shared_by_every_instance():
+    calls: list = []
+    script = [True, True]
+
+    class _Sessions:
+        def get(self, _cfg):
+            return _PasswordSession(calls, script)
+
+    job_id = _password_job(generated=False)
+    _tick(_Sessions(), job_id)
+    _tick(_Sessions(), job_id, rewind=True)
+    assert calls == ["First-Pass-2345", "First-Pass-2345"]

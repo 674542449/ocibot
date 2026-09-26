@@ -378,6 +378,9 @@
           <input v-model="form.root_password" style="flex:1" />
           <button type="button" @click="genPassword">随机生成</button>
         </div>
+        <p v-if="batchCount > 1" class="muted" style="margin: 0.2rem 0 0; font-size: 12px">
+          留空：每台各自生成不同的密码；填写或点「随机生成」：{{ batchCount }} 台共用这一个。
+        </p>
       </div>
 
       <div class="field">

@@ -336,6 +336,42 @@ def test_capacity_retry_accepts_a_batch(client, monkeypatch):
         db.commit()
 
 
+@pytest.mark.parametrize(
+    ("typed", "generated"),
+    [("", True), ("MyOwnPass123!", False)],
+)
+def test_a_retry_job_remembers_whether_its_password_was_generated(client, monkeypatch, typed, generated):
+    """只有面板生成的密码才每台换一个；用户自己填的要所有机器共用。"""
+    c, tid = client
+    _stub_launch(monkeypatch, auth_mode="password")
+    stubbed_build = instances_router.build_launch_request
+    monkeypatch.setattr(
+        instances_router,
+        "build_launch_request",
+        lambda body, meta=None: {
+            **stubbed_build(body, meta),
+            "retry_interval_sec": 120,
+            "retry_max_attempts": 50,
+            "availability_domains": [],
+        },
+    )
+    r = c.post(
+        f"/api/tenants/{tid}/launch",
+        json=_body(count=2, as_retry=True, auth_mode="password", root_password=typed),
+    )
+    assert r.status_code == 200, r.text
+
+    from web.backend.models import CapacityJob
+
+    with SessionLocal() as db:
+        job = db.get(CapacityJob, r.json()["capacity_job_id"])
+        flag = job.root_password_generated
+        # 先删再断言：留下一个进行中的任务，下一个参数会被「一个租户一个任务」挡成 409。
+        db.delete(job)
+        db.commit()
+    assert flag is generated
+
+
 def test_count_is_bounded(client, monkeypatch):
     c, tid = client
     _stub_launch(monkeypatch)

@@ -33,6 +33,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from app.oci_client import (  # noqa: E402
     derive_retry_token,
+    generate_root_password,
     is_capacity_error,
     is_capacity_message,
     is_rate_limit_error,
@@ -49,7 +50,7 @@ from app.scheduler import (  # noqa: E402
 )
 from web.backend.audit import prune_audit_log  # noqa: E402
 from web.backend.config import get_settings  # noqa: E402
-from web.backend.crypto_util import decrypt_text  # noqa: E402
+from web.backend.crypto_util import decrypt_text, encrypt_text  # noqa: E402
 from web.backend.db import SessionLocal, init_db  # noqa: E402
 from web.backend.meta import (  # noqa: E402
     KEY_WORKER_HEARTBEAT,
@@ -723,6 +724,15 @@ class Worker:
                 # tick_capacity 那道 last_attempt_at 地板同样兜着）。
                 job.status = "idle"
                 job.next_run_at = _utcnow() + timedelta(seconds=interval)
+            if not finished and root_password and job.root_password_generated:
+                # 自动生成的密码每台一个，和直接批量创建一致 —— 一台泄露不该连带其余几台。
+                # 这台的密码已经写进它自己的标签，实例列表里照样看得到。
+                #
+                # 下一台的密码**现在**生成，和 created_count 在同一次 commit 里落库，
+                # 而不是等到下一台开机时再随机：下一台的每一次尝试 —— 包括容器在
+                # LaunchInstance 和 commit 之间重启后、用同一个 retry token 的那次重放
+                # —— 都读到同一个密码，请求体才会逐字相同，Oracle 才会把它当成重放。
+                job.root_password_encrypted = encrypt_text(generate_root_password(16))
             data = getattr(result, "data", None)
             inst_id = ""
             if isinstance(data, dict):

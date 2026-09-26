@@ -139,6 +139,10 @@ class CapacityJob(Base):
     # 空串 = 密钥模式(或老版本建的任务)。default="" 是给 _ensure_schema 用的:
     # 它会据此生成 DEFAULT '',让已有安装升级时能给 NOT NULL 列补上这一列。
     root_password_encrypted: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    # 密码是面板自动生成的（用户没填）。多台任务里这种密码**每台一个**：开出一台后
+    # worker 给下一台换一个新密码存回 root_password_encrypted。用户自己填的密码
+    # 照旧所有机器共用。老任务升级后是 False，行为不变。
+    root_password_generated: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     interval_sec: Mapped[int] = mapped_column(Integer, default=180)
     max_attempts: Mapped[int] = mapped_column(Integer, default=200)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
