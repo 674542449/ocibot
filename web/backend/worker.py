@@ -951,6 +951,22 @@ class Worker:
     ) -> None:
         job.last_error = msg[:2000]
         now = _utcnow()
+        # 用户可能在这次尝试进行中点了「停止」：LaunchInstance 要跑好几秒，而 job 是
+        # 尝试开始前读进来的，内存里的 enabled 还是 True。下面每条分支都会写
+        # status="idle"，不先看一眼库里的真实状态，就会把用户的「已停止」改回「等待中」
+        # —— 任务其实不会再跑（enabled 仍是 False），界面却说它在排队。
+        # 用一个**独立的短会话**去读：本会话可能还停在尝试开始前开的那个读事务里，
+        # SQLite 的 WAL 快照隔离下它看不到之后才提交的「停止」。
+        with SessionLocal() as fresh:
+            still_enabled = fresh.scalar(
+                select(CapacityJob.enabled).where(CapacityJob.id == job.id)
+            )
+        if still_enabled is False:
+            job.enabled = False
+            job.status = "stopped"
+            job.next_run_at = None
+            log.info("capacity job=%s stopped by user during attempt: %s", job.id, msg[:200])
+            return
         rate_limited = is_rate_limit_message(msg) or (exc is not None and is_rate_limit_error(exc))
         capacity = is_capacity_message(msg) or (exc is not None and is_capacity_error(exc))
 

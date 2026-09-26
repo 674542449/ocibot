@@ -97,6 +97,19 @@ def create_capacity_job(
         payload = sanitize_launch_payload(body.launch_payload, for_retry=True)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=safe_error_text(exc)) from exc
+    # 这个接口没有地方带密码（密码只能加密存在 root_password_encrypted 上，永不进
+    # launch_payload），所以密码模式的任务在这里建出来就注定失败：worker 第一次
+    # 尝试就会以「root 密码无法解密（主密钥可能已变更）」停掉它 —— 一个从没发生过的
+    # 主密钥变更。密码模式的抢机请走 POST /tenants/{id}/launch（as_retry=true），
+    # 那里会生成 / 加密保存密码。
+    if payload.get("auth_mode") == "password":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "该接口不支持 root + 密码模式（无法携带密码）。"
+                "请在「创建实例」页勾选「容量不足时加入自动重试」来创建密码模式的抢机任务。"
+            ),
+        )
 
     # 行数上限放在 enforce_launch_quota **之前**：那一步是一整轮租户枚举，会实打
     # 实地花掉 Oracle 的速率预算（抢机循环和它抢的是同一个额度）。任何不需要

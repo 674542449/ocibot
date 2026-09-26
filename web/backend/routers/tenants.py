@@ -215,15 +215,10 @@ def import_tenant_from_paste(
     )
     _commit_new_tenant(db, row)
 
-    if body.test_connection:
-        try:
-            session = get_session_for_row(row)
-            test = session.test_connection()
-            if not test.ok:
-                pass
-        except Exception:
-            pass
-
+    # body.test_connection 仍然接受（老客户端会传），但这里**不**再测：以前这里跑一遍
+    # test_connection() 然后把结果丢掉，而前端勾了「保存后自动测试连接」时会紧接着
+    # 自己调 /tenants/{id}/test —— 同一个测试打两遍 Oracle，其中一遍没人看。
+    # 调用额度和抢机循环共用（见 CLAUDE.md），测试结果由 /test 接口返回给用户。
     return _to_out(row)
 
 
@@ -774,6 +769,15 @@ def batch_delete_tenants(
             select(Tenant).where(Tenant.owner_id == user.id, Tenant.id.in_(wanted))
         ).all()
     }
+    # 所有被选中行的副区一次查出来，而不是循环里每行一条 SELECT（最多 200 行）。
+    children_of: dict[str, list[Tenant]] = {}
+    if rows:
+        for child in db.scalars(
+            select(Tenant).where(
+                Tenant.owner_id == user.id, Tenant.parent_tenant_id.in_(list(rows))
+            )
+        ).all():
+            children_of.setdefault(child.parent_tenant_id, []).append(child)
     doomed: dict[str, Tenant] = {}
     skipped: list[TenantBatchDeleteSkipped] = []
     for tid in wanted:
@@ -785,7 +789,7 @@ def batch_delete_tenants(
         if tid in doomed:
             # Already going as the 副区 of a primary selected earlier in the list.
             continue
-        children = _children_of(db, user.id, row)
+        children = children_of.get(row.id, [])
         reason = _delete_block_reason(row, children)
         if reason:
             skipped.append(TenantBatchDeleteSkipped(id=row.id, name=row.name, reason=reason))
@@ -795,6 +799,9 @@ def batch_delete_tenants(
             doomed.setdefault(child.id, child)
 
     targets = list(doomed.values())
+    # 删之前先把审计要用的 id / 名称取出来，不去碰已删除对象的属性。
+    deleted_ids = [t.id for t in targets]
+    deleted_names = [t.name for t in targets]
     if targets:
         _purge_tenants(db, user, targets)
     selected = sum(1 for tid in wanted if tid in doomed)
@@ -804,19 +811,28 @@ def batch_delete_tenants(
         message += f"（另含 {extra} 个随主租户一起删除的副区）"
     if skipped:
         message += f"；{len(skipped)} 个未删除"
+    # write_audit 把 detail 截到 4000 字符，截断的 JSON 就解析不了了 —— 一次删 200 个
+    # 的时候整条记录都废掉。这里自己先限量，并写明总数，保证存下来的始终是合法 JSON。
+    # 最坏情况：30 个名字 × ~64 字符 + 8 条跳过 × ~190 字符 ≈ 3.5k，留在 4000 以内。
+    _AUDIT_DELETED, _AUDIT_SKIPPED = 30, 8
     write_audit(
         db,
         owner_id=user.id,
         action="tenant.batch_delete",
-        target=f"{len(targets)} tenants",
+        target=f"{len(deleted_ids)} tenants",
         detail={
-            "deleted": [{"id": t.id, "name": t.name} for t in targets],
-            "skipped": [s.model_dump() for s in skipped],
+            "deleted_count": len(deleted_ids),
+            "deleted": [n[:60] for n in deleted_names[:_AUDIT_DELETED]],
+            "skipped_count": len(skipped),
+            "skipped": [
+                {"name": (s.name or s.id)[:60], "reason": s.reason[:100]}
+                for s in skipped[:_AUDIT_SKIPPED]
+            ],
         },
     )
     return TenantBatchDeleteResult(
         message=message,
-        deleted=[t.id for t in targets],
+        deleted=deleted_ids,
         skipped=skipped,
     )
 
