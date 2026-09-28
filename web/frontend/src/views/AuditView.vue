@@ -117,6 +117,70 @@ const ACTION_LABELS: Record<string, string> = {
   // `notify.failed`,而这恰恰是操作员最需要一眼认出来的一条 ——
   // 任务是绿的、实例也开出来了,只有通知没送到。
   'notify.failed': '通知推送失败',
+
+  // ---- 非登录类操作 ----
+  // 页头写的是「危险操作与登录记录」，而这张表以前只有登录那几条：其余 50 多种
+  // 操作在动作列里裸显示成 `instance.launch`、`firewall.sl_clear` 这样的内部 id。
+  // tests/test_audit_labels.py 从后端所有 write_audit 调用里收集 action，
+  // 后端新增一种而这里没跟上时测试会失败。
+  'instance.launch': '创建实例',
+  'instance.terminate': '终止实例',
+  'instance.protect': '开启终止保护',
+  'instance.unprotect': '解除终止保护',
+  'instance.root_password_note': '修改密码备注',
+  'instance.console_output': '抓取引导日志',
+  'firewall.open_all': '放行全部端口',
+  'firewall.clear': '清空防火墙规则',
+  'firewall.cloudflare': '放行 Cloudflare 网段',
+  'firewall.repair': '一键修复防火墙',
+  'firewall.tighten_subnet': '收紧子网放行',
+  'firewall.sl_add': '子网规则 · 添加',
+  'firewall.sl_delete': '子网规则 · 删除',
+  'firewall.sl_open_all': '子网规则 · 放行全部出站',
+  'firewall.sl_clear': '子网规则 · 清空入站',
+  'firewall.sl_cloudflare': '子网规则 · 放行 Cloudflare',
+  'reserved_ip.create': '新建保留 IP',
+  'reserved_ip.attach': '绑定保留 IP',
+  'reserved_ip.detach': '解绑保留 IP',
+  'reserved_ip.delete': '删除保留 IP',
+  'boot_volume.resize': '调整引导卷',
+  'boot_volume.rename': '重命名引导卷',
+  'boot_volume.delete': '删除引导卷',
+  'boot_backup.create': '创建引导卷备份',
+  'boot_backup.delete': '删除引导卷备份',
+  'block_volume.create': '创建块卷',
+  'block_volume.update': '扩容块卷',
+  'block_volume.attach': '挂载块卷',
+  'block_volume.detach': '卸载块卷',
+  'block_volume.delete': '删除块卷',
+  'object_storage.create_bucket': '创建存储桶',
+  'object_storage.delete_bucket': '删除存储桶',
+  'object_storage.put_object': '上传对象',
+  'object_storage.delete_object': '删除对象',
+  'image.delete': '删除镜像',
+  'tenant.batch_delete': '批量删除租户',
+  'tenant.protect': '开启删除保护',
+  'tenant.unprotect': '解除删除保护',
+  'tenant.region.subscribe': '开通副区',
+  'webssh.connect': 'WebSSH 连接',
+  'webssh.disconnect': 'WebSSH 断开',
+  'webssh.hostkey_mismatch': 'WebSSH 主机密钥不符',
+  'webssh.hostkey_reset': '清除 WebSSH 主机密钥',
+  'backup.export': '导出备份',
+  'backup.import': '导入备份',
+  'admin.user_patch': '修改用户',
+  'admin.reset_password': '重置用户密码',
+  'admin.settings': '修改面板设置',
+  'admin.self_update': '一键更新',
+}
+
+/** 电源操作的 action 是拼出来的：`instance.power.SOFTSTOP`。 */
+const POWER_LABELS: Record<string, string> = {
+  START: '开机',
+  STOP: '强制关机',
+  SOFTSTOP: '关机',
+  RESET: '强制重启',
+  SOFTRESET: '重启',
 }
 
 const REASON_LABELS: Record<string, string> = {
@@ -129,7 +193,40 @@ const REASON_LABELS: Record<string, string> = {
 }
 
 function actionLabel(a: string) {
+  if (a.startsWith('instance.power.')) {
+    const op = a.slice('instance.power.'.length)
+    return `实例${POWER_LABELS[op] || op}`
+  }
   return ACTION_LABELS[a] || a
+}
+
+/** 一条非登录记录的「结果」：有 message 就用它（失败时标出来），批量删除报数量，
+ *  其余列几个标量字段。以前 JSON 一律被当成「已读取」，而只取了登录才有的
+ *  ip / reason / ua 三个字段 —— 于是除登录外每一行的结果都是「—」，
+ *  「创建实例失败，原因是…」这种正是最该看到的内容被整个吞掉了。 */
+function summarize(o: Record<string, any>): string {
+  if (typeof o.message === 'string' && o.message.trim()) {
+    return (o.ok === false ? '失败：' : '') + o.message.trim().slice(0, 300)
+  }
+  if (typeof o.deleted_count === 'number') {
+    return (
+      `删除 ${o.deleted_count} 个` +
+      (o.skipped_count ? `，跳过 ${o.skipped_count} 个` : '')
+    )
+  }
+  // 其余的：列出几个标量字段。*_id 是 OCID / UUID，对人没有信息量，跳过。
+  const parts = Object.entries(o)
+    .filter(
+      ([k, v]) =>
+        !k.endsWith('_id') &&
+        v !== '' &&
+        v !== null &&
+        ['string', 'number', 'boolean'].includes(typeof v),
+    )
+    .slice(0, 4)
+    .map(([k, v]) => `${k}=${String(v).slice(0, 60)}`)
+  const text = parts.join(' · ')
+  return o.ok === false ? `失败${text ? '：' + text : ''}` : text
 }
 
 function actionClass(a: string) {
@@ -161,6 +258,8 @@ function parseDetail(detail: string): Parsed {
           .map((c: any) => `${c?.name || c?.kind || '?'}: ${c?.detail || '失败'}`)
           .join('；')
         out.note = `${o.failed}/${o.attempted ?? o.failed} 个渠道未推送` + (names ? ` — ${names}` : '')
+      } else if (!out.reason && o && typeof o === 'object' && !Array.isArray(o)) {
+        out.note = summarize(o)
       }
       out.consumed = true
       return out

@@ -53,7 +53,15 @@
             </tr>
             <template v-for="j in capacityJobs" :key="j.id">
               <tr>
-                <td>{{ j.name }}</td>
+                <td>
+                  {{ j.name }}
+                  <!-- 一个租户同时只能有一个进行中的任务，任务名里却没有租户 ——
+                       多个租户各挂一个任务时，这一格是唯一能看出「哪个任务在抢哪个账号」
+                       的地方。租户列表 load() 一直在拉，只是以前从没显示过。 -->
+                  <div v-if="tenantLabel(j.tenant_id)" class="muted" style="font-size: 12px">
+                    {{ tenantLabel(j.tenant_id) }}
+                  </div>
+                </td>
                 <td>
                   <span class="badge" :class="jobBadge(j.status)">{{ statusLabel(j.status) }}</span>
                 </td>
@@ -107,7 +115,7 @@
 </template>
 
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref } from 'vue'
 import api, { type CapacityJob, type Tenant } from '@/api/client'
 
 type Attempt = {
@@ -160,6 +168,11 @@ function statusLabel(status: string) {
     failed: '已失败',
   }
   return map[status] || status
+}
+
+function tenantLabel(id: string) {
+  const t = tenants.value.find((x) => x.id === id)
+  return t ? `${t.name} · ${t.region_label || t.region}` : ''
 }
 
 function configSummary(j: CapacityJob) {

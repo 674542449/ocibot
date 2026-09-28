@@ -263,20 +263,29 @@
         </table>
       </div>
       <div v-else-if="invoiceError" class="error-box">读取账单失败：{{ invoiceError }}</div>
-      <div v-else class="empty">该账号暂无账单记录。</div>
+      <div v-else-if="invoicesLoaded" class="empty">该账号暂无账单记录。</div>
+      <div v-else class="muted" style="font-size: 13px">尚未读取。点右上角「刷新用量」。</div>
     </div>
 
     <div class="card stack">
       <div class="row" style="justify-content: space-between">
         <h3 style="margin: 0">费用（最近 {{ days }} 天）</h3>
-        <div class="muted" style="font-size: 13px">
+        <div v-if="usage" class="muted" style="font-size: 13px">
           合计：
           <!-- total 现在在读取失败时是 null（以前是 0）。?? 只挡 null/undefined，
                0 会原样显示 —— 对账单数字来说「0」和「读不到」是相反的答案。 -->
-          <strong>{{ usage?.total ?? '未能读取' }}</strong>
-          {{ usage?.total == null ? '' : usage?.currency || '' }}
+          <strong>{{ usage.total ?? '未能读取' }}</strong>
+          {{ usage.total == null ? '' : usage.currency || '' }}
         </div>
       </div>
+
+      <!-- usage 为 null = 还没读过（换租户也会清成 null）。以前这里照样渲染，
+           于是一次都没请求过就写着「合计：未能读取 / 本月费用 未能读取 /
+           暂无每日费用数据」—— 把「还没问」说成了「问了，失败了」。 -->
+      <p v-if="!usage" class="muted" style="margin: 0; font-size: 13px">
+        尚未读取。点右上角「刷新用量」。
+      </p>
+      <template v-else>
 
       <!-- 本月费用. Deliberately its own block rather than another number in the
            header row: it answers a different question from "最近 N 天" (calendar
@@ -343,6 +352,7 @@
           </tbody>
         </table>
       </div>
+      </template>
     </div>
   </div>
 </template>
@@ -502,6 +512,13 @@ async function loadAccount() {
   const guard = beginLoad('account')
   const res = await api.get(`/tenants/${tenantId.value}/account`)
   if (guard.stale()) return
+  // ok=false 是 Oracle 拒绝了这次读取（权限、限流）。以前照样把 message 写进
+  // 绿色的成功框、把空的 data 渲染成一整张「—」卡片 —— 读失败看起来像读成功了。
+  if (res.data.ok === false) {
+    data.value = null
+    error.value = res.data.message || '读取账号信息失败'
+    return
+  }
   data.value = res.data.data || {}
   msg.value = res.data.message || ''
 }
@@ -534,6 +551,9 @@ const invoiceMsg = ref('')
 /** Set only when the read itself failed. Kept apart from invoiceMsg so the page
  *  never reports "no bills" for an account it could not read. */
 const invoiceError = ref('')
+/** 本租户的账单是否已经读过一次。没读过之前不能说「暂无账单记录」——
+ *  本页刻意不在进入时请求 Oracle，所以「列表是空的」在点刷新之前是常态，不是结论。 */
+const invoicesLoaded = ref(false)
 const unpaidCount = computed(
   () => invoices.value.filter((i) => !i.is_paid).length,
 )
@@ -578,6 +598,7 @@ async function loadInvoices() {
   try {
     const res = await api.get(`/tenants/${tenantId.value}/invoices`)
     if (guard.stale()) return
+    invoicesLoaded.value = true
     invoices.value = res.data.data?.invoices || []
     invoiceMsg.value = res.data.message || ''
     // ok=false means Oracle refused the read; an empty list then proves nothing.
@@ -628,6 +649,7 @@ function onTenantChange() {
   invoices.value = []
   invoiceMsg.value = ''
   invoiceError.value = ''
+  invoicesLoaded.value = false
   msg.value = ''
   error.value = ''
 }
@@ -636,6 +658,8 @@ async function loadAll() {
   if (!tenantId.value) return
   const guard = beginLoad('all')
   error.value = ''
+  // 上一次的「已读取账号信息」也要清：这一次读失败时，它会和新的报错并排挂着。
+  msg.value = ''
   loading.value = true
   try {
     await Promise.all([loadAccount(), loadUsage(), loadQuota(), loadInvoices()])

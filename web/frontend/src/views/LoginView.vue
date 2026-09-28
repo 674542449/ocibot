@@ -59,12 +59,14 @@
               id="login-pass"
               v-model="password"
               type="password"
-              autocomplete="current-password"
+              :autocomplete="mode === 'login' ? 'current-password' : 'new-password'"
               required
               minlength="8"
             />
           </div>
-          <div v-if="needTotp" class="field">
+          <!-- 只在登录模式下出现：登录时要过两步验证之后切到「注册」，这个框以前还挂着，
+               注册根本不用它，看上去却像是必填项。 -->
+          <div v-if="needTotp && mode === 'login'" class="field">
             <label for="login-totp">两步验证码</label>
             <input
               id="login-totp"

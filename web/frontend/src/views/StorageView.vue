@@ -105,7 +105,7 @@
           </thead>
           <tbody>
             <tr v-if="!bootVolumes.length">
-              <td colspan="7" class="muted empty">暂无引导卷</td>
+              <td colspan="7" class="muted empty">{{ loaded.boot ? '暂无引导卷' : NOT_LOADED }}</td>
             </tr>
             <tr v-else-if="!filteredBoot.length">
               <td colspan="7" class="muted empty">
@@ -222,7 +222,7 @@
           </thead>
           <tbody>
             <tr v-if="!blockVolumes.length">
-              <td colspan="6" class="muted empty">暂无块卷</td>
+              <td colspan="6" class="muted empty">{{ loaded.block ? '暂无块卷' : NOT_LOADED }}</td>
             </tr>
             <tr v-for="v in blockVolumes" :key="v.id">
               <td>
@@ -293,7 +293,7 @@
             </thead>
             <tbody>
               <tr v-if="!buckets.length">
-                <td colspan="4" class="muted empty">暂无存储桶</td>
+                <td colspan="4" class="muted empty">{{ loaded.buckets ? '暂无存储桶' : NOT_LOADED }}</td>
               </tr>
               <tr v-for="b in buckets" :key="b.name">
                 <td>
@@ -401,6 +401,14 @@ const quota = ref<any>(null)
 const includeSub = ref(true)
 
 const bootVolumes = ref<any[]>([])
+/** 三张表各自是否已经为当前租户读过一次。
+ *
+ *  本页刻意不在进入时请求 Oracle，所以「表是空的」在点刷新之前是常态。以前三张表
+ *  一进来就写着「暂无引导卷 / 暂无块卷 / 暂无存储桶」—— 对一个有卷有桶的账号，
+ *  这是在替一次还没发生的读取下结论。InstancesView 的 loadedOnce 是同一个问题。
+ *  读失败时保持 false：那时有报错框在说原因，「暂无」同样不成立。 */
+const loaded = reactive({ boot: false, block: false, buckets: false })
+const NOT_LOADED = '尚未读取。选择租户后点右上角「刷新」。'
 /** 部分读取失败的提示；空串表示这次读取是完整的。 */
 const bootPartial = ref('')
 const blockPartial = ref('')
@@ -536,6 +544,7 @@ async function loadBoot() {
     if (guard.stale()) return
     // Surface a tenant-level failure instead of rendering it as "no volumes".
     if (data.ok === false) error.value = data.message || '读取引导卷失败'
+    else loaded.boot = true
     bootVolumes.value = data.data?.volumes || []
     // 后端在部分 compartment 读不到时返回 ok=true + 一个 errors 数组，
     // 并在 message 末尾附上「（部分 compartment 读取失败 N 处）」。
@@ -627,6 +636,7 @@ async function loadBlock() {
   })
   if (guard.stale()) return
   if (data.ok === false) error.value = data.message || '读取块卷失败'
+  else loaded.block = true
   blockVolumes.value = data.data?.volumes || []
   blockPartial.value = pickPartial(data)
   // Pre-fill AD from first volume or boot
@@ -645,6 +655,7 @@ async function loadBuckets() {
   const { data } = await api.get(`/tenants/${tenantId.value}/object-storage/buckets`)
   if (guard.stale()) return
   if (data.ok === false) error.value = data.message || '读取存储桶失败'
+  else loaded.buckets = true
   buckets.value = data.data?.buckets || []
   objectNs.value = data.data?.namespace || ''
 }
@@ -670,6 +681,9 @@ function onTenantChange() {
   bootVolumes.value = []
   blockVolumes.value = []
   buckets.value = []
+  loaded.boot = false
+  loaded.block = false
+  loaded.buckets = false
   quota.value = null
   // 「部分读取失败」是上一个租户的读取结果，同 InstancesView 的 partialWarn。
   bootPartial.value = ''

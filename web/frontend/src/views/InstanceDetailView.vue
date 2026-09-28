@@ -410,7 +410,7 @@
                 <td>{{ r.cidr }}</td>
                 <td>{{ r.port }}</td>
                 <td>
-                  <button class="danger" @click="deleteRule(g.id, r.id)">删</button>
+                  <button class="danger" :disabled="fwBusy" @click="deleteRule(g.id, r.id)">删</button>
                 </td>
               </tr>
             </tbody>
@@ -442,7 +442,9 @@
             <input v-model.number="ruleForm.port_min" type="number" placeholder="例如 22" />
           </div>
         </div>
-        <button class="primary" style="margin-top: 0.4rem" @click="addRule(g.id)">添加规则</button>
+        <button class="primary" style="margin-top: 0.4rem" :disabled="fwBusy" @click="addRule(g.id)">
+          添加规则
+        </button>
 
         <!-- Cloudflare 回源网段一键放行。
              放在每个 NSG 卡片里而不是页顶：规则是加到某一个具体安全组上的，
@@ -1051,6 +1053,7 @@ async function createReservedIp() {
   if (name == null) return
   ripBusy.value = true
   error.value = ''
+  msg.value = ''
   try {
     const { data } = await api.post(`/tenants/${tenantId.value}/reserved-ips`, {
       display_name: name.trim(),
@@ -1077,6 +1080,7 @@ async function attachReservedIp(ip: ReservedIp) {
     return
   ripBusy.value = true
   error.value = ''
+  msg.value = ''
   try {
     const { data } = await api.post(
       `/tenants/${act.tenant}/instances/${act.target}/reserved-ip/attach`,
@@ -1099,6 +1103,7 @@ async function detachReservedIp(ip: ReservedIp) {
     return
   ripBusy.value = true
   error.value = ''
+  msg.value = ''
   try {
     const { data } = await api.post(`/tenants/${tenantId.value}/reserved-ips/${ip.id}/detach`)
     if (data.ok) msg.value = data.message
@@ -1115,6 +1120,7 @@ async function deleteReservedIp(ip: ReservedIp) {
   if (!confirm(`删除保留 IP ${ip.ip_address}？删除后该地址彻底释放。`)) return
   ripBusy.value = true
   error.value = ''
+  msg.value = ''
   try {
     const { data } = await api.delete(`/tenants/${tenantId.value}/reserved-ips/${ip.id}`)
     if (data.ok) msg.value = data.message
@@ -1164,6 +1170,7 @@ async function createBackup() {
   if (name == null) return
   backupBusy.value = true
   error.value = ''
+  msg.value = ''
   try {
     const { data } = await api.post(`/tenants/${tenantId.value}/boot-volume-backups`, {
       boot_volume_id: bootInfo.value.boot_volume_id,
@@ -1184,6 +1191,7 @@ async function deleteBackup(b: BootBackup) {
   if (!confirm(`删除备份「${b.display_name || b.id.slice(-12)}」？不可恢复。`)) return
   backupBusy.value = true
   error.value = ''
+  msg.value = ''
   try {
     const { data } = await api.delete(`/tenants/${tenantId.value}/boot-volume-backups/${b.id}`)
     if (data.ok) msg.value = data.message
@@ -1549,6 +1557,7 @@ async function createConsole() {
 async function deleteConsole(id: string) {
   if (!confirm('删除此控制台连接？')) return
   error.value = ''
+  msg.value = ''
   try {
     await api.delete(
       `/tenants/${tenantId.value}/instances/${instanceId.value}/console/${id}`,
@@ -1664,6 +1673,7 @@ async function addCloudflare(nsgId: string) {
   // 顶上那个「放行全部端口」会清空既有规则，所以那个才需要确认。
   cfBusy.value = true
   error.value = ''
+  msg.value = ''
   try {
     const { data } = await api.post(
       `/tenants/${act.tenant}/instances/${act.target}/firewall/cloudflare`,
@@ -1696,6 +1706,7 @@ async function repairFirewall() {
   const url = `/tenants/${act.tenant}/instances/${act.target}/firewall/repair`
   fwBusy.value = true
   error.value = ''
+  msg.value = ''
   try {
     let force = false
     let includeForeign = false
@@ -1745,7 +1756,7 @@ async function repairFirewall() {
 //
 // 每个写操作都走 beginAction()：安全列表是子网级的,如果用户在请求飞行途中切到了
 // 另一台机器,结果消息会落在新页面上、而描述的是旧页面的子网。NSG 那两个函数
-// （addRule / deleteRule）至今没有这道保护,这里不重复那个疏忽。
+// （addRule / deleteRule）以前没有这道保护，0.4.127 补上了。
 
 // 安全列表是子网共享的 —— 每次确认都得把这句话摆出来,因为用户是从**某一台实例**
 // 的详情页点进来的,天然会以为只影响这一台。
@@ -1760,6 +1771,7 @@ async function runSlWrite(
 ) {
   fwBusy.value = true
   error.value = ''
+  msg.value = ''
   try {
     const { data } = await api.post(
       `/tenants/${act.tenant}/instances/${act.target}/firewall/security-list/${path}`,
@@ -1885,6 +1897,7 @@ async function clearFirewall() {
     return
   fwBusy.value = true
   error.value = ''
+  msg.value = ''
   try {
     const { data } = await api.post(
       `/tenants/${act.tenant}/instances/${act.target}/firewall/clear`,
@@ -1914,6 +1927,7 @@ async function openAllFirewall() {
     return
   fwBusy.value = true
   error.value = ''
+  msg.value = ''
   try {
     const { data } = await api.post(
       `/tenants/${act.tenant}/instances/${act.target}/firewall/open-all`,
@@ -1930,10 +1944,16 @@ async function openAllFirewall() {
   }
 }
 async function addRule(nsgId: string) {
+  // 和上面那些子网 / 整机的写操作一样：锁定目标、占住 fwBusy。以前这两个函数
+  // 两样都没有 —— 「添加规则」连点两下就是两条一模一样的规则，请求途中换到另一台
+  // 机器，结果消息会落在新机器的页面上。
+  const act = beginAction()
+  fwBusy.value = true
   error.value = ''
+  msg.value = ''
   try {
     const { data } = await api.post(
-      `/tenants/${tenantId.value}/instances/${instanceId.value}/firewall/rules`,
+      `/tenants/${act.tenant}/instances/${act.target}/firewall/rules`,
       {
         nsg_id: nsgId,
         direction: ruleForm.direction,
@@ -1945,11 +1965,15 @@ async function addRule(nsgId: string) {
         port_max: portOrNull(),
       },
     )
+    if (act.moved()) return
     if (data.ok) msg.value = data.message
     else error.value = data.message
     await loadFirewall()
   } catch (e: any) {
+    if (act.moved()) return
     error.value = e?.message || '添加失败'
+  } finally {
+    fwBusy.value = false
   }
 }
 /** Port for the rule payload, or null when not applicable / left blank. */
@@ -1961,16 +1985,24 @@ function portOrNull(): number | null {
 
 async function deleteRule(nsgId: string, ruleId: string) {
   if (!confirm('删除该规则？')) return
+  const act = beginAction()
+  fwBusy.value = true
+  error.value = ''
+  msg.value = ''
   try {
     const { data } = await api.post(
-      `/tenants/${tenantId.value}/instances/${instanceId.value}/firewall/delete-rules`,
+      `/tenants/${act.tenant}/instances/${act.target}/firewall/delete-rules`,
       { nsg_id: nsgId, rule_ids: [ruleId] },
     )
+    if (act.moved()) return
     if (data.ok) msg.value = data.message
     else error.value = data.message
     await loadFirewall()
   } catch (e: any) {
+    if (act.moved()) return
     error.value = e?.message || '删除失败'
+  } finally {
+    fwBusy.value = false
   }
 }
 
@@ -2036,6 +2068,7 @@ async function updateBoot() {
   const act = beginAction()
   bootBusy.value = true
   error.value = ''
+  msg.value = ''
   fsGrowResult.value = null
   try {
     const payload: Record<string, any> = {
@@ -2092,6 +2125,7 @@ async function updateShape() {
   const act = beginAction()
   acting.value = true
   error.value = ''
+  msg.value = ''
   try {
     const { data } = await api.post(
       `/tenants/${act.tenant}/instances/${act.target}/shape`,
@@ -2134,6 +2168,7 @@ async function power(action: string) {
   }
   acting.value = true
   error.value = ''
+  msg.value = ''
   try {
     const { data } = await api.post(
       `/tenants/${act.tenant}/instances/${act.target}/power`,
@@ -2163,6 +2198,8 @@ async function doRename() {
   const name = prompt(`重命名实例 ${targetLabel(act.target)}\n新名称`, currentName)
   if (!name?.trim()) return
   acting.value = true
+  error.value = ''
+  msg.value = ''
   try {
     const { data } = await api.post(
       `/tenants/${act.tenant}/instances/${act.target}/rename`,
@@ -2189,6 +2226,8 @@ async function doReplaceIp() {
   )
     return
   acting.value = true
+  error.value = ''
+  msg.value = ''
   try {
     const { data } = await api.post(
       `/tenants/${act.tenant}/instances/${act.target}/public-ip/replace`,
@@ -2208,6 +2247,8 @@ async function doIpv6() {
   // 分配地址是增量操作，不删不断，不加确认。
   const act = beginAction()
   acting.value = true
+  error.value = ''
+  msg.value = ''
   try {
     const { data } = await api.post(`/tenants/${act.tenant}/instances/${act.target}/ipv6`)
     if (act.moved()) return
@@ -2242,6 +2283,8 @@ async function doRemoveIpv6() {
     return
   }
   acting.value = true
+  error.value = ''
+  msg.value = ''
   try {
     const { data } = await api.delete(`/tenants/${act.tenant}/instances/${act.target}/ipv6`)
     if (act.moved()) return
@@ -2299,6 +2342,7 @@ async function toggleProtect() {
   }
   acting.value = true
   error.value = ''
+  msg.value = ''
   try {
     const { data } = await api.post(
       `/tenants/${act.tenant}/instances/${act.target}/protect`,
@@ -2348,6 +2392,8 @@ async function doTerminate() {
   )
     return
   acting.value = true
+  error.value = ''
+  msg.value = ''
   try {
     const { data } = await api.post(
       `/tenants/${act.tenant}/instances/${act.target}/terminate`,
@@ -2460,6 +2506,14 @@ function resetInstanceState() {
   slForm.ports = ''
   slForm.description = ''
   slForm.stateless = false
+  // 本机规则表（NSG）和 Cloudflare 那两份表单同理：上一台填的来源 / 端口
+  // 不该出现在下一台的「添加规则」旁边。
+  ruleForm.direction = 'INGRESS'
+  ruleForm.protocol = '6'
+  ruleForm.cidr = '0.0.0.0/0'
+  ruleForm.port_min = 22
+  cfForm.ports = '80,443'
+  cfForm.include_ipv6 = true
   fwMsg.value = ''
   reservedIps.value = []
   bootInfo.value = null
