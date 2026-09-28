@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import ipaddress
 import logging
 import re
@@ -874,8 +876,8 @@ def derive_retry_token(base: str, index: int) -> str:
     return _clean_retry_token(head + suffix)
 
 
-def generate_root_password(length: int = 16) -> str:
-    """Generate a strong random root password suitable for cloud-init and freeform tags.
+def _build_root_password(length: int, randbelow: Callable[[int], int]) -> str:
+    """Password layout shared by the random and the derived generator.
 
     - At least 12 characters (default 16)
     - Contains upper, lower, digit, and a safe symbol
@@ -888,20 +890,64 @@ def generate_root_password(length: int = 16) -> str:
     digits = "23456789"
     symbols = "!@#%^*-_=+"
     alphabet = upper + lower + digits + symbols
+
+    def pick(pool: str) -> str:
+        return pool[randbelow(len(pool))]
+
     # Guarantee one of each class, then fill the rest.
-    required = [
-        secrets.choice(upper),
-        secrets.choice(lower),
-        secrets.choice(digits),
-        secrets.choice(symbols),
-    ]
-    rest = [secrets.choice(alphabet) for _ in range(length - len(required))]
+    required = [pick(upper), pick(lower), pick(digits), pick(symbols)]
+    rest = [pick(alphabet) for _ in range(length - len(required))]
     chars = required + rest
-    # Fisher–Yates with secrets for an unbiased shuffle.
+    # Fisher–Yates for an unbiased shuffle.
     for i in range(len(chars) - 1, 0, -1):
-        j = secrets.randbelow(i + 1)
+        j = randbelow(i + 1)
         chars[i], chars[j] = chars[j], chars[i]
     return "".join(chars)
+
+
+def generate_root_password(length: int = 16) -> str:
+    """Generate a strong random root password suitable for cloud-init and freeform tags."""
+    return _build_root_password(length, secrets.randbelow)
+
+
+def derive_root_password(key: bytes, label: str, length: int = 16) -> str:
+    """Same ``(key, label)`` → same password; otherwise as strong as the random one.
+
+    Why it exists: a launch whose response was lost is resubmitted with the same
+    ``opc-retry-token``, and Oracle answers the repeat with the ORIGINAL instance
+    — without comparing the request body. A password generated afresh for the
+    repeat is therefore not the one that machine got, yet it is the one the page
+    shows as 「请立即保存」. Deriving it from the submission makes the repeat carry
+    the very same password.
+
+    The byte source is HMAC-SHA256(key, label ‖ counter); indices come from
+    rejection sampling, so the character distribution is as unbiased as
+    ``secrets.randbelow``. ``key`` must be a server secret: the label is built from
+    values the browser knows.
+    """
+    if not key:
+        raise ValueError("derive_root_password needs a non-empty key")
+    msg = label.encode("utf-8") + b"\x00"
+    pool = bytearray()
+    counter = 0
+
+    def next_u32() -> int:
+        nonlocal counter
+        if len(pool) < 4:
+            pool.extend(hmac.new(key, msg + counter.to_bytes(8, "big"), hashlib.sha256).digest())
+            counter += 1
+        value = int.from_bytes(pool[:4], "big")
+        del pool[:4]
+        return value
+
+    def randbelow(n: int) -> int:
+        limit = (1 << 32) - ((1 << 32) % n)
+        while True:
+            value = next_u32()
+            if value < limit:
+                return value % n
+
+    return _build_root_password(length, randbelow)
 
 
 def shape_display_label(shape: str, ocpus=None, memory=None) -> str:

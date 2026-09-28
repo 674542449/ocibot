@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -16,6 +17,20 @@ def _fernet() -> Fernet:
     digest = hashlib.sha256(settings.master_key.encode("utf-8")).digest()
     key = base64.urlsafe_b64encode(digest)
     return Fernet(key)
+
+
+def launch_password_key() -> bytes:
+    """HMAC key for app.oci_client.derive_root_password.
+
+    Derived from the master secret with its own label, so it is never the same
+    bytes as the Fernet key above (that one is a bare SHA-256 of the secret).
+    """
+    settings = get_settings()
+    return hmac.new(
+        settings.master_key.encode("utf-8"),
+        b"ocibot/launch-root-password/v1",
+        hashlib.sha256,
+    ).digest()
 
 
 def encrypt_text(plain: str) -> str:

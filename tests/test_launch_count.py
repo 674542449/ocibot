@@ -295,6 +295,58 @@ def test_an_operator_supplied_password_is_reused(client, monkeypatch):
     assert {x["root_password"] for x in calls} == {"MyOwnPass123!"}
 
 
+def test_a_resubmitted_launch_gets_the_same_generated_passwords(client, monkeypatch):
+    """响应丢了、原样再点一次：Oracle 按同一个 retry token 把第一次开出来的机器还回来，
+    不比对请求体。第二次请求里要是换了新密码，页面「请立即保存」的就是一个机器上
+    根本不存在的密码。同一次提交（同一个 idempotency_key）必须派生出同样的密码。"""
+    c, tid = client
+    calls = _stub_launch(monkeypatch, auth_mode="password")
+    body = _body(count=2, idempotency_key="k" * 32)
+    first = c.post(f"/api/tenants/{tid}/launch", json=body)
+    second = c.post(f"/api/tenants/{tid}/launch", json=body)
+    assert first.status_code == second.status_code == 200, (first.text, second.text)
+
+    sent = [x["root_password"] for x in calls]
+    assert sent[:2] == sent[2:], "重发时换了密码"
+    assert sent[0] != sent[1], "同一批里两台的密码一样"
+    # 页面上显示的也得是发给 Oracle 的那两个。
+    shown = [i["root_password"] for i in second.json()["instances"]]
+    assert shown == sent[2:]
+
+    # 换一次提交（新 key）就是一次新的创建，密码也必须是新的。
+    c.post(f"/api/tenants/{tid}/launch", json=_body(count=2, idempotency_key="z" * 32))
+    assert set(x["root_password"] for x in calls[4:]).isdisjoint(sent)
+
+
+def test_a_typed_password_is_not_replaced_by_a_derived_one(client, monkeypatch):
+    c, tid = client
+    calls = _stub_launch(monkeypatch, auth_mode="password")
+    r = c.post(
+        f"/api/tenants/{tid}/launch",
+        json=_body(count=2, idempotency_key="k" * 32, root_password="MyOwnPass123!"),
+    )
+    assert r.status_code == 200, r.text
+    assert {x["root_password"] for x in calls} == {"MyOwnPass123!"}
+
+
+def test_derived_passwords_are_stable_strong_and_keyed():
+    from app.oci_client import derive_root_password
+
+    key = b"s" * 32
+    a = derive_root_password(key, "user|tenant|key|0")
+    assert a == derive_root_password(key, "user|tenant|key|0")
+    assert a != derive_root_password(key, "user|tenant|key|1")
+    # 标签是浏览器也知道的值；没有服务端密钥就算不出来。
+    assert a != derive_root_password(b"t" * 32, "user|tenant|key|0")
+    assert len(a) == 16
+    assert any(ch.isupper() for ch in a)
+    assert any(ch.islower() for ch in a)
+    assert any(ch.isdigit() for ch in a)
+    assert any(ch in "!@#%^*-_=+" for ch in a)
+    with pytest.raises(ValueError):
+        derive_root_password(b"", "x")
+
+
 def test_capacity_retry_accepts_a_batch(client, monkeypatch):
     """要 2 台 AMD 的人以前只能拿到 1 台：这里 400、前端又把数量锁成 1。
     现在是一个任务带着 target_count 入队，额度按总量校验，开机全交给 worker。"""

@@ -21,9 +21,9 @@ from app.oci_client import (
 )
 from web.backend.audit import write_audit
 from web.backend.auth import get_current_user
-from web.backend.crypto_util import encrypt_text
+from web.backend.crypto_util import encrypt_text, launch_password_key
 from web.backend.db import get_db
-from app.oci_client import derive_retry_token, generate_root_password
+from app.oci_client import derive_retry_token, derive_root_password, generate_root_password
 from web.backend.launch_service import (
     build_launch_request,
     fetch_launch_meta,
@@ -1097,11 +1097,28 @@ def launch_instance(
         # no protection, not an error.
         idempotency_key = str(getattr(body, "idempotency_key", "") or "").strip()
 
+        # 面板生成的密码按「这次提交」派生，而不是每次请求重新随机。
+        #
+        # 响应丢了、用户原样再点一次时，请求带着同一个 retry token，Oracle 直接把
+        # **第一次**开出来的那台还回来，不比对请求体。随机密码的话，第二次请求里的是
+        # 一个新密码 —— 机器用的是第一次那个，页面却把第二个当作「请立即保存」显示。
+        # 派生之后两次算出来的是同一个，显示的就是机器真正的密码。
+        # 标签里带上用户和租户：idempotency_key 是浏览器生成、浏览器知道的值，
+        # 真正保密的是 launch_password_key()（由主密钥派生）。
+        derive_passwords = (
+            auth_mode == "password" and not user_supplied_password and bool(idempotency_key)
+        )
+        password_key = launch_password_key() if derive_passwords else b""
+
         for index in range(count):
             item_payload = dict(payload)
             if count > 1:
                 item_payload["display_name"] = f"{base_name}-{index + 1}"
-            if index == 0 or user_supplied_password or auth_mode != "password":
+            if derive_passwords:
+                item_password = derive_root_password(
+                    password_key, f"{user.id}\x1f{row.id}\x1f{idempotency_key}\x1f{index}"
+                )
+            elif index == 0 or user_supplied_password or auth_mode != "password":
                 item_password = root_password
             else:
                 item_password = generate_root_password(16)
