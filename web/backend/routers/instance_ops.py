@@ -1243,6 +1243,18 @@ def _require_paid(db: Session, row: Any) -> None:
         raise HTTPException(status_code=403, detail=reason)
 
 
+def _publish_note(session: Any, instance_id: str, compartment_id: str) -> str:
+    """把最新的辅助 IP 列表写进实例元数据，返回附在结果消息后面的一句话。
+
+    绑定 / 解绑之后都要写 —— 部分成功也写：那时 Oracle 那边已经变了，服务器得跟着变。
+    写失败不推翻绑定本身的结果，但必须说出来，否则用户只会看到服务器上 IP 迟迟不生效。
+    """
+    pub = session.publish_secondary_ips(instance_id, compartment_id)
+    if pub.ok:
+        return "；已通知服务器，装了同步服务的话约 1 分钟内自动生效"
+    return f"；但写入实例元数据失败（服务器不会自动同步）：{pub.message}"
+
+
 class ReservedIpBatchCreate(BaseModel):
     count: int = Field(ge=1, le=50)
     name_prefix: str = Field(default="ip", max_length=40)
@@ -1332,6 +1344,8 @@ def attach_multi_ips(
         session = get_session_for_row(row)
         info = session.get_instance(instance_id, resolve_ips=False)
         result = session.attach_multi_ips(instance_id, info.compartment_id, body.public_ip_ids)
+        if (result.data or {}).get("attached"):
+            result.message += _publish_note(session, instance_id, info.compartment_id)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     write_audit(
@@ -1357,6 +1371,8 @@ def detach_multi_ips(
         session = get_session_for_row(row)
         info = session.get_instance(instance_id, resolve_ips=False)
         result = session.detach_multi_ips(instance_id, info.compartment_id, body.private_ip_ids)
+        if (result.data or {}).get("detached"):
+            result.message += _publish_note(session, instance_id, info.compartment_id)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     write_audit(
@@ -1399,10 +1415,21 @@ def install_multi_ip_sync(
     try:
         session = get_session_for_row(row)
         target = resolve_instance_ssh_target(session, instance_id)
+        info = session.get_instance(instance_id, resolve_ips=False)
+        # 先把当前的辅助 IP 列表写进元数据，安装脚本里的那次同步才有东西可读。
+        # 已经绑好 IP、之后才来装服务的情况（以及 0.4.129 装过、读不到列表的旧服务）靠这一步。
+        published = session.publish_secondary_ips(instance_id, info.compartment_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
+    if not published.ok:
+        return {
+            "ok": False,
+            "message": f"写入实例元数据失败，同步服务将无法得知 IP 列表：{published.message}",
+            "stdout": "",
+            "stderr": "",
+        }
 
     # 和 WebSSH、引导卷扩容同一道闸：先验主机密钥，再把凭据交出去。
     hostkey = check_instance_host_key(

@@ -174,15 +174,17 @@ def _load_sync(tmp_path):
     from app import ip_sync
 
     src = ip_sync._SYNC_PY.strip()
-    assert src.endswith("sys.exit(main())")
+    body, _, last = src.rpartition("\n")
+    assert last.startswith("sys.exit(main(")
     ns: dict = {"__name__": "ocibot_ip_sync_test"}
-    exec(compile(src[: -len("sys.exit(main())")], "ocibot-ip-sync", "exec"), ns)
+    exec(compile(body, "ocibot-ip-sync", "exec"), ns)
     ns["STATE_DIR"] = str(tmp_path / "state")
     return ns
 
 
-def _wire(ns, vnics, have, cmds):
+def _wire(ns, vnics, have, cmds, panel=None):
     ns["read_vnics"] = vnics if callable(vnics) else (lambda: vnics)
+    ns["read_panel_list"] = panel if callable(panel) else (lambda: panel)
     ns["interfaces_by_mac"] = lambda: {"02:00:17:00:00:01": "enp0s6"}
     ns["current_ipv4"] = lambda dev: set(have)
 
@@ -238,6 +240,97 @@ def test_sync_changes_nothing_when_metadata_cannot_be_read(tmp_path):
     ns["main"]()
     assert cmds == []
     assert "10.0.0.11" in have
+
+
+# 用户实例上 /opc/v2/vnics/ 的真实返回（2026-10，ap-singapore-1）：
+# 根本没有 secondaryPrivateIps —— 0.4.129 因此一个 IP 都没加上。
+_REAL_VNICS = [{
+    "ipv6SubnetCidrBlock": "2603:c024:4520:a600::/64",
+    "macAddr": "02:00:17:00:00:01",
+    "privateIp": "10.0.0.129",
+    "subnetCidrBlock": "10.0.0.0/24",
+    "virtualRouterIp": "10.0.0.1",
+    "vlanTag": 577,
+    "vnicId": "ocid1.vnic.oc1..v1",
+}]
+
+
+def test_sync_uses_the_list_the_panel_wrote_into_instance_metadata(tmp_path):
+    ns = _load_sync(tmp_path)
+    have = {"10.0.0.129"}
+    cmds: list[str] = []
+    _wire(ns, _REAL_VNICS, have, cmds, panel={"ocid1.vnic.oc1..v1": ["10.0.0.11", "10.0.0.12"]})
+    ns["main"]()
+    assert cmds == ["addr add 10.0.0.11/24 dev enp0s6", "addr add 10.0.0.12/24 dev enp0s6"]
+
+    # 全部解绑：面板写的是空列表（不是删掉键），于是自己加的都要拿掉
+    cmds.clear()
+    _wire(ns, _REAL_VNICS, have, cmds, panel={"ocid1.vnic.oc1..v1": []})
+    ns["main"]()
+    assert sorted(cmds) == ["addr del 10.0.0.11/24 dev enp0s6", "addr del 10.0.0.12/24 dev enp0s6"]
+    assert have == {"10.0.0.129"}
+
+
+def test_no_panel_list_and_no_vnics_field_changes_nothing(tmp_path):
+    """真实的 IMDS 返回 + 面板还没写过元数据：不能当成「一个都不要」去删。"""
+    ns = _load_sync(tmp_path)
+    have = {"10.0.0.129", "10.0.0.11"}
+    cmds: list[str] = []
+    _wire(ns, _REAL_VNICS, have, cmds, panel={"ocid1.vnic.oc1..v1": ["10.0.0.11"]})
+    ns["main"]()  # .11 已经在网卡上（手工加的），不重复加、也不收编
+    _wire(ns, _REAL_VNICS, have, cmds, panel=None)
+    ns["main"]()
+    assert cmds == [] and "10.0.0.11" in have
+
+
+def test_install_mode_waits_for_the_panel_list_to_show_up(tmp_path):
+    ns = _load_sync(tmp_path)
+    have = {"10.0.0.129"}
+    cmds: list[str] = []
+    answers = [None, None, {"ocid1.vnic.oc1..v1": ["10.0.0.11"]}]
+    _wire(ns, _REAL_VNICS, have, cmds, panel=lambda: answers.pop(0))
+    ns["time"] = SimpleNamespace(time=__import__("time").time, sleep=lambda _s: None)
+    ns["main"](wait=60)
+    assert cmds == ["addr add 10.0.0.11/24 dev enp0s6"]
+    assert answers == []
+
+
+# ---------------------------------------------------------------- 写实例元数据
+
+
+class _FakeCompute:
+    def __init__(self, metadata):
+        self.metadata = dict(metadata)
+        self.updates: list = []
+
+    def get_instance(self, instance_id):
+        return SimpleNamespace(data=SimpleNamespace(metadata=dict(self.metadata)), headers={"etag": "e1"})
+
+    def update_instance(self, instance_id, details, **kw):
+        self.updates.append((details.metadata, kw))
+        self.metadata = dict(details.metadata)
+
+
+def test_publishing_keeps_every_existing_metadata_key(monkeypatch):
+    """UpdateInstance 的 metadata 是整体替换；user_data / ssh_authorized_keys 必须原样带回。"""
+    monkeypatch.setattr("oci.pagination.list_call_get_all_results", lambda fn, **kw: fn(**kw))
+    net = _FakeNet(privs=[
+        _priv("pv-primary", "10.0.0.129", primary=True),
+        _priv("pv2", "10.0.0.20", managed=True),
+        _priv("pv1", "10.0.0.3", managed=True),
+    ])
+    s = _session(net, [])
+    s._compute = _FakeCompute({"ssh_authorized_keys": "ssh-ed25519 AAA", "user_data": "IyEvYmlu"})
+    res = s.publish_secondary_ips("inst", "comp")
+    assert res.ok, res.message
+    (md, kw), = s._compute.updates
+    assert md["ssh_authorized_keys"] == "ssh-ed25519 AAA" and md["user_data"] == "IyEvYmlu"
+    assert md[TenantSession.SECONDARY_IPS_METADATA_KEY] == '{"vnic1":["10.0.0.3","10.0.0.20"]}'
+    assert kw == {"if_match": "e1"}, "要用 etag 防止覆盖别人同时做的修改"
+
+    # 内容没变就不再写一次
+    assert s.publish_secondary_ips("inst", "comp").ok
+    assert len(s._compute.updates) == 1
 
 
 def test_sync_parses_real_ip_addr_output(tmp_path):

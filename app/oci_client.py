@@ -9615,6 +9615,51 @@ class TenantSession:
             },
         )
 
+    # 实例里的同步服务（app/ip_sync.py）从这个元数据键读「该加哪些辅助 IP」。
+    SECONDARY_IPS_METADATA_KEY = "ocibot_secondary_ips"
+
+    def publish_secondary_ips(self, instance_id: str, compartment_id: str) -> OperationResult:
+        """把主网卡当前的辅助私网 IP 写进实例元数据，供实例内的同步服务读取。
+
+        为什么要写：Oracle 文档说 IMDS 的 /opc/v2/vnics/ 会列出 secondaryPrivateIps，
+        实测（2026-10，ap-singapore-1）并没有 —— 实例自己无从得知 Oracle 给它分了哪些辅助
+        IP。实例元数据（/opc/v2/instance/metadata/<key>）是实例不需要任何凭据就能读、
+        面板又能写的地方，UpdateInstance 改元数据不重启，约一分钟内在 IMDS 生效。
+
+        值是 ``{"<vnic OCID>": ["10.0.0.11", ...]}`` 的 JSON，列出主网卡上**全部**辅助 IP
+        （面板建的和手工建的都列；同步服务对已在网卡上的地址不会重复加）。
+
+        UpdateInstance 的 metadata 是**整体替换**，所以必须把现有的键（含 user_data、
+        ssh_authorized_keys —— 这两个 Oracle 不允许改，必须原样带回）一起送回去；
+        用 GetInstance 的 etag 做 if-match，别和同时进行的其他修改互相覆盖。
+        """
+        import json
+
+        try:
+            network, privs = self._primary_vnic_private_ips(instance_id, compartment_id)
+            ips = sorted(
+                (str(getattr(p, "ip_address", "") or "") for p in privs if not getattr(p, "is_primary", False)),
+                key=lambda ip: ipaddress.ip_address(ip) if ip else ipaddress.ip_address("0.0.0.0"),
+            )
+            value = json.dumps({network.vnic_id: [ip for ip in ips if ip]}, separators=(",", ":"))
+            resp = self.compute.get_instance(instance_id)
+            metadata = dict(getattr(resp.data, "metadata", None) or {})
+            if metadata.get(self.SECONDARY_IPS_METADATA_KEY) == value:
+                return OperationResult(ok=True, message="实例元数据已是最新", data={"ips": ips})
+            metadata[self.SECONDARY_IPS_METADATA_KEY] = value
+            etag = (getattr(resp, "headers", None) or {}).get("etag")
+            kwargs: dict[str, Any] = {"if_match": etag} if etag else {}
+            self.compute.update_instance(
+                instance_id, oci.core.models.UpdateInstanceDetails(metadata=metadata), **kwargs
+            )
+            return OperationResult(ok=True, message="已写入实例元数据", data={"ips": ips})
+        except OCIClientError as exc:
+            return OperationResult(ok=False, message=str(exc))
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=safe_error_text(exc))
+
     def attach_multi_ips(
         self, instance_id: str, compartment_id: str, public_ip_ids: list[str]
     ) -> OperationResult:

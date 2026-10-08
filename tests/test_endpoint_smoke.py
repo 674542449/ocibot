@@ -171,8 +171,11 @@ def make_session():
             "limit": 64,
         },
     )
-    s.attach_multi_ips.return_value = R(True, "已绑定 1 个", {"attached": [], "failed": ""})
-    s.detach_multi_ips.return_value = R(True, "已解绑 1 个", {"detached": [], "failed": ""})
+    s.attach_multi_ips.return_value = R(
+        True, "已绑定 1 个", {"attached": [{"public_ip": "1.1.1.1", "private_ip": "10.0.0.11"}], "failed": ""}
+    )
+    s.detach_multi_ips.return_value = R(True, "已解绑 1 个", {"detached": ["1.1.1.1"], "failed": ""})
+    s.publish_secondary_ips.return_value = R(True, "已写入实例元数据", {"ips": ["10.0.0.11"]})
     s.home_region.return_value = "ap-tokyo-1"
     s.list_subscribed_regions.return_value = R(
         True,

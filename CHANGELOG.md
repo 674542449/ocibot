@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.4.131 — 2026-10-08
+
+修复多出口 IP：同步服务装上了，但一个辅助 IP 都没加到系统里。
+
+### 修复
+
+- **【高】同步服务读不到辅助 IP 列表。** 0.4.129 照 Oracle 文档，从实例内部的元数据服务
+  （`/opc/v2/vnics/`）读 `secondaryPrivateIps`。实际返回里根本没有这个字段 —— 服务每分钟
+  跑一次，日志一直是「metadata has no secondary IP list, skipped」，Oracle 那边绑好的 IP
+  在系统里一个都没有。这是没在真实实例上验证文档说法造成的。
+  现在改为由面板告诉服务器：每次绑定 / 解绑之后（以及安装同步服务时），面板把这台实例
+  主网卡上的辅助私网 IP 列表写进**实例元数据**（键 `ocibot_secondary_ips`），服务器从
+  `/opc/v2/instance/metadata/ocibot_secondary_ips` 读取 —— 这和服务器读取自己 SSH 公钥
+  用的是同一条路径，不需要任何 Oracle 凭据。
+  - 写元数据时原有的键（含 `user_data`、`ssh_authorized_keys`）原样保留，并用 etag
+    防止覆盖同时进行的其他修改；Oracle 说明改元数据约一分钟内生效、不重启实例。
+  - 读不到列表时仍然什么都不删。
+  - 安装时直接跑一次同步并显示结果（加了哪些 IP），最多等 75 秒让新写的列表生效，
+    不用再去查日志。
+  - 绑定 / 解绑的结果提示里会说明是否已通知服务器；写元数据失败会明确说出来。
+
+**已经装过 0.4.129 同步服务的：** 更新面板后，在实例的「保留 IP」页签再点一次
+「安装 / 更新同步服务」即可，已绑定的 IP 会在这一步加到系统里。
+
+### 维护
+
+- `TenantSession.publish_secondary_ips`；`tests/test_multi_ip.py` 增至 16 条（含用户实例
+  上 `/opc/v2/vnics/` 的真实返回、全部解绑、安装时等待列表、写元数据保留原有键）。
+
+### 升级
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.131
+```
+
 ## 0.4.130 — 2026-10-08
 
 「账号用量」的配额表显示公网 IP 的上限和已用数。
