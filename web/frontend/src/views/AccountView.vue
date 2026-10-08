@@ -71,7 +71,7 @@
       <!-- Filtered to the Always Free shapes server-side (FREE_TIER_LIMIT_TAGS):
            Oracle reports non-zero limits for paid families on free accounts too,
            so listing them was quota the operator has no use for. -->
-      <h3 style="margin: 0.5rem 0 0">计算配额（参考 · 仅免费套餐 A1 / E2.1.Micro）</h3>
+      <h3 style="margin: 0.5rem 0 0">计算配额（参考 · 免费套餐 A1 / E2.1.Micro 与公网 IP）</h3>
       <div class="table-wrap">
         <table>
           <thead>
@@ -82,7 +82,7 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-if="!(data.limits || []).length">
+            <tr v-if="!(data.limits || []).length && !(data.public_ip_limits || []).length">
               <td colspan="3" class="muted empty">无配额数据或无权限</td>
             </tr>
             <!-- key 要带上可用域：服务限额是按 AD 报的，同一个 name 在 3 个 AD 上
@@ -91,6 +91,18 @@
               <td>{{ l.name }}</td>
               <td class="muted" style="font-size: 12px">{{ shortAd(l.ad) || '全区域' }}</td>
               <td>{{ l.value }}</td>
+            </tr>
+            <!-- 公网 IP 限额：名字和数字都是 Oracle 当场报的（见 oci_client._public_ip_limits），
+                 已用数读得到时一并显示 —— 只给上限的话，看不出还能再建几个。 -->
+            <tr v-for="p in data.public_ip_limits || []" :key="`pip:${p.name}@${p.ad || '-'}`">
+              <td :title="p.name">{{ publicIpLabel(p.name) }}</td>
+              <td class="muted" style="font-size: 12px">{{ shortAd(p.ad) || '全区域' }}</td>
+              <td>
+                {{ p.value ?? '—' }}
+                <span v-if="p.used != null" class="muted" style="font-size: 12px">
+                  （已用 {{ p.used }}<template v-if="p.available != null">，剩余 {{ p.available }}</template>）
+                </span>
+              </td>
             </tr>
           </tbody>
         </table>
@@ -421,6 +433,14 @@ function shortAd(ad: string) {
   if (!ad) return ''
   const i = ad.indexOf(':')
   return i >= 0 ? ad.slice(i + 1) : ad
+}
+
+/** Oracle 的限额名 → 中文。认不出的原样显示（悬停仍能看到原名）。 */
+function publicIpLabel(name: string) {
+  const n = String(name || '').toLowerCase()
+  if (n.includes('reserved')) return '保留公网 IP'
+  if (n.includes('ephemeral')) return '临时公网 IP'
+  return name
 }
 
 function tierLabel(t: string) {

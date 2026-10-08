@@ -8142,6 +8142,7 @@ class TenantSession:
             info["limits"] = sorted(rows, key=lambda r: (r["name"], r["ad"]))[:12]
         except (ServiceError, Exception):  # noqa: BLE001
             info["limits"] = []
+        info["public_ip_limits"] = self._public_ip_limits(tenancy_id)
 
         # Tier is decided from the tenancy's subscription record — the
         # authoritative source. Dashboard keeps home-region fallback for reliability.
@@ -8168,6 +8169,67 @@ class TenantSession:
         )
         info["home_region"] = self._home_region() or info["home_region"]
         return OperationResult(ok=True, message="已读取账号信息", data=info)
+
+    def _public_ip_limits(self, tenancy_id: str) -> list[dict[str, Any]]:
+        """公网 IP 的服务限额（上限 + 已用），给「账号用量」页的配额表用。
+
+        限额名和所属服务都**问 Oracle**，不写死：先从服务列表里找网络服务
+        （名字是 ``vcn``，或描述里写着 Virtual Cloud Network 的那个），再在它的
+        限额里挑名字带 ``public-ip`` 的。Oracle 改名或新增一种公网 IP 限额，这里
+        自动跟上，而不是静默显示一个对不上的数字。
+
+        已用数来自 GetResourceAvailability；不是每种限额都支持，读不到就只给上限。
+        和上面的计算配额一样是参考信息：任何一步失败都返回空列表，不影响其余内容。
+        """
+        try:
+            services = oci.pagination.list_call_get_all_results(
+                self.limits.list_services,
+                tenancy_id,
+                retry_strategy=sdk_bounded_paged_retry_strategy(),
+            ).data
+            names = {str(getattr(s, "name", "") or "") for s in services}
+            service = "vcn" if "vcn" in names else next(
+                (
+                    str(getattr(s, "name", "") or "")
+                    for s in services
+                    if "virtual cloud network" in str(getattr(s, "description", "") or "").lower()
+                ),
+                "",
+            )
+            if not service:
+                return []
+            values = oci.pagination.list_call_get_all_results(
+                self.limits.list_limit_values,
+                tenancy_id,
+                service,
+                retry_strategy=sdk_bounded_paged_retry_strategy(),
+            ).data
+        except Exception:  # noqa: BLE001 - reference data only
+            return []
+
+        rows: list[dict[str, Any]] = []
+        for v in values:
+            name = str(getattr(v, "name", "") or "")
+            if "public-ip" not in name and "publicip" not in name:
+                continue
+            ad = str(getattr(v, "availability_domain", "") or "")
+            row: dict[str, Any] = {
+                "name": name,
+                "ad": ad,
+                "scope": str(getattr(v, "scope_type", "") or ""),
+                "value": getattr(v, "value", None),
+                "used": None,
+                "available": None,
+            }
+            try:
+                kwargs: dict[str, Any] = {"availability_domain": ad} if ad else {}
+                avail = self.limits.get_resource_availability(service, name, tenancy_id, **kwargs).data
+                row["used"] = getattr(avail, "used", None)
+                row["available"] = getattr(avail, "available", None)
+            except Exception:  # noqa: BLE001 - not every limit supports availability
+                pass
+            rows.append(row)
+        return sorted(rows, key=lambda r: (r["name"], r["ad"]))
 
     def list_console_password_policies(self) -> OperationResult:
         """List Identity Domain password policies (console login password expiry, etc.).
