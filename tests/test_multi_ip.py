@@ -167,6 +167,35 @@ def test_batch_create_continues_numbering_and_stops_at_the_limit():
     assert [c["display_name"] for c in res.data["created"]] == ["proxy-08", "proxy-09"]
 
 
+def test_batch_release_keeps_going_past_a_refused_ip(monkeypatch):
+    """一个还绑着的 IP 被拒绝，不能连带其余几个都不释放。"""
+    from web.backend.routers import instance_ops
+
+    asked: list[str] = []
+
+    def delete(pid):
+        asked.append(pid)
+        if pid == "busy":
+            return SimpleNamespace(ok=False, message="该保留 IP 仍绑定在实例上，请先解绑")
+        return SimpleNamespace(ok=True, message=f"已删除保留 IP {pid}")
+
+    monkeypatch.setattr(instance_ops, "_row", lambda db, uid, tid: SimpleNamespace(id=tid))
+    monkeypatch.setattr(
+        instance_ops, "get_session_for_row", lambda row: SimpleNamespace(delete_reserved_public_ip=delete)
+    )
+    monkeypatch.setattr(instance_ops, "write_audit", lambda *a, **k: None)
+    out = instance_ops.batch_delete_reserved_ips(
+        "t1",
+        instance_ops.ReservedIpBatchDelete(public_ip_ids=["a", "busy", "b", "a"]),
+        SimpleNamespace(id="u1"),
+        None,
+    )
+    assert asked == ["a", "busy", "b"], "重复的只处理一次，失败的不中断后面的"
+    assert out["ok"] is False
+    assert out["data"]["released"] == 2
+    assert "2/3" in out["message"] and "仍绑定" in out["message"]
+
+
 # ---------------------------------------------------------------- 实例上的同步脚本
 
 

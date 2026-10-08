@@ -144,6 +144,7 @@ const ACTION_LABELS: Record<string, string> = {
   'reserved_ip.detach': '解绑保留 IP',
   'reserved_ip.delete': '删除保留 IP',
   'reserved_ip.batch_create': '批量新建保留 IP',
+  'reserved_ip.batch_delete': '批量释放保留 IP',
   'multi_ip.attach': '多出口 IP · 绑定',
   'multi_ip.detach': '多出口 IP · 解绑',
   'multi_ip.install_sync': '多出口 IP · 安装同步服务',

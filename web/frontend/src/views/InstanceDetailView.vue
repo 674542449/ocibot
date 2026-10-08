@@ -640,7 +640,17 @@
         <table>
           <thead>
             <tr>
-              <th v-if="multiAllowed" style="width: 34px"></th>
+              <th v-if="multiAllowed" style="width: 34px">
+                <input
+                  type="checkbox"
+                  :checked="reservedSelectState === 'all'"
+                  :indeterminate="reservedSelectState === 'some'"
+                  :disabled="!selectableReservedIds.length"
+                  title="全选未绑定的保留 IP"
+                  aria-label="全选未绑定的保留 IP"
+                  @change="toggleAllReserved"
+                />
+              </th>
               <th>IP 地址</th>
               <th>名称</th>
               <th>状态</th>
@@ -706,6 +716,9 @@
         <button class="primary" :disabled="multiBusy || ripBusy" @click="attachSelectedMulti">
           {{ multiBusy ? '绑定中…' : '作为多出口绑定到本实例' }}
         </button>
+        <button class="danger" :disabled="multiBusy || ripBusy" @click="releaseSelectedReserved">
+          {{ ripBusy ? '处理中…' : '批量释放' }}
+        </button>
         <button :disabled="multiBusy" @click="selectedReserved.clear()">取消选择</button>
       </div>
     </div>
@@ -730,7 +743,17 @@
           <table>
             <thead>
               <tr>
-                <th style="width: 34px"></th>
+                <th style="width: 34px">
+                  <input
+                    type="checkbox"
+                    :checked="multiSelectState === 'all'"
+                    :indeterminate="multiSelectState === 'some'"
+                    :disabled="!selectableMultiIds.length"
+                    title="全选面板创建的多出口 IP"
+                    aria-label="全选面板创建的多出口 IP"
+                    @change="toggleAllMulti"
+                  />
+                </th>
                 <th>公网 IP</th>
                 <th>私网 IP</th>
                 <th>名称</th>
@@ -1339,6 +1362,42 @@ function toggleMulti(id: string) {
   else selectedMulti.add(id)
 }
 
+// ---- 全选 ----
+// 只在「能勾的」那些行里算：已绑定的保留 IP、手工建的辅助 IP 本来就没有勾选框，
+// 把它们算进去的话，全选框永远到不了「全选」状态。
+const selectableReservedIds = computed(() =>
+  reservedIps.value.filter((ip) => !ip.assigned).map((ip) => ip.id),
+)
+const selectableMultiIds = computed(() =>
+  (multiInfo.value?.items || []).filter((m) => m.managed).map((m) => m.private_ip_id),
+)
+
+function selectState(ids: string[], selected: Set<string>): 'none' | 'some' | 'all' {
+  const n = ids.filter((id) => selected.has(id)).length
+  if (!n) return 'none'
+  return n === ids.length ? 'all' : 'some'
+}
+
+const reservedSelectState = computed(() => selectState(selectableReservedIds.value, selectedReserved))
+const multiSelectState = computed(() => selectState(selectableMultiIds.value, selectedMulti))
+
+/** 已全选 → 全部取消；否则（没选或选了一部分）→ 全选。 */
+function toggleAll(ids: string[], selected: Set<string>, state: 'none' | 'some' | 'all') {
+  if (state === 'all') {
+    for (const id of ids) selected.delete(id)
+  } else {
+    for (const id of ids) selected.add(id)
+  }
+}
+
+function toggleAllReserved() {
+  toggleAll(selectableReservedIds.value, selectedReserved, reservedSelectState.value)
+}
+
+function toggleAllMulti() {
+  toggleAll(selectableMultiIds.value, selectedMulti, multiSelectState.value)
+}
+
 async function loadMultiIps() {
   const guard = beginLoad('multiIps')
   multiBusy.value = true
@@ -1433,6 +1492,38 @@ async function attachSelectedMulti() {
     multiBusy.value = false
   }
   if (!act.moved()) await refreshNetworkTab()
+}
+
+async function releaseSelectedReserved() {
+  const picked = reservedIps.value.filter((ip) => selectedReserved.has(ip.id) && !ip.assigned)
+  if (!picked.length) return
+  const addrs = picked.map((ip) => ip.ip_address)
+  if (
+    !confirm(
+      `释放这 ${picked.length} 个保留公网 IP？\n` +
+        `${addrs.slice(0, 15).join('、')}${addrs.length > 15 ? ` … 等 ${addrs.length} 个` : ''}\n\n` +
+        '释放后地址归还 Oracle，不可恢复，以后也拿不回同一个地址。',
+    )
+  )
+    return
+  ripBusy.value = true
+  error.value = ''
+  msg.value = ''
+  try {
+    const { data } = await api.post(
+      `/tenants/${tenantId.value}/reserved-ips/batch-delete`,
+      { public_ip_ids: picked.map((ip) => ip.id) },
+      { timeout: 300_000 },
+    )
+    if (data.ok) msg.value = data.message
+    else error.value = data.message
+    selectedReserved.clear()
+  } catch (e: any) {
+    error.value = e?.message || '批量释放失败'
+  } finally {
+    ripBusy.value = false
+  }
+  await refreshNetworkTab()
 }
 
 async function detachMulti(privateIpIds: string[], label: string) {

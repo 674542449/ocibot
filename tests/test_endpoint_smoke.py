@@ -451,6 +451,7 @@ def test_every_endpoint_is_wired() -> None:
             (f"/api/tenants/{tid}/reserved-ips", {"display_name": "pip"}),
             (f"/api/tenants/{tid}/instances/{iid}/reserved-ip/attach", {"public_ip_id": "pip1"}),
             (f"/api/tenants/{tid}/reserved-ips/pip1/detach", None),
+            (f"/api/tenants/{tid}/reserved-ips/batch-delete", {"public_ip_ids": ["pip1", "pip2"]}),
             (f"/api/tenants/{tid}/boot-volume-backups",
              {"boot_volume_id": "ocid1.bootvolume.oc1..bv1"}),
             (f"/api/tenants/{tid}/block-volumes", {"availability_domain": "AD-1", "size_in_gbs": 50}),

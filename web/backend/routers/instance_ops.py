@@ -1260,6 +1260,53 @@ class ReservedIpBatchCreate(BaseModel):
     name_prefix: str = Field(default="ip", max_length=40)
 
 
+class ReservedIpBatchDelete(BaseModel):
+    public_ip_ids: list[str] = Field(min_length=1, max_length=100)
+
+
+@router.post("/tenants/{tenant_id}/reserved-ips/batch-delete")
+def batch_delete_reserved_ips(
+    tenant_id: str,
+    body: ReservedIpBatchDelete,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    """逐个释放保留 IP。和单个删除同一套检查（仍绑定着的会被拒绝）。
+
+    一个失败不影响其余的：这里每个 IP 互不相关，不像多出口绑定那样中途停下更安全。
+    不限账号等级 —— 释放是清理，和解绑一样不该被卡住。
+    """
+    row = _row(db, user.id, tenant_id)
+    try:
+        session = get_session_for_row(row)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
+    released: list[str] = []
+    failed: list[str] = []
+    for pid in dict.fromkeys(i for i in body.public_ip_ids if i):
+        try:
+            res = session.delete_reserved_public_ip(pid)
+        except Exception as exc:  # noqa: BLE001
+            failed.append(safe_error_text(exc))
+            continue
+        if res.ok:
+            released.append(res.message)
+        else:
+            failed.append(res.message)
+    total = len(released) + len(failed)
+    message = f"已释放 {len(released)}/{total} 个保留 IP"
+    if failed:
+        message += "；失败：" + "；".join(failed[:5]) + (" …" if len(failed) > 5 else "")
+    write_audit(
+        db,
+        owner_id=user.id,
+        action="reserved_ip.batch_delete",
+        target=f"×{total}",
+        detail={"tenant_id": tenant_id, "ok": not failed, "message": message[:500]},
+    )
+    return {"ok": not failed, "message": message, "data": {"released": len(released), "failed": failed}}
+
+
 class MultiIpAttach(BaseModel):
     public_ip_ids: list[str] = Field(min_length=1, max_length=64)
 
