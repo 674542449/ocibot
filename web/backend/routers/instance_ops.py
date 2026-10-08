@@ -1208,6 +1208,237 @@ def detach_reserved_ip(
 
 
 # ---------------------------------------------------------------------------
+# 多出口 IP：批量保留 IP、多个保留 IP 绑到一台实例、系统侧同步服务
+#
+# 只对升级（按量付费）账号开放。免费账号保留 IP 很少，这一整套用不上。判断放在
+# 服务端：只在前端藏按钮，一个手发的请求照样能用。解绑例外，永远放行 ——
+# 清理不该被等级卡住（比如账号等级被重新识别后）。
+# ---------------------------------------------------------------------------
+
+
+def _paid_or_reason(db: Session, row: Any) -> str:
+    """'' if this tenant's account is upgraded (paid), else why the feature is off.
+
+    副区租户行建立时抄了一份主租户的等级，但主租户之后才点「等级查询」的话那份是
+    旧的，所以以主租户为准。
+    """
+    from web.backend.models import Tenant
+
+    tier = str(getattr(row, "account_tier", "") or "")
+    parent_id = str(getattr(row, "parent_tenant_id", "") or "")
+    if parent_id:
+        parent = db.get(Tenant, parent_id)
+        if parent is not None and parent.account_tier:
+            tier = parent.account_tier
+    if tier == "paid":
+        return ""
+    if tier == "free":
+        return "多出口 IP 与批量保留 IP 仅限升级（按量付费）账号使用"
+    return "尚未识别账号等级：请先在「租户」页点该租户的「等级查询」（仅升级账号可用此功能）"
+
+
+def _require_paid(db: Session, row: Any) -> None:
+    reason = _paid_or_reason(db, row)
+    if reason:
+        raise HTTPException(status_code=403, detail=reason)
+
+
+class ReservedIpBatchCreate(BaseModel):
+    count: int = Field(ge=1, le=50)
+    name_prefix: str = Field(default="ip", max_length=40)
+
+
+class MultiIpAttach(BaseModel):
+    public_ip_ids: list[str] = Field(min_length=1, max_length=64)
+
+
+class MultiIpDetach(BaseModel):
+    private_ip_ids: list[str] = Field(min_length=1, max_length=64)
+
+
+class IpSyncInstall(BaseModel):
+    ssh_username: str = "ubuntu"
+    ssh_private_key_pem: Optional[str] = None
+    ssh_password: Optional[str] = None
+    ssh_port: int = 22
+
+
+@router.post("/tenants/{tenant_id}/reserved-ips/batch")
+def batch_create_reserved_ips(
+    tenant_id: str,
+    body: ReservedIpBatchCreate,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    row = _row(db, user.id, tenant_id)
+    _require_paid(db, row)
+    try:
+        session = get_session_for_row(row)
+        result = session.create_reserved_public_ips(body.count, body.name_prefix)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
+    data = result.data if isinstance(result.data, dict) else {}
+    write_audit(
+        db,
+        owner_id=user.id,
+        action="reserved_ip.batch_create",
+        target=f"{body.name_prefix} ×{body.count}",
+        detail={"tenant_id": tenant_id, "ok": result.ok, "message": result.message},
+    )
+    return {"ok": result.ok, "message": result.message, "data": data}
+
+
+@router.get("/tenants/{tenant_id}/instances/{instance_id}/multi-ips")
+def list_multi_ips(
+    tenant_id: str,
+    instance_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    row = _row(db, user.id, tenant_id)
+    reason = _paid_or_reason(db, row)
+    if reason:
+        # 免费账号连 Oracle 都不问：页面只需要知道「不可用、为什么」。
+        return {"ok": True, "allowed": False, "reason": reason, "items": []}
+    try:
+        session = get_session_for_row(row)
+        info = session.get_instance(instance_id, resolve_ips=False)
+        result = session.list_multi_ips(instance_id, info.compartment_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
+    data = result.data if isinstance(result.data, dict) else {}
+    return {
+        "ok": result.ok,
+        "message": result.message,
+        "allowed": True,
+        "reason": "",
+        "items": data.get("items", []),
+        "primary_private_ip": data.get("primary_private_ip", ""),
+        "limit": data.get("limit", 64),
+    }
+
+
+@router.post("/tenants/{tenant_id}/instances/{instance_id}/multi-ips/attach")
+def attach_multi_ips(
+    tenant_id: str,
+    instance_id: str,
+    body: MultiIpAttach,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> PowerActionResult:
+    row = _row(db, user.id, tenant_id)
+    _require_paid(db, row)
+    try:
+        session = get_session_for_row(row)
+        info = session.get_instance(instance_id, resolve_ips=False)
+        result = session.attach_multi_ips(instance_id, info.compartment_id, body.public_ip_ids)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
+    write_audit(
+        db,
+        owner_id=user.id,
+        action="multi_ip.attach",
+        target=instance_id,
+        detail={"tenant_id": tenant_id, "ok": result.ok, "message": result.message},
+    )
+    return PowerActionResult(**op_result_dict(result))
+
+
+@router.post("/tenants/{tenant_id}/instances/{instance_id}/multi-ips/detach")
+def detach_multi_ips(
+    tenant_id: str,
+    instance_id: str,
+    body: MultiIpDetach,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> PowerActionResult:
+    row = _row(db, user.id, tenant_id)
+    try:
+        session = get_session_for_row(row)
+        info = session.get_instance(instance_id, resolve_ips=False)
+        result = session.detach_multi_ips(instance_id, info.compartment_id, body.private_ip_ids)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
+    write_audit(
+        db,
+        owner_id=user.id,
+        action="multi_ip.detach",
+        target=instance_id,
+        detail={"tenant_id": tenant_id, "ok": result.ok, "message": result.message},
+    )
+    return PowerActionResult(**op_result_dict(result))
+
+
+@router.post("/tenants/{tenant_id}/instances/{instance_id}/multi-ips/install-sync")
+def install_multi_ip_sync(
+    tenant_id: str,
+    instance_id: str,
+    body: IpSyncInstall,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    """SSH in once and install app.ip_sync's service. Credentials are used for this request only."""
+    from app.fs_grow import truncate_output
+    from web.backend.ssh_bridge import (
+        install_ip_sync_over_ssh,
+        resolve_instance_ssh_target,
+        validate_ssh_auth,
+    )
+
+    row = _row(db, user.id, tenant_id)
+    _require_paid(db, row)
+    try:
+        auth = validate_ssh_auth(
+            username=body.ssh_username or "ubuntu",
+            private_key_pem=body.ssh_private_key_pem,
+            password=body.ssh_password,
+            port=int(body.ssh_port or 22),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=safe_error_text(exc)) from exc
+    try:
+        session = get_session_for_row(row)
+        target = resolve_instance_ssh_target(session, instance_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=safe_error_text(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
+
+    # 和 WebSSH、引导卷扩容同一道闸：先验主机密钥，再把凭据交出去。
+    hostkey = check_instance_host_key(
+        db,
+        owner_id=user.id,
+        tenant_id=tenant_id,
+        instance_id=instance_id,
+        host=target.host,
+        port=int(auth["port"]),
+    )
+    if not hostkey.ok:
+        return {"ok": False, "message": hostkey.message(), "stdout": "", "stderr": ""}
+    result = install_ip_sync_over_ssh(
+        target.host,
+        port=auth["port"],
+        username=auth["username"],
+        private_key_pem=auth.get("private_key_pem"),
+        password=auth.get("password"),
+        known_hosts=known_hosts_for(hostkey.server_key),
+    )
+    write_audit(
+        db,
+        owner_id=user.id,
+        action="multi_ip.install_sync",
+        target=instance_id,
+        detail={"tenant_id": tenant_id, "ok": result.ok, "message": result.message},
+    )
+    return {
+        "ok": result.ok,
+        "message": result.message,
+        "stdout": truncate_output(result.stdout),
+        "stderr": truncate_output(result.stderr),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Boot volume backups + custom images
 # ---------------------------------------------------------------------------
 

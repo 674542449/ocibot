@@ -608,14 +608,39 @@
           </p>
         </div>
         <div class="row">
-          <button :disabled="ripBusy" @click="loadReservedIps">刷新</button>
+          <button :disabled="ripBusy || multiBusy" @click="refreshNetworkTab">刷新</button>
           <button class="primary" :disabled="ripBusy" @click="createReservedIp">新建保留 IP</button>
+          <button
+            v-if="multiAllowed"
+            :disabled="ripBusy"
+            @click="batchForm.open = !batchForm.open"
+          >
+            {{ batchForm.open ? '收起批量新建' : '批量新建' }}
+          </button>
         </div>
+      </div>
+      <div v-if="multiAllowed && batchForm.open" class="batch-ip-form">
+        <label>
+          数量
+          <input v-model.number="batchForm.count" type="number" min="1" max="50" style="width: 5rem" />
+        </label>
+        <label>
+          名称前缀
+          <input v-model="batchForm.prefix" maxlength="40" placeholder="proxy" style="width: 9rem" />
+        </label>
+        <button class="primary" :disabled="ripBusy" @click="batchCreateReservedIps">
+          {{ ripBusy ? '创建中…' : `创建 ${batchCountClamped} 个` }}
+        </button>
+        <span class="muted" style="font-size: 12px">
+          命名为 {{ batchForm.prefix || 'ip' }}-01、-02 …（接着已有编号）。本区域已有
+          {{ reservedIps.length }} 个，Oracle 默认上限每区域 50 个，到上限时会停下并说明。
+        </span>
       </div>
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
+              <th v-if="multiAllowed" style="width: 34px"></th>
               <th>IP 地址</th>
               <th>名称</th>
               <th>状态</th>
@@ -626,12 +651,21 @@
           <tbody>
             <!-- 读取中不说「暂无」：换租户会先清空这张表。 -->
             <tr v-if="ripBusy && !reservedIps.length">
-              <td colspan="5" class="muted empty">正在读取…</td>
+              <td :colspan="multiAllowed ? 6 : 5" class="muted empty">正在读取…</td>
             </tr>
             <tr v-else-if="reservedIps.length === 0">
-              <td colspan="5" class="muted empty">该区域暂无保留 IP。「新建保留 IP」后即可绑定到实例。</td>
+              <td :colspan="multiAllowed ? 6 : 5" class="muted empty">该区域暂无保留 IP。「新建保留 IP」后即可绑定到实例。</td>
             </tr>
             <tr v-for="ip in reservedIps" :key="ip.id">
+              <td v-if="multiAllowed">
+                <input
+                  v-if="!ip.assigned"
+                  type="checkbox"
+                  :checked="selectedReserved.has(ip.id)"
+                  :aria-label="`选择 ${ip.ip_address}`"
+                  @change="toggleReserved(ip.id)"
+                />
+              </td>
               <td
                 class="copyable"
                 title="单击复制"
@@ -644,13 +678,18 @@
               <td><span class="badge">{{ ip.lifecycle_state }}</span></td>
               <td>
                 <span class="badge" :class="ip.assigned ? 'running' : ''">
-                  {{ ip.assigned ? '已绑定' : '未绑定' }}
+                  {{ ip.assigned ? (multiByPublic[ip.id] ? '本实例 · 多出口' : '已绑定') : '未绑定' }}
                 </span>
               </td>
               <td>
                 <div class="row">
-                  <button v-if="!ip.assigned" :disabled="ripBusy" @click="attachReservedIp(ip)">
-                    绑定到本实例
+                  <button
+                    v-if="!ip.assigned"
+                    :disabled="ripBusy"
+                    title="替换本实例的主公网 IP（原来的临时 IP 会被释放）"
+                    @click="attachReservedIp(ip)"
+                  >
+                    设为主公网 IP
                   </button>
                   <button v-if="ip.assigned" :disabled="ripBusy" @click="detachReservedIp(ip)">解绑</button>
                   <button v-if="!ip.assigned" class="danger" :disabled="ripBusy" @click="deleteReservedIp(ip)">
@@ -662,6 +701,113 @@
           </tbody>
         </table>
       </div>
+      <div v-if="multiAllowed && selectedReserved.size" class="row">
+        <strong style="font-size: 13px">已选 {{ selectedReserved.size }} 个</strong>
+        <button class="primary" :disabled="multiBusy || ripBusy" @click="attachSelectedMulti">
+          {{ multiBusy ? '绑定中…' : '作为多出口绑定到本实例' }}
+        </button>
+        <button :disabled="multiBusy" @click="selectedReserved.clear()">取消选择</button>
+      </div>
+    </div>
+
+    <!-- 多出口 IP：一台实例挂多个保留公网 IP（升级账号） -->
+    <div v-if="tab === 'network'" class="card stack">
+      <div>
+        <h3 style="margin: 0">多出口 IP</h3>
+        <p class="muted" style="margin: 0.2rem 0 0; font-size: 12px">
+          一台实例挂多个公网 IP：每个保留 IP 对应网卡上的一个辅助私网 IP，从哪个私网 IP 发出的流量就从对应的公网 IP 出去。
+          主公网 IP 不受影响，SSH 不会断。一块网卡最多 {{ multiInfo?.limit || 64 }} 个。
+        </p>
+      </div>
+      <div v-if="!multiInfo" class="muted" style="font-size: 13px">
+        {{ multiBusy ? '正在读取…' : '尚未读取。点上面的「刷新」。' }}
+      </div>
+      <p v-else-if="!multiInfo.allowed" style="margin: 0; font-size: 13px; color: var(--warn)">
+        {{ multiInfo.reason }}
+      </p>
+      <template v-else>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th style="width: 34px"></th>
+                <th>公网 IP</th>
+                <th>私网 IP</th>
+                <th>名称</th>
+                <th>来源</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-if="!multiInfo.items.length">
+                <td colspan="5" class="muted empty">
+                  本实例还没有多出口 IP。在上面勾选未绑定的保留 IP，点「作为多出口绑定到本实例」。
+                </td>
+              </tr>
+              <tr v-for="m in multiInfo.items" :key="m.private_ip_id">
+                <td>
+                  <input
+                    v-if="m.managed"
+                    type="checkbox"
+                    :checked="selectedMulti.has(m.private_ip_id)"
+                    :aria-label="`选择 ${m.public_ip || m.private_ip}`"
+                    @change="toggleMulti(m.private_ip_id)"
+                  />
+                </td>
+                <td
+                  class="copyable"
+                  :class="{ empty: !m.public_ip }"
+                  title="单击复制"
+                  role="button"
+                  tabindex="0"
+                  @click="copy(m.public_ip)"
+                  @keydown.enter.prevent="copy(m.public_ip)"
+                >{{ m.public_ip || '—' }}</td>
+                <td class="mono">{{ m.private_ip }}</td>
+                <td>{{ m.public_ip_name || '—' }}</td>
+                <td>
+                  <span v-if="m.managed" class="badge">面板</span>
+                  <span v-else class="muted" title="在 Oracle 控制台手工创建的辅助 IP，面板不会改动它">手工</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div v-if="selectedMulti.size" class="row">
+          <strong style="font-size: 13px">已选 {{ selectedMulti.size }} 个</strong>
+          <button class="danger" :disabled="multiBusy" @click="detachSelectedMulti">
+            {{ multiBusy ? '解绑中…' : '解绑所选' }}
+          </button>
+          <span class="muted" style="font-size: 12px">保留 IP 仍在，可再次绑定</span>
+        </div>
+
+        <div class="sync-box stack">
+          <strong style="font-size: 13px">系统侧同步服务</strong>
+          <p class="muted" style="margin: 0; font-size: 12px">
+            Oracle 绑好之后，服务器系统并不会自动认这些辅助私网 IP，不装的话流量到了也会被丢掉。
+            同步服务只需在这台服务器上装一次：之后在这里增减 IP，最多一分钟系统就跟上，重启后也会自动恢复。
+            它只管辅助 IP，不碰主 IP，也不碰你自己手工配置的地址。
+            代理端口记得在安全列表 / 系统防火墙里放行。
+          </p>
+          <SshCredentialFields v-model="syncCreds" />
+          <div class="row">
+            <button class="primary" :disabled="syncBusy" @click="installIpSync">
+              {{ syncBusy ? '安装中…' : '安装 / 更新同步服务' }}
+            </button>
+            <span class="muted" style="font-size: 12px">SSH 凭据只用于这一次，不会保存</span>
+          </div>
+          <div v-if="syncResult" class="card" style="padding: 0.6rem">
+            <span class="badge" :class="syncResult.ok ? 'running' : 'err'">
+              {{ syncResult.ok ? '成功' : '失败' }}
+            </span>
+            <span style="margin-left: 0.4rem; font-size: 13px">{{ syncResult.message }}</span>
+            <pre
+              v-if="syncResult.stdout || syncResult.stderr"
+              class="muted"
+              style="font-size: 11px; white-space: pre-wrap; max-height: 200px; overflow: auto; margin: 0.4rem 0 0"
+            >{{ syncResult.stdout || '' }}{{ syncResult.stderr ? '\n' + syncResult.stderr : '' }}</pre>
+          </div>
+        </div>
+      </template>
     </div>
 
     <!-- Boot / Shape -->
@@ -1099,6 +1245,13 @@ async function attachReservedIp(ip: ReservedIp) {
 }
 
 async function detachReservedIp(ip: ReservedIp) {
+  // 作为多出口绑在本实例上的：走多出口解绑，连辅助私网 IP 一起删掉。
+  // 只解绑公网 IP 的话，那个面板建的辅助私网 IP 会留在网卡上没人管。
+  const multi = multiByPublic.value[ip.id]
+  if (multi) {
+    await detachMulti([multi.private_ip_id], `多出口 IP ${ip.ip_address}`)
+    return
+  }
   if (!confirm(`解绑保留 IP ${ip.ip_address}？地址会保留，可再次绑定。绑定它的实例会暂时没有公网 IPv4。`))
     return
   ripBusy.value = true
@@ -1130,6 +1283,224 @@ async function deleteReservedIp(ip: ReservedIp) {
     error.value = e?.message || '删除失败'
   } finally {
     ripBusy.value = false
+  }
+}
+
+// ---- 多出口 IP（升级账号）----
+type MultiIp = {
+  private_ip_id: string
+  private_ip: string
+  managed: boolean
+  public_ip_id: string
+  public_ip: string
+  public_ip_name: string
+}
+type MultiInfo = {
+  allowed: boolean
+  reason: string
+  items: MultiIp[]
+  primary_private_ip?: string
+  limit?: number
+}
+const multiInfo = ref<MultiInfo | null>(null)
+const multiBusy = ref(false)
+/** 是否开放这套功能 —— 判断在服务端（账号等级），这里只照着它显示。 */
+const multiAllowed = computed(() => !!multiInfo.value?.allowed)
+/** 保留 IP id → 它绑着的本实例多出口条目。上面那张表靠它把「解绑」转给多出口解绑。 */
+const multiByPublic = computed<Record<string, MultiIp>>(() => {
+  const out: Record<string, MultiIp> = {}
+  for (const m of multiInfo.value?.items || []) if (m.public_ip_id) out[m.public_ip_id] = m
+  return out
+})
+const selectedReserved = reactive(new Set<string>())
+const selectedMulti = reactive(new Set<string>())
+const batchForm = reactive({ open: false, count: 5, prefix: 'proxy' })
+const batchCountClamped = computed(() =>
+  Math.min(50, Math.max(1, Math.floor(Number(batchForm.count) || 1))),
+)
+const syncCreds = reactive<SshCredModel>({
+  username: 'ubuntu',
+  port: 22,
+  authMode: 'key',
+  privateKeyPem: '',
+  password: '',
+})
+const syncBusy = ref(false)
+const syncResult = ref<{ ok: boolean; message: string; stdout?: string; stderr?: string } | null>(null)
+
+function toggleReserved(id: string) {
+  if (selectedReserved.has(id)) selectedReserved.delete(id)
+  else selectedReserved.add(id)
+}
+
+function toggleMulti(id: string) {
+  if (selectedMulti.has(id)) selectedMulti.delete(id)
+  else selectedMulti.add(id)
+}
+
+async function loadMultiIps() {
+  const guard = beginLoad('multiIps')
+  multiBusy.value = true
+  try {
+    const { data } = await api.get(`/tenants/${tenantId.value}/instances/${instanceId.value}/multi-ips`)
+    if (guard.stale()) return
+    if (data.ok === false) {
+      error.value = data.message || '读取多出口 IP 失败'
+      return
+    }
+    multiInfo.value = {
+      allowed: !!data.allowed,
+      reason: data.reason || '',
+      items: data.items || [],
+      primary_private_ip: data.primary_private_ip,
+      limit: data.limit,
+    }
+    // 列表变了，勾选里已经不存在的去掉，免得「已选 N 个」数进别的东西。
+    const live = new Set(multiInfo.value.items.map((m) => m.private_ip_id))
+    for (const id of [...selectedMulti]) if (!live.has(id)) selectedMulti.delete(id)
+  } catch (e: any) {
+    if (guard.stale()) return
+    error.value = e?.message || '读取多出口 IP 失败'
+  } finally {
+    if (!guard.superseded()) multiBusy.value = false
+  }
+}
+
+async function refreshNetworkTab() {
+  await Promise.all([loadReservedIps(), loadMultiIps()])
+  // 勾选只对「还没绑定」的保留 IP 有意义。
+  const free = new Set(reservedIps.value.filter((ip) => !ip.assigned).map((ip) => ip.id))
+  for (const id of [...selectedReserved]) if (!free.has(id)) selectedReserved.delete(id)
+}
+
+async function batchCreateReservedIps() {
+  const count = batchCountClamped.value
+  if (!confirm(`新建 ${count} 个保留公网 IP（${batchForm.prefix || 'ip'}-NN）？`)) return
+  ripBusy.value = true
+  error.value = ''
+  msg.value = ''
+  try {
+    const { data } = await api.post(
+      `/tenants/${tenantId.value}/reserved-ips/batch`,
+      { count, name_prefix: batchForm.prefix.trim() || 'ip' },
+      // 一次最多 50 个，逐个创建，留足时间。
+      { timeout: 300_000 },
+    )
+    if (data.ok) msg.value = data.message
+    else error.value = data.message
+  } catch (e: any) {
+    error.value = e?.message || '批量新建失败'
+  } finally {
+    ripBusy.value = false
+  }
+  await refreshNetworkTab()
+}
+
+async function attachSelectedMulti() {
+  const act = beginAction()
+  const ids = reservedIps.value.filter((ip) => selectedReserved.has(ip.id)).map((ip) => ip.id)
+  if (!ids.length) return
+  const addrs = reservedIps.value
+    .filter((ip) => selectedReserved.has(ip.id))
+    .map((ip) => ip.ip_address)
+  if (
+    !confirm(
+      `把 ${ids.length} 个保留 IP 作为多出口绑定到实例 ${targetLabel(act.target)}？\n` +
+        `${addrs.slice(0, 10).join('、')}${addrs.length > 10 ? ' …' : ''}\n\n` +
+        '每个 IP 会在网卡上新建一个辅助私网 IP 与之对应；主公网 IP 不变。\n' +
+        '系统里还需要装一次「同步服务」，这些 IP 才能真正收发流量。',
+    )
+  )
+    return
+  multiBusy.value = true
+  error.value = ''
+  msg.value = ''
+  try {
+    const { data } = await api.post(
+      `/tenants/${act.tenant}/instances/${act.target}/multi-ips/attach`,
+      { public_ip_ids: ids },
+      { timeout: 300_000 },
+    )
+    if (act.moved()) return
+    if (data.ok) msg.value = data.message
+    else error.value = data.message
+    selectedReserved.clear()
+  } catch (e: any) {
+    if (act.moved()) return
+    error.value = e?.message || '绑定失败'
+  } finally {
+    multiBusy.value = false
+  }
+  if (!act.moved()) await refreshNetworkTab()
+}
+
+async function detachMulti(privateIpIds: string[], label: string) {
+  const act = beginAction()
+  if (
+    !confirm(
+      `从实例 ${targetLabel(act.target)} 解绑 ${label}？\n\n` +
+        '对应的辅助私网 IP 会删除；保留公网 IP 仍在，可以再绑给别的机器。\n' +
+        '装了同步服务的话，系统里的地址一分钟内会自动去掉。',
+    )
+  )
+    return
+  multiBusy.value = true
+  error.value = ''
+  msg.value = ''
+  try {
+    const { data } = await api.post(
+      `/tenants/${act.tenant}/instances/${act.target}/multi-ips/detach`,
+      { private_ip_ids: privateIpIds },
+      { timeout: 300_000 },
+    )
+    if (act.moved()) return
+    if (data.ok) msg.value = data.message
+    else error.value = data.message
+    selectedMulti.clear()
+  } catch (e: any) {
+    if (act.moved()) return
+    error.value = e?.message || '解绑失败'
+  } finally {
+    multiBusy.value = false
+  }
+  if (!act.moved()) await refreshNetworkTab()
+}
+
+async function detachSelectedMulti() {
+  const items = (multiInfo.value?.items || []).filter((m) => selectedMulti.has(m.private_ip_id))
+  if (!items.length) return
+  await detachMulti(
+    items.map((m) => m.private_ip_id),
+    `${items.length} 个多出口 IP（${items.map((m) => m.public_ip || m.private_ip).slice(0, 10).join('、')}）`,
+  )
+}
+
+async function installIpSync() {
+  const act = beginAction()
+  syncBusy.value = true
+  syncResult.value = null
+  error.value = ''
+  msg.value = ''
+  try {
+    const body: Record<string, any> = {
+      ssh_username: syncCreds.username || 'ubuntu',
+      ssh_port: syncCreds.port || 22,
+    }
+    if (syncCreds.authMode === 'key') body.ssh_private_key_pem = syncCreds.privateKeyPem
+    else body.ssh_password = syncCreds.password
+    const { data } = await api.post(
+      `/tenants/${act.tenant}/instances/${act.target}/multi-ips/install-sync`,
+      body,
+      { timeout: 180_000 },
+    )
+    if (act.moved()) return
+    syncResult.value = data
+    if (syncCreds.authMode === 'password') syncCreds.password = ''
+  } catch (e: any) {
+    if (act.moved()) return
+    syncResult.value = { ok: false, message: e?.message || '安装失败' }
+  } finally {
+    syncBusy.value = false
   }
 }
 
@@ -2424,7 +2795,7 @@ async function loadCurrentTab() {
   if (tab.value === 'metrics') await loadMetrics()
   else if (tab.value === 'console') await loadConsole()
   else if (tab.value === 'firewall') await loadFirewall()
-  else if (tab.value === 'network') await loadReservedIps()
+  else if (tab.value === 'network') await refreshNetworkTab()
   else if (tab.value === 'volume') {
     await loadBoot()
     await loadBackups()
@@ -2516,6 +2887,14 @@ function resetInstanceState() {
   cfForm.include_ipv6 = true
   fwMsg.value = ''
   reservedIps.value = []
+  // 多出口：列表、勾选、安装结果都属于上一台；SSH 凭据更不能带到下一台。
+  multiInfo.value = null
+  selectedReserved.clear()
+  selectedMulti.clear()
+  batchForm.open = false
+  syncResult.value = null
+  syncCreds.privateKeyPem = ''
+  syncCreds.password = ''
   bootInfo.value = null
   bootForm.size_in_gbs = null
   bootForm.vpus_per_gb = 10
@@ -2543,6 +2922,27 @@ watch([tenantId, instanceId], async () => {
 </script>
 
 <style scoped>
+.batch-ip-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.9rem;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+}
+.batch-ip-form label {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 13px;
+}
+.sync-box {
+  border-top: 1px solid var(--border);
+  padding-top: 0.75rem;
+}
+
 /* 引导日志是等宽、可能很长的机器输出。给固定高度 + 自己滚动，否则一份几千行的
    内核日志会把整页撑到没法用；不换行，因为内核那些对齐的表格一折行就废了。 */
 .bootlog {

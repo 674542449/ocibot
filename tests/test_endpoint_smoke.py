@@ -158,6 +158,21 @@ def make_session():
     s.delete_reserved_public_ip.return_value = R(True, "已删除", {})
     s.attach_reserved_public_ip.return_value = R(True, "已绑定", {})
     s.detach_reserved_public_ip.return_value = R(True, "已解绑", {})
+    s.create_reserved_public_ips.return_value = R(
+        True, "已创建 2 个", {"created": [{"id": "pip2", "ip_address": "2.2.2.2"}], "failed": ""}
+    )
+    s.list_multi_ips.return_value = R(
+        True,
+        "",
+        {
+            "items": [{"private_ip_id": "pv1", "private_ip": "10.0.0.11", "managed": True,
+                       "public_ip_id": "pip1", "public_ip": "1.1.1.1", "public_ip_name": "proxy-01"}],
+            "primary_private_ip": "10.0.0.5",
+            "limit": 64,
+        },
+    )
+    s.attach_multi_ips.return_value = R(True, "已绑定 1 个", {"attached": [], "failed": ""})
+    s.detach_multi_ips.return_value = R(True, "已解绑 1 个", {"detached": [], "failed": ""})
     s.home_region.return_value = "ap-tokyo-1"
     s.list_subscribed_regions.return_value = R(
         True,
@@ -462,6 +477,37 @@ def test_every_endpoint_is_wired() -> None:
             f"/api/tenants/{tid}/reserved-ips/pip1",
         ]:
             check("DELETE", p, c.delete(p))
+
+        # 多出口 IP：免费 / 未识别等级的租户要被服务端挡下（403，不是 5xx），
+        # 升级账号才走到真正的代码路径。install-sync 故意不带凭据，停在 400 ——
+        # 冒烟测试不该真的去连一台机器的 SSH，但函数里那几个 import 已经执行到了。
+        multi_posts = [
+            (f"/api/tenants/{tid}/reserved-ips/batch", {"count": 2, "name_prefix": "proxy"}),
+            (f"/api/tenants/{tid}/instances/{iid}/multi-ips/attach", {"public_ip_ids": ["pip1"]}),
+            (f"/api/tenants/{tid}/instances/{iid}/multi-ips/install-sync", {"ssh_username": "ubuntu"}),
+        ]
+        r = c.get(f"/api/tenants/{tid}/instances/{iid}/multi-ips")
+        assert r.status_code == 200 and r.json()["allowed"] is False, r.text
+        for p, body in multi_posts:
+            r = c.post(p, json=body)
+            assert r.status_code == 403, f"未升级的租户没被挡住：{p} -> {r.status_code}"
+
+        from web.backend.models import Tenant
+
+        with SessionLocal() as db:
+            db.get(Tenant, tid).account_tier = "paid"
+            db.commit()
+        p = f"/api/tenants/{tid}/instances/{iid}/multi-ips"
+        r = c.get(p)
+        check("GET", p, r)
+        assert r.json().get("allowed") is True, r.text
+        for p, body in multi_posts:
+            check("POST", p, c.post(p, json=body))
+        p = f"/api/tenants/{tid}/instances/{iid}/multi-ips/detach"
+        check("POST", p, c.post(p, json={"private_ip_ids": ["pv1"]}))
+        with SessionLocal() as db:
+            db.get(Tenant, tid).account_tier = ""
+            db.commit()
 
         # create-image answers 403 by design (CLAUDE.md), but "refuses" and
         # "raises on the way to refusing" are different things and only one of

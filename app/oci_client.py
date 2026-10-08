@@ -9329,7 +9329,11 @@ class TenantSession:
                     "lifecycle_state": getattr(ip, "lifecycle_state", "") or "",
                     # 按状态判断，不看 deprecated 的 private_ip_id —— 见 _public_ip_busy。
                     "assigned": _public_ip_busy(ip),
-                    "private_ip_id": getattr(ip, "private_ip_id", "") or "",
+                    # assigned_entity_id 是现行字段，private_ip_id 已 deprecated；
+                    # 多出口 IP 列表靠它把公网 IP 对回辅助私网 IP。
+                    "private_ip_id": getattr(ip, "assigned_entity_id", "")
+                    or getattr(ip, "private_ip_id", "")
+                    or "",
                     "time_created": str(getattr(ip, "time_created", "") or ""),
                 }
             )
@@ -9444,6 +9448,237 @@ class TenantSession:
             return OperationResult(ok=False, message=_format_service_error(exc))
         except Exception as exc:  # noqa: BLE001
             return OperationResult(ok=False, message=safe_error_text(exc))
+
+    # ------------------------------------------------------------------
+    # 多出口 IP：一台实例上挂多个保留公网 IP
+    #
+    # 每个保留 IP 绑一个辅助私网 IP（都在实例的主 VNIC 上，一块 VNIC 最多 64 个
+    # 辅助 IP）。面板建的辅助私网 IP 打 MULTI_IP_TAG 标签，解绑时只动这些 ——
+    # 用户在 Oracle 控制台手工建的辅助 IP 列出来但不碰。
+    # ------------------------------------------------------------------
+    MULTI_IP_TAG = "ocibot_multi_ip"
+    MAX_SECONDARY_IPS_PER_VNIC = 64
+
+    def create_reserved_public_ips(
+        self, count: int, name_prefix: str = "", compartment_id: Optional[str] = None
+    ) -> OperationResult:
+        """Create ``count`` reserved IPs named ``prefix-NN``, one call each, stop at the first error.
+
+        Numbering continues after the highest existing ``prefix-NN`` so a second
+        batch does not produce a second ``proxy-01``. Already-created addresses are
+        kept and reported when a later one fails (Oracle's limit message included).
+        """
+        count = max(1, min(50, int(count or 1)))
+        prefix = re.sub(r"[^A-Za-z0-9_.-]", "", (name_prefix or "").strip())[:40] or "ip"
+        try:
+            existing = self.list_reserved_public_ips(compartment_id)
+        except OCIClientError as exc:
+            return OperationResult(ok=False, message=str(exc))
+        pattern = re.compile(rf"^{re.escape(prefix)}-(\d+)$")
+        start = 1 + max(
+            [int(m.group(1)) for m in (pattern.match(i["display_name"]) for i in existing) if m],
+            default=0,
+        )
+        created: list[dict[str, str]] = []
+        failure = ""
+        for n in range(start, start + count):
+            res = self.create_reserved_public_ip(compartment_id, display_name=f"{prefix}-{n:02d}")
+            if not res.ok:
+                failure = res.message
+                break
+            data = res.data or {}
+            created.append(
+                {
+                    "id": str(data.get("public_ip_id") or ""),
+                    "ip_address": str(data.get("ip_address") or ""),
+                    "display_name": f"{prefix}-{n:02d}",
+                }
+            )
+        total = len(existing) + len(created)
+        if failure:
+            msg = f"已创建 {len(created)}/{count} 个，第 {len(created) + 1} 个失败：{failure}"
+        else:
+            msg = f"已创建 {len(created)} 个保留 IP（本区域现有 {total} 个）"
+        return OperationResult(
+            ok=not failure,
+            message=msg,
+            data={"created": created, "existing_before": len(existing), "failed": failure},
+        )
+
+    def _primary_vnic_private_ips(self, instance_id: str, compartment_id: str) -> tuple[Any, list[Any]]:
+        network = self.resolve_primary_network(instance_id, compartment_id)
+        if not network.vnic_id:
+            raise OCIClientError("找不到实例的主网卡（VNIC）")
+        privs = oci.pagination.list_call_get_all_results(
+            self.network.list_private_ips,
+            vnic_id=network.vnic_id,
+            retry_strategy=sdk_bounded_paged_retry_strategy(),
+        ).data
+        return network, list(privs)
+
+    def list_multi_ips(self, instance_id: str, compartment_id: str) -> OperationResult:
+        """Secondary private IPs on the primary VNIC and the reserved IP bound to each."""
+        try:
+            network, privs = self._primary_vnic_private_ips(instance_id, compartment_id)
+            by_private = {r["private_ip_id"]: r for r in self.list_reserved_public_ips() if r["private_ip_id"]}
+        except OCIClientError as exc:
+            return OperationResult(ok=False, message=str(exc))
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        items = []
+        for p in privs:
+            if getattr(p, "is_primary", False):
+                continue
+            pub = by_private.get(p.id) or {}
+            tags = getattr(p, "freeform_tags", None) or {}
+            items.append(
+                {
+                    "private_ip_id": p.id,
+                    "private_ip": getattr(p, "ip_address", "") or "",
+                    "managed": tags.get(self.MULTI_IP_TAG) == "1",
+                    "public_ip_id": pub.get("id", ""),
+                    "public_ip": pub.get("ip_address", ""),
+                    "public_ip_name": pub.get("display_name", ""),
+                }
+            )
+        items.sort(key=lambda i: ipaddress.ip_address(i["private_ip"]) if i["private_ip"] else ipaddress.ip_address("0.0.0.0"))
+        return OperationResult(
+            ok=True,
+            message="",
+            data={
+                "items": items,
+                "vnic_id": network.vnic_id,
+                "primary_private_ip": network.private_ipv4,
+                "limit": self.MAX_SECONDARY_IPS_PER_VNIC,
+            },
+        )
+
+    def attach_multi_ips(
+        self, instance_id: str, compartment_id: str, public_ip_ids: list[str]
+    ) -> OperationResult:
+        """For each reserved IP: new secondary private IP on the primary VNIC, then bind.
+
+        Everything that can be checked up front is checked before the first write
+        (address is reserved, in this region, not bound; VNIC has room), so a bad
+        selection changes nothing. After that it stops at the first Oracle error;
+        a private IP whose bind failed is deleted again rather than left behind.
+        """
+        ids = list(dict.fromkeys(i for i in public_ip_ids if i))
+        if not ids:
+            return OperationResult(ok=False, message="没有选择保留 IP")
+        try:
+            reserved = {r["id"]: r for r in self.list_reserved_public_ips()}
+            for pid in ids:
+                r = reserved.get(pid)
+                if r is None:
+                    return OperationResult(ok=False, message="所选 IP 不是本区域的保留 IP，请刷新后重试")
+                if r["assigned"]:
+                    return OperationResult(ok=False, message=f"保留 IP {r['ip_address']} 已绑定在别处，请先解绑")
+            network, privs = self._primary_vnic_private_ips(instance_id, compartment_id)
+        except OCIClientError as exc:
+            return OperationResult(ok=False, message=str(exc))
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        secondary = sum(1 for p in privs if not getattr(p, "is_primary", False))
+        room = self.MAX_SECONDARY_IPS_PER_VNIC - secondary
+        if len(ids) > room:
+            return OperationResult(
+                ok=False,
+                message=f"这块网卡已有 {secondary} 个辅助 IP，最多还能加 {max(room, 0)} 个（上限 {self.MAX_SECONDARY_IPS_PER_VNIC}）",
+            )
+
+        attached: list[dict[str, str]] = []
+        failure = ""
+        for pid in ids:
+            r = reserved[pid]
+            try:
+                priv = self.network.create_private_ip(
+                    oci.core.models.CreatePrivateIpDetails(
+                        vnic_id=network.vnic_id,
+                        display_name=f"ocibot-multi-{r['ip_address']}",
+                        freeform_tags={self.MULTI_IP_TAG: "1"},
+                    )
+                ).data
+            except ServiceError as exc:
+                failure = f"创建辅助私网 IP 失败：{_format_service_error(exc)}"
+                break
+            try:
+                self.network.update_public_ip(
+                    pid, oci.core.models.UpdatePublicIpDetails(private_ip_id=priv.id)
+                )
+            except ServiceError as exc:
+                try:
+                    self.network.delete_private_ip(priv.id)
+                except Exception:  # noqa: BLE001
+                    _OCI_LOG.exception("rollback of private IP %s failed", priv.id)
+                failure = f"绑定 {r['ip_address']} 失败：{_format_service_error(exc)}"
+                break
+            attached.append({"public_ip": r["ip_address"], "private_ip": priv.ip_address or ""})
+        if failure:
+            msg = f"已绑定 {len(attached)}/{len(ids)} 个，之后停止：{failure}"
+        else:
+            msg = f"已绑定 {len(attached)} 个保留 IP 到本实例（每个对应一个辅助私网 IP）"
+        return OperationResult(ok=not failure, message=msg, data={"attached": attached, "failed": failure})
+
+    def detach_multi_ips(
+        self, instance_id: str, compartment_id: str, private_ip_ids: list[str]
+    ) -> OperationResult:
+        """Unbind the reserved IP from each panel-made secondary private IP, then delete that private IP.
+
+        The reserved addresses stay reserved and can be bound again. Secondary IPs
+        the panel did not create (made in the Oracle console) are refused.
+        """
+        ids = list(dict.fromkeys(i for i in private_ip_ids if i))
+        if not ids:
+            return OperationResult(ok=False, message="没有选择要解绑的 IP")
+        try:
+            _network, privs = self._primary_vnic_private_ips(instance_id, compartment_id)
+            by_private = {r["private_ip_id"]: r for r in self.list_reserved_public_ips() if r["private_ip_id"]}
+        except OCIClientError as exc:
+            return OperationResult(ok=False, message=str(exc))
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        known = {p.id: p for p in privs}
+        for iid in ids:
+            p = known.get(iid)
+            if p is None or getattr(p, "is_primary", False):
+                return OperationResult(ok=False, message="所选 IP 不是本实例的辅助私网 IP，请刷新后重试")
+            if (getattr(p, "freeform_tags", None) or {}).get(self.MULTI_IP_TAG) != "1":
+                return OperationResult(
+                    ok=False,
+                    message=f"{p.ip_address} 不是面板创建的辅助 IP，请到 Oracle 控制台处理",
+                )
+
+        done: list[str] = []
+        failure = ""
+        for iid in ids:
+            p = known[iid]
+            pub = by_private.get(iid)
+            try:
+                if pub:
+                    self.network.update_public_ip(
+                        pub["id"], oci.core.models.UpdatePublicIpDetails(private_ip_id="")
+                    )
+                # 解绑是异步的（UNASSIGNING），紧接着删私网 IP 可能撞上 409，短暂重试。
+                deadline = time.monotonic() + 30
+                while True:
+                    try:
+                        self.network.delete_private_ip(iid)
+                        break
+                    except ServiceError as exc:
+                        if getattr(exc, "status", None) == 409 and time.monotonic() < deadline:
+                            time.sleep(2)
+                            continue
+                        raise
+            except ServiceError as exc:
+                failure = f"{p.ip_address}：{_format_service_error(exc)}"
+                break
+            done.append(pub["ip_address"] if pub else p.ip_address)
+        if failure:
+            msg = f"已解绑 {len(done)}/{len(ids)} 个，之后停止：{failure}"
+        else:
+            msg = f"已解绑 {len(done)} 个（保留 IP 仍在，可再次绑定）"
+        return OperationResult(ok=not failure, message=msg, data={"detached": done, "failed": failure})
 
     # ------------------------------------------------------------------
     # Boot volume backups

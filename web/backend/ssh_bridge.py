@@ -136,35 +136,26 @@ def _import_private_key(private_key_pem: str) -> Any:
 # is the pattern to copy if a command runner is ever needed again.
 
 
-def grow_filesystem_over_ssh(
+def _exec_script(
     host: str,
+    script: str,
     *,
-    port: int = 22,
+    command: str,
+    port: int,
     username: str,
-    private_key_pem: Optional[str] = None,
-    password: Optional[str] = None,
-    retries: int = 3,
-    retry_delay_sec: float = 8.0,
-    timeout: float = 120.0,
-    known_hosts: Any = None,
+    private_key_pem: Optional[str],
+    password: Optional[str],
+    known_hosts: Any,
+    timeout: float,
+    ok_message: str,
+    fail_message: str,
 ) -> SshExecResult:
-    """Upload-free: pipe grow script via bash -s over SSH, with short retries."""
-    from app.fs_grow import build_grow_script
+    """One SSH connection that runs ``command`` with ``script`` on stdin.
 
-    if known_hosts is None:
-        # Fail closed. asyncssh reads known_hosts=None as "trust anything", so a
-        # caller that simply forgot the argument would silently hand the user's
-        # private key to whatever answered on the address — the exact hole the
-        # TOFU work closed. The parameter keeps its None default only because
-        # making it required would break the signature; this check is the gate.
-        return SshExecResult(ok=False, message="缺少已验证的 SSH 主机密钥，已拒绝连接", host=host)
-
-    script = build_grow_script()
-    # Feed script on stdin so we never write a remote file that needs cleanup.
-    command = "bash -s"
-    last: Optional[SshExecResult] = None
-    # Wrap: ssh_exec runs a single command string; pass script via bash -c with heredoc-ish.
-    # asyncssh run() can take input= for stdin.
+    Feeding the script on stdin means nothing is written to the remote disk that
+    would need cleanup. ``known_hosts`` must be the key check_instance_host_key()
+    verified — both public callers refuse to get here without one.
+    """
     import asyncio as _asyncio
 
     async def _once() -> SshExecResult:
@@ -175,10 +166,9 @@ def grow_filesystem_over_ssh(
             "host": host,
             "port": int(port or 22),
             "username": user,
-            # The only caller (instance_ops boot-volume grow) always passes the key
-            # that check_instance_host_key() just verified, and refuses to call at
-            # all when the check did not pass — so this never legitimately runs
-            # with None. Do not "simplify" it back to a default of None.
+            # Always the key check_instance_host_key() just verified; the public
+            # wrappers refuse to call at all without one. Do not "simplify" this
+            # back to a default of None.
             "known_hosts": known_hosts,
             "login_timeout": 30.0,
         }
@@ -207,7 +197,7 @@ def grow_filesystem_over_ssh(
                     exit_status=status,
                     stdout=stdout,
                     stderr=stderr,
-                    message="文件系统已扩展" if ok else f"文件系统扩展失败（退出码 {status}）",
+                    message=ok_message if ok else f"{fail_message}（退出码 {status}）",
                     host=host,
                 )
         except _asyncio.TimeoutError:
@@ -215,21 +205,100 @@ def grow_filesystem_over_ssh(
         except Exception as exc:  # noqa: BLE001
             return SshExecResult(ok=False, message=f"SSH 连接/执行失败：{exc}", host=host)
 
-    def _run_once() -> SshExecResult:
-        try:
-            loop = _asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        if loop and loop.is_running():
-            import concurrent.futures
+    try:
+        loop = _asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop and loop.is_running():
+        import concurrent.futures
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                return pool.submit(lambda: _asyncio.run(_once())).result(timeout=float(timeout) + 30)
-        return _asyncio.run(_once())
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(lambda: _asyncio.run(_once())).result(timeout=float(timeout) + 30)
+    return _asyncio.run(_once())
+
+
+def install_ip_sync_over_ssh(
+    host: str,
+    *,
+    port: int = 22,
+    username: str,
+    private_key_pem: Optional[str] = None,
+    password: Optional[str] = None,
+    timeout: float = 120.0,
+    known_hosts: Any = None,
+) -> SshExecResult:
+    """Install / update the 多出口 IP sync service (app.ip_sync) on the instance.
+
+    One attempt, no retries: the script is idempotent and the operator can press
+    the button again. Non-root logins go through ``sudo -n`` — OCI's stock
+    ubuntu / opc users have passwordless sudo; anything else fails with a clear
+    "a password is required" instead of hanging on a prompt.
+    """
+    from app.ip_sync import build_install_script
+
+    if known_hosts is None:
+        # Same fail-closed gate as grow_filesystem_over_ssh.
+        return SshExecResult(ok=False, message="缺少已验证的 SSH 主机密钥，已拒绝连接", host=host)
+    user = validate_ssh_username(username)
+    result = _exec_script(
+        host,
+        build_install_script(),
+        command="bash -s" if user == "root" else "sudo -n bash -s",
+        port=port,
+        username=user,
+        private_key_pem=private_key_pem,
+        password=password,
+        known_hosts=known_hosts,
+        timeout=timeout,
+        ok_message="同步服务已安装",
+        fail_message="同步服务安装失败",
+    )
+    if not result.ok and "password is required" in (result.stderr or ""):
+        result.message += "：该用户执行 sudo 需要密码，请改用 root 或有免密 sudo 的用户"
+    return result if result.ok else _enrich_hints(result)
+
+
+def grow_filesystem_over_ssh(
+    host: str,
+    *,
+    port: int = 22,
+    username: str,
+    private_key_pem: Optional[str] = None,
+    password: Optional[str] = None,
+    retries: int = 3,
+    retry_delay_sec: float = 8.0,
+    timeout: float = 120.0,
+    known_hosts: Any = None,
+) -> SshExecResult:
+    """Upload-free: pipe grow script via bash -s over SSH, with short retries."""
+    from app.fs_grow import build_grow_script
+
+    if known_hosts is None:
+        # Fail closed. asyncssh reads known_hosts=None as "trust anything", so a
+        # caller that simply forgot the argument would silently hand the user's
+        # private key to whatever answered on the address — the exact hole the
+        # TOFU work closed. The parameter keeps its None default only because
+        # making it required would break the signature; this check is the gate.
+        return SshExecResult(ok=False, message="缺少已验证的 SSH 主机密钥，已拒绝连接", host=host)
+
+    script = build_grow_script()
+    last: Optional[SshExecResult] = None
 
     attempts = max(1, int(retries))
     for i in range(attempts):
-        last = _run_once()
+        last = _exec_script(
+            host,
+            script,
+            command="bash -s",
+            port=port,
+            username=username,
+            private_key_pem=private_key_pem,
+            password=password,
+            known_hosts=known_hosts,
+            timeout=timeout,
+            ok_message="文件系统已扩展",
+            fail_message="文件系统扩展失败",
+        )
         if last.ok:
             return last
         if i + 1 < attempts:
