@@ -190,7 +190,7 @@ def test_response_carries_the_usage_the_panel_shows(client, monkeypatch):
         ({"ocpus": _CAP_CPU}, "A1 额度不足"),
         ({"memory_in_gbs": _CAP_MEM}, "A1 额度不足"),
         ({"boot_volume_size_in_gbs": 150}, "块存储"),
-        ({"shape": "VM.Standard.E4.Flex"}, "付费 Shape"),
+        ({"shape": "VM.Standard.E4.Flex"}, "付费型号"),
     ],
 )
 def test_over_quota_configs_are_blocked_with_a_reason(client, monkeypatch, over, needle):

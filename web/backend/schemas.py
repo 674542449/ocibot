@@ -473,6 +473,9 @@ class LaunchInstanceRequest(BaseModel):
     # Flex-only downgrade candidates tried after the primary config fails
     # across all ADs: [{"ocpus": 2, "memory_in_gbs": 12}, ...] (max 5).
     fallback_configs: list[dict[str, Any]] = Field(default_factory=list)
+    # 付费型号的二次确认。页面上用户在确认框里点了「确定」才会带 true；没带的付费型号
+    # 请求一律 400 —— 绕过页面直接调接口，也不会在没人确认的情况下开出一台计费机器。
+    confirm_paid_shape: bool = False
 
 
 class LaunchInstanceResult(BaseModel):

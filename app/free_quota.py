@@ -544,7 +544,8 @@ def validate_launch_against_quota(
         issues.append(
             GuardIssue(
                 "non_free_shape",
-                f"仅免费模式已开启：不允许创建付费 Shape「{shape or '—'}」。请使用 A1.Flex 或 E2.1.Micro。",
+                f"该租户开启了「仅使用免费额度」，不允许创建付费型号「{shape or '—'}」。"
+                "确需创建的话，到「租户」页编辑该租户、取消勾选「仅使用免费额度」；否则请选 A1.Flex 或 E2.1.Micro。",
             )
         )
 

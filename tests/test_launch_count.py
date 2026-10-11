@@ -347,6 +347,53 @@ def test_derived_passwords_are_stable_strong_and_keyed():
         derive_root_password(b"", "x")
 
 
+def _set_tier(tid: str, tier: str) -> None:
+    with SessionLocal() as db:
+        db.query(Tenant).filter(Tenant.id == tid).update({"account_tier": tier})
+        db.commit()
+
+
+@pytest.mark.parametrize(("tier", "needle"), [("", "等级查询"), ("free", "免费（未升级）账号")])
+def test_a_paid_shape_is_refused_for_an_account_not_known_to_be_upgraded(client, monkeypatch, tier, needle):
+    c, tid = client
+    calls = _stub_launch(monkeypatch)
+    _set_tier(tid, tier)
+    r = c.post(
+        f"/api/tenants/{tid}/launch",
+        json=_body(shape="VM.Standard.E4.Flex", confirm_paid_shape=True),
+    )
+    assert r.status_code == 400, r.text
+    assert needle in r.json()["detail"]
+    assert calls == [], "被拒的请求不能碰到 Oracle"
+
+
+def test_a_paid_shape_needs_the_explicit_confirmation(client, monkeypatch):
+    c, tid = client
+    calls = _stub_launch(monkeypatch)
+    _set_tier(tid, "paid")
+    try:
+        r = c.post(f"/api/tenants/{tid}/launch", json=_body(shape="VM.Standard.E4.Flex"))
+        assert r.status_code == 400 and "确认" in r.json()["detail"], r.text
+        assert calls == []
+
+        r = c.post(
+            f"/api/tenants/{tid}/launch",
+            json=_body(shape="VM.Standard.E4.Flex", confirm_paid_shape=True),
+        )
+        assert r.status_code == 200, r.text
+        assert [x["payload"]["shape"] for x in calls] == ["VM.Standard.E4.Flex"]
+    finally:
+        _set_tier(tid, "")
+
+
+def test_free_shapes_need_no_confirmation_on_any_account(client, monkeypatch):
+    c, tid = client
+    calls = _stub_launch(monkeypatch)
+    r = c.post(f"/api/tenants/{tid}/launch", json=_body())  # A1.Flex，未识别等级
+    assert r.status_code == 200, r.text
+    assert len(calls) == 1
+
+
 def test_capacity_retry_accepts_a_batch(client, monkeypatch):
     """要 2 台 AMD 的人以前只能拿到 1 台：这里 400、前端又把数量锁成 1。
     现在是一个任务带着 target_count 入队，额度按总量校验，开机全交给 worker。"""

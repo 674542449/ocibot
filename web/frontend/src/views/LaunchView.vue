@@ -62,6 +62,12 @@
           </tbody>
         </table>
       </div>
+      <div v-if="isBilledLaunch" class="error-box" style="font-size: 13px">
+        <strong>这次创建会产生费用：</strong>
+        <template v-if="isPaidShape">「{{ form.shape }}」是付费型号，按量计费。</template>
+        <template v-if="isSecondaryRegion">所选区域是副区，副区资源（包括免费型号）一律按量计费。</template>
+        点「确认并创建」后还会弹出一次确认。
+      </div>
       <p class="muted warn-text" style="margin: 0; font-size: 12px">
         ⚠ 若勾选了「允许外网直接访问」，系统会放宽云端安全组与系统内防火墙；容量重试会持续调用创建接口，请确认间隔与次数。
         服务端会按 Always Free 额度拦截超额创建（免费/未知账号硬拦；已付费账号仅警告）。
@@ -290,10 +296,28 @@
         <div class="field">
           <label>Shape *</label>
           <select v-model="form.shape" @change="onShapeChange">
-            <option v-for="s in compatibleShapes" :key="s.shape" :value="s.shape">
-              {{ s.label || s.shape }}{{ s.free_tag ? ' · ' + s.free_tag : '' }}
-            </option>
+            <optgroup v-if="freeShapeOptions.length" label="免费型号">
+              <option v-for="s in freeShapeOptions" :key="s.shape" :value="s.shape">
+                {{ s.label || s.shape }}{{ s.free_tag ? ' · ' + s.free_tag : '' }}
+              </option>
+            </optgroup>
+            <optgroup v-if="paidShapeOptions.length" label="付费型号（按量计费）">
+              <option v-for="s in paidShapeOptions" :key="s.shape" :value="s.shape">
+                {{ s.label || s.shape }}{{ shapeSpecText(s) }}
+              </option>
+            </optgroup>
           </select>
+          <p v-if="meta && !accountPaid" class="field-hint">
+            {{
+              accountTier === 'free'
+                ? '免费（未升级）账号只能创建免费型号。'
+                : '还没查询过账号等级，先只列出免费型号；升级账号到「租户」页点「等级查询」后重新加载配置，即可看到全部型号。'
+            }}
+          </p>
+          <p v-else-if="meta && accountPaid" class="field-hint">
+            升级账号：列出 Oracle 在本区域提供给该账号的全部型号。付费型号是否还有额度以 Oracle 为准，
+            超出账号限额时创建会被 Oracle 拒绝。
+          </p>
         </div>
         <div class="field">
           <label>Boot 性能 VPUs/GB</label>
@@ -348,6 +372,16 @@
         </div>
       </div>
       <p v-if="shapeSpecHint" class="muted" style="margin: 0; font-size: 12px">{{ shapeSpecHint }}</p>
+      <div v-if="isPaidShape" class="card warn-panel">
+        <strong>⚠ 「{{ form.shape }}」不是免费型号</strong>
+        <p class="muted" style="margin: 0.25rem 0 0; font-size: 12px">
+          创建后会按量计费（实例运行期间持续产生费用，停止后部分费用仍会继续）。提交前还会再请你确认一次。
+          <template v-if="freeOnly">
+            <br />该租户开启了「仅使用免费额度」，服务端会拒绝创建付费型号 ——
+            确需创建的话，到「租户」页编辑该租户，取消勾选「仅使用免费额度」。
+          </template>
+        </p>
+      </div>
 
       <div class="field">
         <label>Root 登录方式</label>
@@ -719,7 +753,48 @@ const images = computed(() => {
   if (osFamily.value === 'ubuntu') return (meta.value?.images as ImageInfo[]) || []
   return (byOs?.[osFamily.value] as ImageInfo[]) || []
 })
-const shapes = computed(() => (meta.value?.shapes as ShapeInfo[]) || [])
+/** 账号等级，以主租户为准（副区行抄的那份可能是旧的，和服务端 tenant_tier 同一规则）。 */
+const accountTier = computed(() => String(regionRows.value[0]?.account_tier || ''))
+const accountPaid = computed(() => accountTier.value === 'paid')
+
+const FREE_SHAPE_NAMES = computed<Set<string>>(
+  () =>
+    new Set(
+      Object.keys(meta.value?.free_tier_shapes || {}).length
+        ? Object.keys(meta.value.free_tier_shapes)
+        : ['VM.Standard.A1.Flex', 'VM.Standard.E2.1.Micro'],
+    ),
+)
+function isFreeShape(shape: string) {
+  return FREE_SHAPE_NAMES.value.has(shape)
+}
+
+/**
+ * 能选的型号。升级账号：Oracle 在这个区域列给它的全部型号（meta.all_shapes）；
+ * 免费 / 还没查过等级的账号：只给免费型号 —— 服务端对它们开付费型号是直接拒绝的，
+ * 列出来只会让人选了再被拒。
+ */
+const shapes = computed(() => {
+  const all = (meta.value?.all_shapes as ShapeInfo[]) || []
+  if (accountPaid.value && all.length) return all
+  return (meta.value?.shapes as ShapeInfo[]) || []
+})
+const freeShapeOptions = computed(() => compatibleShapes.value.filter((s) => isFreeShape(s.shape)))
+const paidShapeOptions = computed(() => compatibleShapes.value.filter((s) => !isFreeShape(s.shape)))
+
+/** 付费型号在下拉框里带上规格，几十个型号光看名字分不出来。 */
+function shapeSpecText(s: ShapeInfo) {
+  const parts: string[] = []
+  if (s.is_flexible) parts.push('可调规格')
+  else if (s.ocpus != null && s.memory_in_gbs != null) parts.push(`${s.ocpus} OCPU / ${s.memory_in_gbs} GB`)
+  if (s.processor_description) parts.push(s.processor_description)
+  return parts.length ? ' · ' + parts.join(' · ') : ''
+}
+
+/** 当前选的是付费型号（会按量计费）。 */
+const isPaidShape = computed(() => !!form.shape && !isFreeShape(form.shape))
+/** 这次创建会不会计费：付费型号，或者在副区（副区里免费型号也按量计费）。 */
+const isBilledLaunch = computed(() => isPaidShape.value || isSecondaryRegion.value)
 const presets = computed(() => (meta.value?.quick_presets as Preset[]) || [])
 const vpuPresets = computed(
   () =>
@@ -986,7 +1061,12 @@ function onImageChange() {
     form.shape = ''
     return
   }
-  const prefer = list.find((s) => s.shape.includes('A1.Flex')) || list[0]
+  // 默认永远先落在免费型号上。升级账号的列表里有几十个付费型号，按字母排第一个的
+  // 往往是付费的 —— 换个镜像就悄悄把型号换成计费的，不能这样。
+  const prefer =
+    list.find((s) => s.shape.includes('A1.Flex')) ||
+    list.find((s) => isFreeShape(s.shape)) ||
+    list[0]
   form.shape = prefer.shape
   onShapeChange()
 }
@@ -1098,7 +1178,7 @@ const confirmRows = computed(() => {
       : []),
     ['AD', form.availability_domain || '—'],
     ['镜像', img?.label || img?.display_name || form.image_id || '—'],
-    ['Shape', form.shape || '—'],
+    ['Shape', form.shape ? `${form.shape}${isPaidShape.value ? '（付费型号 · 按量计费）' : '（免费型号）'}` : '—'],
     ['OCPU / 内存', isFlex.value ? `${form.ocpus} / ${form.memory_in_gbs} GB（可调）` : `${form.ocpus ?? '—'} / ${form.memory_in_gbs ?? '—'} GB（固定规格，不可改）`],
     ['Boot', `${boot} · ${form.boot_volume_vpus_per_gb} VPUs/GB`],
     ['登录', auth],
@@ -1321,6 +1401,22 @@ function createdPasswords(data: any): Array<{ name: string; password: string }> 
 }
 
 async function doLaunch() {
+  // 二次确认：会计费的创建（付费型号，或副区）在真正提交前再问一次。
+  // 确认页上已经有红框提示，这里是「点下去之前最后一道」——点了取消就什么都不发。
+  if (isBilledLaunch.value) {
+    const reasons: string[] = []
+    if (isPaidShape.value) reasons.push(`「${form.shape}」是付费型号，按量计费`)
+    if (isSecondaryRegion.value) reasons.push('所选区域是副区，资源按量计费')
+    const n = batchCount.value
+    if (
+      !confirm(
+        `这次创建会产生费用：\n${reasons.join('\n')}\n\n` +
+          `将创建 ${n} 台${form.as_retry ? '（容量不足时自动重试）' : ''}。确认继续？`,
+      )
+    ) {
+      return
+    }
+  }
   error.value = ''
   msg.value = ''
   submitting.value = true
@@ -1354,6 +1450,8 @@ async function doLaunch() {
         form.as_retry && isFlex.value
           ? fallbacks.value.filter((f) => f.ocpus > 0 && f.memory_in_gbs > 0)
           : [],
+      // 只有走到这里（上面那个确认框点了「确定」）才会是 true；服务端对付费型号要求它。
+      confirm_paid_shape: isPaidShape.value,
     }
 
     // Reuse the key only while the request is genuinely THE SAME. If the operator

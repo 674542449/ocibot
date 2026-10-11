@@ -1219,17 +1219,11 @@ def detach_reserved_ip(
 def _paid_or_reason(db: Session, row: Any) -> str:
     """'' if this tenant's account is upgraded (paid), else why the feature is off.
 
-    副区租户行建立时抄了一份主租户的等级，但主租户之后才点「等级查询」的话那份是
-    旧的，所以以主租户为准。
+    等级的判断（含副区以主租户为准）在 tenant_tier.effective_tier，和付费型号共用。
     """
-    from web.backend.models import Tenant
+    from web.backend.tenant_tier import effective_tier
 
-    tier = str(getattr(row, "account_tier", "") or "")
-    parent_id = str(getattr(row, "parent_tenant_id", "") or "")
-    if parent_id:
-        parent = db.get(Tenant, parent_id)
-        if parent is not None and parent.account_tier:
-            tier = parent.account_tier
+    tier = effective_tier(db, row)
     if tier == "paid":
         return ""
     if tier == "free":
