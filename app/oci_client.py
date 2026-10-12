@@ -144,6 +144,36 @@ def _format_probe_report(
 _ENDPOINT_HOST_RE = re.compile(r"https?://([^/\s?]+)")
 
 
+def _usage_item_cost(item: Any) -> float:
+    """一条 Usage API 汇总记录的费用。账单页和试用积分的「已用」共用这条规则。"""
+    # cost fields vary by query_type
+    cost = getattr(item, "computed_amount", None)
+    if cost is None:
+        cost = getattr(item, "attributed_cost", None)
+    if cost is None:
+        # 读不到费用就是 0，**不能拿单价顶上**。
+        #
+        # SDK 的字段说明写得很清楚：computed_amount 是 "The computed cost."，
+        # 而 unit_price 是 "The price per unit." —— 两者差一个用量系数。
+        # computedAmount 为 null 最典型的场景恰恰是「免费额度内的用量」，
+        # 于是每一条这样的记录都会把**每单位价格**当成该行费用累加进
+        # total / month_to_date / by_service，账单页凭空多出一笔钱。
+        cost = 0
+    try:
+        return float(cost or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _as_list(value: Any) -> list:
+    """None → []，单个对象 → [对象]，列表原样。SDK 有些字段时而是列表时而是单个对象。"""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
 def _public_ip_busy(ip: Any) -> bool:
     """这个公网 IP 是不是「已绑定 或 正在绑定」。
 
@@ -7741,24 +7771,8 @@ class TenantSession:
             total = 0.0
             month_total = 0.0
             for it in items:
-                # cost fields vary by query_type
-                cost = getattr(it, "computed_amount", None)
-                if cost is None:
-                    cost = getattr(it, "attributed_cost", None)
-                if cost is None:
-                    # 读不到费用就是 0，**不能拿单价顶上**。
-                    #
-                    # SDK 的字段说明写得很清楚：computed_amount 是 "The computed cost."，
-                    # 而 unit_price 是 "The price per unit." —— 两者差一个用量系数。
-                    # computedAmount 为 null 最典型的场景恰恰是「免费额度内的用量」，
-                    # 于是每一条这样的记录都会把**每单位价格**当成该行费用累加进
-                    # total / month_to_date / by_service，账单页凭空多出一笔钱。
-                    cost = 0
-                try:
-                    amount = float(cost or 0)
-                except (TypeError, ValueError):
-                    amount = 0.0
-                cur = str(getattr(it, "currency", "") or getattr(it, "currency_code", "") or "")
+                amount = _usage_item_cost(it)
+                cur =str(getattr(it, "currency", "") or getattr(it, "currency_code", "") or "")
                 if cur and not currency:
                     currency = cur
                 svc = str(getattr(it, "service", "") or getattr(it, "service_name", "") or "Other")
@@ -9123,28 +9137,22 @@ class TenantSession:
             )
         )
 
-    def _detect_subscription_tier(
+    def _subscription_records(
         self, regions: Optional[list[str]] = None
-    ) -> tuple[str, str, dict]:
-        """Classify the tenancy from its actual subscription record.
+    ) -> tuple[list[tuple[Any, Any]], str]:
+        """账号的订阅记录：``([(列表里的那条, 完整记录或 None), ...], 错误说明)``。
 
-        This is the authoritative signal: an upgraded (PAYG) tenancy reports a
-        paid payment model even when it has spent nothing, whereas billed spend
-        alone cannot distinguish "upgraded but only using free resources" from
-        a genuine Always Free account.
+        等级识别和试用积分都要它。完整记录（GetSubscription, V1 = ClassicSubscription）
+        才有 subscription_tier / promotion / start_date；单条读失败不影响其余的，
+        对应位置给 None。错误说明为空串表示读取成功（列表可能为空）。
 
-        Returns ``(verdict, note, details)`` with verdict in
-        ``{"paid", "free", "unknown"}``.
-
-        ``regions``: optional endpoint list; default is home region then tenant
-        region. Sidebar tier probe passes only the tenant region to skip the
-        ``list_region_subscriptions`` call inside ``_home_region``.
+        依次试 ``regions``（默认主区、再租户所在区域）：网络不可达就换下一个端点，
+        Oracle 明确拒绝（ServiceError）就不再试 —— 换个区域也一样会被拒。
         """
-        details: dict = {}
         try:
             from oci.tenant_manager_control_plane import SubscriptionClient
         except ImportError:
-            return "unknown", "SDK 不支持订阅查询", details
+            return [], "SDK 不支持订阅查询"
         tenancy = self.tenant.tenancy_ocid.strip()
         client = None
         items: list = []
@@ -9164,10 +9172,8 @@ class TenantSession:
                 last_exc = None
                 break
             except ServiceError as exc:
-                return (
-                    "unknown",
-                    f"订阅查询失败 [{getattr(exc, 'status', '')}] {getattr(exc, 'code', '') or ''}".strip(),
-                    details,
+                return [], (
+                    f"订阅查询失败 [{getattr(exc, 'status', '')}] {getattr(exc, 'code', '') or ''}".strip()
                 )
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
@@ -9176,35 +9182,62 @@ class TenantSession:
                     continue  # endpoint unreachable — try the next region
                 break
         if last_exc is not None:
-            note = "订阅服务网络不可达" if self._is_network_error(last_exc) else f"订阅查询失败：{str(last_exc)[:60]}"
-            return "unknown", note, details
-        if not items:
+            if self._is_network_error(last_exc):
+                return [], "订阅服务网络不可达"
+            return [], f"订阅查询失败：{str(last_exc)[:60]}"
+
+        pairs: list[tuple[Any, Any]] = []
+        for item in items:
+            full = None
+            sub_id = getattr(item, "id", "") or ""
+            if sub_id and client is not None:
+                try:
+                    full = client.get_subscription(subscription_id=sub_id, entity_version="V1").data
+                except Exception:  # noqa: BLE001
+                    full = None
+            pairs.append((item, full))
+        return pairs, ""
+
+    def _detect_subscription_tier(
+        self, regions: Optional[list[str]] = None
+    ) -> tuple[str, str, dict]:
+        """Classify the tenancy from its actual subscription record.
+
+        This is the authoritative signal: an upgraded (PAYG) tenancy reports a
+        paid payment model even when it has spent nothing, whereas billed spend
+        alone cannot distinguish "upgraded but only using free resources" from
+        a genuine Always Free account.
+
+        Returns ``(verdict, note, details)`` with verdict in
+        ``{"paid", "free", "unknown"}``.
+
+        ``regions``: optional endpoint list; default is home region then tenant
+        region. Sidebar tier probe passes only the tenant region to skip the
+        ``list_region_subscriptions`` call inside ``_home_region``.
+        """
+        details: dict = {}
+        pairs, error = self._subscription_records(regions)
+        if error:
+            return "unknown", error, details
+        if not pairs:
             return "unknown", "未返回订阅信息", details
 
         payment_models: list[str] = []
         tiers: list[str] = []
         promo_active = False
-        for item in items:
+        for item, full in pairs:
             model = str(getattr(item, "payment_model", "") or "").strip()
             if model:
                 payment_models.append(model)
-            sub_id = getattr(item, "id", "") or ""
-            if not sub_id:
+            if full is None:
                 continue
             # The full record carries subscription_tier / promotion.
-            try:
-                full = client.get_subscription(subscription_id=sub_id, entity_version="V1").data
-                tier = str(getattr(full, "subscription_tier", "") or "").strip()
-                if tier:
-                    tiers.append(tier)
-                promos = getattr(full, "promotion", None) or []
-                if not isinstance(promos, (list, tuple)):
-                    promos = [promos]
-                for promo in promos:
-                    if str(getattr(promo, "status", "") or "").upper() == "ACTIVE":
-                        promo_active = True
-            except Exception:  # noqa: BLE001
-                pass
+            tier = str(getattr(full, "subscription_tier", "") or "").strip()
+            if tier:
+                tiers.append(tier)
+            for promo in _as_list(getattr(full, "promotion", None)):
+                if str(getattr(promo, "status", "") or "").upper() == "ACTIVE":
+                    promo_active = True
 
         details["payment_models"] = payment_models
         details["subscription_tiers"] = tiers
@@ -9216,6 +9249,153 @@ class TenantSession:
         if any(k in blob for k in ("free", "trial", "promo")):
             return "free", f"订阅层级：{summary}", details
         return "unknown", f"订阅信息：{summary}", details
+
+    def _cost_between(self, start: Any, end: Any) -> tuple[Optional[float], str, str]:
+        """``start``～``end`` 之间的总费用：``(金额或 None, 币种, 说明)``。
+
+        金额为 None 表示没读到（权限、限流、SDK 缺 usage_api）—— 不能当 0：对一个
+        「已用多少积分」的数字，「0」和「读不到」是相反的答案。
+        Usage API 的 DAILY 粒度要求起止都是 UTC 零点，这里按天对齐；跨度封顶 366 天。
+        """
+        from datetime import timedelta, timezone
+
+        if self._usage is None:
+            return None, "", "Usage API 客户端不可用"
+        start = start.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = end.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        note = ""
+        if end - start > timedelta(days=366):
+            start = end - timedelta(days=366)
+            note = "只统计了最近 366 天"
+        try:
+            details = oci.usage_api.models.RequestSummarizedUsagesDetails(
+                tenant_id=self.tenant.tenancy_ocid.strip(),
+                time_usage_started=start,
+                time_usage_ended=end,
+                granularity="DAILY",
+                query_type="COST",
+                group_by=["currency"],
+            )
+            total = 0.0
+            currency = ""
+            page: Optional[str] = None
+            for _ in range(10):  # 和账单页同一个页数上限，别把请求预算打光
+                kw = {"page": page} if page else {}
+                resp = self.usage.request_summarized_usages(details, **kw)
+                for it in getattr(getattr(resp, "data", None), "items", None) or []:
+                    total += _usage_item_cost(it)
+                    currency = currency or str(getattr(it, "currency", "") or "")
+                page = getattr(resp, "next_page", None) or (
+                    (getattr(resp, "headers", None) or {}).get("opc-next-page")
+                )
+                if not page:
+                    break
+            else:
+                note = (note + "；" if note else "") + "记录太多，只统计了前 10 页"
+            return total, currency, note
+        except ServiceError as exc:
+            return None, "", f"读取费用失败：{_format_service_error(exc)}"
+        except Exception as exc:  # noqa: BLE001
+            return None, "", f"读取费用失败：{safe_error_text(exc)}"
+
+    def get_trial_credits(self) -> OperationResult:
+        """注册日期 + 试用积分（总额、已用、剩余、到期时间）。
+
+        * 注册日期：根 compartment（OCID 就是租户 OCID）的 time_created —— Tenancy
+          对象本身没有创建时间。读不到时退回订阅记录的 start_date。
+        * 积分：订阅记录（GetSubscription, V1）里的 promotion：总额、币种、开始 / 到期、
+          状态。Oracle 不给「已用 / 剩余」字段。
+        * 已用：Usage API 里从积分开始到现在（或到期）的总费用 —— 试用期内的费用就是从
+          积分里扣的。剩余 = 总额 − 已用。两者都是**估算**：Usage API 有几小时延迟，
+          和控制台的数字可能略有出入，页面上会写明。
+        """
+        from datetime import datetime, timezone
+
+        def iso(v: Any) -> Optional[str]:
+            if v is None:
+                return None
+            return v.isoformat() if hasattr(v, "isoformat") else str(v)
+
+        data: dict[str, Any] = {
+            "registered_at": None,
+            "registered_source": "",
+            "promotions": [],
+            "credit": None,
+            "notes": [],
+        }
+        tenancy = self.tenant.tenancy_ocid.strip()
+        try:
+            root = self.identity.get_compartment(tenancy).data
+            data["registered_at"] = iso(getattr(root, "time_created", None))
+            data["registered_source"] = "租户根 compartment 创建时间"
+        except Exception as exc:  # noqa: BLE001
+            data["notes"].append(f"读取注册日期失败：{safe_error_text(exc)}")
+
+        pairs, error = self._subscription_records()
+        if error:
+            return OperationResult(ok=False, message=error, data=data)
+
+        promos: list[dict[str, Any]] = []
+        for item, full in pairs:
+            record = full if full is not None else item
+            if not data["registered_at"] and getattr(record, "start_date", None):
+                data["registered_at"] = iso(record.start_date)
+                data["registered_source"] = "订阅开始日期"
+            for p in _as_list(getattr(record, "promotion", None)):
+                promos.append(
+                    {
+                        "amount": getattr(p, "amount", None),
+                        "currency": str(getattr(p, "currency_unit", "") or ""),
+                        "status": str(getattr(p, "status", "") or "").upper(),
+                        "time_started": getattr(p, "time_started", None),
+                        "time_expired": getattr(p, "time_expired", None),
+                        "duration": getattr(p, "duration", None),
+                        "duration_unit": str(getattr(p, "duration_unit", "") or ""),
+                    }
+                )
+        data["promotions"] = [
+            {**p, "time_started": iso(p["time_started"]), "time_expired": iso(p["time_expired"])} for p in promos
+        ]
+        if not promos:
+            return OperationResult(
+                ok=True, message="订阅记录里没有试用积分（促销）信息", data=data
+            )
+
+        # 主积分：有效的优先，其次金额最大的。
+        main = sorted(
+            promos,
+            key=lambda p: (p["status"] != "ACTIVE", -(float(p["amount"] or 0))),
+        )[0]
+        credit: dict[str, Any] = {
+            "amount": main["amount"],
+            "currency": main["currency"],
+            "status": main["status"],
+            "time_started": iso(main["time_started"]),
+            "time_expired": iso(main["time_expired"]),
+            "used": None,
+            "remaining": None,
+            "used_currency": "",
+            "used_note": "",
+        }
+        started = main["time_started"]
+        if started is not None:
+            now = datetime.now(timezone.utc)
+            expired = main["time_expired"]
+            until = min(now, expired) if expired is not None and expired < now else now
+            used, used_cur, note = self._cost_between(started, until)
+            credit["used"] = round(used, 2) if used is not None else None
+            credit["used_currency"] = used_cur
+            credit["used_note"] = note
+            if used is not None and main["amount"] is not None:
+                credit["remaining"] = round(max(0.0, float(main["amount"]) - used), 2)
+                if used_cur and main["currency"] and used_cur.upper() != main["currency"].upper():
+                    credit["used_note"] = (
+                        (note + "；") if note else ""
+                    ) + f"费用币种（{used_cur}）与积分币种（{main['currency']}）不同，剩余额度仅供参考"
+        else:
+            credit["used_note"] = "积分没有开始时间，无法统计已用金额"
+        data["credit"] = credit
+        return OperationResult(ok=True, message="已读取试用积分", data=data)
 
     def replace_ephemeral_public_ip(self, instance_id: str, compartment_id: str) -> OperationResult:
         try:

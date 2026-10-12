@@ -570,6 +570,28 @@ def account_status(
         raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
+@router.get("/tenants/{tenant_id}/trial-credits")
+def trial_credits(
+    tenant_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    """注册日期与试用积分（总额 / 已用 / 剩余 / 到期）。只在用户点「查询试用积分」时读。"""
+    row = _tenant_or_404(db, user.id, tenant_id)
+    try:
+        session = get_session_for_row(row)
+        result = session.get_trial_credits()
+        return {
+            "ok": bool(result.ok),
+            "message": result.message or "",
+            "data": result.data if isinstance(result.data, dict) else {},
+        }
+    except OCIClientError as exc:
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
+
+
 @router.get("/tenants/{tenant_id}/invoices")
 def account_invoices(
     tenant_id: str,

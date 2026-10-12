@@ -37,6 +37,70 @@
     <div v-if="error" class="error-box">{{ error }}</div>
     <div v-if="msg" class="success-box">{{ msg }}</div>
 
+    <!-- 试用积分：新注册账号送的那笔（通常 300 美元、30 天）。单独一个按钮查询 ——
+         它要读订阅记录和整段试用期的费用，比别的读取都重，不跟「刷新用量」绑在一起。 -->
+    <div class="card stack">
+      <div class="row" style="justify-content: space-between; align-items: baseline">
+        <h3 style="margin: 0">试用积分</h3>
+        <button type="button" :disabled="trialBusy || !tenantId" @click="loadTrial">
+          {{ trialBusy ? '查询中…' : '查询试用积分' }}
+        </button>
+      </div>
+      <p v-if="!trial && !trialError" class="muted" style="margin: 0; font-size: 13px">
+        {{ trialBusy ? '正在读取订阅记录与试用期费用…' : '点「查询试用积分」读取注册日期、积分总额、已用、剩余和到期时间。' }}
+      </p>
+      <div v-if="trialError" class="error-box">读取失败：{{ trialError }}</div>
+      <template v-if="trial">
+        <div class="grid-2 trial-grid">
+          <div>
+            <div class="muted" style="font-size: 12px">账号注册日期</div>
+            <div :title="trial.registered_source || ''">{{ fmtDateTime(trial.registered_at) }}</div>
+          </div>
+          <template v-if="trial.credit">
+            <div>
+              <div class="muted" style="font-size: 12px">积分总额</div>
+              <div class="trial-num">{{ money(trial.credit.amount, trial.credit.currency) }}</div>
+            </div>
+            <div>
+              <div class="muted" style="font-size: 12px">已用（估算）</div>
+              <div class="trial-num">
+                {{ trial.credit.used == null ? '读不到' : money(trial.credit.used, trial.credit.used_currency || trial.credit.currency) }}
+              </div>
+            </div>
+            <div>
+              <div class="muted" style="font-size: 12px">剩余可用（估算）</div>
+              <div class="trial-num">
+                {{ trial.credit.remaining == null ? '读不到' : money(trial.credit.remaining, trial.credit.currency) }}
+              </div>
+            </div>
+            <div>
+              <div class="muted" style="font-size: 12px">到期时间</div>
+              <div>
+                {{ fmtDateTime(trial.credit.time_expired) }}
+                <span class="badge" :class="trialStatusClass(trial.credit.status)">
+                  {{ trialStatusLabel(trial.credit.status) }}
+                </span>
+                <span v-if="trialDaysLeft != null" class="muted" style="font-size: 12px">
+                  （还剩 {{ trialDaysLeft }} 天）
+                </span>
+              </div>
+            </div>
+            <div>
+              <div class="muted" style="font-size: 12px">开始时间</div>
+              <div>{{ fmtDateTime(trial.credit.time_started) }}</div>
+            </div>
+          </template>
+        </div>
+        <p v-if="!trial.credit" class="muted" style="margin: 0; font-size: 13px">{{ trialMessage }}</p>
+        <p v-if="trial.credit" class="muted" style="margin: 0; font-size: 12px">
+          积分总额和到期时间来自 Oracle 订阅记录；已用 = 试用期开始至今（或至到期）的费用合计，
+          剩余 = 总额 − 已用。费用数据有几小时延迟，以 Oracle 控制台为准。
+          <template v-if="trial.credit.used_note">（{{ trial.credit.used_note }}）</template>
+        </p>
+        <p v-for="(n, i) in trial.notes || []" :key="i" class="muted" style="margin: 0; font-size: 12px">{{ n }}</p>
+      </template>
+    </div>
+
     <div v-if="data" class="card stack">
       <div class="grid-2">
         <div>
@@ -435,6 +499,62 @@ function shortAd(ad: string) {
   return i >= 0 ? ad.slice(i + 1) : ad
 }
 
+// ---- 试用积分 ----
+const trial = ref<any>(null)
+const trialMessage = ref('')
+const trialError = ref('')
+const trialBusy = ref(false)
+
+/** 到期前还剩几天；已过期 / 没有到期时间时为 null。 */
+const trialDaysLeft = computed<number | null>(() => {
+  const c = trial.value?.credit
+  if (!c?.time_expired || c.status !== 'ACTIVE') return null
+  const ms = new Date(c.time_expired).getTime() - Date.now()
+  return Number.isFinite(ms) && ms > 0 ? Math.ceil(ms / 86_400_000) : null
+})
+
+function trialStatusLabel(s: string) {
+  return ({ ACTIVE: '有效', EXPIRED: '已过期', INITIALIZED: '未开始' } as Record<string, string>)[s] || s || '未知'
+}
+
+function trialStatusClass(s: string) {
+  if (s === 'ACTIVE') return 'running'
+  if (s === 'EXPIRED') return 'stopped'
+  return ''
+}
+
+function fmtDateTime(iso: string | null | undefined) {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return String(iso)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+async function loadTrial() {
+  if (!tenantId.value) return
+  const guard = beginLoad('trial')
+  trialBusy.value = true
+  trialError.value = ''
+  try {
+    const res = await api.get(`/tenants/${tenantId.value}/trial-credits`)
+    if (guard.stale()) return
+    if (res.data.ok === false) {
+      trial.value = null
+      trialError.value = res.data.message || '未知原因'
+      return
+    }
+    trial.value = res.data.data || {}
+    trialMessage.value = res.data.message || ''
+  } catch (e: any) {
+    if (guard.stale()) return
+    trial.value = null
+    trialError.value = e?.message || '请求失败'
+  } finally {
+    if (!guard.superseded()) trialBusy.value = false
+  }
+}
+
 /** Oracle 的限额名 → 中文。认不出的原样显示（悬停仍能看到原名）。 */
 function publicIpLabel(name: string) {
   const n = String(name || '').toLowerCase()
@@ -670,6 +790,9 @@ function onTenantChange() {
   invoiceMsg.value = ''
   invoiceError.value = ''
   invoicesLoaded.value = false
+  trial.value = null
+  trialMessage.value = ''
+  trialError.value = ''
   msg.value = ''
   error.value = ''
 }
@@ -713,6 +836,14 @@ onMounted(async () => {
 /* 本月费用. Given its own surface so it reads as a distinct figure rather than a
    second interpretation of the chart below it — the chart is a rolling window,
    this is the calendar month. */
+.trial-grid {
+  gap: 0.7rem 1.5rem;
+}
+.trial-num {
+  font-size: 1.15rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
 .mtd {
   display: flex;
   align-items: baseline;

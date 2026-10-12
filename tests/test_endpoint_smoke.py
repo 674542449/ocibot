@@ -158,6 +158,12 @@ def make_session():
     s.delete_reserved_public_ip.return_value = R(True, "已删除", {})
     s.attach_reserved_public_ip.return_value = R(True, "已绑定", {})
     s.detach_reserved_public_ip.return_value = R(True, "已解绑", {})
+    s.get_trial_credits.return_value = R(
+        True,
+        "已读取试用积分",
+        {"registered_at": "2026-09-20T08:00:00+00:00", "promotions": [], "notes": [],
+         "credit": {"amount": 300.0, "currency": "USD", "status": "ACTIVE", "used": 12.5, "remaining": 287.5}},
+    )
     s.create_reserved_public_ips.return_value = R(
         True, "已创建 2 个", {"created": [{"id": "pip2", "ip_address": "2.2.2.2"}], "failed": ""}
     )
@@ -341,7 +347,7 @@ def test_every_endpoint_is_wired() -> None:
             f"/api/tenants/{tid}", f"/api/tenants/{tid}/instances",
             f"/api/tenants/{tid}/instances/{iid}", f"/api/tenants/{tid}/account",
             f"/api/tenants/{tid}/usage", f"/api/tenants/{tid}/free-quota",
-            f"/api/tenants/{tid}/invoices",
+            f"/api/tenants/{tid}/invoices", f"/api/tenants/{tid}/trial-credits",
             f"/api/tenants/{tid}/launch-meta", f"/api/tenants/{tid}/launch-meta/status",
             f"/api/tenants/{tid}/boot-volumes",
             f"/api/tenants/{tid}/block-volumes", f"/api/tenants/{tid}/reserved-ips",
