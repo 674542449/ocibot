@@ -10,8 +10,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import oci.tenant_manager_control_plane as tmcp
+from oci.tenant_manager_control_plane.subscription_client import (
+    SubscriptionClient as _RealSubscriptionClient,
+)
 
 from app.oci_client import TenantSession
+from tests._oci_fakes import check_sdk_kwargs
 
 SSL_EOF = (
     "OCIConnectionPool(host='usageapi.eu-zurich-1.oci.oraclecloud.com', port=443): "
@@ -50,7 +54,8 @@ def _session(payment_model, subscription_tier="", monkeypatch=None, home_region=
                 data=SimpleNamespace(items=[SimpleNamespace(payment_model=payment_model, id="sub1")])
             )
 
-        def get_subscription(self, subscription_id=None, entity_version=None):
+        def get_subscription(self, subscription_id=None, **kwargs):
+            check_sdk_kwargs(_RealSubscriptionClient.get_subscription, subscription_id, **kwargs)
             return SimpleNamespace(
                 data=SimpleNamespace(subscription_tier=subscription_tier, promotion=None)
             )
@@ -132,7 +137,8 @@ def test_subscription_lookup_falls_back_to_tenant_region_on_tls_failure(monkeypa
                 data=SimpleNamespace(items=[SimpleNamespace(payment_model="Pay as you go", id="s1")])
             )
 
-        def get_subscription(self, subscription_id=None, entity_version=None):
+        def get_subscription(self, subscription_id=None, **kwargs):
+            check_sdk_kwargs(_RealSubscriptionClient.get_subscription, subscription_id, **kwargs)
             return SimpleNamespace(data=SimpleNamespace(subscription_tier="", promotion=None))
 
     monkeypatch.setattr(tmcp, "SubscriptionClient", FakeSubscription)

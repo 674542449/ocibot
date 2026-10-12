@@ -9139,12 +9139,13 @@ class TenantSession:
 
     def _subscription_records(
         self, regions: Optional[list[str]] = None
-    ) -> tuple[list[tuple[Any, Any]], str]:
-        """账号的订阅记录：``([(列表里的那条, 完整记录或 None), ...], 错误说明)``。
+    ) -> tuple[list[tuple[Any, Any, str]], str]:
+        """账号的订阅记录：``([(列表里的那条, 完整记录或 None, 读完整记录的错误), ...], 错误说明)``。
 
-        等级识别和试用积分都要它。完整记录（GetSubscription, V1 = ClassicSubscription）
-        才有 subscription_tier / promotion / start_date；单条读失败不影响其余的，
-        对应位置给 None。错误说明为空串表示读取成功（列表可能为空）。
+        等级识别和试用积分都要它。完整记录（GetSubscription）才有 subscription_tier /
+        promotion / start_date；单条读失败不影响其余的，对应位置给 None 并带上原因 ——
+        原因必须带出来，吞掉它就是 0.4.135 那个「明明有积分却显示没有」的 bug。
+        错误说明为空串表示列表读取成功（列表可能为空）。
 
         依次试 ``regions``（默认主区、再租户所在区域）：网络不可达就换下一个端点，
         Oracle 明确拒绝（ServiceError）就不再试 —— 换个区域也一样会被拒。
@@ -9186,16 +9187,24 @@ class TenantSession:
                 return [], "订阅服务网络不可达"
             return [], f"订阅查询失败：{str(last_exc)[:60]}"
 
-        pairs: list[tuple[Any, Any]] = []
+        pairs: list[tuple[Any, Any, str]] = []
         for item in items:
             full = None
+            read_error = ""
             sub_id = getattr(item, "id", "") or ""
             if sub_id and client is not None:
                 try:
-                    full = client.get_subscription(subscription_id=sub_id, entity_version="V1").data
-                except Exception:  # noqa: BLE001
-                    full = None
-            pairs.append((item, full))
+                    # 不能传 entity_version：SDK 的 get_subscription 只认 retry_strategy /
+                    # opc_request_id 等几个参数，多传一个就直接抛 ValueError("unknown
+                    # kwargs")。0.4.135 之前这里一直传着它、异常又被吞掉，完整记录一条都
+                    # 没读到过 —— 试用积分永远显示「没有」，等级识别里的 subscription_tier /
+                    # promotion 也从没生效过。list_subscriptions 才接受 entity_version。
+                    full = client.get_subscription(subscription_id=sub_id).data
+                except ServiceError as exc:
+                    read_error = _format_service_error(exc)
+                except Exception as exc:  # noqa: BLE001
+                    read_error = safe_error_text(exc)
+            pairs.append((item, full, read_error))
         return pairs, ""
 
     def _detect_subscription_tier(
@@ -9225,7 +9234,7 @@ class TenantSession:
         payment_models: list[str] = []
         tiers: list[str] = []
         promo_active = False
-        for item, full in pairs:
+        for item, full, _read_error in pairs:
             model = str(getattr(item, "payment_model", "") or "").strip()
             if model:
                 payment_models.append(model)
@@ -9336,7 +9345,10 @@ class TenantSession:
             return OperationResult(ok=False, message=error, data=data)
 
         promos: list[dict[str, Any]] = []
-        for item, full in pairs:
+        read_errors: list[str] = []
+        for item, full, read_error in pairs:
+            if read_error:
+                read_errors.append(read_error)
             record = full if full is not None else item
             if not data["registered_at"] and getattr(record, "start_date", None):
                 data["registered_at"] = iso(record.start_date)
@@ -9356,7 +9368,17 @@ class TenantSession:
         data["promotions"] = [
             {**p, "time_started": iso(p["time_started"]), "time_expired": iso(p["time_expired"])} for p in promos
         ]
+        for err in read_errors:
+            data["notes"].append(f"读取订阅详情失败：{err}")
         if not promos:
+            if read_errors:
+                # 积分只在完整记录里。完整记录没读到，就不能说「没有积分」——
+                # 那是把「读不到」说成了「没有」。
+                return OperationResult(
+                    ok=False,
+                    message=f"读取订阅详情失败，无法得知试用积分：{read_errors[0]}",
+                    data=data,
+                )
             return OperationResult(
                 ok=True, message="订阅记录里没有试用积分（促销）信息", data=data
             )

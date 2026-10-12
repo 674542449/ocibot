@@ -6,8 +6,12 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import oci.tenant_manager_control_plane as tmcp
+from oci.tenant_manager_control_plane.subscription_client import (
+    SubscriptionClient as _RealSubscriptionClient,
+)
 
 from app.oci_client import TenantSession
+from tests._oci_fakes import check_sdk_kwargs
 
 NOW = datetime.now(timezone.utc)
 
@@ -44,7 +48,8 @@ def _session(monkeypatch, *, promotion, usage_items=None, usage_error=None, sub_
                 raise RuntimeError(sub_error)
             return SimpleNamespace(data=SimpleNamespace(items=[SimpleNamespace(id="sub1", payment_model="")]))
 
-        def get_subscription(self, subscription_id=None, entity_version=None):
+        def get_subscription(self, subscription_id=None, **kwargs):
+            check_sdk_kwargs(_RealSubscriptionClient.get_subscription, subscription_id, **kwargs)
             return SimpleNamespace(data=SimpleNamespace(
                 promotion=promotion, start_date=datetime(2026, 9, 21, tzinfo=timezone.utc),
                 subscription_tier="FREE_TIER",
@@ -109,3 +114,26 @@ def test_an_unreadable_subscription_is_reported(monkeypatch):
     res = s.get_trial_credits()
     assert not res.ok and "订阅查询失败" in res.message
     assert res.data["registered_at"].startswith("2026-09-20"), "注册日期不依赖订阅接口"
+
+
+def test_a_failed_detail_read_is_reported_not_turned_into_no_credit(monkeypatch):
+    """完整订阅记录没读到时，不能说「没有积分」—— 那正是 0.4.135 的症状。"""
+    from oci.exceptions import ServiceError
+
+    s, _ = _session(monkeypatch, promotion=_promo())
+
+    class Denied:
+        def __init__(self, cfg, **_kw):
+            pass
+
+        def list_subscriptions(self, compartment_id=None, entity_version=None):
+            return SimpleNamespace(data=SimpleNamespace(items=[SimpleNamespace(id="sub1", payment_model="")]))
+
+        def get_subscription(self, subscription_id=None, **kwargs):
+            raise ServiceError(404, "NotAuthorizedOrNotFound", {}, "Authorization failed or requested resource not found")
+
+    monkeypatch.setattr(tmcp, "SubscriptionClient", Denied)
+    res = s.get_trial_credits()
+    assert not res.ok
+    assert "读取订阅详情失败" in res.message and "NotAuthorizedOrNotFound" in res.message
+    assert "没有试用积分" not in res.message
