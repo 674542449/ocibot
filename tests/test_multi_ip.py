@@ -387,3 +387,41 @@ def test_install_script_is_valid_bash_and_embeds_valid_python():
         pytest.skip("bash not available")
     res = subprocess.run([bash, "-n"], input=script, capture_output=True, text=True)
     assert res.returncode == 0, res.stderr
+
+
+# ---------------------------------------------------------------- 0.4.138 检查修掉的两处
+
+
+def test_a_chinese_name_prefix_is_kept():
+    names: list[str] = []
+
+    def create(_comp=None, display_name=""):
+        names.append(display_name)
+        return SimpleNamespace(ok=True, message="", data={"public_ip_id": "x", "ip_address": "9.9.9.9"})
+
+    s = _session(_FakeNet(), [_reserved("a", "1.1.1.1", name="代理-03")])
+    s.create_reserved_public_ip = create  # type: ignore[method-assign]
+    s.create_reserved_public_ips(2, " 代理 ")
+    assert names == ["代理-04", "代理-05"], "以前中文前缀被整个删掉，建出来的是 ip-01"
+
+
+def test_a_failed_removal_is_retried_on_the_next_run(tmp_path):
+    ns = _load_sync(tmp_path)
+    have = {"10.0.0.129"}
+    cmds: list[str] = []
+    _wire(ns, _REAL_VNICS, have, cmds, panel={"ocid1.vnic.oc1..v1": ["10.0.0.11"]})
+    ns["main"]()
+    assert "10.0.0.11" in have
+
+    # 解绑了，但这一次 ip addr del 失败
+    _wire(ns, _REAL_VNICS, have, cmds, panel={"ocid1.vnic.oc1..v1": []})
+    ns["ip_cmd"] = lambda *args: False
+    ns["main"]()
+    assert "10.0.0.11" in have
+
+    # 下一轮要接着删，而不是把它忘掉
+    cmds.clear()
+    _wire(ns, _REAL_VNICS, have, cmds, panel={"ocid1.vnic.oc1..v1": []})
+    ns["main"]()
+    assert cmds == ["addr del 10.0.0.11/24 dev enp0s6"]
+    assert "10.0.0.11" not in have

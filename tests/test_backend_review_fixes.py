@@ -236,3 +236,17 @@ def test_a_large_batch_delete_still_writes_valid_audit_json(client, ids):
     detail = json.loads(rec.detail)  # 截断的 JSON 会在这里抛
     assert detail["deleted_count"] == 80
     assert detail["skipped_count"] == 2
+
+
+# ------------------------------------------------------------------ 5. 抢机接口的付费型号确认
+
+
+def test_the_capacity_api_needs_confirmation_for_a_paid_shape(client, ids):
+    """和「创建实例」同一条规则：付费型号不确认就不建任务（0.4.138 前这里没有这道检查）。"""
+    _user_id, tenant_id = ids
+    r = client.post(
+        "/api/jobs/capacity",
+        json={"tenant_id": tenant_id, "launch_payload": _payload(shape="VM.Standard.E4.Flex")},
+    )
+    assert r.status_code == 400, r.text
+    assert "confirm_paid_shape" in r.json()["detail"]

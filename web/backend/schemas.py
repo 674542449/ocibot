@@ -526,6 +526,8 @@ class CapacityJobCreate(BaseModel):
     interval_sec: int = Field(default=180, ge=0, le=86_400)
     max_attempts: int = Field(default=200, ge=0, le=1_000_000)
     enabled: bool = True
+    # 同 LaunchInstanceRequest.confirm_paid_shape：付费型号必须明确确认会计费。
+    confirm_paid_shape: bool = False
     # Flex-only downgrade candidates the worker rotates through after the primary
     # config fails across all ADs: [{"ocpus": 2, "memory_in_gbs": 12}, ...] (max 5).
     fallback_configs: list[dict[str, Any]] = Field(default_factory=list)

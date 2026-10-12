@@ -520,7 +520,13 @@ def validate_launch_against_quota(
     # 与 quota_guard._blocked_by_incomplete_read 共用同一个谓词，二者不能再各写一份。
     hard = hard_free_caps(free_only, account_tier)
     if enforce_storage_cap is None:
-        enforce_storage_cap = hard
+        # 付费型号不吃这条硬上限（0.4.138）。免费账号关掉「仅使用免费额度」开付费型号
+        # 是在用试用积分，创建前已经二次确认过「会计费」；它的引导卷超出 200GB 同样只是
+        # 计费。以前这里只看账号等级，于是一个已经用满 200GB 的免费账号（4 台 A1 各
+        # 50GB 是最常见的用法）开任何付费型号都被「块存储将超过免费 200GB」拦下 ——
+        # 0.4.134 放开的功能在这类账号上根本用不了。
+        # 免费型号照旧硬拦：那台机器用户以为是免费的，超出部分计费不能悄悄发生。
+        enforce_storage_cap = hard and (free_only or is_free_shape(shape))
 
     issues: list[GuardIssue] = []
     warnings: list[GuardIssue] = []

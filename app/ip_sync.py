@@ -174,9 +174,14 @@ def main(wait=0):
                 managed.add(ip)
                 log("%s: added %s" % (dev, ip))
         for ip in sorted(managed - want):
-            if ip != primary and ip in have and ip_cmd("addr", "del", "%s/%d" % (ip, prefix), "dev", dev):
+            if ip == primary or ip not in have:
+                managed.discard(ip)  # 已经不在网卡上（或是主 IP），不用再管
+                continue
+            # 删成功了才从记录里去掉。以前不管成败都去掉，一次失败之后这个地址就再也
+            # 不会被重试，永远挂在网卡上。
+            if ip_cmd("addr", "del", "%s/%d" % (ip, prefix), "dev", dev):
                 log("%s: removed %s" % (dev, ip))
-            managed.discard(ip)
+                managed.discard(ip)
         # 只记自己加的。已经在网卡上的（手工写进 netplan 的）不收编，
         # 否则它从 Oracle 那边解绑后会被这里删掉 —— 那不是本服务该动的东西。
         save_state(dev, managed)

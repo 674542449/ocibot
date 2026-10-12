@@ -523,3 +523,23 @@ def test_lost_response_is_explained_for_gateway_statuses():
         assert str(status) in src, f"{status} not treated as a lost response"
     # The multi-line guidance is useless if the box collapses newlines.
     assert 'class="error-box" style="white-space: pre-line"' in src
+
+
+def test_a_paid_shape_is_not_blocked_by_the_free_storage_cap():
+    """免费账号用积分开付费型号：块存储超出 200GB 只提醒（0.4.138）。
+    免费型号照旧硬拦，「仅使用免费额度」开着时照旧拦。"""
+    full = {"usage": {"a1_ocpu": 0.0, "a1_memory_gb": 0.0, "e2_micro_count": 0,
+                      "block_storage_gb": free_quota.FREE_BLOCK_STORAGE_GB}}
+
+    def guard(shape, free_only):
+        return free_quota.validate_launch_against_quota(
+            shape=shape, ocpus=1, memory_in_gbs=6, boot_volume_size_in_gbs=50,
+            free_only_mode=free_only, account_tier="free", usage=full,
+        )
+
+    paid = guard("VM.Standard.E4.Flex", False)
+    assert paid.ok, paid.error_messages()
+    assert any(w.code == "storage_over_free_cap" for w in paid.warnings)
+
+    assert not guard("VM.Standard.E2.1.Micro", False).ok, "免费型号超出仍要拦"
+    assert not guard("VM.Standard.E4.Flex", True).ok, "仅使用免费额度开着时仍要拦"

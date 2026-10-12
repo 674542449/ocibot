@@ -9307,18 +9307,26 @@ class TenantSession:
         except Exception as exc:  # noqa: BLE001
             return None, "", f"读取费用失败：{safe_error_text(exc)}"
 
+    # 新账号试用积分的有效期。Oracle 的说法是「30 天内有效」，按注册日期起算。
+    TRIAL_DAYS = 30
+
     def get_trial_credits(self) -> OperationResult:
         """注册日期 + 试用积分（总额、已用、剩余、到期时间）。
 
         * 注册日期：根 compartment（OCID 就是租户 OCID）的 time_created —— Tenancy
           对象本身没有创建时间。读不到时退回订阅记录的 start_date。
-        * 积分：订阅记录（GetSubscription, V1）里的 promotion：总额、币种、开始 / 到期、
-          状态。Oracle 不给「已用 / 剩余」字段。
-        * 已用：Usage API 里从积分开始到现在（或到期）的总费用 —— 试用期内的费用就是从
-          积分里扣的。剩余 = 总额 − 已用。两者都是**估算**：Usage API 有几小时延迟，
-          和控制台的数字可能略有出入，页面上会写明。
+        * 到期时间：**注册日期 + 30 天**（按用户要求固定这样算，不用 Oracle 促销记录里的
+          time_expired）。有效 / 已过期、还剩几天都按它判断。
+        * 积分总额：订阅记录（GetSubscription）里的 promotion。读不到就显示「读不到」，
+          不编一个 300 出来 —— 各地区的试用金额和币种并不一样。
+        * 已用：Usage API 里从注册日期到现在（已过期则到到期日）的总费用 —— 试用期内的
+          费用就是从积分里扣的。剩余 = 总额 − 已用。两者都是**估算**：Usage API 有几小时
+          延迟，和控制台的数字可能略有出入，页面上会写明。
+
+        订阅记录读不到时不整个失败：只要知道注册日期，到期时间和已用照样算得出来，
+        读不到的那部分写进 notes。
         """
-        from datetime import datetime, timezone
+        from datetime import datetime, timedelta, timezone
 
         def iso(v: Any) -> Optional[str]:
             if v is None:
@@ -9333,25 +9341,25 @@ class TenantSession:
             "notes": [],
         }
         tenancy = self.tenant.tenancy_ocid.strip()
+        registered = None
         try:
-            root = self.identity.get_compartment(tenancy).data
-            data["registered_at"] = iso(getattr(root, "time_created", None))
-            data["registered_source"] = "租户根 compartment 创建时间"
+            registered = getattr(self.identity.get_compartment(tenancy).data, "time_created", None)
+            if registered is not None:
+                data["registered_source"] = "租户根 compartment 创建时间"
         except Exception as exc:  # noqa: BLE001
             data["notes"].append(f"读取注册日期失败：{safe_error_text(exc)}")
 
         pairs, error = self._subscription_records()
         if error:
-            return OperationResult(ok=False, message=error, data=data)
-
+            data["notes"].append(f"读取订阅记录失败：{error}")
         promos: list[dict[str, Any]] = []
         read_errors: list[str] = []
         for item, full, read_error in pairs:
             if read_error:
                 read_errors.append(read_error)
             record = full if full is not None else item
-            if not data["registered_at"] and getattr(record, "start_date", None):
-                data["registered_at"] = iso(record.start_date)
+            if registered is None and getattr(record, "start_date", None):
+                registered = record.start_date
                 data["registered_source"] = "订阅开始日期"
             for p in _as_list(getattr(record, "promotion", None)):
                 promos.append(
@@ -9359,64 +9367,58 @@ class TenantSession:
                         "amount": getattr(p, "amount", None),
                         "currency": str(getattr(p, "currency_unit", "") or ""),
                         "status": str(getattr(p, "status", "") or "").upper(),
-                        "time_started": getattr(p, "time_started", None),
-                        "time_expired": getattr(p, "time_expired", None),
-                        "duration": getattr(p, "duration", None),
-                        "duration_unit": str(getattr(p, "duration_unit", "") or ""),
+                        "time_started": iso(getattr(p, "time_started", None)),
+                        "time_expired": iso(getattr(p, "time_expired", None)),
                     }
                 )
-        data["promotions"] = [
-            {**p, "time_started": iso(p["time_started"]), "time_expired": iso(p["time_expired"])} for p in promos
-        ]
         for err in read_errors:
             data["notes"].append(f"读取订阅详情失败：{err}")
-        if not promos:
-            if read_errors:
-                # 积分只在完整记录里。完整记录没读到，就不能说「没有积分」——
-                # 那是把「读不到」说成了「没有」。
-                return OperationResult(
-                    ok=False,
-                    message=f"读取订阅详情失败，无法得知试用积分：{read_errors[0]}",
-                    data=data,
-                )
+        data["registered_at"] = iso(registered)
+        data["promotions"] = promos
+
+        if registered is None:
+            reason = error or (read_errors[0] if read_errors else "")
             return OperationResult(
-                ok=True, message="订阅记录里没有试用积分（促销）信息", data=data
+                ok=False,
+                message="读不到账号注册日期，无法推算试用积分" + (f"：{reason}" if reason else ""),
+                data=data,
             )
 
-        # 主积分：有效的优先，其次金额最大的。
-        main = sorted(
-            promos,
-            key=lambda p: (p["status"] != "ACTIVE", -(float(p["amount"] or 0))),
-        )[0]
+        # 主积分（只用来取总额和币种）：有效的优先，其次金额最大的。
+        main = (
+            sorted(promos, key=lambda p: (p["status"] != "ACTIVE", -(float(p["amount"] or 0))))[0]
+            if promos
+            else None
+        )
+        now = datetime.now(timezone.utc)
+        expiry = registered + timedelta(days=self.TRIAL_DAYS)
+        amount = main["amount"] if main else None
+        currency = main["currency"] if main else ""
         credit: dict[str, Any] = {
-            "amount": main["amount"],
-            "currency": main["currency"],
-            "status": main["status"],
-            "time_started": iso(main["time_started"]),
-            "time_expired": iso(main["time_expired"]),
+            "amount": amount,
+            "currency": currency,
+            "status": "ACTIVE" if now < expiry else "EXPIRED",
+            "time_started": iso(registered),
+            "time_expired": iso(expiry),
+            "expiry_source": f"注册日期 + {self.TRIAL_DAYS} 天",
             "used": None,
             "remaining": None,
             "used_currency": "",
             "used_note": "",
         }
-        started = main["time_started"]
-        if started is not None:
-            now = datetime.now(timezone.utc)
-            expired = main["time_expired"]
-            until = min(now, expired) if expired is not None and expired < now else now
-            used, used_cur, note = self._cost_between(started, until)
-            credit["used"] = round(used, 2) if used is not None else None
-            credit["used_currency"] = used_cur
-            credit["used_note"] = note
-            if used is not None and main["amount"] is not None:
-                credit["remaining"] = round(max(0.0, float(main["amount"]) - used), 2)
-                if used_cur and main["currency"] and used_cur.upper() != main["currency"].upper():
-                    credit["used_note"] = (
-                        (note + "；") if note else ""
-                    ) + f"费用币种（{used_cur}）与积分币种（{main['currency']}）不同，剩余额度仅供参考"
-        else:
-            credit["used_note"] = "积分没有开始时间，无法统计已用金额"
+        used, used_cur, note = self._cost_between(registered, min(now, expiry))
+        credit["used"] = round(used, 2) if used is not None else None
+        credit["used_currency"] = used_cur
+        credit["used_note"] = note
+        if used is not None and amount is not None:
+            credit["remaining"] = round(max(0.0, float(amount) - used), 2)
+            if used_cur and currency and used_cur.upper() != currency.upper():
+                credit["used_note"] = ((note + "；") if note else "") + (
+                    f"费用币种（{used_cur}）与积分币种（{currency}）不同，剩余额度仅供参考"
+                )
         data["credit"] = credit
+        if main is None:
+            data["notes"].append("Oracle 订阅记录里没有读到积分金额，所以总额和剩余显示「读不到」")
         return OperationResult(ok=True, message="已读取试用积分", data=data)
 
     def replace_ephemeral_public_ip(self, instance_id: str, compartment_id: str) -> OperationResult:
@@ -9733,7 +9735,11 @@ class TenantSession:
         kept and reported when a later one fails (Oracle's limit message included).
         """
         count = max(1, min(50, int(count or 1)))
-        prefix = re.sub(r"[^A-Za-z0-9_.-]", "", (name_prefix or "").strip())[:40] or "ip"
+        # 只去掉控制字符和空白，中文照留：Oracle 的 display_name 允许任意文字，以前这里
+        # 只保留 [A-Za-z0-9_.-]，输入「代理」实际建出来是「ip-01」，页面提示却写着「代理-01」。
+        prefix = "".join(
+            ch for ch in (name_prefix or "").strip() if ch.isprintable() and not ch.isspace()
+        )[:40] or "ip"
         try:
             existing = self.list_reserved_public_ips(compartment_id)
         except OCIClientError as exc:

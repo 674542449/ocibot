@@ -59,7 +59,9 @@
           <template v-if="trial.credit">
             <div>
               <div class="muted" style="font-size: 12px">积分总额</div>
-              <div class="trial-num">{{ money(trial.credit.amount, trial.credit.currency) }}</div>
+              <div class="trial-num">
+                {{ trial.credit.amount == null ? '读不到' : money(trial.credit.amount, trial.credit.currency) }}
+              </div>
             </div>
             <div>
               <div class="muted" style="font-size: 12px">已用（估算）</div>
@@ -74,7 +76,9 @@
               </div>
             </div>
             <div>
-              <div class="muted" style="font-size: 12px">到期时间</div>
+              <div class="muted" style="font-size: 12px">
+                到期时间<span v-if="trial.credit.expiry_source">（{{ trial.credit.expiry_source }}）</span>
+              </div>
               <div>
                 {{ fmtDateTime(trial.credit.time_expired) }}
                 <span class="badge" :class="trialStatusClass(trial.credit.status)">
@@ -86,15 +90,15 @@
               </div>
             </div>
             <div>
-              <div class="muted" style="font-size: 12px">开始时间</div>
+              <div class="muted" style="font-size: 12px">开始时间（注册日期）</div>
               <div>{{ fmtDateTime(trial.credit.time_started) }}</div>
             </div>
           </template>
         </div>
         <p v-if="!trial.credit" class="muted" style="margin: 0; font-size: 13px">{{ trialMessage }}</p>
         <p v-if="trial.credit" class="muted" style="margin: 0; font-size: 12px">
-          积分总额和到期时间来自 Oracle 订阅记录；已用 = 试用期开始至今（或至到期）的费用合计，
-          剩余 = 总额 − 已用。费用数据有几小时延迟，以 Oracle 控制台为准。
+          到期时间按注册日期 + 30 天计算；积分总额来自 Oracle 订阅记录；已用 = 注册至今（或至到期）
+          的费用合计，剩余 = 总额 − 已用。费用数据有几小时延迟，以 Oracle 控制台为准。
           <template v-if="trial.credit.used_note">（{{ trial.credit.used_note }}）</template>
         </p>
         <p v-for="(n, i) in trial.notes || []" :key="i" class="muted" style="margin: 0; font-size: 12px">{{ n }}</p>

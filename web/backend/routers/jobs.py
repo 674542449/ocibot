@@ -113,6 +113,17 @@ def create_capacity_job(
             ),
         )
 
+    # 付费型号要明确确认会计费 —— 和「创建实例」接口同一条规则。以前这个接口没有这道
+    # 检查，绕过页面直接调它就能建出一个会反复尝试开计费机器的任务，没有任何人确认过。
+    from app.free_quota import is_free_shape
+
+    shape = str(payload.get("shape") or "")
+    if shape and not is_free_shape(shape) and not body.confirm_paid_shape:
+        raise HTTPException(
+            status_code=400,
+            detail=f"「{shape}」不是免费型号，创建后会按量计费，需要带 confirm_paid_shape=true 确认",
+        )
+
     # 行数上限放在 enforce_launch_quota **之前**：那一步是一整轮租户枚举，会实打
     # 实地花掉 Oracle 的速率预算（抢机循环和它抢的是同一个额度）。任何不需要
     # Oracle 就能判定的拒绝，都不该排在它后面。
