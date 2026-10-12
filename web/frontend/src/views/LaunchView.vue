@@ -64,7 +64,9 @@
       </div>
       <div v-if="isBilledLaunch" class="error-box" style="font-size: 13px">
         <strong>这次创建会产生费用：</strong>
-        <template v-if="isPaidShape">「{{ form.shape }}」是付费型号，按量计费。</template>
+        <template v-if="isPaidShape">
+          「{{ form.shape }}」是付费型号，{{ accountPaid ? '按量计费。' : '会消耗账号的试用积分。' }}
+        </template>
         <template v-if="isSecondaryRegion">所选区域是副区，副区资源（包括免费型号）一律按量计费。</template>
         点「确认并创建」后还会弹出一次确认。
       </div>
@@ -307,16 +309,12 @@
               </option>
             </optgroup>
           </select>
-          <p v-if="meta && !accountPaid" class="field-hint">
-            {{
-              accountTier === 'free'
-                ? '免费（未升级）账号只能创建免费型号。'
-                : '还没查询过账号等级，先只列出免费型号；升级账号到「租户」页点「等级查询」后重新加载配置，即可看到全部型号。'
-            }}
-          </p>
-          <p v-else-if="meta && accountPaid" class="field-hint">
-            升级账号：列出 Oracle 在本区域提供给该账号的全部型号。付费型号是否还有额度以 Oracle 为准，
-            超出账号限额时创建会被 Oracle 拒绝。
+          <p v-if="meta && paidShapeOptions.length" class="field-hint">
+            列出 Oracle 在本区域提供给该账号的全部型号。
+            <template v-if="!accountPaid">
+              未升级的账号创建付费型号会消耗试用积分，积分用完或过期后 Oracle 会拒绝创建。
+            </template>
+            付费型号是否还有额度以 Oracle 为准，超出限额时创建会被 Oracle 拒绝。
           </p>
         </div>
         <div class="field">
@@ -375,7 +373,11 @@
       <div v-if="isPaidShape" class="card warn-panel">
         <strong>⚠ 「{{ form.shape }}」不是免费型号</strong>
         <p class="muted" style="margin: 0.25rem 0 0; font-size: 12px">
-          创建后会按量计费（实例运行期间持续产生费用，停止后部分费用仍会继续）。提交前还会再请你确认一次。
+          {{
+            accountPaid
+              ? '创建后会按量计费（实例运行期间持续产生费用，停止后部分费用仍会继续）。'
+              : '未升级账号创建它会消耗试用积分（积分用完或过期后 Oracle 会拒绝或停用）。'
+          }}提交前还会再请你确认一次。
           <template v-if="freeOnly">
             <br />该租户开启了「仅使用免费额度」，服务端会拒绝创建付费型号 ——
             确需创建的话，到「租户」页编辑该租户，取消勾选「仅使用免费额度」。
@@ -770,14 +772,13 @@ function isFreeShape(shape: string) {
 }
 
 /**
- * 能选的型号。升级账号：Oracle 在这个区域列给它的全部型号（meta.all_shapes）；
- * 免费 / 还没查过等级的账号：只给免费型号 —— 服务端对它们开付费型号是直接拒绝的，
- * 列出来只会让人选了再被拒。
+ * 能选的型号：Oracle 在这个区域列给该账号的全部型号（meta.all_shapes）。
+ * 不按账号等级过滤 —— 未升级的新号带试用积分，也能开付费型号（0.4.134）。
+ * 付费型号靠下面的提醒和提交前的二次确认把关。
  */
 const shapes = computed(() => {
   const all = (meta.value?.all_shapes as ShapeInfo[]) || []
-  if (accountPaid.value && all.length) return all
-  return (meta.value?.shapes as ShapeInfo[]) || []
+  return all.length ? all : (meta.value?.shapes as ShapeInfo[]) || []
 })
 const freeShapeOptions = computed(() => compatibleShapes.value.filter((s) => isFreeShape(s.shape)))
 const paidShapeOptions = computed(() => compatibleShapes.value.filter((s) => !isFreeShape(s.shape)))
@@ -1405,7 +1406,13 @@ async function doLaunch() {
   // 确认页上已经有红框提示，这里是「点下去之前最后一道」——点了取消就什么都不发。
   if (isBilledLaunch.value) {
     const reasons: string[] = []
-    if (isPaidShape.value) reasons.push(`「${form.shape}」是付费型号，按量计费`)
+    if (isPaidShape.value) {
+      reasons.push(
+        accountPaid.value
+          ? `「${form.shape}」是付费型号，按量计费`
+          : `「${form.shape}」是付费型号，会消耗账号的试用积分（积分用完后按量计费或被拒绝）`,
+      )
+    }
     if (isSecondaryRegion.value) reasons.push('所选区域是副区，资源按量计费')
     const n = batchCount.value
     if (

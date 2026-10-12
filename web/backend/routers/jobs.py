@@ -113,14 +113,6 @@ def create_capacity_job(
             ),
         )
 
-    # 付费型号和「创建实例」同一条规则：只对已识别为升级的账号开放。这个接口没有
-    # 二次确认的入口（面板界面不走它），所以这里只判账号等级。
-    from web.backend.tenant_tier import paid_shape_block_reason
-
-    shape_blocked = paid_shape_block_reason(db, tenant, str(payload.get("shape") or ""))
-    if shape_blocked:
-        raise HTTPException(status_code=400, detail=shape_blocked)
-
     # 行数上限放在 enforce_launch_quota **之前**：那一步是一整轮租户枚举，会实打
     # 实地花掉 Oracle 的速率预算（抢机循环和它抢的是同一个额度）。任何不需要
     # Oracle 就能判定的拒绝，都不该排在它后面。

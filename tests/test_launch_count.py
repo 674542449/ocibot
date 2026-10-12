@@ -353,18 +353,25 @@ def _set_tier(tid: str, tier: str) -> None:
         db.commit()
 
 
-@pytest.mark.parametrize(("tier", "needle"), [("", "等级查询"), ("free", "免费（未升级）账号")])
-def test_a_paid_shape_is_refused_for_an_account_not_known_to_be_upgraded(client, monkeypatch, tier, needle):
+@pytest.mark.parametrize("tier", ["", "free"])
+def test_unupgraded_accounts_may_launch_paid_shapes_once_confirmed(client, monkeypatch, tier):
+    """新注册的号带试用积分，可以用积分开付费型号（0.4.134 放开）；二次确认照样要。"""
     c, tid = client
     calls = _stub_launch(monkeypatch)
     _set_tier(tid, tier)
-    r = c.post(
-        f"/api/tenants/{tid}/launch",
-        json=_body(shape="VM.Standard.E4.Flex", confirm_paid_shape=True),
-    )
-    assert r.status_code == 400, r.text
-    assert needle in r.json()["detail"]
-    assert calls == [], "被拒的请求不能碰到 Oracle"
+    try:
+        r = c.post(f"/api/tenants/{tid}/launch", json=_body(shape="VM.Standard.E4.Flex"))
+        assert r.status_code == 400 and "确认" in r.json()["detail"], r.text
+        assert calls == [], "没确认的请求不能碰到 Oracle"
+
+        r = c.post(
+            f"/api/tenants/{tid}/launch",
+            json=_body(shape="VM.Standard.E4.Flex", confirm_paid_shape=True),
+        )
+        assert r.status_code == 200, r.text
+        assert [x["payload"]["shape"] for x in calls] == ["VM.Standard.E4.Flex"]
+    finally:
+        _set_tier(tid, "")
 
 
 def test_a_paid_shape_needs_the_explicit_confirmation(client, monkeypatch):

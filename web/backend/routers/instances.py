@@ -34,7 +34,6 @@ from web.backend.launch_service import (
 )
 from app.free_quota import is_free_shape
 from web.backend.models import CapacityJob, Tenant, User
-from web.backend.tenant_tier import paid_shape_block_reason
 from web.backend.oci_bridge import (
     get_owned_tenant,
     get_session_for_row,
@@ -684,22 +683,6 @@ def launch_quota_check(
     so the UI can show both "what you have used" and "what this would need".
     """
     row = _tenant_or_404(db, user.id, tenant_id)
-    # 和创建路径同一条规则：未升级 / 没查过等级的账号不能开付费型号。在这里先说，
-    # 不然确认框照样打开，用户点了「确认并创建」才被拒。不用问 Oracle 就能判断。
-    shape_blocked = paid_shape_block_reason(db, row, str(body.shape or ""))
-    if shape_blocked:
-        return {
-            "ok": False,
-            "blocked": True,
-            "errors": [shape_blocked],
-            "warnings": [],
-            "issues": [],
-            "projected": {},
-            "free_only_mode": free_only_for_tenant(row),
-            "account_tier": getattr(row, "account_tier", "") or "",
-            "read_incomplete": False,
-            "secondary_region": False,
-        }
     try:
         session = get_session_for_row(row)
         tier = getattr(row, "account_tier", "") or ""
@@ -898,10 +881,8 @@ def launch_instance(
     row = _tenant_or_404(db, user.id, tenant_id)
     if not row.enabled:
         raise HTTPException(status_code=400, detail="租户已禁用")
-    # 付费型号：账号得是升级的，而且这次提交得明确确认过。两条都在碰 Oracle 之前判。
-    blocked = paid_shape_block_reason(db, row, body.shape)
-    if blocked:
-        raise HTTPException(status_code=400, detail=blocked)
+    # 付费型号：这次提交得明确确认过（页面上的二次确认）。不看账号等级 —— 未升级的
+    # 新号带试用积分，也可以开付费型号（0.4.134）。在碰 Oracle 之前判。
     if not is_free_shape(body.shape) and not body.confirm_paid_shape:
         raise HTTPException(
             status_code=400,
