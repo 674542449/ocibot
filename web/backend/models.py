@@ -88,6 +88,10 @@ class Tenant(Base):
     # 账号是否已就绪：PROVISIONING（刚注册，Oracle 还在开通）| READY | ""（未读过）。
     # 同样在「等级查询」/「刷新用量」时写入，只用于显示。
     setup_state: Mapped[str] = mapped_column(String(16), default="", nullable=False)
+    # Oracle 账号的注册时间（租户根 compartment 的创建时间），「等级查询」/「刷新用量」/
+    # 「查询试用积分」时顺手记下。租户列表据此显示注册天数和试用积分到期（注册 + 30 天），
+    # 不用再问 Oracle。可空且没有默认值：没查过的行就是 NULL，前端不显示。
+    registered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     # Hard-enforce the Always-Free caps for this tenant, regardless of whether Oracle
     # reports the account as paid. Defaults ON: an upgraded/PAYG account that only
     # wants free resources is the common case, and inferring intent from account_tier

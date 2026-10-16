@@ -175,6 +175,10 @@ class TenantOut(BaseModel):
     upgrade_state_details: str = ""
     # PROVISIONING = 刚注册、Oracle 还在开通（准备中）；READY；'' = 未读过。
     setup_state: str = ""
+    # Oracle 账号注册时间（没查过为 None）；trial_expires_at = 注册 + TRIAL_DAYS，
+    # 由服务端算好，前端不重复这条规则。
+    registered_at: Optional[UtcDatetime] = None
+    trial_expires_at: Optional[UtcDatetime] = None
     free_only_mode: bool = True
     # 删除保护：True 时单个 / 批量删除都会拒绝这个租户。
     delete_protected: bool = False

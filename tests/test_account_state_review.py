@@ -105,6 +105,7 @@ def test_pointing_a_tenant_at_another_account_forgets_the_cached_states(monkeypa
         fingerprint="11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00",
         private_key_encrypted=encrypt_text(TEST_PEM),
         account_tier="paid", upgrade_state="UPGRADED", setup_state="PROVISIONING",
+        registered_at=datetime(2026, 10, 1, tzinfo=timezone.utc),
     )
     now = datetime.now(timezone.utc)
     db.add(Tenant(id="p", owner_id="u1", name="p", region="ap-tokyo-1", created_at=now, updated_at=now, **creds))
@@ -124,4 +125,5 @@ def test_pointing_a_tenant_at_another_account_forgets_the_cached_states(monkeypa
     for tid in ("p", "c"):
         row = db.get(Tenant, tid)
         assert (row.account_tier, row.upgrade_state, row.setup_state) == ("", "", ""), tid
-    assert out.setup_state == ""
+        assert row.registered_at is None, tid
+    assert out.setup_state == "" and out.trial_expires_at is None

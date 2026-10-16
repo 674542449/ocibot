@@ -104,6 +104,11 @@ def make_session():
     s.remove_public_ipv6.return_value = R(True, "已取消 IPv6", {"removed": ["2603::1"]})
     s.get_instance_metrics.return_value = R(True, "", {"cpu": [], "network": []})
     s.get_account_status.return_value = R(True, "", {"tier_code": "free", "tier": "Always Free"})
+    s.get_tier_status.return_value = R(True, "", {
+        "tier_code": "free", "tier": "Always Free",
+        "upgrade": {"upgrade_state": "PROMO"},
+        "setup": {"state": "READY", "registered_at": "2026-10-01T00:00:00+00:00"},
+    })
     s.get_usage_summary.return_value = R(True, "", {"total": 0.0, "currency": "USD", "days": []})
     s.get_free_quota_usage.return_value = R(True, "", dict(QUOTA))
     s.list_boot_volumes.return_value = R(True, "", {"volumes": [dict(VOL)]})
@@ -346,6 +351,7 @@ def test_every_endpoint_is_wired() -> None:
             "/api/jobs/capacity",
             f"/api/tenants/{tid}", f"/api/tenants/{tid}/instances",
             f"/api/tenants/{tid}/instances/{iid}", f"/api/tenants/{tid}/account",
+            f"/api/tenants/{tid}/tier",
             f"/api/tenants/{tid}/usage", f"/api/tenants/{tid}/free-quota",
             f"/api/tenants/{tid}/invoices", f"/api/tenants/{tid}/trial-credits",
             f"/api/tenants/{tid}/launch-meta", f"/api/tenants/{tid}/launch-meta/status",

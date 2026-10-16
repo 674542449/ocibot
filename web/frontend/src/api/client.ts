@@ -219,6 +219,10 @@ export type Tenant = {
   upgrade_state_details: string
   /** PROVISIONING = 刚注册、Oracle 还在开通（准备中）；READY；'' = 未读过。 */
   setup_state: string
+  /** Oracle 账号注册时间（ISO）；没做过等级查询 / 试用积分查询时为 null。 */
+  registered_at: string | null
+  /** 试用积分到期 = 注册 + 30 天，服务端算好（ISO）；registered_at 为 null 时也为 null。 */
+  trial_expires_at: string | null
   free_only_mode: boolean
   /** 删除保护：开启后单个 / 批量删除都会被服务端拒绝。 */
   delete_protected: boolean

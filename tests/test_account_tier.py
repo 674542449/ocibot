@@ -72,30 +72,6 @@ def test_upgraded_payg_is_detected_without_any_spend(monkeypatch):
     assert "未升级" not in data["tier"]
 
 
-def test_detect_account_tier_is_subscription_only(monkeypatch):
-    """Sidebar probe must not touch Service Limits / get_tenancy."""
-    s = _session("Pay as you go", monkeypatch=monkeypatch)
-    called = {"tenancy": 0, "limits": 0}
-
-    def _boom_tenancy(*_a, **_k):
-        called["tenancy"] += 1
-        raise AssertionError("get_tenancy should not run for tier-only probe")
-
-    def _boom_limits(*_a, **_k):
-        called["limits"] += 1
-        raise AssertionError("list_limit_values should not run for tier-only probe")
-
-    s._identity = SimpleNamespace(
-        get_tenancy=_boom_tenancy,
-        list_region_subscriptions=lambda t: SimpleNamespace(data=[]),
-    )
-    s._limits = SimpleNamespace(list_limit_values=_boom_limits)
-    data = s.detect_account_tier().data
-    assert data["tier_code"] == "paid"
-    assert called["tenancy"] == 0
-    assert called["limits"] == 0
-
-
 def test_genuine_free_tier_subscription(monkeypatch):
     s = _session("Free Tier", subscription_tier="FREETIER", monkeypatch=monkeypatch)
     data = s.get_account_status().data

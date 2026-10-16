@@ -609,6 +609,10 @@ FREE_TIER_SHAPES = {
 # （gpu-a10-count、bm-gpu-a100-v2-8-count ……），免费号上都是 0、排序又在前，截到 12 条
 # 时 A1 自己那几条被挤掉 —— 配额表里只剩 GPU，「新号配额全是 0 = 准备中」也跟着误判。
 FREE_TIER_LIMIT_TAGS = ("standard-a1-", "e2-micro")
+# 「新号配额还没下发」看的那一条限额：A1 核数。就绪的免费号在主区一定大于 0。
+A1_CORE_LIMIT_NAME = "standard-a1-core-count"
+# 新账号试用积分的有效期（天），到期 = 注册日期 + 这么多天。租户列表和试用积分卡片共用。
+TRIAL_DAYS = 30
 
 # Oracle Always Free resource caps (tenancy-wide reference; not region-scoped).
 # Source: Oracle Cloud Always Free resources documentation.
@@ -7667,39 +7671,6 @@ class TenantSession:
             },
         )
 
-    def detect_account_tier(self) -> OperationResult:
-        """Classify Always Free vs PAYG using the subscription record only.
-
-        Intentionally avoids ``get_tenancy``, Service Limits, and home-region
-        resolution — those are extra API calls not needed for the sidebar badge.
-        """
-        region = (self.tenant.region or "").strip()
-        regions = [region] if region else None
-        sub_verdict, sub_note, sub_details = self._detect_subscription_tier(regions=regions)
-        info = {
-            "tier": "未知",
-            "tier_code": "unknown",
-            "tier_reason": "",
-            "subscription": sub_details,
-        }
-        if sub_verdict == "paid":
-            info["tier"] = "已升级 / 付费（PAYG）"
-            info["tier_code"] = "paid"
-            info["tier_reason"] = f"订阅记录显示为付费账号。依据：{sub_note}"
-        elif sub_verdict == "free":
-            info["tier"] = "Always Free / 未升级"
-            info["tier_code"] = "free"
-            info["tier_reason"] = f"订阅记录显示为免费层级。依据：{sub_note}"
-        else:
-            info["tier"] = "无法确定"
-            info["tier_code"] = "unknown"
-            info["tier_reason"] = (
-                f"未能读取到订阅记录，因此无法判定账号等级。（{sub_note}）"
-                "如需准确判定，请给当前用户授予订阅读取权限："
-                "Allow group <你的组> to inspect subscriptions in tenancy"
-            )
-        return OperationResult(ok=True, message="已读取订阅等级", data=info)
-
     def get_usage_summary(self, days: int = 30) -> OperationResult:
         """Summarize daily COST from Usage API (best-effort; needs usage-report rights).
 
@@ -8135,9 +8106,9 @@ class TenantSession:
             pass
 
         # Service limits — informational only (dashboard). Not used for tier.
-        # free_quota_values：同一批 A1 / E2 Micro 限额里**真有数值**的那些，不截断、
-        # 不把空值当 0 —— 给「准备中」判断用（表格那份为了显示把 None 记成 0）。
-        free_quota_values: list[float] = []
+        # a1_core_values：A1 核数限额里**真有数值**的那些，不截断、不把空值当 0 ——
+        # 给「准备中」判断用（表格那份为了显示把 None 记成 0）。
+        a1_core_values: list[float] = []
         try:
             values = oci.pagination.list_call_get_all_results(
                 self.limits.list_limit_values, tenancy_id, service_name="compute",
@@ -8162,8 +8133,8 @@ class TenantSession:
                 except (TypeError, ValueError):
                     numeric = 0.0
                 else:
-                    if value is not None:
-                        free_quota_values.append(numeric)
+                    if value is not None and name == A1_CORE_LIMIT_NAME:
+                        a1_core_values.append(numeric)
                 rows.append(
                     {
                         "name": name,
@@ -8178,10 +8149,25 @@ class TenantSession:
             info["limits"] = []
         info["public_ip_limits"] = self._public_ip_limits(tenancy_id)
 
-        # Tier is decided from the tenancy's subscription record — the
-        # authoritative source. Dashboard keeps home-region fallback for reliability.
+        info.update(self._account_tier_info(a1_core_values))
+        info["tier_note"] = (
+            "等级依据租户的订阅记录判定。服务配额仅供参考——免费账号上也可能非零，不能作为付费依据。"
+        )
+        info["home_region"] = self._home_region() or info["home_region"]
+        return OperationResult(ok=True, message="已读取账号信息", data=info)
+
+    def _account_tier_info(self, a1_core_values: Optional[list[float]]) -> dict[str, Any]:
+        """等级 + 升级状态 + 准备中。
+
+        账号用量页（get_account_status）和租户页「等级查询」（get_tier_status）共用这一份
+        判定，两处说法不会走散。``a1_core_values`` 是调用方已经读到的 A1 核数限额；
+        传 None 表示没读，需要时（新号、在主区）由这里只按名字查那一条。
+        """
+        # 先读区域订阅：既是「准备中」的依据之一，也顺带把主区记进缓存，后面订阅记录、
+        # 升级记录要用主区时就不用再问一次。
+        region_subs = self._read_region_subscriptions()
         sub_verdict, sub_note, sub_details = self._detect_subscription_tier()
-        info["subscription"] = sub_details
+        info: dict[str, Any] = {"subscription": sub_details}
         if sub_verdict == "paid":
             info["tier"] = "已升级 / 付费（PAYG）"
             info["tier_code"] = "paid"
@@ -8228,7 +8214,7 @@ class TenantSession:
                 )
         # 账号是否已就绪（刚注册、Oracle 还在开通）。放在最后：开通没完成时这是最要紧的
         # 一条，盖过上面的等级文字；tier_code 不动 —— 额度保护照旧按订阅记录判定。
-        setup = self._account_setup_state(sub_details, free_quota_values)
+        setup = self._account_setup_state(sub_details, a1_core_values, region_subs)
         info["setup"] = setup
         if setup["state"] == "PROVISIONING":
             info["tier"] = "准备中（Oracle 还在开通账号）"
@@ -8236,11 +8222,60 @@ class TenantSession:
                 "账号还没准备好：" + "；".join(setup["reasons"]) + "。开通完成前创建实例等操作多半会失败，"
                 "等 Oracle 开通完成（通常会发邮件通知）后再点「等级查询」更新。" + (info.get("tier_reason") or "")
             )
-        info["tier_note"] = (
-            "等级依据租户的订阅记录判定。服务配额仅供参考——免费账号上也可能非零，不能作为付费依据。"
-        )
-        info["home_region"] = self._home_region() or info["home_region"]
-        return OperationResult(ok=True, message="已读取账号信息", data=info)
+        return info
+
+    def get_tier_status(self) -> OperationResult:
+        """租户页「等级查询」用的精简版：只要等级、升级状态、准备中、注册日期。
+
+        以前这个按钮用的是账号用量页那整份报告（get_account_status）：租户详情、整张计算
+        配额表（要翻好几页）、公网 IP 配额 —— 每个账号十几次 Oracle 调用，租户页却只用到
+        等级那几样。这里只读要用的：区域订阅、订阅记录、升级记录、租户创建时间，新号再
+        按名字查一条 A1 配额，一般 5～6 次。省下的请求额度留给抢机重试。
+        """
+        info = self._account_tier_info(None)
+        return OperationResult(ok=True, message="已读取账号等级", data=info)
+
+    def _read_region_subscriptions(self) -> Optional[list]:
+        """现读一次区域订阅（不用缓存：要看各区域的开通状态）。读不到返回 None。
+
+        读到主区时顺带写进主区缓存（和 _home_region 问出来时一样），同一次请求后面
+        再要主区就不用再问。
+        """
+        try:
+            subs = list(self.identity.list_region_subscriptions(self.tenant.tenancy_ocid.strip()).data or [])
+        except Exception:  # noqa: BLE001
+            return None
+        home = next((s for s in subs if getattr(s, "is_home_region", False)), None)
+        if home is not None and getattr(home, "region_name", ""):
+            self._home_region_name = home.region_name
+            self._home_region_resolved = True
+        return subs
+
+    def _a1_core_quota_values(self) -> list[float]:
+        """只按名字查 A1 核数限额（每个可用域一条），有数值的那些。读不到返回空列表。"""
+        try:
+            values = oci.pagination.list_call_get_all_results(
+                self.limits.list_limit_values,
+                self.tenant.tenancy_ocid.strip(),
+                service_name="compute",
+                name=A1_CORE_LIMIT_NAME,
+                retry_strategy=sdk_bounded_paged_retry_strategy(),
+            ).data
+        except Exception:  # noqa: BLE001
+            return []
+        out: list[float] = []
+        for v in values or []:
+            # 服务端已按名字过滤；这里再核一次，别把别的限额算进来。
+            if str(getattr(v, "name", "") or "") != A1_CORE_LIMIT_NAME:
+                continue
+            value = getattr(v, "value", None)
+            if value is None:
+                continue
+            try:
+                out.append(float(value))
+            except (TypeError, ValueError):
+                continue
+        return out
 
     def get_upgrade_status(self) -> OperationResult:
         """账号的升级状态（OSP Gateway 订阅记录）。
@@ -8307,17 +8342,25 @@ class TenantSession:
     # 多半是 Oracle 对这个号另有限制，不能再说成「准备中」。
     SETUP_NEW_ACCOUNT_DAYS = 7
 
-    def _account_setup_state(self, sub_details: dict, quota_values: list[float]) -> dict[str, Any]:
+    def _account_setup_state(
+        self,
+        sub_details: dict,
+        quota_values: Optional[list[float]],
+        region_subs: Optional[list],
+    ) -> dict[str, Any]:
         """账号是否已就绪：刚注册的账号 Oracle 要先开通一阵，这期间很多操作都会失败。
 
         依据（任一成立即为「准备中」）：
         * 订阅记录 ``lifecycle_state == CREATING``（Tenant Manager，已在等级识别里读过）；
         * 根区间（即租户本身）``lifecycle_state == CREATING``；
         * 主区的区域订阅 ``status == IN_PROGRESS``；
-        * 注册不满 ``SETUP_NEW_ACCOUNT_DAYS`` 天、当前就在主区、而 A1 / E2 Micro 的计算配额
-          读到了且**全是 0** —— 新号开通完成前配额还没下发，这是最常见的表现。
+        * 注册不满 ``SETUP_NEW_ACCOUNT_DAYS`` 天、当前就在主区、而 A1 核数限额读到了且
+          **全是 0** —— 新号开通完成前配额还没下发，这是最常见的表现。就绪的免费号在
+          主区的 A1 核数一定大于 0。
 
-        ``quota_values``：A1 / E2 Micro 限额里 Oracle 真给了数值的那些（空值不算 0）。
+        ``quota_values``：A1 核数限额里 Oracle 真给了数值的那些（空值不算 0）；None 表示
+        调用方没读，只在这条用得上（新号、在主区）时才按名字查一次。
+        ``region_subs``：调用方现读的区域订阅列表，读失败为 None。
         最后一条只能在主区看：在副区行上读、账号又还在 7 天内时，这条做不了，此时不下
         「已就绪」的结论（返回空串）—— 状态是记到整个账号的，副区那一次读不能把主区读出的
         「准备中」改回去。
@@ -8348,24 +8391,23 @@ class TenantSession:
             pass
 
         home_name = ""
-        try:
-            subs = self.identity.list_region_subscriptions(tenancy).data
-            home = next((s for s in subs if getattr(s, "is_home_region", False)), None)
-            if home is not None:
-                known = True
-                home_name = str(getattr(home, "region_name", "") or "")
-                if str(getattr(home, "status", "") or "").upper() == "IN_PROGRESS":
-                    reasons.append(f"主区 {home_name} 的区域订阅状态为 IN_PROGRESS（还在开通）")
-        except Exception:  # noqa: BLE001
-            pass
+        home = next((s for s in region_subs or [] if getattr(s, "is_home_region", False)), None)
+        if home is not None:
+            known = True
+            home_name = str(getattr(home, "region_name", "") or "")
+            if str(getattr(home, "status", "") or "").upper() == "IN_PROGRESS":
+                reasons.append(f"主区 {home_name} 的区域订阅状态为 IN_PROGRESS（还在开通）")
 
         is_new = False
         if isinstance(registered, datetime):
             reg = registered if registered.tzinfo else registered.replace(tzinfo=timezone.utc)
             is_new = datetime.now(timezone.utc) - reg < timedelta(days=self.SETUP_NEW_ACCOUNT_DAYS)
         in_home = bool(home_name) and home_name == (self.tenant.region or "").strip()
-        if is_new and in_home and quota_values and all(v == 0 for v in quota_values):
-            reasons.append("新注册账号的 A1 / E2 Micro 计算配额还全是 0（配额尚未下发）")
+        if is_new and in_home:
+            if quota_values is None:
+                quota_values = self._a1_core_quota_values()
+            if quota_values and all(v == 0 for v in quota_values):
+                reasons.append("新注册账号的 A1 计算配额还是 0（配额尚未下发）")
 
         note = ""
         if reasons:
@@ -9423,8 +9465,7 @@ class TenantSession:
         ``{"paid", "free", "unknown"}``.
 
         ``regions``: optional endpoint list; default is home region then tenant
-        region. Sidebar tier probe passes only the tenant region to skip the
-        ``list_region_subscriptions`` call inside ``_home_region``.
+        region.
         """
         details: dict = {}
         pairs, error = self._subscription_records(regions)
@@ -9516,7 +9557,7 @@ class TenantSession:
             return None, "", f"读取费用失败：{safe_error_text(exc)}"
 
     # 新账号试用积分的有效期。Oracle 的说法是「30 天内有效」，按注册日期起算。
-    TRIAL_DAYS = 30
+    TRIAL_DAYS = TRIAL_DAYS
 
     def get_trial_credits(self) -> OperationResult:
         """注册日期 + 试用积分（总额、已用、剩余、到期时间）。

@@ -96,6 +96,14 @@
             <!-- 不折行：两个字的「免费」被表格挤成一字一行，整行高度翻倍。 -->
             <td class="nowrap-cell" :title="tierHint(t)">
               <span :class="tierBadgeClass(t)">{{ tierLabel(t) }}</span>
+              <div
+                v-if="accountAge(t)"
+                class="muted"
+                style="font-size: 11px; margin-top: 2px"
+                :title="accountAge(t)?.hint"
+              >
+                {{ accountAge(t)?.text }}
+              </div>
             </td>
             <td class="muted" style="font-size: 12px; word-break: break-all">
               {{ shortId(t.tenancy_ocid) }}
@@ -459,7 +467,7 @@ import { pickAndReadTextFile } from '@/utils/file'
 // in-flow banner above the table: that banner appearing pushed the whole table
 // down, so the row you just clicked moved out from under the cursor.
 import { showToast } from '@/utils/toast'
-import { tierBadgeClass, tierHint, tierLabel } from '@/utils/tier'
+import { accountAge, tierBadgeClass, tierHint, tierLabel } from '@/utils/tier'
 
 type ParsePreview = {
   ok: boolean
@@ -1070,7 +1078,8 @@ async function testTenant(t: Tenant) {
 async function detectTier(t: Tenant) {
   busy.value = t.id
   try {
-    const { data } = await api.get(`/tenants/${t.id}/account`)
+    // 精简版：只读等级 / 升级状态 / 准备中 / 注册日期，不拉配额表（那是账号用量页的事）。
+    const { data } = await api.get(`/tenants/${t.id}/tier`)
     const tier = data?.data?.tier || '未知'
     const reason = data?.data?.tier_reason || data?.message || ''
     showToast(`${t.name}: ${tier}${reason ? ' — ' + reason : ''}`, 'ok', 3000)

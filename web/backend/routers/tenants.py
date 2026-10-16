@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from app.oci_client import safe_error_text
+from app.oci_client import TRIAL_DAYS, safe_error_text
 
 import logging
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -77,6 +77,9 @@ def _commit_new_tenant(db: Session, row: Tenant) -> None:
 
 
 def _to_out(row: Tenant) -> TenantOut:
+    registered = getattr(row, "registered_at", None)
+    if registered is not None and registered.tzinfo is None:
+        registered = registered.replace(tzinfo=timezone.utc)  # SQLite 读回来不带时区
     return TenantOut(
         id=row.id,
         name=row.name,
@@ -93,6 +96,8 @@ def _to_out(row: Tenant) -> TenantOut:
         upgrade_state=getattr(row, "upgrade_state", "") or "",
         upgrade_state_details=getattr(row, "upgrade_state_details", "") or "",
         setup_state=getattr(row, "setup_state", "") or "",
+        registered_at=registered,
+        trial_expires_at=registered + timedelta(days=TRIAL_DAYS) if registered else None,
         free_only_mode=bool(getattr(row, "free_only_mode", True)),
         delete_protected=bool(getattr(row, "delete_protected", False)),
         delete_protected_at=getattr(row, "delete_protected_at", None)
@@ -351,6 +356,7 @@ def update_tenant(
             target.upgrade_state = ""
             target.upgrade_state_details = ""
             target.setup_state = ""
+            target.registered_at = None
 
     row.updated_at = datetime.now(timezone.utc)
     db.commit()
@@ -606,6 +612,7 @@ def subscribe_tenant_region(
                 upgrade_state=parent.upgrade_state or "",
                 upgrade_state_details=parent.upgrade_state_details or "",
                 setup_state=parent.setup_state or "",
+                registered_at=parent.registered_at,
                 free_only_mode=False,
             )
             db.add(child)

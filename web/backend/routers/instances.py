@@ -6,7 +6,7 @@ import logging
 from urllib.parse import quote
 import time
 from datetime import datetime, timezone
-from typing import Annotated, Any
+from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import select
@@ -547,30 +547,36 @@ def instance_metrics(
         raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
-def _cache_account_state(db: Session, row: Tenant, data: dict) -> None:
-    """把读到的等级、升级状态、就绪状态记到这个账号的所有行上（主租户 + 它的副区）。
+def _parse_registered_at(value: Any) -> Optional[datetime]:
+    """Oracle 给的注册时间（ISO 串）→ 带时区的 datetime；读不出来返回 None。"""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
-    这些都是整个 Oracle 账号的事，副区行和主租户是同一个账号 —— 只记在点了按钮的那一行，
-    租户页上同一个账号的几行就会一行「升级中」一行不显示。
+
+def _same_value(old: Any, new: Any) -> bool:
+    if isinstance(new, datetime):
+        # SQLite 读回来的是不带时区的 UTC 时间；直接比会永远「不相等」。
+        if not isinstance(old, datetime):
+            return False
+        old_utc = old if old.tzinfo else old.replace(tzinfo=timezone.utc)
+        return old_utc == new
+    return (old or "") == new
+
+
+def _cache_family_fields(db: Session, row: Tenant, fields: dict[str, Any]) -> None:
+    """把 ``fields`` 写到这个账号的所有行上（主租户 + 它的副区）。
+
+    等级、升级状态、准备中、注册日期都是整个 Oracle 账号的事，副区行和主租户是同一个
+    账号 —— 只记在点了按钮的那一行，租户页上同一个账号的几行就会说法不一。
     等级尤其要一起记：0.4.138 起升级状态记到整个账号，等级却还只记这一行，在副区行点
     「等级查询」后主租户标签显示「升级」（来自 upgrade_state），自己的 account_tier 却还是
     free —— 多出口 IP 说「仅升级账号」，开机也照免费上限拦。
-    读不到的那项不动缓存：读不到不等于「没在升级」/「已就绪」。
     """
-    fields: dict[str, str] = {}
-    tier_code = str(data.get("tier_code") or "")
-    if tier_code in {"free", "paid"}:
-        fields["account_tier"] = tier_code
-    upgrade = data.get("upgrade")
-    if isinstance(upgrade, dict) and "error" not in upgrade:
-        state = str(upgrade.get("upgrade_state") or "")[:32]
-        fields["upgrade_state"] = state
-        fields["upgrade_state_details"] = (
-            str(upgrade.get("upgrade_state_details") or "")[:32] if state == "ERROR" else ""
-        )
-    setup = data.get("setup")
-    if isinstance(setup, dict) and setup.get("state") in {"PROVISIONING", "READY"}:
-        fields["setup_state"] = str(setup["state"])
     if not fields:
         return
     root_id = row.parent_tenant_id or row.id
@@ -583,11 +589,52 @@ def _cache_account_state(db: Session, row: Tenant, data: dict) -> None:
     changed = False
     for t in family:
         for name, value in fields.items():
-            if (getattr(t, name) or "") != value:
+            if not _same_value(getattr(t, name), value):
                 setattr(t, name, value)
                 changed = True
     if changed:
         db.commit()
+
+
+def _account_state_fields(data: dict) -> dict[str, Any]:
+    """从等级查询的结果里挑出要缓存的几项。读不到的那项不放进来 —— 读不到不等于
+    「没在升级」/「已就绪」，不能拿它覆盖上次读到的。"""
+    fields: dict[str, Any] = {}
+    tier_code = str(data.get("tier_code") or "")
+    if tier_code in {"free", "paid"}:
+        fields["account_tier"] = tier_code
+    upgrade = data.get("upgrade")
+    if isinstance(upgrade, dict) and "error" not in upgrade:
+        state = str(upgrade.get("upgrade_state") or "")[:32]
+        fields["upgrade_state"] = state
+        fields["upgrade_state_details"] = (
+            str(upgrade.get("upgrade_state_details") or "")[:32] if state == "ERROR" else ""
+        )
+    setup = data.get("setup")
+    if isinstance(setup, dict):
+        if setup.get("state") in {"PROVISIONING", "READY"}:
+            fields["setup_state"] = str(setup["state"])
+        registered = _parse_registered_at(setup.get("registered_at"))
+        if registered is not None:
+            fields["registered_at"] = registered
+    return fields
+
+
+def _cache_account_state(db: Session, row: Tenant, data: dict) -> None:
+    _cache_family_fields(db, row, _account_state_fields(data))
+
+
+def _account_like_route(row: Tenant, db: Session, method: str) -> dict[str, Any]:
+    try:
+        session = get_session_for_row(row)
+        result = getattr(session, method)()
+        data = result.data if isinstance(result.data, dict) else {}
+        _cache_account_state(db, row, data)
+        return {"ok": bool(result.ok), "message": result.message or "", "data": data}
+    except OCIClientError as exc:
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
 @router.get("/tenants/{tenant_id}/account")
@@ -596,17 +643,20 @@ def account_status(
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> dict[str, Any]:
+    """账号用量页「刷新用量」：账号信息全集（含配额表、公网 IP 配额、等级）。"""
     row = _tenant_or_404(db, user.id, tenant_id)
-    try:
-        session = get_session_for_row(row)
-        result = session.get_account_status()
-        data = result.data if isinstance(result.data, dict) else {}
-        _cache_account_state(db, row, data)
-        return {"ok": bool(result.ok), "message": result.message or "", "data": data}
-    except OCIClientError as exc:
-        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
+    return _account_like_route(row, db, "get_account_status")
+
+
+@router.get("/tenants/{tenant_id}/tier")
+def tier_status(
+    tenant_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    """租户页「等级查询」：只读等级、升级状态、准备中、注册日期（精简版，调用少一半以上）。"""
+    row = _tenant_or_404(db, user.id, tenant_id)
+    return _account_like_route(row, db, "get_tier_status")
 
 
 @router.get("/tenants/{tenant_id}/trial-credits")
@@ -620,11 +670,12 @@ def trial_credits(
     try:
         session = get_session_for_row(row)
         result = session.get_trial_credits()
-        return {
-            "ok": bool(result.ok),
-            "message": result.message or "",
-            "data": result.data if isinstance(result.data, dict) else {},
-        }
+        data = result.data if isinstance(result.data, dict) else {}
+        # 顺手记下注册日期，租户列表据此显示「注册 N 天 · 积分剩 M 天」。
+        registered = _parse_registered_at(data.get("registered_at"))
+        if registered is not None:
+            _cache_family_fields(db, row, {"registered_at": registered})
+        return {"ok": bool(result.ok), "message": result.message or "", "data": data}
     except OCIClientError as exc:
         raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001

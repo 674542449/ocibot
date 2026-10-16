@@ -71,3 +71,34 @@ export function upgradeStateLabel(state: string, details = ''): string {
       return state || '—'
   }
 }
+
+const DAY_MS = 24 * 60 * 60 * 1000
+
+function ymd(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
+/**
+ * 租户列表里「注册 N 天 · 积分剩 M 天」那一行，及其悬停说明（具体日期）。
+ * 没记过注册时间（还没做过等级查询）时返回 null，不显示。积分到期后只显示注册天数。
+ */
+export function accountAge(
+  t: { registered_at?: string | null; trial_expires_at?: string | null },
+  now: number = Date.now(),
+): { text: string; hint: string } | null {
+  if (!t.registered_at) return null
+  const reg = new Date(t.registered_at)
+  if (Number.isNaN(reg.getTime())) return null
+  const days = Math.max(0, Math.floor((now - reg.getTime()) / DAY_MS))
+  let text = `注册 ${days} 天`
+  let hint = `注册于 ${ymd(reg)}`
+  const exp = t.trial_expires_at ? new Date(t.trial_expires_at) : null
+  if (exp && !Number.isNaN(exp.getTime())) {
+    const left = Math.ceil((exp.getTime() - now) / DAY_MS)
+    if (left > 0) text += ` · 积分剩 ${left} 天`
+    hint += `，试用积分 ${ymd(exp)} 到期（注册日期 + 30 天）`
+    if (left <= 0) hint += '，已到期'
+  }
+  return { text, hint }
+}
