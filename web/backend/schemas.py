@@ -170,6 +170,9 @@ class TenantOut(BaseModel):
     color: str
     has_private_key: bool
     account_tier: str
+    # Oracle 升级记录：SUBMITTED = 升级中，ERROR = 升级失败（原因在 details）。
+    upgrade_state: str = ""
+    upgrade_state_details: str = ""
     free_only_mode: bool = True
     # 删除保护：True 时单个 / 批量删除都会拒绝这个租户。
     delete_protected: bool = False

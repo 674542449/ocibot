@@ -79,6 +79,12 @@ class Tenant(Base):
     password_changed_at: Mapped[str] = mapped_column(String(64), default="")
     password_expiry_days: Mapped[int] = mapped_column(Integer, default=0)
     account_tier: Mapped[str] = mapped_column(String(16), default="")  # paid|free|""
+    # Oracle 升级记录的缓存（OSP Gateway 订阅的 upgrade_state / upgrade_state_details），
+    # 在「等级查询」/「刷新用量」时写入，让租户页能显示「升级中 / 升级失败」。
+    # PROMO | SUBMITTED | ERROR | UPGRADED | ""（未读过或读不到）。只用于显示 ——
+    # 额度保护照旧只认 account_tier：升级没完成就不是付费号。
+    upgrade_state: Mapped[str] = mapped_column(String(32), default="", nullable=False)
+    upgrade_state_details: Mapped[str] = mapped_column(String(32), default="", nullable=False)
     # Hard-enforce the Always-Free caps for this tenant, regardless of whether Oracle
     # reports the account as paid. Defaults ON: an upgraded/PAYG account that only
     # wants free resources is the common case, and inferring intent from account_tier

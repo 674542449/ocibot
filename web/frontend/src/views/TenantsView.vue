@@ -94,7 +94,15 @@
               {{ t.region_label || t.region }}
             </td>
             <!-- 不折行：两个字的「免费」被表格挤成一字一行，整行高度翻倍。 -->
-            <td class="nowrap-cell">{{ tierLabel(t.account_tier) }}</td>
+            <td class="nowrap-cell" :title="tierHint(t)">
+              <span
+                :class="{
+                  'badge warn': t.account_tier !== 'paid' && t.upgrade_state === 'SUBMITTED',
+                  'badge err': t.account_tier !== 'paid' && t.upgrade_state === 'ERROR',
+                }"
+                >{{ tierLabel(t) }}</span
+              >
+            </td>
             <td class="muted" style="font-size: 12px; word-break: break-all">
               {{ shortId(t.tenancy_ocid) }}
             </td>
@@ -457,6 +465,7 @@ import { pickAndReadTextFile } from '@/utils/file'
 // in-flow banner above the table: that banner appearing pushed the whole table
 // down, so the row you just clicked moved out from under the cursor.
 import { showToast } from '@/utils/toast'
+import { tierHint, tierLabel } from '@/utils/tier'
 
 type ParsePreview = {
   ok: boolean
@@ -737,10 +746,6 @@ async function passwordExpiry(t: Tenant) {
   } finally {
     busy.value = ''
   }
-}
-
-function tierLabel(t: string) {
-  return { paid: '升级', free: '免费' }[t] || '未知'
 }
 
 function shortId(id: string) {

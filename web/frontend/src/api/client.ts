@@ -214,6 +214,9 @@ export type Tenant = {
   color: string
   has_private_key: boolean
   account_tier: string
+  /** Oracle 升级记录：SUBMITTED = 升级中，ERROR = 升级失败（原因在 details）；'' = 未读过。 */
+  upgrade_state: string
+  upgrade_state_details: string
   free_only_mode: boolean
   /** 删除保护：开启后单个 / 批量删除都会被服务端拒绝。 */
   delete_protected: boolean

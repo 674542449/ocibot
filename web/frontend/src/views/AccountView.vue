@@ -25,7 +25,7 @@
         <select v-model="tenantId" @change="onTenantChange">
           <option disabled value="">选择租户</option>
           <option v-for="t in tenants" :key="t.id" :value="t.id">
-            {{ t.name }} · {{ t.region }} · {{ tierLabel(t.account_tier) }}
+            {{ t.name }} · {{ t.region }} · {{ tierLabel(t) }}
           </option>
         </select>
         <p class="muted" style="margin: 0.35rem 0 0; font-size: 12px">
@@ -125,6 +125,29 @@
               "
             >
               {{ data.tier || '未知' }}
+            </span>
+          </div>
+        </div>
+        <div>
+          <div class="muted" style="font-size: 12px">升级状态</div>
+          <div v-if="data.upgrade?.error" class="muted" style="font-size: 12px" :title="data.upgrade.error">
+            读不到（{{ data.upgrade.error }}）
+          </div>
+          <div v-else>
+            <span
+              :class="{
+                'badge warn': data.upgrade?.upgrade_state === 'SUBMITTED',
+                'badge err': data.upgrade?.upgrade_state === 'ERROR',
+              }"
+              >{{
+                upgradeStateLabel(
+                  data.upgrade?.upgrade_state || '',
+                  data.upgrade?.upgrade_state_details || '',
+                )
+              }}</span
+            >
+            <span v-if="data.upgrade?.time_plan_upgrade" class="muted" style="font-size: 12px">
+              · 升级时间 {{ fmtDateTime(data.upgrade.time_plan_upgrade) }}
             </span>
           </div>
         </div>
@@ -442,6 +465,7 @@ import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import api, { type Tenant } from '@/api/client'
 import { pickTenantId } from '@/stores/tenantLock'
+import { tierLabel, upgradeStateLabel } from '@/utils/tier'
 
 const route = useRoute()
 const tenants = ref<Tenant[]>([])
@@ -567,9 +591,6 @@ function publicIpLabel(name: string) {
   return name
 }
 
-function tierLabel(t: string) {
-  return { paid: '升级', free: '免费' }[t] || '未知'
-}
 
 const quota = ref<any>(null)
 const gauges = [

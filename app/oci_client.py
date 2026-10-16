@@ -1381,6 +1381,16 @@ df -h /
 # oci.osp_gateway.InvoiceServiceClient.list_invoices.
 _INVOICE_SORT_BY = "INVOICE_DATE"
 
+# OSP Gateway 订阅记录的 upgrade_state：PROMO / SUBMITTED / ERROR / UPGRADED。
+# 这两个表示「升级没完成」，此时 plan_type 不能当作已付费的证据。
+UPGRADE_PENDING_STATES = frozenset({"SUBMITTED", "ERROR"})
+# upgrade_state_details 的取值（仅在 ERROR 时有意义）。
+UPGRADE_ERROR_LABELS = {
+    "TAX_ERROR": "税务信息有误",
+    "UPGRADE_ERROR": "升级处理出错",
+    "P2C_ERROR": "付费转换出错",
+}
+
 
 class TenantSession:
     """One authenticated OCI session bound to a TenantConfig."""
@@ -8178,11 +8188,100 @@ class TenantSession:
                 "如需准确判定，请给当前用户授予订阅读取权限："
                 "Allow group <你的组> to inspect subscriptions in tenancy"
             )
+        # 升级状态（升级中 / 升级失败 / 已升级）。读不到不影响上面的结论。
+        upgrade = self.get_upgrade_status()
+        up = dict(upgrade.data or {}) if upgrade.ok else {}
+        info["upgrade"] = up if upgrade.ok else {"error": upgrade.message}
+        state = str(up.get("upgrade_state") or "")
+        plan = str(up.get("plan_type") or "")
+        if info["tier_code"] != "paid":
+            if state == "UPGRADED" or (plan == "PAYG" and state not in UPGRADE_PENDING_STATES):
+                # Oracle 自己的升级记录说已经是按量付费 —— 订阅记录那条路没认出来
+                # （或读不到）时以它为准。升级中 / 出错时 plan_type 不作数：没完成就不是付费号。
+                info["tier"] = "已升级 / 付费（PAYG）"
+                info["tier_code"] = "paid"
+                info["tier_reason"] = (
+                    f"升级记录显示已升级（upgrade_state={state or '—'}，plan_type={plan or '—'}）。"
+                )
+            elif state == "SUBMITTED":
+                # 升级中：还不是付费账号，额度保护照旧按免费处理，只是把状态说出来。
+                info["tier"] = "升级中（已提交，等待 Oracle 完成）"
+                info["tier_reason"] = (
+                    "已向 Oracle 提交升级申请，尚未完成；完成前仍按免费账号处理。" + (info.get("tier_reason") or "")
+                )
+            elif state == "ERROR":
+                why = UPGRADE_ERROR_LABELS.get(str(up.get("upgrade_state_details") or ""), "")
+                info["tier"] = f"升级失败（{why}）" if why else "升级失败"
+                info["tier_reason"] = (
+                    "Oracle 的升级记录显示升级出错，账号仍是免费账号；请到 Oracle 控制台"
+                    "「升级和管理付款」页面查看并处理。" + (info.get("tier_reason") or "")
+                )
         info["tier_note"] = (
             "等级依据租户的订阅记录判定。服务配额仅供参考——免费账号上也可能非零，不能作为付费依据。"
         )
         info["home_region"] = self._home_region() or info["home_region"]
         return OperationResult(ok=True, message="已读取账号信息", data=info)
+
+    def get_upgrade_status(self) -> OperationResult:
+        """账号的升级状态（OSP Gateway 订阅记录）。
+
+        Oracle 文档里这条记录带着：
+        * ``upgrade_state``：PROMO（试用中）/ SUBMITTED（已提交升级，升级中）/
+          ERROR（升级出错）/ UPGRADED（已升级）；
+        * ``upgrade_state_details``：出错时的原因 TAX_ERROR / UPGRADE_ERROR / P2C_ERROR；
+        * ``plan_type``：FREE_TIER / PAYG；``time_plan_upgrade``：从免费转为付费的时间。
+
+        「升级中」的账号还没变成付费账号：tier_code 由调用方按完成状态定，这里只报事实。
+        和账单一样走主区端点。读不到返回 ok=False，不影响等级识别的其余部分。
+        """
+        tenancy = (self.tenant.tenancy_ocid or "").strip()
+        if not tenancy:
+            return OperationResult(ok=False, message="缺少 Tenancy OCID", data={})
+        try:
+            from oci.osp_gateway import SubscriptionServiceClient
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=f"当前 OCI SDK 不含 osp_gateway 模块（{exc}）", data={})
+        try:
+            home = self._home_region() or self.tenant.region
+        except Exception:  # noqa: BLE001
+            home = self.tenant.region
+        cfg = dict(self._config)
+        if home:
+            cfg["region"] = home
+        try:
+            client = SubscriptionServiceClient(
+                cfg,
+                **self._signer_kw,
+                **cb_kwargs("osp_subscription", str(getattr(self.tenant, "id", "") or "")),
+            )
+            resp = client.list_subscriptions(osp_home_region=home, compartment_id=tenancy)
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=f"读取升级状态失败：{_format_service_error(exc)}", data={})
+        except Exception as exc:  # noqa: BLE001
+            return OperationResult(ok=False, message=f"读取升级状态失败：{safe_error_text(exc)}", data={})
+
+        items = list(getattr(getattr(resp, "data", None), "items", None) or [])
+        if not items:
+            return OperationResult(ok=True, message="Oracle 未返回订阅记录", data={"upgrade_state": ""})
+        # 一个账号通常只有一条；有多条时取带升级状态的那条。
+        sub = next((s for s in items if getattr(s, "upgrade_state", None)), items[0])
+
+        def text(name: str) -> str:
+            value = getattr(sub, name, None)
+            return "" if value in (None, "UNKNOWN_ENUM_VALUE") else str(value)
+
+        upgraded_at = getattr(sub, "time_plan_upgrade", None)
+        return OperationResult(
+            ok=True,
+            message="已读取升级状态",
+            data={
+                "upgrade_state": text("upgrade_state").upper(),
+                "upgrade_state_details": text("upgrade_state_details").upper(),
+                "plan_type": text("plan_type").upper(),
+                "account_type": text("account_type").upper(),
+                "time_plan_upgrade": upgraded_at.isoformat() if hasattr(upgraded_at, "isoformat") else None,
+            },
+        )
 
     def _public_ip_limits(self, tenancy_id: str) -> list[dict[str, Any]]:
         """公网 IP 的服务限额（上限 + 已用），给「账号用量」页的配额表用。
