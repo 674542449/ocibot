@@ -129,6 +129,18 @@
           </div>
         </div>
         <div>
+          <div class="muted" style="font-size: 12px">账号状态</div>
+          <div v-if="data.setup?.state === 'PROVISIONING'">
+            <span class="badge stopped">准备中（Oracle 还在开通）</span>
+            <div class="muted" style="font-size: 12px">{{ (data.setup.reasons || []).join('；') }}</div>
+          </div>
+          <div v-else-if="data.setup?.state === 'READY'">已就绪</div>
+          <div v-else class="muted" style="font-size: 12px">读不到</div>
+          <div v-if="data.setup?.registered_at" class="muted" style="font-size: 12px">
+            注册于 {{ fmtDateTime(data.setup.registered_at) }}
+          </div>
+        </div>
+        <div>
           <div class="muted" style="font-size: 12px">升级状态</div>
           <div v-if="data.upgrade?.error" class="muted" style="font-size: 12px" :title="data.upgrade.error">
             读不到（{{ data.upgrade.error }}）
@@ -686,6 +698,13 @@ async function loadAccount() {
   }
   data.value = res.data.data || {}
   msg.value = res.data.message || ''
+  // 服务端刚把等级 / 升级状态 / 准备中记到租户行上，重读面板自己的租户列表，
+  // 让上面下拉里的标签跟着变（这一下不请求 Oracle）。失败也不影响本次结果。
+  try {
+    await loadTenants()
+  } catch {
+    /* 下拉标签晚一点更新而已 */
+  }
 }
 
 async function loadUsage() {

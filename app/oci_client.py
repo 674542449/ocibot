@@ -8216,6 +8216,16 @@ class TenantSession:
                     "Oracle 的升级记录显示升级出错，账号仍是免费账号；请到 Oracle 控制台"
                     "「升级和管理付款」页面查看并处理。" + (info.get("tier_reason") or "")
                 )
+        # 账号是否已就绪（刚注册、Oracle 还在开通）。放在最后：开通没完成时这是最要紧的
+        # 一条，盖过上面的等级文字；tier_code 不动 —— 额度保护照旧按订阅记录判定。
+        setup = self._account_setup_state(sub_details, info.get("limits") or [])
+        info["setup"] = setup
+        if setup["state"] == "PROVISIONING":
+            info["tier"] = "准备中（Oracle 还在开通账号）"
+            info["tier_reason"] = (
+                "账号还没准备好：" + "；".join(setup["reasons"]) + "。开通完成前创建实例等操作多半会失败，"
+                "等 Oracle 开通完成（通常会发邮件通知）后再点「等级查询」更新。" + (info.get("tier_reason") or "")
+            )
         info["tier_note"] = (
             "等级依据租户的订阅记录判定。服务配额仅供参考——免费账号上也可能非零，不能作为付费依据。"
         )
@@ -8282,6 +8292,78 @@ class TenantSession:
                 "time_plan_upgrade": upgraded_at.isoformat() if hasattr(upgraded_at, "isoformat") else None,
             },
         )
+
+    # 新注册多少天内，「计算配额全是 0」才算作「还在开通」的迹象。超过这个天数还是 0，
+    # 多半是 Oracle 对这个号另有限制，不能再说成「准备中」。
+    SETUP_NEW_ACCOUNT_DAYS = 7
+
+    def _account_setup_state(self, sub_details: dict, limit_rows: list[dict]) -> dict[str, Any]:
+        """账号是否已就绪：刚注册的账号 Oracle 要先开通一阵，这期间很多操作都会失败。
+
+        依据（任一成立即为「准备中」）：
+        * 订阅记录 ``lifecycle_state == CREATING``（Tenant Manager，已在等级识别里读过）；
+        * 根区间（即租户本身）``lifecycle_state == CREATING``；
+        * 主区的区域订阅 ``status == IN_PROGRESS``；
+        * 注册不满 ``SETUP_NEW_ACCOUNT_DAYS`` 天、当前就在主区、而 A1 / E2 Micro 的计算配额
+          读到了且**全是 0** —— 新号开通完成前配额还没下发，这是最常见的表现。
+
+        返回 ``{"state": "PROVISIONING" | "READY" | "", "reasons": [...], "registered_at": iso|None}``。
+        ``state`` 为空串表示什么都没读到，下不了结论 —— 调用方不能把它当成「已就绪」。
+        """
+        from datetime import datetime, timedelta, timezone
+
+        tenancy = (self.tenant.tenancy_ocid or "").strip()
+        reasons: list[str] = []
+        known = False
+
+        sub_states = [s for s in (sub_details or {}).get("lifecycle_states") or [] if s]
+        if sub_states:
+            known = True
+            if "CREATING" in sub_states:
+                reasons.append("订阅记录状态为 CREATING（Oracle 还在开通订阅）")
+
+        registered = None
+        try:
+            root = self.identity.get_compartment(tenancy).data
+            known = True
+            if str(getattr(root, "lifecycle_state", "") or "").upper() == "CREATING":
+                reasons.append("租户状态为 CREATING（Oracle 还在创建租户）")
+            registered = getattr(root, "time_created", None)
+        except Exception:  # noqa: BLE001 - 读不到就少一个依据
+            pass
+
+        home_name = ""
+        try:
+            subs = self.identity.list_region_subscriptions(tenancy).data
+            home = next((s for s in subs if getattr(s, "is_home_region", False)), None)
+            if home is not None:
+                known = True
+                home_name = str(getattr(home, "region_name", "") or "")
+                if str(getattr(home, "status", "") or "").upper() == "IN_PROGRESS":
+                    reasons.append(f"主区 {home_name} 的区域订阅状态为 IN_PROGRESS（还在开通）")
+        except Exception:  # noqa: BLE001
+            pass
+
+        is_new = False
+        if isinstance(registered, datetime):
+            reg = registered if registered.tzinfo else registered.replace(tzinfo=timezone.utc)
+            is_new = datetime.now(timezone.utc) - reg < timedelta(days=self.SETUP_NEW_ACCOUNT_DAYS)
+        in_home = bool(home_name) and home_name == (self.tenant.region or "").strip()
+        if is_new and in_home and limit_rows and all(float(r.get("value") or 0) == 0 for r in limit_rows):
+            reasons.append("新注册账号的 A1 / E2 Micro 计算配额还全是 0（配额尚未下发）")
+
+        if reasons:
+            state = "PROVISIONING"
+        elif known:
+            state = "READY"
+        else:
+            state = ""
+        return {
+            "state": state,
+            "reasons": reasons,
+            "subscription_states": sub_states,
+            "registered_at": registered.isoformat() if hasattr(registered, "isoformat") else None,
+        }
 
     def _public_ip_limits(self, tenancy_id: str) -> list[dict[str, Any]]:
         """公网 IP 的服务限额（上限 + 已用），给「账号用量」页的配额表用。
@@ -9332,11 +9414,16 @@ class TenantSession:
 
         payment_models: list[str] = []
         tiers: list[str] = []
+        lifecycle_states: list[str] = []
         promo_active = False
         for item, full, _read_error in pairs:
             model = str(getattr(item, "payment_model", "") or "").strip()
             if model:
                 payment_models.append(model)
+            # CREATING = Oracle 还在开通这个订阅（新注册的账号）；账号就绪判断要用它。
+            state = str(getattr(item, "lifecycle_state", "") or "").strip().upper()
+            if state and state != "UNKNOWN_ENUM_VALUE":
+                lifecycle_states.append(state)
             if full is None:
                 continue
             # The full record carries subscription_tier / promotion.
@@ -9349,6 +9436,7 @@ class TenantSession:
 
         details["payment_models"] = payment_models
         details["subscription_tiers"] = tiers
+        details["lifecycle_states"] = lifecycle_states
         details["promotion_active"] = promo_active
         blob = " ".join(payment_models + tiers).lower()
         summary = "、".join([v for v in (payment_models + tiers) if v]) or "无"

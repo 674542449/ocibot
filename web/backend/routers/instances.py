@@ -547,17 +547,26 @@ def instance_metrics(
         raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
 
 
-def _cache_upgrade_state(db: Session, row: Tenant, upgrade: Any) -> None:
-    """把读到的升级状态记到这个账号的所有行上（主租户 + 它的副区）。
+def _cache_account_state(db: Session, row: Tenant, data: dict) -> None:
+    """把读到的升级状态、就绪状态记到这个账号的所有行上（主租户 + 它的副区）。
 
-    升级是整个 Oracle 账号的事，副区行和主租户是同一个账号 —— 只记在点了按钮的那一行，
-    租户页上同一个账号的几行就会一行「升级中」一行不显示。
-    读失败（``{"error": ...}``）时不动缓存：读不到不等于「没在升级」。
+    升级 / 开通都是整个 Oracle 账号的事，副区行和主租户是同一个账号 —— 只记在点了按钮
+    的那一行，租户页上同一个账号的几行就会一行「升级中」一行不显示。
+    读不到的那项不动缓存：读不到不等于「没在升级」/「已就绪」。
     """
-    if not isinstance(upgrade, dict) or "error" in upgrade:
+    fields: dict[str, str] = {}
+    upgrade = data.get("upgrade")
+    if isinstance(upgrade, dict) and "error" not in upgrade:
+        state = str(upgrade.get("upgrade_state") or "")[:32]
+        fields["upgrade_state"] = state
+        fields["upgrade_state_details"] = (
+            str(upgrade.get("upgrade_state_details") or "")[:32] if state == "ERROR" else ""
+        )
+    setup = data.get("setup")
+    if isinstance(setup, dict) and setup.get("state") in {"PROVISIONING", "READY"}:
+        fields["setup_state"] = str(setup["state"])
+    if not fields:
         return
-    state = str(upgrade.get("upgrade_state") or "")[:32]
-    details = str(upgrade.get("upgrade_state_details") or "")[:32] if state == "ERROR" else ""
     root_id = row.parent_tenant_id or row.id
     family = db.scalars(
         select(Tenant).where(
@@ -567,10 +576,10 @@ def _cache_upgrade_state(db: Session, row: Tenant, upgrade: Any) -> None:
     ).all()
     changed = False
     for t in family:
-        if (t.upgrade_state or "") != state or (t.upgrade_state_details or "") != details:
-            t.upgrade_state = state
-            t.upgrade_state_details = details
-            changed = True
+        for name, value in fields.items():
+            if (getattr(t, name) or "") != value:
+                setattr(t, name, value)
+                changed = True
     if changed:
         db.commit()
 
@@ -591,7 +600,7 @@ def account_status(
         if tier_code in {"free", "paid"} and row.account_tier != tier_code:
             row.account_tier = tier_code
             db.commit()
-        _cache_upgrade_state(db, row, data.get("upgrade"))
+        _cache_account_state(db, row, data)
         return {"ok": bool(result.ok), "message": result.message or "", "data": data}
     except OCIClientError as exc:
         raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc

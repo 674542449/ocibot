@@ -85,6 +85,9 @@ class Tenant(Base):
     # 额度保护照旧只认 account_tier：升级没完成就不是付费号。
     upgrade_state: Mapped[str] = mapped_column(String(32), default="", nullable=False)
     upgrade_state_details: Mapped[str] = mapped_column(String(32), default="", nullable=False)
+    # 账号是否已就绪：PROVISIONING（刚注册，Oracle 还在开通）| READY | ""（未读过）。
+    # 同样在「等级查询」/「刷新用量」时写入，只用于显示。
+    setup_state: Mapped[str] = mapped_column(String(16), default="", nullable=False)
     # Hard-enforce the Always-Free caps for this tenant, regardless of whether Oracle
     # reports the account as paid. Defaults ON: an upgraded/PAYG account that only
     # wants free resources is the common case, and inferring intent from account_tier

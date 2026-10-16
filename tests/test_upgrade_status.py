@@ -133,12 +133,12 @@ def _db():
     return db
 
 
-def _call_account(monkeypatch, db, tenant_id, upgrade):
+def _call_account(monkeypatch, db, tenant_id, upgrade, setup=None):
     from web.backend.models import Tenant
     from web.backend.routers import instances as r
 
     monkeypatch.setattr(r, "_tenant_or_404", lambda db_, uid, tid: db_.get(Tenant, tid))
-    data = {"tier_code": "free", "tier": "x", "upgrade": upgrade}
+    data = {"tier_code": "free", "tier": "x", "upgrade": upgrade, "setup": setup}
     monkeypatch.setattr(
         r, "get_session_for_row",
         lambda row: SimpleNamespace(get_account_status=lambda: SimpleNamespace(ok=True, message="", data=data)),

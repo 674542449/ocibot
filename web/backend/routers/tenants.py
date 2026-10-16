@@ -92,6 +92,7 @@ def _to_out(row: Tenant) -> TenantOut:
         account_tier=row.account_tier or "",
         upgrade_state=getattr(row, "upgrade_state", "") or "",
         upgrade_state_details=getattr(row, "upgrade_state_details", "") or "",
+        setup_state=getattr(row, "setup_state", "") or "",
         free_only_mode=bool(getattr(row, "free_only_mode", True)),
         delete_protected=bool(getattr(row, "delete_protected", False)),
         delete_protected_at=getattr(row, "delete_protected_at", None)
@@ -593,6 +594,7 @@ def subscribe_tenant_region(
                 account_tier=parent.account_tier or "",
                 upgrade_state=parent.upgrade_state or "",
                 upgrade_state_details=parent.upgrade_state_details or "",
+                setup_state=parent.setup_state or "",
                 free_only_mode=False,
             )
             db.add(child)
