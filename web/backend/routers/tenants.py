@@ -285,6 +285,7 @@ def update_tenant(
 
     data = body.model_dump(exclude_unset=True)
     new_pem = data.pop("private_key_pem", None)
+    old_tenancy = (row.tenancy_ocid or "").strip()
 
     for key, value in data.items():
         if value is not None:
@@ -340,6 +341,16 @@ def update_tenant(
         child.fingerprint = row.fingerprint
         child.private_key_encrypted = row.private_key_encrypted
         child.updated_at = datetime.now(timezone.utc)
+
+    # 换了 Tenancy OCID 就是换了一个 Oracle 账号：上一个账号的等级、升级状态、「准备中」
+    # 都不再适用，清空等下一次「等级查询」。留着的话「准备中」（标签里排最前）会一直挂在
+    # 一个正常的号上；等级清成 "" 时额度保护按免费处理，是安全的那一边。
+    if (row.tenancy_ocid or "").strip() != old_tenancy:
+        for target in [row, *children]:
+            target.account_tier = ""
+            target.upgrade_state = ""
+            target.upgrade_state_details = ""
+            target.setup_state = ""
 
     row.updated_at = datetime.now(timezone.utc)
     db.commit()

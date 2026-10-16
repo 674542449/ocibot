@@ -135,7 +135,9 @@
             <div class="muted" style="font-size: 12px">{{ (data.setup.reasons || []).join('；') }}</div>
           </div>
           <div v-else-if="data.setup?.state === 'READY'">已就绪</div>
-          <div v-else class="muted" style="font-size: 12px">读不到</div>
+          <div v-else class="muted" style="font-size: 12px">
+            无法判断{{ data.setup?.note ? `（${data.setup.note}）` : '' }}
+          </div>
           <div v-if="data.setup?.registered_at" class="muted" style="font-size: 12px">
             注册于 {{ fmtDateTime(data.setup.registered_at) }}
           </div>

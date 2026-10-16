@@ -132,7 +132,8 @@ def test_an_old_account_without_compute_quota_is_not_called_provisioning(monkeyp
 def test_zero_quota_outside_the_home_region_is_not_a_signal(monkeypatch):
     """免费 A1 额度只在主区；副区读到 0 是正常的。"""
     s = _session(monkeypatch, limits=(0.0, 0.0), region="us-ashburn-1", home="ap-tokyo-1")
-    assert s.get_account_status().data["setup"]["state"] == "READY"
+    # 不算「准备中」；新号在副区上也不下「已就绪」的结论（见 test_account_state_review）。
+    assert s.get_account_status().data["setup"]["state"] != "PROVISIONING"
 
 
 def test_nothing_readable_is_no_verdict(monkeypatch):

@@ -604,7 +604,11 @@ FREE_TIER_SHAPES = {
 # The paid families (E3/E4/E5/standard3) were listed too, but Oracle reports
 # non-zero limits for those even on a free account, so they were rows of quota the
 # operator has no use for.
-FREE_TIER_LIMIT_TAGS = ("a1", "e2-micro")
+#
+# A1 用 "standard-a1-" 而不是 "a1"：子串 "a1" 同时命中 GPU 的 A10 / A100 限额
+# （gpu-a10-count、bm-gpu-a100-v2-8-count ……），免费号上都是 0、排序又在前，截到 12 条
+# 时 A1 自己那几条被挤掉 —— 配额表里只剩 GPU，「新号配额全是 0 = 准备中」也跟着误判。
+FREE_TIER_LIMIT_TAGS = ("standard-a1-", "e2-micro")
 
 # Oracle Always Free resource caps (tenancy-wide reference; not region-scoped).
 # Source: Oracle Cloud Always Free resources documentation.
@@ -8131,6 +8135,9 @@ class TenantSession:
             pass
 
         # Service limits — informational only (dashboard). Not used for tier.
+        # free_quota_values：同一批 A1 / E2 Micro 限额里**真有数值**的那些，不截断、
+        # 不把空值当 0 —— 给「准备中」判断用（表格那份为了显示把 None 记成 0）。
+        free_quota_values: list[float] = []
         try:
             values = oci.pagination.list_call_get_all_results(
                 self.limits.list_limit_values, tenancy_id, service_name="compute",
@@ -8154,6 +8161,9 @@ class TenantSession:
                     numeric = float(value) if value is not None else 0.0
                 except (TypeError, ValueError):
                     numeric = 0.0
+                else:
+                    if value is not None:
+                        free_quota_values.append(numeric)
                 rows.append(
                     {
                         "name": name,
@@ -8218,7 +8228,7 @@ class TenantSession:
                 )
         # 账号是否已就绪（刚注册、Oracle 还在开通）。放在最后：开通没完成时这是最要紧的
         # 一条，盖过上面的等级文字；tier_code 不动 —— 额度保护照旧按订阅记录判定。
-        setup = self._account_setup_state(sub_details, info.get("limits") or [])
+        setup = self._account_setup_state(sub_details, free_quota_values)
         info["setup"] = setup
         if setup["state"] == "PROVISIONING":
             info["tier"] = "准备中（Oracle 还在开通账号）"
@@ -8297,7 +8307,7 @@ class TenantSession:
     # 多半是 Oracle 对这个号另有限制，不能再说成「准备中」。
     SETUP_NEW_ACCOUNT_DAYS = 7
 
-    def _account_setup_state(self, sub_details: dict, limit_rows: list[dict]) -> dict[str, Any]:
+    def _account_setup_state(self, sub_details: dict, quota_values: list[float]) -> dict[str, Any]:
         """账号是否已就绪：刚注册的账号 Oracle 要先开通一阵，这期间很多操作都会失败。
 
         依据（任一成立即为「准备中」）：
@@ -8306,6 +8316,11 @@ class TenantSession:
         * 主区的区域订阅 ``status == IN_PROGRESS``；
         * 注册不满 ``SETUP_NEW_ACCOUNT_DAYS`` 天、当前就在主区、而 A1 / E2 Micro 的计算配额
           读到了且**全是 0** —— 新号开通完成前配额还没下发，这是最常见的表现。
+
+        ``quota_values``：A1 / E2 Micro 限额里 Oracle 真给了数值的那些（空值不算 0）。
+        最后一条只能在主区看：在副区行上读、账号又还在 7 天内时，这条做不了，此时不下
+        「已就绪」的结论（返回空串）—— 状态是记到整个账号的，副区那一次读不能把主区读出的
+        「准备中」改回去。
 
         返回 ``{"state": "PROVISIONING" | "READY" | "", "reasons": [...], "registered_at": iso|None}``。
         ``state`` 为空串表示什么都没读到，下不了结论 —— 调用方不能把它当成「已就绪」。
@@ -8349,17 +8364,23 @@ class TenantSession:
             reg = registered if registered.tzinfo else registered.replace(tzinfo=timezone.utc)
             is_new = datetime.now(timezone.utc) - reg < timedelta(days=self.SETUP_NEW_ACCOUNT_DAYS)
         in_home = bool(home_name) and home_name == (self.tenant.region or "").strip()
-        if is_new and in_home and limit_rows and all(float(r.get("value") or 0) == 0 for r in limit_rows):
+        if is_new and in_home and quota_values and all(v == 0 for v in quota_values):
             reasons.append("新注册账号的 A1 / E2 Micro 计算配额还全是 0（配额尚未下发）")
 
+        note = ""
         if reasons:
             state = "PROVISIONING"
-        elif known:
+        elif known and not (is_new and not in_home):
             state = "READY"
         else:
             state = ""
+            note = (
+                "新注册账号要在主区看配额才能判断，请在主区那一行上查询"
+                if known else "读不到订阅、租户和区域订阅状态"
+            )
         return {
             "state": state,
+            "note": note,
             "reasons": reasons,
             "subscription_states": sub_states,
             "registered_at": registered.isoformat() if hasattr(registered, "isoformat") else None,

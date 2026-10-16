@@ -548,13 +548,19 @@ def instance_metrics(
 
 
 def _cache_account_state(db: Session, row: Tenant, data: dict) -> None:
-    """把读到的升级状态、就绪状态记到这个账号的所有行上（主租户 + 它的副区）。
+    """把读到的等级、升级状态、就绪状态记到这个账号的所有行上（主租户 + 它的副区）。
 
-    升级 / 开通都是整个 Oracle 账号的事，副区行和主租户是同一个账号 —— 只记在点了按钮
-    的那一行，租户页上同一个账号的几行就会一行「升级中」一行不显示。
+    这些都是整个 Oracle 账号的事，副区行和主租户是同一个账号 —— 只记在点了按钮的那一行，
+    租户页上同一个账号的几行就会一行「升级中」一行不显示。
+    等级尤其要一起记：0.4.138 起升级状态记到整个账号，等级却还只记这一行，在副区行点
+    「等级查询」后主租户标签显示「升级」（来自 upgrade_state），自己的 account_tier 却还是
+    free —— 多出口 IP 说「仅升级账号」，开机也照免费上限拦。
     读不到的那项不动缓存：读不到不等于「没在升级」/「已就绪」。
     """
     fields: dict[str, str] = {}
+    tier_code = str(data.get("tier_code") or "")
+    if tier_code in {"free", "paid"}:
+        fields["account_tier"] = tier_code
     upgrade = data.get("upgrade")
     if isinstance(upgrade, dict) and "error" not in upgrade:
         state = str(upgrade.get("upgrade_state") or "")[:32]
@@ -595,11 +601,6 @@ def account_status(
         session = get_session_for_row(row)
         result = session.get_account_status()
         data = result.data if isinstance(result.data, dict) else {}
-        # cache tier on tenant row when known
-        tier_code = str(data.get("tier_code") or "")
-        if tier_code in {"free", "paid"} and row.account_tier != tier_code:
-            row.account_tier = tier_code
-            db.commit()
         _cache_account_state(db, row, data)
         return {"ok": bool(result.ok), "message": result.message or "", "data": data}
     except OCIClientError as exc:
