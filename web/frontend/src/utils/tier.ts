@@ -91,7 +91,8 @@ export function accountAge(
   const reg = new Date(t.registered_at)
   if (Number.isNaN(reg.getTime())) return null
   const days = Math.max(0, Math.floor((now - reg.getTime()) / DAY_MS))
-  let text = `注册 ${days} 天`
+  // 不满一天写「注册不到 1 天」—— 「注册 0 天」读着像没注册；而准备中的新号多半正是这个阶段。
+  let text = days === 0 ? '注册不到 1 天' : `注册 ${days} 天`
   let hint = `注册于 ${ymd(reg)}`
   const exp = t.trial_expires_at ? new Date(t.trial_expires_at) : null
   if (exp && !Number.isNaN(exp.getTime())) {

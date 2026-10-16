@@ -10,6 +10,7 @@ from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.oci_client import (
@@ -555,7 +556,9 @@ def _parse_registered_at(value: Any) -> Optional[datetime]:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    # 一律换算成 UTC 再存：SQLite 存带时区的时间时直接丢掉时区、不换算，+08:00 的
+    # 11 点会被当成 UTC 11 点存下，读回来差 8 小时。
+    return (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
 
 
 def _same_value(old: Any, new: Any) -> bool:
@@ -592,8 +595,16 @@ def _cache_family_fields(db: Session, row: Tenant, fields: dict[str, Any]) -> No
             if not _same_value(getattr(t, name), value):
                 setattr(t, name, value)
                 changed = True
-    if changed:
+    if not changed:
+        return
+    # 缓存只是顺手记一下，写不进去不能连累这次查询：SQLite 在 worker 写库时会报
+    # database is locked，以前这会把一次已经成功的 Oracle 查询变成 502、结果直接丢掉。
+    # 下次查询会再记。
+    try:
         db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        log.warning("caching account state failed tenant=%s", row.id, exc_info=True)
 
 
 def _account_state_fields(data: dict) -> dict[str, Any]:

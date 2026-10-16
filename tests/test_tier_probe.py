@@ -174,3 +174,37 @@ def test_the_tenant_list_shows_when_the_trial_credit_expires():
     row.registered_at = None
     out = _to_out(row)
     assert out.registered_at is None and out.trial_expires_at is None
+
+
+# ---------------------------------------------------------------- 0.4.141 检查出的问题
+
+
+def test_a_locked_database_does_not_lose_the_query_result(monkeypatch):
+    """缓存只是顺手记一下。SQLite 在 worker 写库时会报 database is locked —— 以前这会让
+    一次已经成功的 Oracle 查询变成 502，结果直接丢掉；「查询试用积分」0.4.141 之前
+    根本不写库，这是新引入的失败方式。"""
+    from sqlalchemy.exc import OperationalError
+
+    db = _db()
+
+    def locked():
+        raise OperationalError("UPDATE tenants", {}, Exception("database is locked"))
+
+    monkeypatch.setattr(db, "commit", locked)
+    data = {"tier_code": "free", "setup": {"state": "READY", "registered_at": "2026-10-10T08:00:00+00:00"}}
+    assert _route(monkeypatch, db, "p", "get_tier_status", data)["data"] == data
+    trial = {"registered_at": "2026-10-01T00:00:00Z", "credit": {"amount": 300}}
+    assert _route(monkeypatch, db, "p", "get_trial_credits", trial)["data"] == trial
+
+
+def test_a_non_utc_registration_time_is_stored_as_utc(monkeypatch):
+    """SQLite 存带时区的时间时直接丢掉时区、不换算：+08:00 的 11 点会被当成 UTC 11 点
+    存下，读回来差 8 小时。"""
+    from web.backend.models import Tenant
+
+    db = _db()
+    _route(monkeypatch, db, "p", "get_tier_status", {"setup": {"registered_at": "2026-10-05T11:00:00+08:00"}})
+    db.expire_all()
+    stored = db.get(Tenant, "p").registered_at
+    stored = stored if stored.tzinfo else stored.replace(tzinfo=timezone.utc)
+    assert stored == datetime(2026, 10, 5, 3, 0, tzinfo=timezone.utc)
