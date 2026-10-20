@@ -278,7 +278,16 @@
         >
           <div class="tenant-modal-head">
             <h3 style="margin: 0">{{ editingId ? '编辑租户' : '粘贴原始 API 添加租户' }}</h3>
-            <button type="button" class="ghost tenant-modal-close" aria-label="关闭" @click="closeFormGuarded">✕</button>
+            <!-- 保存进行中 ✕ / 取消 / Esc 都不关：关了也拦不住那次请求，结果只会无处显示。 -->
+            <button
+              type="button"
+              class="ghost tenant-modal-close"
+              aria-label="关闭"
+              :disabled="saving"
+              @click="closeFormGuarded"
+            >
+              ✕
+            </button>
           </div>
           <!-- 表单里所有出错（导入 / 保存失败、私钥文件不对、剪贴板为空、解析失败）都写进
                error。页面顶部那个错误框被遮罩盖着，必须在弹窗里也显示。 -->
@@ -362,7 +371,7 @@ key_file=~/.oci/oci_api_key.pem"
         <button type="button" @click="showManual = !showManual">
           {{ showManual ? '收起手动表单' : '改用手动填写' }}
         </button>
-        <button @click="closeForm">取消</button>
+        <button :disabled="saving" @click="closeForm">取消</button>
       </div>
 
       <!-- Optional manual fallback -->
@@ -465,7 +474,7 @@ key_file=~/.oci/oci_api_key.pem"
         <button class="primary" :disabled="saving" @click="saveManual">
           {{ saving ? '保存中…' : '保存' }}
         </button>
-        <button @click="closeForm">取消</button>
+        <button :disabled="saving" @click="closeForm">取消</button>
       </div>
     </div>
         </div>
@@ -522,6 +531,7 @@ function formState() {
 }
 
 function closeForm() {
+  if (saving.value) return
   showForm.value = false
   error.value = ''
 }
@@ -529,6 +539,7 @@ function closeForm() {
 /** ✕ / Esc 关弹窗：填了东西没保存的话先问一句（重新点「添加租户」会清空表单）。
  *  「取消」按钮是明确的放弃，不问。 */
 function closeFormGuarded() {
+  if (saving.value) return
   if (formState() !== formSnapshot && !confirm('放弃这次填写、还没保存的内容？')) return
   closeForm()
 }
