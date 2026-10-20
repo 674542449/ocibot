@@ -263,9 +263,25 @@
       </template>
     </div>
 
+    <!-- 添加 / 编辑租户：弹窗。以前表单追加在页面最底部，点「添加租户」之后要一直滚到
+         租户表格下面才看得到，租户一多就像没反应。点遮罩不关（免得贴了半天的配置一下
+         没了），用右上角 ✕、「取消」或 Esc 关。 -->
+    <Teleport to="body">
+      <div v-if="showForm" class="tenant-modal-backdrop">
+        <div
+          ref="modalEl"
+          class="tenant-modal card stack"
+          role="dialog"
+          aria-modal="true"
+          :aria-label="editingId ? '编辑租户' : '添加租户'"
+        >
+          <div class="tenant-modal-head">
+            <h3 style="margin: 0">{{ editingId ? '编辑租户' : '粘贴原始 API 添加租户' }}</h3>
+            <button type="button" class="ghost tenant-modal-close" aria-label="关闭" @click="closeForm">✕</button>
+          </div>
+
     <!-- Create: paste-first -->
-    <div v-if="showForm && !editingId" class="card stack">
-      <h3 style="margin: 0">粘贴原始 API 添加租户</h3>
+    <div v-if="!editingId" class="stack">
       <p class="muted" style="margin: 0; font-size: 13px">
         支持 <code>~/.oci/config</code> 格式（user / fingerprint / tenancy / region）。<br />
         私钥推荐：点 <strong>选择私钥文件…</strong> 读取本地 <code>.pem</code>；也可与 config 贴在同一段文本，或粘贴到下方文本框。
@@ -387,8 +403,7 @@ key_file=~/.oci/oci_api_key.pem"
     </div>
 
     <!-- Edit: field form -->
-    <div v-if="showForm && editingId" class="card stack">
-      <h3 style="margin: 0">编辑租户</h3>
+    <div v-if="editingId" class="stack">
       <div class="grid-2">
         <div class="field">
           <label>显示名称</label>
@@ -449,11 +464,14 @@ key_file=~/.oci/oci_api_key.pem"
         <button @click="showForm = false">取消</button>
       </div>
     </div>
+        </div>
+      </div>
+    </Teleport>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import api, { type Tenant, type TenantRegions } from '@/api/client'
 import Icon from '@/components/Icon.vue'
 import {
@@ -490,6 +508,30 @@ const showForm = ref(false)
 const showManual = ref(false)
 const editingId = ref<string | null>(null)
 const saving = ref(false)
+const modalEl = ref<HTMLElement | null>(null)
+
+function closeForm() {
+  showForm.value = false
+}
+
+/** Esc 关弹窗；保存进行中不关（关了也拦不住那次请求，只会让结果无处显示）。 */
+function onModalKey(e: KeyboardEvent) {
+  if (e.key === 'Escape' && showForm.value && !saving.value) closeForm()
+}
+
+// 弹窗开着时锁住背后的页面滚动，并把焦点放进第一个输入框。
+watch(showForm, async (open) => {
+  document.body.style.overflow = open ? 'hidden' : ''
+  if (open) {
+    await nextTick()
+    modalEl.value?.querySelector<HTMLElement>('textarea, input')?.focus()
+  }
+})
+onMounted(() => window.addEventListener('keydown', onModalKey))
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onModalKey)
+  document.body.style.overflow = ''
+})
 const parsePreview = ref<ParsePreview | null>(null)
 const pasteKeyFile = ref('')
 const formKeyFile = ref('')
@@ -1123,6 +1165,37 @@ onMounted(async () => {
 </script>
 
 <style scoped>
+/* 添加 / 编辑租户弹窗。z-index 压过侧栏和手机导航（最高 60），低于提示条（9999）——
+   保存成功 / 失败的提示要能盖在弹窗上面。表单很长：遮罩自己滚动，弹窗随内容变高，
+   手机上也一样能滚到「保存」。 */
+.tenant-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgba(20, 20, 19, 0.45);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 4vh 1rem;
+  overflow-y: auto;
+}
+.tenant-modal {
+  width: min(760px, 100%);
+  margin: 0;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.25);
+}
+.tenant-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.tenant-modal-close {
+  font-size: 16px;
+  line-height: 1;
+  padding: 0.3rem 0.55rem;
+}
+
 .dot {
   display: inline-block;
   width: 8px;
