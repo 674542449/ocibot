@@ -534,6 +534,20 @@ def test_every_endpoint_is_wired() -> None:
         p = f"/api/tenants/{tid}/oci-password-policy/disable-expiry"
         check("POST", p, c.post(p, json={"policy_id": "p1"}))
 
+        # IP 封禁（管理员接口）。smoke 账号默认不是管理员，这几条会停在 403、根本跑不到
+        # 代码 —— 临时提升一下。封一个公网地址再解掉，不在共享库里留东西。
+        with SessionLocal() as db:
+            me = db.scalar(select(User).where(User.username == "smoke"))
+            me.is_admin = True
+            db.commit()
+        check("GET", "/api/admin/ip-bans", c.get("/api/admin/ip-bans"))
+        check("POST", "/api/admin/ip-bans", c.post("/api/admin/ip-bans", json={"ip": "45.79.1.1"}))
+        check("POST", "/api/admin/ip-bans/unban",
+              c.post("/api/admin/ip-bans/unban", json={"ips": ["45.79.1.1"]}))
+        check("PUT", "/api/admin/ip-ban-rules",
+              c.put("/api/admin/ip-ban-rules",
+                    json={"user_agents": ["curl/8.14.1", "Mozilla/5.0"], "usernames": ["admin"]}))
+
         # Admin reset targets a SECOND user on purpose: the route refuses to reset
         # the caller's own password, so pointing it at ourselves would exercise the
         # 400 guard instead of the code path that actually does the work.

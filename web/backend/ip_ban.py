@@ -30,6 +30,7 @@ import ipaddress
 import logging
 import threading
 import time
+from functools import lru_cache
 from typing import Any, Iterable, Optional
 
 from sqlalchemy import func, select
@@ -103,17 +104,19 @@ BROWSER_SAMPLES: tuple[str, ...] = (
     "Chrome/130.0.0.0 Safari/537.36",
 )
 REFRESH_SEC = 10.0
+# 新封、还没确认写进数据库的 IP 在内存里钉住多久（见 _Cache.add）。
+LOCAL_PIN_SEC = 600.0
+IPV6_BAN_PREFIX = 64
 BANNED_DETAIL = "该 IP 已被封禁"
 
 
 # ---------------------------------------------------------------- 永不封禁的地址
 
 
-def _allowlist() -> list[Any]:
-    from web.backend.config import get_settings
-
+@lru_cache(maxsize=4)
+def _parse_allowlist(text: str) -> tuple[Any, ...]:
     nets = []
-    for part in (get_settings().ip_ban_allowlist or "").replace(";", ",").split(","):
+    for part in (text or "").replace(";", ",").split(","):
         part = part.strip()
         if not part:
             continue
@@ -121,12 +124,56 @@ def _allowlist() -> list[Any]:
             nets.append(ipaddress.ip_network(part, strict=False))
         except ValueError:
             log.warning("OCIBOT_IP_BAN_ALLOWLIST 里有一项不是 IP / CIDR，已忽略：%r", part)
-    return nets
+    return tuple(nets)
+
+
+def _allowlist() -> tuple[Any, ...]:
+    from web.backend.config import get_settings
+
+    return _parse_allowlist(get_settings().ip_ban_allowlist or "")
+
+
+def allowlisted(ip: str) -> bool:
+    return client_ip.in_networks(_address_of(ip), _allowlist())
+
+
+def ban_key(value: Any) -> str:
+    """封禁表里的键：IPv4 是地址本身，IPv6 是它所在的 /64。
+
+    一台 IPv6 机器手里通常是一整个 /64（2^64 个地址），只封单个地址的话换一个地址就能
+    接着试。/64 一般就是一台服务器或一户宽带，封整段不会殃及别人。已经是 ``…/64`` 写法
+    的输入原样规范化；其它写不成 IP 的输入原样返回（由 exempt_reason 拒绝）。
+    """
+    text = str(value or "").strip()
+    addr = client_ip.parse_ip(text)
+    if addr is None:
+        try:
+            net = ipaddress.ip_network(text, strict=False)
+        except ValueError:
+            return text
+        if net.version == 6 and net.prefixlen == IPV6_BAN_PREFIX:
+            return str(net)
+        return text
+    if addr.version == 6:
+        return str(ipaddress.ip_network(f"{addr}/{IPV6_BAN_PREFIX}", strict=False))
+    return str(addr)
+
+
+def _address_of(value: Any) -> Optional[client_ip.IPAddress]:
+    """地址本身；``…/64`` 的封禁键取它的网络地址。"""
+    addr = client_ip.parse_ip(value)
+    if addr is not None:
+        return addr
+    try:
+        net = ipaddress.ip_network(str(value or "").strip(), strict=False)
+    except ValueError:
+        return None
+    return net.network_address if net.version == 6 and net.prefixlen == IPV6_BAN_PREFIX else None
 
 
 def exempt_reason(ip: str) -> str:
-    """这个地址不能封的原因；能封返回空串。"""
-    addr = client_ip.parse_ip(ip)
+    """这个地址（或 IPv6 /64）不能封的原因；能封返回空串。"""
+    addr = _address_of(ip)
     if addr is None:
         return "不是有效的 IP 地址"
     if client_ip.is_cloudflare(addr):
@@ -257,6 +304,10 @@ class _Cache:
         self.ban_empty_ua = DEFAULT_BAN_EMPTY_UA
         self.usernames: frozenset[str] = frozenset(DEFAULT_USERNAMES)
         self.loaded_at = 0.0
+        # 本进程刚封、还没确认进了数据库的 → 到期时间。重读时并进去，不被数据库那份冲掉：
+        # 否则重读恰好落在「进内存」和「提交」之间时，新封的 IP 会被放行到下一次重读；
+        # 写库失败的那种更是 10 秒后就没了。
+        self._pins: dict[str, float] = {}
         self._lock = threading.Lock()
 
     def stale(self) -> bool:
@@ -274,7 +325,9 @@ class _Cache:
                 with SessionLocal() as db:
                     ips = frozenset(db.scalars(select(IpBan.ip)).all())
                     rules = get_rules(db)
-                self.ips = ips
+                now = time.monotonic()
+                self._pins = {k: t for k, t in self._pins.items() if t > now}
+                self.ips = ips | frozenset(self._pins)
                 self.ua_rules = UaRules(rules["user_agents"])
                 self.ban_empty_ua = bool(rules["ban_empty_user_agent"])
                 self.usernames = frozenset(rules["usernames"])
@@ -282,13 +335,28 @@ class _Cache:
                 log.warning("refreshing IP ban list failed; keeping the previous one", exc_info=True)
             self.loaded_at = time.monotonic()
 
-    def add(self, ip: str) -> None:
+    def add(self, key: str) -> None:
+        """立即拦，并钉住直到 unpin（确认进了数据库）或 LOCAL_PIN_SEC 到期。"""
         with self._lock:
-            self.ips = self.ips | {ip}
+            self.ips = self.ips | {key}
+            self._pins[key] = time.monotonic() + LOCAL_PIN_SEC
 
-    def remove(self, ips: Iterable[str]) -> None:
+    def unpin(self, key: str) -> None:
+        """已经确认在数据库里了，之后交给重读 —— 别的进程或命令行解封时才能及时生效。"""
         with self._lock:
-            self.ips = self.ips - set(ips)
+            self._pins.pop(key, None)
+
+    def remove(self, keys: Iterable[str]) -> None:
+        with self._lock:
+            keys = set(keys)
+            self.ips = self.ips - keys
+            for k in keys:
+                self._pins.pop(k, None)
+
+    def blocks(self, ip: str) -> bool:
+        """这个访客地址在不在封禁表里（IPv6 按所在的 /64，也认老版本存的单个地址）。"""
+        ips = self.ips
+        return bool(ips) and (ban_key(ip) in ips or ip in ips)
 
     def set_rules(self, user_agents: Iterable[str], usernames: Iterable[str], ban_empty_ua: bool) -> None:
         with self._lock:
@@ -303,6 +371,7 @@ class _Cache:
             self.ua_rules = UaRules(DEFAULT_USER_AGENTS)
             self.ban_empty_ua = DEFAULT_BAN_EMPTY_UA
             self.usernames = frozenset(DEFAULT_USERNAMES)
+            self._pins = {}
             self.loaded_at = 0.0
 
 
@@ -310,9 +379,11 @@ _CACHE = _Cache()
 
 
 def is_banned(ip: str) -> bool:
+    """被封且不在白名单里。白名单优先：被封之后把自己的 IP 写进白名单就能进来，
+    README 说的「白名单永远不封」对已经在列表里的也成立。"""
     if _CACHE.stale():
         _CACHE.refresh()
-    return ip in _CACHE.ips
+    return _CACHE.blocks(ip) and not allowlisted(ip)
 
 
 def is_honeypot_username(normalized: str) -> bool:
@@ -333,35 +404,40 @@ def ban_ip(
     detail: str = "",
     actor_id: Optional[str] = None,
 ) -> tuple[bool, str]:
-    """封禁 ``ip``。返回 ``(现在是否处于封禁状态, 说明)``；不能封的地址返回 False 和原因。"""
+    """封禁 ``ip``（IPv6 封它所在的 /64）。返回 ``(现在是否处于封禁状态, 说明)``；
+    不能封的地址返回 False 和原因。"""
     from web.backend.audit import write_audit
     from web.backend.models import IpBan
 
-    ip = client_ip.normalize_ip(ip)
     why_not = exempt_reason(ip)
     if why_not:
         return False, why_not
-    # 先进内存：数据库写失败时这个进程至少已经在拦了。
-    _CACHE.add(ip)
+    key = ban_key(ip)
+    # 先进内存（并钉住）：数据库写失败时这个进程至少已经在拦了。
+    _CACHE.add(key)
     try:
-        if db.scalar(select(IpBan).where(IpBan.ip == ip)) is not None:
+        if db.scalar(select(IpBan).where(IpBan.ip == key)) is not None:
+            _CACHE.unpin(key)
             return True, "已在封禁列表里"
-        db.add(IpBan(ip=ip, reason=reason[:32], detail=(detail or "")[:255]))
+        db.add(IpBan(ip=key, reason=reason[:32], detail=(detail or "")[:255]))
         db.commit()
     except IntegrityError:
         db.rollback()  # 同一个 IP 并发触发了两次，另一边已经写进去了
+        _CACHE.unpin(key)
         return True, "已在封禁列表里"
     except SQLAlchemyError:
         db.rollback()
-        log.warning("persisting IP ban failed ip=%s (blocked in this process only)", ip, exc_info=True)
-        return True, "已封禁（写入数据库失败，仅本进程生效，重启后失效）"
-    log.warning("banned ip=%s reason=%s detail=%s", ip, reason, detail)
+        log.warning("persisting IP ban failed ip=%s (blocked in this process only)", key, exc_info=True)
+        minutes = int(LOCAL_PIN_SEC // 60)
+        return True, f"已封禁（写入数据库失败，只在本进程临时生效约 {minutes} 分钟）"
+    _CACHE.unpin(key)
+    log.warning("banned ip=%s reason=%s detail=%s", key, reason, detail)
     write_audit(
         db,
         owner_id=actor_id,
         action="security.ip_banned",
-        target=ip,
-        detail={"reason": reason, "detail": detail},
+        target=key,
+        detail={"reason": reason, "detail": detail, "address": client_ip.normalize_ip(ip)},
     )
     return True, "已封禁"
 
@@ -371,7 +447,12 @@ def unban_ips(db: Session, ips: Iterable[str], *, actor_id: Optional[str] = None
     from web.backend.audit import write_audit
     from web.backend.models import IpBan
 
-    wanted = {client_ip.normalize_ip(ip) for ip in ips if str(ip or "").strip()}
+    wanted: set[str] = set()
+    for ip in ips:
+        if str(ip or "").strip():
+            # 新的键（IPv6 是 /64）和老版本存的单个地址都认：按地址解封也能解掉它的 /64。
+            wanted.add(ban_key(ip))
+            wanted.add(client_ip.normalize_ip(ip))
     if not wanted:
         return []
     rows = db.scalars(select(IpBan).where(IpBan.ip.in_(wanted))).all()
@@ -410,7 +491,7 @@ def ban_standalone(ip: str, *, reason: str, detail: str) -> None:
         with SessionLocal() as db:
             ban_ip(db, ip, reason=reason, detail=detail)
     except Exception:  # noqa: BLE001
-        _CACHE.add(client_ip.normalize_ip(ip))
+        _CACHE.add(ban_key(ip))
         log.warning("banning ip=%s failed", ip, exc_info=True)
 
 
@@ -432,7 +513,7 @@ class IpBanMiddleware:
         if _CACHE.stale():
             await run_in_threadpool(_CACHE.refresh)
         ip = client_ip.from_scope(scope)
-        if ip in _CACHE.ips:
+        if _CACHE.blocks(ip) and not allowlisted(ip):
             await _reject(scope, send)
             return
         ua = ""

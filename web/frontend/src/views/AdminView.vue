@@ -181,7 +181,8 @@
       </div>
       <p class="muted" style="margin: 0; font-size: 12px">
         User-Agent 命中下面某一行、不带 User-Agent（开关打开时）、或用诱饵用户名登录（面板里没有这个账号时）的请求，来源 IP
-        会被立即封禁，之后它的所有请求都返回 403。内网 / 本机 / Cloudflare 节点 / 白名单（OCIBOT_IP_BAN_ALLOWLIST）地址永远不封。
+        会被立即封禁，之后它的所有请求都返回 403；IPv6 地址封它所在的整个 /64（否则换个地址就能接着试）。内网 / 本机 / Cloudflare
+        节点 / 白名单（OCIBOT_IP_BAN_ALLOWLIST）地址永远不封，已经被封的 IP 写进白名单后也会放行。
         被封在外面时，在服务器上执行 <code>bash scripts/install.sh unban 你的IP</code>。
       </p>
       <div v-if="banViewer" style="font-size: 13px">

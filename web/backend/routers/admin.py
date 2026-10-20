@@ -270,14 +270,15 @@ def add_ip_ban(
     db: Annotated[Session, Depends(get_db)],
 ) -> dict[str, Any]:
     ip = client_ip.normalize_ip(body.ip)
-    if ip == client_ip.from_request(request):
-        raise HTTPException(status_code=400, detail="这是你当前的 IP，封了你自己也进不来")
+    # 按封禁键比：IPv6 封的是整个 /64，和你同一个 /64 的地址也会把你自己封掉。
+    if ip_ban.ban_key(ip) == ip_ban.ban_key(client_ip.from_request(request)):
+        raise HTTPException(status_code=400, detail="这是你当前的 IP（或同一个 IPv6 /64），封了你自己也进不来")
     banned, message = ip_ban.ban_ip(
         db, ip, reason="manual", detail=f"管理员 {admin.username} 手动封禁", actor_id=admin.id
     )
     if not banned:
         raise HTTPException(status_code=400, detail=f"不能封禁 {ip}：{message}")
-    return {"ok": True, "ip": ip, "message": message}
+    return {"ok": True, "ip": ip_ban.ban_key(ip), "message": message}
 
 
 @router.post("/ip-bans/unban")

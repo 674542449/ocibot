@@ -351,3 +351,63 @@ def test_the_empty_user_agent_rule_can_be_switched_off():
     # 老前端不传这个字段：保持原样，不会被悄悄打开。
     r = c.put("/api/admin/ip-ban-rules", json={"user_agents": ["curl/8.14.1"], "usernames": ["admin"]})
     assert r.json()["rules"]["ban_empty_user_agent"] is False
+
+
+# ---------------------------------------------------------------- 0.4.143 / 0.4.144 检查出的问题
+
+
+V6_A = "2a01:4f8:1:2::10"  # 公网 IPv6
+V6_A_OTHER = "2a01:4f8:1:2:ffff:1:2:3"  # 同一个 /64 里的另一个地址
+V6_B = "2a01:4f8:1:3::10"  # 隔壁的 /64
+
+
+def test_an_ipv6_attacker_cannot_dodge_the_ban_by_rotating_within_its_64():
+    """一台 IPv6 机器手里通常是一整个 /64（2^64 个地址）。只封单个地址的话，换一个地址
+    就能接着试 —— 诱饵用户名那条规则对它等于没有。"""
+    r = _client(V6_A).post("/api/auth/login", json={"username": "admin", "password": "whatever1"})
+    assert r.status_code == 403
+    assert _client(V6_A_OTHER).get("/api/health", headers={"User-Agent": BROWSER_UA}).status_code == 403
+    assert _client(V6_B).get("/api/health", headers={"User-Agent": BROWSER_UA}).status_code == 200
+    assert _banned_ips() == {"2a01:4f8:1:2::/64"}
+    # 按地址解封也能解掉它所在的 /64。
+    with SessionLocal() as db:
+        assert ip_ban.unban_ips(db, [V6_A_OTHER]) == ["2a01:4f8:1:2::/64"]
+    assert _client(V6_A).get("/api/health", headers={"User-Agent": BROWSER_UA}).status_code == 200
+
+
+def test_bans_stored_by_older_versions_still_hold():
+    with SessionLocal() as db:
+        db.add(IpBan(ip=V6_A, reason="user_agent"))  # 0.4.143 / 0.4.144 存的是单个地址
+        db.commit()
+    assert _client(V6_A).get("/api/health", headers={"User-Agent": BROWSER_UA}).status_code == 403
+    with SessionLocal() as db:
+        assert ip_ban.unban_ips(db, [V6_A]) == [V6_A]
+
+
+def test_allowlisting_an_already_banned_ip_lets_it_back_in(monkeypatch):
+    """README 说白名单里的地址「永远不封」。被封之后再把自己的 IP 写进白名单、重启，
+    以前照样 403 —— 白名单只在封禁那一刻看，不管已经在列表里的。"""
+    from web.backend.config import get_settings
+
+    with SessionLocal() as db:
+        ip_ban.ban_ip(db, "9.9.9.9", reason="manual")
+    assert _client("9.9.9.9").get("/api/health").status_code == 403
+    monkeypatch.setattr(get_settings(), "ip_ban_allowlist", "9.9.9.9")
+    assert _client("9.9.9.9").get("/api/health").status_code == 200
+
+
+def test_a_ban_that_could_not_be_saved_survives_the_next_refresh(monkeypatch):
+    """数据库写失败时封禁只留在内存里 —— 可每 10 秒一次的重读会拿数据库的列表整个替换
+    内存里的，这条封禁 10 秒后就没了（提示里却写着「重启后失效」）。正常写库时也有同样的
+    窗口：重读恰好落在「进内存」和「提交」之间，新封的 IP 会被放行到下一次重读。"""
+    from sqlalchemy.exc import OperationalError
+
+    with SessionLocal() as db:
+        def locked():
+            raise OperationalError("INSERT", {}, Exception("database is locked"))
+
+        monkeypatch.setattr(db, "commit", locked)
+        banned, message = ip_ban.ban_ip(db, "9.9.9.9", reason="manual")
+    assert banned
+    ip_ban._CACHE.loaded_at = 0.0  # 到点重读
+    assert _client("9.9.9.9").get("/api/health").status_code == 403
