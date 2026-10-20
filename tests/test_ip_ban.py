@@ -31,7 +31,7 @@ from web.backend import ip_ban  # noqa: E402
 from web.backend.auth import hash_password  # noqa: E402
 from web.backend.db import SessionLocal, init_db  # noqa: E402
 from web.backend.main import app  # noqa: E402
-from web.backend.meta import KEY_BAN_USER_AGENTS, KEY_BAN_USERNAMES  # noqa: E402
+from web.backend.meta import KEY_BAN_EMPTY_UA, KEY_BAN_USER_AGENTS, KEY_BAN_USERNAMES  # noqa: E402
 from web.backend.models import AppMeta, IpBan, User  # noqa: E402
 
 _ADMIN = "ipban-admin"
@@ -49,7 +49,9 @@ def _clean():
     init_db()
     with SessionLocal() as db:
         db.query(IpBan).delete()
-        db.query(AppMeta).filter(AppMeta.key.in_([KEY_BAN_USER_AGENTS, KEY_BAN_USERNAMES])).delete()
+        db.query(AppMeta).filter(
+            AppMeta.key.in_([KEY_BAN_USER_AGENTS, KEY_BAN_USERNAMES, KEY_BAN_EMPTY_UA])
+        ).delete()
         db.query(User).filter(User.username.in_(["admin", "Admin"])).delete()
         if db.query(User).filter(User.username == _ADMIN).one_or_none() is None:
             db.add(User(username=_ADMIN, password_hash=hash_password(_PW), is_admin=True))
@@ -208,7 +210,12 @@ def test_the_admin_page_lists_bans_and_shows_what_ip_it_sees():
     data = c.get("/api/admin/ip-bans").json()
     assert [b["ip"] for b in data["bans"]] == ["9.9.9.9"]
     assert data["total"] == 1
-    assert data["rules"] == {"user_agents": ["curl/8.14.1", "Mozilla/5.0"], "usernames": ["admin"]}
+    assert data["rules"] == {
+        "user_agents": ["curl/8.14.1", "Mozilla/5.0"],
+        "usernames": ["admin"],
+        "ban_empty_user_agent": True,
+    }
+    assert "~go-http-client" in data["recommended_user_agents"]
     assert data["viewer"]["your_ip"] == "8.8.8.8"
 
     via_cf = _admin(CF_EDGE)
@@ -232,12 +239,18 @@ def test_manual_ban_unban_and_self_protection():
 
 def test_rules_can_be_changed_but_not_to_ban_yourself():
     c = _admin()
-    r = c.put("/api/admin/ip-ban-rules", json={"user_agents": [BROWSER_UA], "usernames": ["admin"]},
-              headers={"User-Agent": BROWSER_UA})
-    assert r.status_code == 400 and "你自己" in r.json()["detail"]
+    own = "MyOwnTool/1.0 (ops laptop)"
+    for rules in ([own], ["~myowntool"]):
+        r = c.put("/api/admin/ip-ban-rules", json={"user_agents": rules, "usernames": ["admin"]},
+                  headers={"User-Agent": own})
+        assert r.status_code == 400 and "你自己" in r.json()["detail"], rules
 
     r = c.put("/api/admin/ip-ban-rules", json={"user_agents": ["sqlmap/1.8"], "usernames": ["Root", "admin"]})
-    assert r.json()["rules"] == {"user_agents": ["sqlmap/1.8"], "usernames": ["root", "admin"]}
+    assert r.json()["rules"] == {
+        "user_agents": ["sqlmap/1.8"],
+        "usernames": ["root", "admin"],
+        "ban_empty_user_agent": True,
+    }
     assert _client("9.9.9.9").get("/api/health", headers={"User-Agent": "curl/8.14.1"}).status_code == 200
     assert _client("9.9.9.8").get("/api/health", headers={"User-Agent": "sqlmap/1.8"}).status_code == 403
     r = _client("9.9.9.7").post("/api/auth/login", json={"username": "root", "password": "whatever1"})
@@ -267,3 +280,74 @@ def test_the_command_line_can_unban(capsys):
     assert ip_ban._main(["clear"]) == 0
     assert _banned_ips() == set()
     assert "已清空" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------- 包含匹配 / 空 UA
+
+
+def _set_rules(**kw):
+    with SessionLocal() as db:
+        ip_ban.set_rules(db, user_agents=kw.get("uas", ip_ban.DEFAULT_USER_AGENTS),
+                         usernames=["admin"], ban_empty_user_agent=kw.get("empty"))
+
+
+@pytest.mark.parametrize("ua", ["python-requests/2.32.3", "Python-Requests/2.0", "foo python-requests bar"])
+def test_a_contains_rule_covers_every_version_case_insensitively(ua):
+    _set_rules(uas=["~python-requests"])
+    assert _client("9.9.9.9").get("/api/health", headers={"User-Agent": ua}).status_code == 403
+    with SessionLocal() as db:
+        assert "~python-requests" in db.query(IpBan).one().detail
+
+
+def test_a_contains_rule_does_not_touch_other_agents():
+    _set_rules(uas=["~python-requests"])
+    assert _client("9.9.9.9").get("/api/health", headers={"User-Agent": BROWSER_UA}).status_code == 200
+    assert _client("9.9.9.8").get("/api/health", headers={"User-Agent": "python-httpx/0.27"}).status_code == 200
+
+
+@pytest.mark.parametrize(
+    "rule, needle",
+    [
+        ("~mozilla", "正常浏览器"),
+        ("~Chrome", "正常浏览器"),
+        ("~safari", "正常浏览器"),
+        ("~gecko", "正常浏览器"),
+        ("~micromessenger", "正常浏览器"),
+        (BROWSER_UA, "正常浏览器"),
+        ("~ab", "太短"),
+        ("~", "太短"),
+    ],
+)
+def test_rules_that_would_ban_ordinary_visitors_are_refused(rule, needle):
+    """管理员自己的 IP 免封（内网 / 白名单）也一样拒绝：会封掉所有别的访客。"""
+    c = _admin("127.0.0.1")
+    r = c.put("/api/admin/ip-ban-rules", json={"user_agents": ["curl/8.14.1", rule], "usernames": ["admin"]})
+    assert r.status_code == 400 and needle in r.json()["detail"], r.text
+
+
+def test_the_recommended_list_is_safe_for_ordinary_browsers():
+    assert ip_ban.validate_user_agent_rules(list(ip_ban.RECOMMENDED_USER_AGENTS)) == ""
+    rules = ip_ban.UaRules(ip_ban.RECOMMENDED_USER_AGENTS)
+    for ua in ("Go-http-client/1.1", "python-requests/2.31.0", "sqlmap/1.8#stable (https://sqlmap.org)",
+               "Mozilla/5.0 (compatible; Nmap Scripting Engine; https://nmap.org/book/nse.html)",
+               "Mozilla/5.0 zgrab/0.x", "Mozilla/4.0 (Hydra)", "Mozilla/4.0", "-"):
+        assert rules.match(ua), ua
+
+
+def test_a_missing_user_agent_bans_by_default():
+    assert _client("9.9.9.9").get("/api/health", headers={"User-Agent": ""}).status_code == 403
+    with SessionLocal() as db:
+        assert db.query(IpBan).one().reason == "empty_user_agent"
+    # 本机 / 内网不封（服务器上自己的探活脚本可能不带 UA）。
+    assert _client("127.0.0.1").get("/api/health", headers={"User-Agent": ""}).status_code == 200
+
+
+def test_the_empty_user_agent_rule_can_be_switched_off():
+    c = _admin()
+    r = c.put("/api/admin/ip-ban-rules",
+              json={"user_agents": ["curl/8.14.1"], "usernames": ["admin"], "ban_empty_user_agent": False})
+    assert r.json()["rules"]["ban_empty_user_agent"] is False
+    assert _client("9.9.9.9").get("/api/health", headers={"User-Agent": ""}).status_code == 200
+    # 老前端不传这个字段：保持原样，不会被悄悄打开。
+    r = c.put("/api/admin/ip-ban-rules", json={"user_agents": ["curl/8.14.1"], "usernames": ["admin"]})
+    assert r.json()["rules"]["ban_empty_user_agent"] is False

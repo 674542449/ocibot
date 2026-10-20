@@ -16,6 +16,7 @@ KEY_OPEN_REGISTRATION = "allow_open_registration"  # "true"/"false"; overrides e
 # IP 封禁规则（ip_ban.py），每行一个；没设置过时用 ip_ban 里的默认值。
 KEY_BAN_USER_AGENTS = "ip_ban_user_agents"
 KEY_BAN_USERNAMES = "ip_ban_usernames"
+KEY_BAN_EMPTY_UA = "ip_ban_empty_user_agent"  # "true"/"false"；没设置过时默认开启
 
 
 def get_meta(db: Session, key: str) -> Optional[str]:

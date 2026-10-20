@@ -220,6 +220,8 @@ class IpBanOut(BaseModel):
 class IpBanRules(BaseModel):
     user_agents: list[str] = Field(default_factory=list, max_length=ip_ban.MAX_RULES)
     usernames: list[str] = Field(default_factory=list, max_length=ip_ban.MAX_RULES)
+    # 不传 = 保持原样（老前端不认识这个开关）。
+    ban_empty_user_agent: Optional[bool] = None
 
 
 class IpBanAdd(BaseModel):
@@ -255,6 +257,7 @@ def list_ip_bans(
         "bans": [IpBanOut(**r).model_dump(mode="json") for r in rows],
         "total": total,
         "rules": ip_ban.get_rules(db),
+        "recommended_user_agents": list(ip_ban.RECOMMENDED_USER_AGENTS),
         "viewer": _viewer(request),
     }
 
@@ -294,15 +297,21 @@ def put_ip_ban_rules(
     admin: Annotated[User, Depends(get_admin_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> dict[str, Any]:
-    # 自己的浏览器 UA 写进去的话，保存后的下一个请求就把自己封了（除非 IP 本来免封）。
+    uas = ip_ban.clean_user_agent_rules(body.user_agents)
+    # 自己的浏览器 UA 被某条规则命中的话，保存后的下一个请求就把自己封了（除非 IP 本来免封）。
+    # 不管 IP 免不免封，会命中正常浏览器的规则（~mozilla、~chrome）一律拒绝 —— 那会封掉所有访客。
     mine = (request.headers.get("user-agent") or "").strip()
-    if mine and mine in {u.strip() for u in body.user_agents}:
-        if not ip_ban.exempt_reason(client_ip.from_request(request)):
-            raise HTTPException(
-                status_code=400,
-                detail="列表里有你当前浏览器的 User-Agent，保存后你自己会被立即封禁",
-            )
-    rules = ip_ban.set_rules(db, user_agents=body.user_agents, usernames=body.usernames)
+    if ip_ban.exempt_reason(client_ip.from_request(request)):
+        mine = ""
+    problem = ip_ban.validate_user_agent_rules(uas, own_ua=mine)
+    if problem:
+        raise HTTPException(status_code=400, detail=problem)
+    rules = ip_ban.set_rules(
+        db,
+        user_agents=uas,
+        usernames=body.usernames,
+        ban_empty_user_agent=body.ban_empty_user_agent,
+    )
     write_audit(
         db,
         owner_id=admin.id,

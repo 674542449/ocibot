@@ -1,10 +1,17 @@
 """按 IP 封禁：命中规则的访客 IP 直接封掉，之后它的所有请求一律 403。
 
-两条自动规则（管理页「IP 封禁」里可改）：
-  * User-Agent **完全等于**列表里的某一项（默认 ``curl/8.14.1``、``Mozilla/5.0``）——
-    正常浏览器的 UA 是一长串，裸 ``Mozilla/5.0`` 只有脚本会发；
+自动规则（管理页「IP 封禁」里可改）：
+  * User-Agent 命中 UA 列表里的某一行（默认 ``curl/8.14.1``、``Mozilla/5.0``）——
+    普通一行是**完全等于**（区分大小写）；以 ``~`` 开头的一行是**包含**（不分大小写），
+    ``~python-requests`` 一行就能覆盖所有版本号。正常浏览器的 UA 是一长串，
+    裸 ``Mozilla/5.0`` 只有脚本会发；
+  * 不带 User-Agent（或为空）的请求 —— 浏览器一定会发 UA，空的只有脚本和扫描器；
+    默认开启，可关；
   * 用诱饵用户名登录（默认 ``admin``）—— 面板里**没有**这个账号时才算。真有一个叫
     admin 的账号的话，封掉的就是它的主人，所以那种情况下这条规则不生效。
+
+保存 UA 规则时拿一组正常浏览器的 UA 试一遍（BROWSER_SAMPLES），命中任何一个就拒绝
+保存 —— 一条 ``~mozilla`` 会把所有访客连同管理员自己一起封掉。
 
 永远不封：内网 / 本机 / 保留地址（只封公网 IP）、Cloudflare 节点地址，以及
 OCIBOT_IP_BAN_ALLOWLIST 里的地址。前两类的意义在于「识别错了也不会封错」：面板在反代
@@ -35,8 +42,66 @@ log = logging.getLogger("ocibot.ip_ban")
 
 DEFAULT_USER_AGENTS: tuple[str, ...] = ("curl/8.14.1", "Mozilla/5.0")
 DEFAULT_USERNAMES: tuple[str, ...] = ("admin",)
-MAX_RULES = 50
+DEFAULT_BAN_EMPTY_UA = True
+CONTAINS_PREFIX = "~"
+MIN_CONTAINS_LEN = 3
+MAX_RULES = 100
 MAX_RULE_LEN = 200
+
+# 常见爬虫 / 扫描器 / 爆破工具。管理页「填入常见爬虫 UA」把它们追加进输入框，确认后
+# 再保存 —— 不是默认规则：其中有些（python-requests、wget）也可能是运营者自己的脚本。
+RECOMMENDED_USER_AGENTS: tuple[str, ...] = (
+    "Mozilla/4.0",
+    "-",
+    "~python-requests",
+    "~python-urllib",
+    "~python-httpx",
+    "~aiohttp",
+    "~go-http-client",
+    "~okhttp",
+    "~java/",
+    "~apache-httpclient",
+    "~libwww-perl",
+    "~node-fetch",
+    "~axios/",
+    "~wget/",
+    "~zgrab",
+    "~nuclei",
+    "~sqlmap",
+    "~nmap",
+    "~masscan",
+    "~nikto",
+    "~hydra",
+    "~gobuster",
+    "~fuzz faster u fool",
+    "~censysinspect",
+    "~l9explore",
+    "~l9tcpid",
+)
+
+# 正常浏览器的 UA 样本（桌面 / 手机的 Chrome、Edge、Firefox、Safari，微信内置浏览器）。
+# 保存 UA 规则前逐个试，命中就拒绝保存。
+BROWSER_SAMPLES: tuple[str, ...] = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/18.0 Safari/605.1.15",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/130.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; V2309A Build/UP1A.231005.007; wv) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Version/4.0 Chrome/122.0.6261.120 Mobile Safari/537.36 "
+    "XWEB/1220099 MMWEBSDK/20240404 MMWEBID/2307 MicroMessenger/8.0.49.2600(0x28003133) "
+    "WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/130.0.0.0 Safari/537.36",
+)
 REFRESH_SEC = 10.0
 BANNED_DETAIL = "该 IP 已被封禁"
 
@@ -79,10 +144,61 @@ def exempt_reason(ip: str) -> str:
 def _clean_rules(values: Iterable[Any]) -> list[str]:
     out: list[str] = []
     for v in values:
-        text = str(v or "").strip()
+        text = str(v or "").strip()[:MAX_RULE_LEN]
+        if text.startswith(CONTAINS_PREFIX):
+            # 包含匹配不分大小写，存成统一的小写，免得同一条写两遍。
+            text = CONTAINS_PREFIX + text[len(CONTAINS_PREFIX):].strip().lower()
         if text and text not in out:
-            out.append(text[:MAX_RULE_LEN])
+            out.append(text)
     return out[:MAX_RULES]
+
+
+class UaRules:
+    """UA 规则：普通一行完全等于（区分大小写），``~`` 开头的一行包含（不分大小写）。"""
+
+    def __init__(self, lines: Iterable[str]) -> None:
+        exact: set[str] = set()
+        contains: list[str] = []
+        for line in lines:
+            if line.startswith(CONTAINS_PREFIX):
+                pattern = line[len(CONTAINS_PREFIX):].strip().lower()
+                if pattern:
+                    contains.append(pattern)
+            elif line:
+                exact.add(line)
+        self.exact = frozenset(exact)
+        self.contains = tuple(contains)
+
+    def match(self, ua: str) -> str:
+        """命中的那条规则（原样写法）；没命中返回空串。"""
+        if not ua:
+            return ""
+        if ua in self.exact:
+            return ua
+        low = ua.lower()
+        for pattern in self.contains:
+            if pattern in low:
+                return CONTAINS_PREFIX + pattern
+        return ""
+
+
+def validate_user_agent_rules(lines: list[str], *, own_ua: str = "") -> str:
+    """规则有问题时返回原因，没问题返回空串。"""
+    for line in lines:
+        if line.startswith(CONTAINS_PREFIX):
+            pattern = line[len(CONTAINS_PREFIX):].strip()
+            if len(pattern) < MIN_CONTAINS_LEN:
+                return f"「{line}」太短：包含匹配（~ 开头）至少要 {MIN_CONTAINS_LEN} 个字符，太短会误伤正常访客"
+    rules = UaRules(lines)
+    for sample in BROWSER_SAMPLES:
+        hit = rules.match(sample)
+        if hit:
+            return f"「{hit}」会匹配正常浏览器（{sample[:70]}…），保存后所有访客都会被封"
+    if own_ua:
+        hit = rules.match(own_ua.strip())
+        if hit:
+            return f"「{hit}」匹配你当前浏览器的 User-Agent，保存后你自己会被立即封禁"
+    return ""
 
 
 def _read_rule(db: Session, key: str, default: tuple[str, ...]) -> list[str]:
@@ -94,25 +210,41 @@ def _read_rule(db: Session, key: str, default: tuple[str, ...]) -> list[str]:
     return _clean_rules(stored.splitlines())
 
 
-def get_rules(db: Session) -> dict[str, list[str]]:
-    from web.backend.meta import KEY_BAN_USER_AGENTS, KEY_BAN_USERNAMES
+def get_rules(db: Session) -> dict[str, Any]:
+    from web.backend.meta import KEY_BAN_EMPTY_UA, KEY_BAN_USER_AGENTS, KEY_BAN_USERNAMES, get_meta
 
+    empty = get_meta(db, KEY_BAN_EMPTY_UA)
     return {
         "user_agents": _read_rule(db, KEY_BAN_USER_AGENTS, DEFAULT_USER_AGENTS),
         "usernames": _read_rule(db, KEY_BAN_USERNAMES, DEFAULT_USERNAMES),
+        "ban_empty_user_agent": DEFAULT_BAN_EMPTY_UA if empty is None else empty == "true",
     }
 
 
-def set_rules(db: Session, *, user_agents: Iterable[Any], usernames: Iterable[Any]) -> dict[str, list[str]]:
-    from web.backend.meta import KEY_BAN_USER_AGENTS, KEY_BAN_USERNAMES, set_meta
+def clean_user_agent_rules(values: Iterable[Any]) -> list[str]:
+    return _clean_rules(values)
+
+
+def set_rules(
+    db: Session,
+    *,
+    user_agents: Iterable[Any],
+    usernames: Iterable[Any],
+    ban_empty_user_agent: Optional[bool] = None,
+) -> dict[str, Any]:
+    """保存规则。``user_agents`` 应先经 validate_user_agent_rules 检查（管理接口会做）。"""
+    from web.backend.meta import KEY_BAN_EMPTY_UA, KEY_BAN_USER_AGENTS, KEY_BAN_USERNAMES, set_meta
 
     uas = _clean_rules(user_agents)
     names = [n.lower() for n in _clean_rules(usernames)]
+    if ban_empty_user_agent is None:
+        ban_empty_user_agent = bool(get_rules(db)["ban_empty_user_agent"])
     set_meta(db, KEY_BAN_USER_AGENTS, "\n".join(uas))
     set_meta(db, KEY_BAN_USERNAMES, "\n".join(names))
+    set_meta(db, KEY_BAN_EMPTY_UA, "true" if ban_empty_user_agent else "false")
     db.commit()
-    _CACHE.set_rules(uas, names)
-    return {"user_agents": uas, "usernames": names}
+    _CACHE.set_rules(uas, names, ban_empty_user_agent)
+    return {"user_agents": uas, "usernames": names, "ban_empty_user_agent": ban_empty_user_agent}
 
 
 # ---------------------------------------------------------------- 进程内缓存
@@ -121,7 +253,8 @@ def set_rules(db: Session, *, user_agents: Iterable[Any], usernames: Iterable[An
 class _Cache:
     def __init__(self) -> None:
         self.ips: frozenset[str] = frozenset()
-        self.user_agents: frozenset[str] = frozenset(DEFAULT_USER_AGENTS)
+        self.ua_rules = UaRules(DEFAULT_USER_AGENTS)
+        self.ban_empty_ua = DEFAULT_BAN_EMPTY_UA
         self.usernames: frozenset[str] = frozenset(DEFAULT_USERNAMES)
         self.loaded_at = 0.0
         self._lock = threading.Lock()
@@ -142,7 +275,8 @@ class _Cache:
                     ips = frozenset(db.scalars(select(IpBan.ip)).all())
                     rules = get_rules(db)
                 self.ips = ips
-                self.user_agents = frozenset(rules["user_agents"])
+                self.ua_rules = UaRules(rules["user_agents"])
+                self.ban_empty_ua = bool(rules["ban_empty_user_agent"])
                 self.usernames = frozenset(rules["usernames"])
             except Exception:  # noqa: BLE001
                 log.warning("refreshing IP ban list failed; keeping the previous one", exc_info=True)
@@ -156,16 +290,18 @@ class _Cache:
         with self._lock:
             self.ips = self.ips - set(ips)
 
-    def set_rules(self, user_agents: Iterable[str], usernames: Iterable[str]) -> None:
+    def set_rules(self, user_agents: Iterable[str], usernames: Iterable[str], ban_empty_ua: bool) -> None:
         with self._lock:
-            self.user_agents = frozenset(user_agents)
+            self.ua_rules = UaRules(user_agents)
             self.usernames = frozenset(usernames)
+            self.ban_empty_ua = bool(ban_empty_ua)
 
     def reset(self) -> None:
         """测试用：清空并让下一次检查重新读库。"""
         with self._lock:
             self.ips = frozenset()
-            self.user_agents = frozenset(DEFAULT_USER_AGENTS)
+            self.ua_rules = UaRules(DEFAULT_USER_AGENTS)
+            self.ban_empty_ua = DEFAULT_BAN_EMPTY_UA
             self.usernames = frozenset(DEFAULT_USERNAMES)
             self.loaded_at = 0.0
 
@@ -304,10 +440,16 @@ class IpBanMiddleware:
             if name == b"user-agent":
                 ua = value.decode("latin-1").strip()
                 break
-        # UA **完全等于**某条规则（区分大小写，只去掉首尾空白）。
-        if ua and ua in _CACHE.user_agents and not exempt_reason(ip):
-            detail = f"UA={ua} {scope.get('method') or 'WS'} {scope.get('path') or ''}"
-            await run_in_threadpool(ban_standalone, ip, reason="user_agent", detail=detail)
+        where = f"{scope.get('method') or 'WS'} {scope.get('path') or ''}"
+        if not ua:
+            reason = "empty_user_agent" if _CACHE.ban_empty_ua else ""
+            detail = f"没有 User-Agent {where}"
+        else:
+            hit = _CACHE.ua_rules.match(ua)
+            reason = "user_agent" if hit else ""
+            detail = f"UA={ua}（规则 {hit}）{where}" if hit and hit != ua else f"UA={ua} {where}"
+        if reason and not exempt_reason(ip):
+            await run_in_threadpool(ban_standalone, ip, reason=reason, detail=detail)
             await _reject(scope, send)
             return
         await self.app(scope, receive, send)

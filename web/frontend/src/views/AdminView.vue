@@ -180,9 +180,9 @@
         <button :disabled="banBusy" @click="loadBans">刷新</button>
       </div>
       <p class="muted" style="margin: 0; font-size: 12px">
-        User-Agent 完全等于下面某一行的请求、或用诱饵用户名登录（面板里没有这个账号时），来源 IP 会被立即封禁，之后它的所有请求都返回
-        403。内网 / 本机 / Cloudflare 节点 / 白名单（OCIBOT_IP_BAN_ALLOWLIST）地址永远不封。被封在外面时，在服务器上执行
-        <code>bash scripts/install.sh unban 你的IP</code>。
+        User-Agent 命中下面某一行、不带 User-Agent（开关打开时）、或用诱饵用户名登录（面板里没有这个账号时）的请求，来源 IP
+        会被立即封禁，之后它的所有请求都返回 403。内网 / 本机 / Cloudflare 节点 / 白名单（OCIBOT_IP_BAN_ALLOWLIST）地址永远不封。
+        被封在外面时，在服务器上执行 <code>bash scripts/install.sh unban 你的IP</code>。
       </p>
       <div v-if="banViewer" style="font-size: 13px">
         面板看到的你的 IP：<b>{{ banViewer.your_ip }}</b>
@@ -195,16 +195,28 @@
 
       <div class="grid-2">
         <div class="field">
-          <label>封禁的 User-Agent（每行一个，完全匹配，区分大小写）</label>
-          <textarea v-model="banUaText" rows="4" spellcheck="false"></textarea>
+          <label>封禁的 User-Agent（每行一个）</label>
+          <textarea v-model="banUaText" rows="6" spellcheck="false"></textarea>
+          <p class="muted" style="margin: 0.25rem 0 0; font-size: 12px">
+            普通一行：完全等于才封（区分大小写），如 <code>curl/8.14.1</code>。<br />
+            <code>~</code> 开头：UA 里包含这段文字就封（不分大小写、不管版本号），如 <code>~python-requests</code>。<br />
+            会误伤正常浏览器的规则（如 <code>~mozilla</code>）保存时会被拒绝。
+          </p>
         </div>
         <div class="field">
           <label>诱饵用户名（每行一个，不区分大小写）</label>
           <textarea v-model="banNameText" rows="4" spellcheck="false"></textarea>
         </div>
       </div>
+      <label class="choice">
+        <input v-model="banEmptyUa" type="checkbox" />
+        <span>不带 User-Agent 的请求也封（浏览器一定会带 UA，空的只有脚本和扫描器）</span>
+      </label>
       <div class="row">
         <button class="primary" :disabled="banBusy" @click="saveBanRules">保存规则</button>
+        <button :disabled="banBusy || !banRecommended.length" @click="fillRecommended">
+          填入常见爬虫 UA
+        </button>
         <input v-model="manualBanIp" placeholder="手动封禁 IP，如 1.2.3.4" style="max-width: 260px" @keyup.enter="manualBan" />
         <button :disabled="banBusy || !manualBanIp.trim()" @click="manualBan">封禁</button>
       </div>
@@ -417,14 +429,42 @@ const banTotal = ref(0)
 const banViewer = ref<any>(null)
 const banUaText = ref('')
 const banNameText = ref('')
+const banEmptyUa = ref(true)
+const banRecommended = ref<string[]>([])
 const manualBanIp = ref('')
 const banBusy = ref(false)
 const banSelected = reactive(new Set<string>())
+// 上一次从服务器填进表单的规则。刷新列表 / 封禁 / 解封都会重读，只有表单还没被改过时
+// 才用新读到的覆盖 —— 否则改了一半的规则会在点「解封」的瞬间被冲掉。
+// 初值等于空表单，第一次加载才会填进去。
+let banRulesShown = JSON.stringify(['', '', true])
 
 const allBansSelected = computed(() => bans.value.length > 0 && bans.value.every((b) => banSelected.has(b.ip)))
 
 function banReasonLabel(r: string) {
-  return ({ user_agent: '封禁 UA', honeypot_username: '诱饵用户名', manual: '手动封禁' } as Record<string, string>)[r] || r
+  return (
+    ({
+      user_agent: '封禁 UA',
+      empty_user_agent: '没有 UA',
+      honeypot_username: '诱饵用户名',
+      manual: '手动封禁',
+    } as Record<string, string>)[r] || r
+  )
+}
+
+function banRulesForm() {
+  return JSON.stringify([banUaText.value, banNameText.value, banEmptyUa.value])
+}
+
+function fillRecommended() {
+  const have = new Set(lines(banUaText.value).map((l) => (l.startsWith('~') ? l.toLowerCase() : l)))
+  const add = banRecommended.value.filter((r) => !have.has(r))
+  if (!add.length) {
+    msg.value = '常见爬虫 UA 都已经在列表里了'
+    return
+  }
+  banUaText.value = [...lines(banUaText.value), ...add].join('\n')
+  msg.value = `已填入 ${add.length} 条常见爬虫 UA，确认后点「保存规则」才会生效`
 }
 
 function lines(text: string) {
@@ -440,8 +480,13 @@ async function loadBans() {
     bans.value = data.bans || []
     banTotal.value = data.total || 0
     banViewer.value = data.viewer || null
-    banUaText.value = (data.rules?.user_agents || []).join('\n')
-    banNameText.value = (data.rules?.usernames || []).join('\n')
+    banRecommended.value = data.recommended_user_agents || []
+    if (banRulesForm() === banRulesShown) {
+      banUaText.value = (data.rules?.user_agents || []).join('\n')
+      banNameText.value = (data.rules?.usernames || []).join('\n')
+      banEmptyUa.value = data.rules?.ban_empty_user_agent !== false
+      banRulesShown = banRulesForm()
+    }
     // 只保留还在列表里的勾选。
     for (const ip of [...banSelected]) if (!bans.value.some((b) => b.ip === ip)) banSelected.delete(ip)
   } catch (e: any) {
@@ -453,10 +498,16 @@ async function saveBanRules() {
   error.value = ''
   banBusy.value = true
   try {
-    await api.put('/admin/ip-ban-rules', {
+    const { data } = await api.put('/admin/ip-ban-rules', {
       user_agents: lines(banUaText.value),
       usernames: lines(banNameText.value),
+      ban_empty_user_agent: banEmptyUa.value,
     })
+    // 用服务器规范化之后的写法（~ 规则转小写、去重）回填，并当作「未改动」的基准。
+    banUaText.value = (data.rules?.user_agents || []).join('\n')
+    banNameText.value = (data.rules?.usernames || []).join('\n')
+    banEmptyUa.value = data.rules?.ban_empty_user_agent !== false
+    banRulesShown = banRulesForm()
     msg.value = '封禁规则已保存'
     await loadBans()
   } catch (e: any) {
