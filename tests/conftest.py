@@ -49,9 +49,10 @@ def _fresh_login_limiters():
         login_ip_limiter,
         login_user_limiter,
         register_ip_limiter,
+        unlock_ip_limiter,
     )
 
-    for limiter in (login_ip_limiter, login_user_limiter, register_ip_limiter):
+    for limiter in (login_ip_limiter, login_user_limiter, register_ip_limiter, unlock_ip_limiter):
         with limiter._lock:  # noqa: SLF001 - test-only reset of shared state
             limiter._hits.clear()  # noqa: SLF001
     yield

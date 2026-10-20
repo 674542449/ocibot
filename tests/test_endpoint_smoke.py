@@ -547,6 +547,12 @@ def test_every_endpoint_is_wired() -> None:
         check("PUT", "/api/admin/ip-ban-rules",
               c.put("/api/admin/ip-ban-rules",
                     json={"user_agents": ["curl/8.14.1", "Mozilla/5.0"], "usernames": ["admin"]}))
+        # 登录锁屏：开、解锁、关 —— 必须关回去，否则后面重新登录那一步会被锁屏挡住。
+        check("GET", "/api/auth/lock-status", c.get("/api/auth/lock-status"))
+        check("GET", "/api/admin/lock-screen", c.get("/api/admin/lock-screen"))
+        check("PUT", "/api/admin/lock-screen", c.put("/api/admin/lock-screen", json={"password": "smoke-lock-1"}))
+        check("POST", "/api/auth/unlock", c.post("/api/auth/unlock", json={"password": "smoke-lock-1"}))
+        check("DELETE", "/api/admin/lock-screen", c.delete("/api/admin/lock-screen"))
 
         # Admin reset targets a SECOND user on purpose: the route refuses to reset
         # the caller's own password, so pointing it at ourselves would exercise the

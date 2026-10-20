@@ -176,6 +176,32 @@
 
     <div class="card stack">
       <div class="row" style="justify-content: space-between; align-items: center">
+        <h3 style="margin: 0">登录锁屏</h3>
+        <span class="badge" :class="lockEnabled ? 'running' : ''">{{ lockEnabled ? '已开启' : '未开启' }}</span>
+      </div>
+      <p class="muted" style="margin: 0; font-size: 12px">
+        开启后，登录页先显示锁屏，输对锁屏密码才出现账号密码框；服务端登录接口同样要求先解锁，直接调接口的爆破脚本连账号密码都试不了。
+        锁屏页上会写「默认密码为 {{ lockDecoy }}」—— 那是诱饵，<b>输入 {{ lockDecoy }} 的 IP 会被直接封禁</b>（你自己也别输）。
+        解锁后 {{ lockTtl }} 分钟内要完成登录。忘了锁屏密码：在服务器上执行 <code>bash scripts/install.sh lock-off</code>。
+      </p>
+      <div class="row" style="align-items: flex-end">
+        <div class="field" style="max-width: 220px">
+          <label>{{ lockEnabled ? '新的锁屏密码' : '锁屏密码' }}</label>
+          <input v-model="lockPassword" type="password" autocomplete="new-password" />
+        </div>
+        <div class="field" style="max-width: 220px">
+          <label>再输一次</label>
+          <input v-model="lockPassword2" type="password" autocomplete="new-password" @keyup.enter="saveLock" />
+        </div>
+        <button class="primary" :disabled="lockBusy || !lockPassword" @click="saveLock">
+          {{ lockEnabled ? '修改锁屏密码' : '开启登录锁屏' }}
+        </button>
+        <button v-if="lockEnabled" :disabled="lockBusy" @click="disableLock">关闭锁屏</button>
+      </div>
+    </div>
+
+    <div class="card stack">
+      <div class="row" style="justify-content: space-between; align-items: center">
         <h3 style="margin: 0">IP 封禁</h3>
         <button :disabled="banBusy" @click="loadBans">刷新</button>
       </div>
@@ -420,7 +446,69 @@ async function load() {
   allowOpenRegistration.value = !!s.data.allow_open_registration
   settingsSource.value = s.data.source
   meId.value = me.data.id
-  await Promise.all([loadUpdate(), loadBans()])
+  await Promise.all([loadUpdate(), loadBans(), loadLock()])
+}
+
+// ---- 登录锁屏
+const lockEnabled = ref(false)
+const lockDecoy = ref('123456')
+const lockTtl = ref(30)
+const lockPassword = ref('')
+const lockPassword2 = ref('')
+const lockBusy = ref(false)
+
+function applyLock(data: any) {
+  lockEnabled.value = !!data?.enabled
+  if (data?.decoy_password) lockDecoy.value = data.decoy_password
+  if (data?.unlock_ttl_min) lockTtl.value = data.unlock_ttl_min
+}
+
+async function loadLock() {
+  try {
+    const { data } = await api.get('/admin/lock-screen')
+    applyLock(data)
+  } catch (e: any) {
+    error.value = e?.message || '读取登录锁屏设置失败'
+  }
+}
+
+async function saveLock() {
+  error.value = ''
+  if (lockPassword.value !== lockPassword2.value) {
+    error.value = '两次输入的锁屏密码不一致'
+    return
+  }
+  if (lockPassword.value === lockDecoy.value) {
+    error.value = `${lockDecoy.value} 是诱饵密码（输入它的人会被封 IP），不能用作锁屏密码`
+    return
+  }
+  lockBusy.value = true
+  try {
+    const { data } = await api.put('/admin/lock-screen', { password: lockPassword.value })
+    applyLock(data)
+    lockPassword.value = ''
+    lockPassword2.value = ''
+    msg.value = `${data.message}。下次登录时先输入锁屏密码；请记住它（忘了只能在服务器上执行 lock-off）。`
+  } catch (e: any) {
+    error.value = e?.message || '保存失败'
+  } finally {
+    lockBusy.value = false
+  }
+}
+
+async function disableLock() {
+  if (!confirm('关闭登录锁屏？之后登录页直接显示账号密码框。')) return
+  error.value = ''
+  lockBusy.value = true
+  try {
+    const { data } = await api.delete('/admin/lock-screen')
+    applyLock(data)
+    msg.value = data.message || '登录锁屏已关闭'
+  } catch (e: any) {
+    error.value = e?.message || '关闭失败'
+  } finally {
+    lockBusy.value = false
+  }
 }
 
 // ---- IP 封禁（只读写面板自己的数据库，不请求 Oracle，所以随页面一起加载）
@@ -449,6 +537,7 @@ function banReasonLabel(r: string) {
       empty_user_agent: '没有 UA',
       honeypot_username: '诱饵用户名',
       manual: '手动封禁',
+      lock_decoy: '锁屏诱饵密码',
     } as Record<string, string>)[r] || r
   )
 }

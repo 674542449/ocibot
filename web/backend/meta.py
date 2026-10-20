@@ -17,6 +17,8 @@ KEY_OPEN_REGISTRATION = "allow_open_registration"  # "true"/"false"; overrides e
 KEY_BAN_USER_AGENTS = "ip_ban_user_agents"
 KEY_BAN_USERNAMES = "ip_ban_usernames"
 KEY_BAN_EMPTY_UA = "ip_ban_empty_user_agent"  # "true"/"false"；没设置过时默认开启
+# 登录锁屏密码的哈希（lock_screen.py）；空串 / 没设置 = 锁屏未开启。
+KEY_LOCK_PASSWORD_HASH = "lock_screen_password_hash"
 
 
 def get_meta(db: Session, key: str) -> Optional[str]:

@@ -47,3 +47,5 @@ class SlidingWindowLimiter:
 login_user_limiter = SlidingWindowLimiter(max_hits=10, window_sec=300)
 login_ip_limiter = SlidingWindowLimiter(max_hits=30, window_sec=300)
 register_ip_limiter = SlidingWindowLimiter(max_hits=5, window_sec=600)
+# 登录锁屏密码（lock_screen.py）：每 IP 5 分钟 10 次。输诱饵密码 123456 的直接封 IP，不走这里。
+unlock_ip_limiter = SlidingWindowLimiter(max_hits=10, window_sec=300)

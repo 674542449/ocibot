@@ -32,6 +32,12 @@ class RegisterRequest(BaseModel):
     password: str = Field(min_length=8, max_length=128)
 
 
+class UnlockRequest(BaseModel):
+    """登录锁屏（lock_screen.py）。"""
+
+    password: str = Field(min_length=1, max_length=128)
+
+
 class LoginRequest(BaseModel):
     # Bounded like RegisterRequest: the username becomes part of the in-memory
     # rate-limit bucket key, so an unbounded value let unauthenticated requests

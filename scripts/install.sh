@@ -855,6 +855,14 @@ do_bans() {
   fi
 }
 
+# 登录锁屏（web/backend/lock_screen.py）：忘了锁屏密码时从服务器上关掉它。
+do_lock_off() {
+  ensure_docker
+  ensure_repo
+  link_root_env
+  compose exec -T api python -m web.backend.lock_screen off
+}
+
 cmd="${1:-install}"
 case "$cmd" in
   install|up) do_install ;;
@@ -875,9 +883,13 @@ case "$cmd" in
   update-off) do_update_toggle 0 ;;
   unban)      do_bans unban "${@:2}" ;;
   bans)       do_bans list ;;
+  lock-off)   do_lock_off ;;
   *)
     cat <<EOF
-用法: $0 {install|update|status|uninstall|domain <域名>|ip|update-on|update-off|unban <IP>|bans}
+用法: $0 {install|update|status|uninstall|domain <域名>|ip|update-on|update-off|unban <IP>|bans|lock-off}
+
+登录锁屏:
+  $0 lock-off                   忘了锁屏密码时关掉登录锁屏（登录后可在管理页重新设置）
 
 IP 封禁（被封在面板外面时用）:
   $0 unban 1.2.3.4              解封这个 IP（可以一次写多个）

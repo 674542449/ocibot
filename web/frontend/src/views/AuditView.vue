@@ -178,6 +178,8 @@ const ACTION_LABELS: Record<string, string> = {
   'admin.settings': '修改面板设置',
   'admin.self_update': '一键更新',
   'admin.ip_ban_rules': '修改 IP 封禁规则',
+  'admin.lock_screen': '修改登录锁屏',
+  'auth.unlock_failed': '锁屏密码错误',
   'security.ip_banned': '封禁 IP',
   'security.ip_unbanned': '解封 IP',
 }

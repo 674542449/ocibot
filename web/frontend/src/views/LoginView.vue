@@ -22,7 +22,25 @@
       </section>
 
       <section class="panel">
-        <form class="login-form stack" @submit.prevent="submit">
+        <!-- 登录锁屏（管理页「登录锁屏」开启后才出现）。那行「默认密码」是诱饵：
+             真正的锁屏密码不允许设成它，输它的 IP 会被服务端直接封禁。 -->
+        <form v-if="locked" class="login-form stack" @submit.prevent="doUnlock">
+          <header class="form-head">
+            <h2>屏幕已锁定</h2>
+            <p class="muted">请输入锁屏密码以继续。</p>
+          </header>
+          <div class="field">
+            <label for="lock-pass">锁屏密码</label>
+            <input id="lock-pass" v-model="lockPassword" type="password" autocomplete="off" required />
+          </div>
+          <p v-if="lock.default_hint" class="muted tip">提示：默认锁屏密码为 {{ lock.default_hint }}</p>
+          <div v-if="error" class="error-box">{{ error }}</div>
+          <button class="primary submit" type="submit" :disabled="loading">
+            {{ loading ? '验证中…' : '解锁' }}
+          </button>
+        </form>
+
+        <form v-else class="login-form stack" @submit.prevent="submit">
           <header class="form-head">
             <h2>{{ mode === 'login' ? '登录' : '创建账号' }}</h2>
             <p v-if="mode === 'register'" class="muted">首个注册账号将获得管理员权限。</p>
@@ -125,7 +143,29 @@ const hint = ref('')
 /** Version of the running build, read before sign-in (/api/health is public). */
 const health = reactive<{ version: string; status: string }>({ version: '', status: '' })
 
+/** 登录锁屏状态。读不到时先按「没开」显示登录框 —— 服务端照样把关，登录时会答
+ *  unlock_required，那时再切到锁屏（见 submit）。 */
+const lock = reactive<{ enabled: boolean; unlocked: boolean; default_hint: string }>({
+  enabled: false,
+  unlocked: true,
+  default_hint: '',
+})
+const locked = computed(() => lock.enabled && !lock.unlocked)
+const lockPassword = ref('')
+
+async function loadLockStatus() {
+  try {
+    const { data } = await api.get('/auth/lock-status')
+    lock.enabled = !!data?.enabled
+    lock.unlocked = !!data?.unlocked
+    lock.default_hint = String(data?.default_hint || '')
+  } catch {
+    // 同上：读不到不挡路。
+  }
+}
+
 onMounted(async () => {
+  void loadLockStatus()
   try {
     const { data } = await api.get<{ version?: string; status?: string }>('/health')
     health.version = String(data?.version || '')
@@ -135,6 +175,21 @@ onMounted(async () => {
     // and an error here would sit above the field the operator came to fill in.
   }
 })
+
+async function doUnlock() {
+  error.value = ''
+  hint.value = ''
+  loading.value = true
+  try {
+    await api.post('/auth/unlock', { password: lockPassword.value })
+    lock.unlocked = true
+    lockPassword.value = ''
+  } catch (e: any) {
+    error.value = e?.message || '解锁失败'
+  } finally {
+    loading.value = false
+  }
+}
 
 /** 'ok' is the only state with a settled meaning; anything else is shown
  *  verbatim rather than flattened into a word that hides which fault it is. */
@@ -168,6 +223,12 @@ async function submit() {
     if (msg === 'totp_required') {
       needTotp.value = true
       error.value = '该账号已开启两步验证，请输入认证器中的 6 位验证码'
+    } else if (msg === 'unlock_required') {
+      // 锁屏是刚开的，或者解锁已经过期（30 分钟）：回到锁屏，账号密码保留在框里。
+      await loadLockStatus()
+      lock.enabled = true
+      lock.unlocked = false
+      error.value = '请先输入锁屏密码'
     } else {
       error.value = msg
     }

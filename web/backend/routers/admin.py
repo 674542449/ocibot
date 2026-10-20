@@ -19,7 +19,7 @@ from web.backend.db import get_db
 from web.backend.meta import KEY_OPEN_REGISTRATION, get_meta, set_meta
 from web.backend.schemas import UtcDatetime
 from web.backend.models import Tenant, User
-from web.backend import client_ip, ip_ban, self_update
+from web.backend import client_ip, ip_ban, lock_screen, self_update
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -321,6 +321,69 @@ def put_ip_ban_rules(
         detail=rules,
     )
     return {"ok": True, "rules": rules}
+
+
+# ---------------------------------------------------------------------------
+# 登录锁屏（web/backend/lock_screen.py）
+# ---------------------------------------------------------------------------
+
+
+class LockScreenSet(BaseModel):
+    password: str = Field(min_length=1, max_length=lock_screen.MAX_LENGTH)
+
+
+def _lock_state(db: Session) -> dict[str, Any]:
+    return {
+        "enabled": lock_screen.enabled(db),
+        "decoy_password": lock_screen.DECOY_PASSWORD,
+        "unlock_ttl_min": lock_screen.UNLOCK_TTL_MIN,
+    }
+
+
+@router.get("/lock-screen")
+def get_lock_screen(
+    admin: Annotated[User, Depends(get_admin_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    _ = admin
+    return _lock_state(db)
+
+
+@router.put("/lock-screen")
+def set_lock_screen(
+    body: LockScreenSet,
+    admin: Annotated[User, Depends(get_admin_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    problem = lock_screen.password_problem(body.password)
+    if problem:
+        raise HTTPException(status_code=400, detail=problem)
+    was_on = lock_screen.enabled(db)
+    lock_screen.set_password(db, body.password)
+    write_audit(
+        db,
+        owner_id=admin.id,
+        action="admin.lock_screen",
+        target="login_lock_screen",
+        detail="修改锁屏密码" if was_on else "开启登录锁屏",
+    )
+    return {"ok": True, "message": "锁屏密码已更新" if was_on else "登录锁屏已开启", **_lock_state(db)}
+
+
+@router.delete("/lock-screen")
+def disable_lock_screen(
+    admin: Annotated[User, Depends(get_admin_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    lock_screen.disable(db)
+    write_audit(
+        db,
+        owner_id=admin.id,
+        action="admin.lock_screen",
+        target="login_lock_screen",
+        detail="关闭登录锁屏",
+    )
+    return {"ok": True, "message": "登录锁屏已关闭", **_lock_state(db)}
 
 
 # ---------------------------------------------------------------------------

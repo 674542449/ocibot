@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from web.backend import ip_ban
+from web.backend import ip_ban, lock_screen
 from web.backend.audit import write_audit
 from web.backend.auth import (
     clear_auth_cookie,
@@ -31,6 +31,7 @@ from web.backend.rate_limit import (
     login_ip_limiter,
     login_user_limiter,
     register_ip_limiter,
+    unlock_ip_limiter,
 )
 from web.backend.schemas import (
     ChangePasswordRequest,
@@ -38,6 +39,7 @@ from web.backend.schemas import (
     LoginRequest,
     RegisterRequest,
     TokenResponse,
+    UnlockRequest,
     TotpDisableRequest,
     TotpEnableRequest,
     TotpSetupOut,
@@ -185,6 +187,70 @@ def _verify_totp(user: User, code: str) -> bool:
     return pyotp.TOTP(secret).verify((code or "").strip().replace(" ", ""), valid_window=1)
 
 
+def _require_unlocked(request: Request, db: Session) -> None:
+    if not lock_screen.request_unlocked(request, db):
+        raise HTTPException(status_code=403, detail=lock_screen.UNLOCK_REQUIRED)
+
+
+@router.get("/lock-status")
+def lock_status(request: Request, db: Annotated[Session, Depends(get_db)]) -> dict[str, Any]:
+    """登录页据此决定先显示锁屏还是直接显示账号密码框。"""
+    on = lock_screen.enabled(db)
+    return {
+        "enabled": on,
+        "unlocked": (not on) or lock_screen.request_unlocked(request, db),
+        # 锁屏页上那行「默认密码为 …」—— 诱饵，见 unlock()。
+        "default_hint": lock_screen.DECOY_PASSWORD if on else "",
+    }
+
+
+@router.post("/unlock")
+def unlock(
+    body: UnlockRequest,
+    request: Request,
+    response: Response,
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    """输锁屏密码。输对了下发解锁凭证（HttpOnly Cookie，UNLOCK_TTL_MIN 分钟内有效）。
+
+    锁屏页写着「默认密码为 123456」，那是诱饵：真正的锁屏密码不允许设成它，所以输它的
+    只会是照着提示来的人或脚本 —— 直接封 IP。放在限流之前，第一次就封。
+    """
+    if not lock_screen.enabled(db):
+        return {"ok": True, "unlocked": True}
+    ip = _client_ip(request)
+    agent = (request.headers.get("user-agent") or "").strip()[:200]
+    if body.password.strip() == lock_screen.DECOY_PASSWORD:
+        banned, _why = ip_ban.ban_ip(
+            db,
+            ip,
+            reason="lock_decoy",
+            detail=f"锁屏输入了诱饵密码 {lock_screen.DECOY_PASSWORD} UA={agent}",
+        )
+        if banned:
+            raise HTTPException(status_code=403, detail=ip_ban.BANNED_DETAIL)
+        # 免封的地址（内网 / 白名单）：当成普通的输错处理，不说破。
+
+    ok, retry = unlock_ip_limiter.check(f"unlock:{ip}")
+    if not ok:
+        raise HTTPException(
+            status_code=429,
+            detail=f"锁屏密码尝试过多，请 {int(retry) + 1} 秒后重试",
+            headers={"Retry-After": str(int(retry) + 1)},
+        )
+    if not lock_screen.verify(db, body.password):
+        write_audit(
+            db,
+            owner_id=None,
+            action="auth.unlock_failed",
+            target="(锁屏)",
+            detail={"ip": ip, "ua": agent},
+        )
+        raise HTTPException(status_code=401, detail="锁屏密码错误")
+    lock_screen.set_unlock_cookie(response, lock_screen.issue_token(db))
+    return {"ok": True, "unlocked": True}
+
+
 @router.post("/register", response_model=TokenResponse, status_code=201)
 def register(
     body: RegisterRequest,
@@ -193,6 +259,7 @@ def register(
     db: Annotated[Session, Depends(get_db)],
 ) -> TokenResponse:
     ip = _client_ip(request)
+    _require_unlocked(request, db)
     ok, retry = register_ip_limiter.check(f"reg:{ip}")
     if not ok:
         raise HTTPException(
@@ -301,6 +368,10 @@ def login(
         )
         if banned:
             raise HTTPException(status_code=403, detail=ip_ban.BANNED_DETAIL)
+
+    # 登录锁屏：开着的话先要有解锁凭证，直接调接口的脚本连账号密码都试不了。
+    # 放在诱饵用户名之后：拿 admin 来试的，不管有没有解锁都先封掉。
+    _require_unlocked(request, db)
 
     ok_ip, retry_ip = login_ip_limiter.check(f"login-ip:{ip}")
     # 限流键要用**归一化后**的用户名。

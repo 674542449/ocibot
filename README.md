@@ -394,6 +394,7 @@ ocibot/
 | 容量重试不跑 | 侧栏 Worker 离线提示；检查 worker 容器日志 |
 | 登录限流异常 | 直连部署保持 `OCIBOT_TRUST_PROXY=0`；反代需覆盖客户端 IP 头后再开启 |
 | 打开面板只看到 `{"detail":"该 IP 已被封禁"}` | 你的 IP 被自动封禁了（UA 命中封禁规则，或用诱饵用户名登录过）。在服务器上 `bash scripts/install.sh unban 你的IP`，10 秒内生效；以后把自己的 IP 写进 `OCIBOT_IP_BAN_ALLOWLIST` |
+| 忘了登录锁屏密码 | 在服务器上 `bash scripts/install.sh lock-off` 关掉锁屏，登录后在「用户管理 · 系统更新」→「登录锁屏」重新设置。锁屏页上的「默认密码 123456」是诱饵，输了会被封 IP（见上一行） |
 | 管理页「IP 封禁」里「你的 IP」是 172.x / 10.x 之类内网地址 | 面板没拿到真实 IP，自动封禁不会生效。域名模式（内置 Caddy）和 Cloudflare 都不用额外配置；自建反代要开 `OCIBOT_TRUST_PROXY=1` 并把反代地址写进 `OCIBOT_FORWARDED_ALLOW_IPS` |
 | 私钥解密失败 | `OCIBOT_MASTER_KEY` 被更换；需用旧密钥或重新导入租户 / 恢复备份 |
 | compose 报 `POSTGRES_PASSWORD 未设置` | `web/.env` 里写一个随机值，并确认项目根有 `.env` → `web/.env` 的软链（以前这里会静默回落到内置默认密码） |
