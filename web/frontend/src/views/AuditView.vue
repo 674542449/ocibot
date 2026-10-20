@@ -180,6 +180,7 @@ const ACTION_LABELS: Record<string, string> = {
   'admin.ip_ban_rules': '修改 IP 封禁规则',
   'admin.lock_screen': '修改登录锁屏',
   'auth.unlock_failed': '锁屏密码错误',
+  'auth.login_locked': '未解锁锁屏就登录（被拦）',
   'security.ip_banned': '封禁 IP',
   'security.ip_unbanned': '解封 IP',
 }

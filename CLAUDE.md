@@ -75,6 +75,16 @@ unmapping one again fails the suite instead of production.
   rather than reimplementing the caps, so the two cannot drift.
 - `OCIBOT_MASTER_KEY` is stretched with a single unsalted SHA-256 into the Fernet
   key. Changing that derivation makes every stored OCI private key undecryptable.
+- `/api/health` omits `version` for public-IP callers that are not logged in. The repo
+  is public, so the version tells an outsider exactly which source (and which
+  defences) is running. Server-local / private callers (the README `curl
+  127.0.0.1`, install.sh, the container healthcheck, self-update) still get it.
+- The frontend bundle is downloadable without logging in, so it must not contain
+  honeypot values or what they are for (the lock-screen decoy password, honeypot
+  usernames, ban rules, ban reason codes). The admin page gets that text from the
+  admin-only API; `tests/test_frontend_exposure.py` fails if it reappears in
+  `web/frontend/src`. Login responses carry no session token in the body — it lives
+  only in the HttpOnly cookie.
 
 ## Security review history
 

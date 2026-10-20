@@ -22,9 +22,16 @@
       </section>
 
       <section class="panel">
-        <!-- 登录锁屏（管理页「登录锁屏」开启后才出现）。那行「默认密码」是诱饵：
-             真正的锁屏密码不允许设成它，输它的 IP 会被服务端直接封禁。 -->
-        <form v-if="locked" class="login-form stack" @submit.prevent="doUnlock">
+        <!-- 登录锁屏（管理页「登录锁屏」开启后才出现）。提示文字和它的用意都在服务端
+             （web/backend/lock_screen.py），这里只照着 /auth/lock-status 显示，前端代码里
+             不写任何具体的值 —— 打包出来的 JS 不用登录就能下载。 -->
+        <!-- 锁屏状态读回来之前什么表单都不给：以前先露出账号密码框、再被锁屏换掉，
+             锁屏开着的面板会先把登录框亮给访客看一眼。 -->
+        <div v-if="!lockChecked" class="login-form stack" aria-busy="true">
+          <p class="muted">正在加载…</p>
+        </div>
+
+        <form v-else-if="locked" class="login-form stack" @submit.prevent="doUnlock">
           <header class="form-head">
             <h2>屏幕已锁定</h2>
             <p class="muted">请输入锁屏密码以继续。</p>
@@ -110,8 +117,9 @@
     </main>
 
     <!-- Real, not decorative: the build you are about to sign in to. -->
-    <footer v-if="health.version" class="readout">
-      <span class="ro"><i class="ro-k">版本</i><b>v{{ health.version }}</b></span>
+    <!-- 版本号只在服务器本机 / 内网访问时才有（/api/health 不对外网未登录的访客报版本）。 -->
+    <footer v-if="health.status" class="readout">
+      <span v-if="health.version" class="ro"><i class="ro-k">版本</i><b>v{{ health.version }}</b></span>
       <span class="ro">
         <i class="ro-k">API</i>
         <b><i class="dot" :class="{ down: health.status !== 'ok' }"></i>{{ apiStatusLabel }}</b>
@@ -140,7 +148,7 @@ const loading = ref(false)
 const error = ref('')
 const hint = ref('')
 
-/** Version of the running build, read before sign-in (/api/health is public). */
+/** 正在运行的版本（/api/health 公开，但只对服务器本机 / 内网和已登录的人报版本号）。 */
 const health = reactive<{ version: string; status: string }>({ version: '', status: '' })
 
 /** 登录锁屏状态。读不到时先按「没开」显示登录框 —— 服务端照样把关，登录时会答
@@ -152,6 +160,8 @@ const lock = reactive<{ enabled: boolean; unlocked: boolean; default_hint: strin
 })
 const locked = computed(() => lock.enabled && !lock.unlocked)
 const lockPassword = ref('')
+/** 锁屏状态读回来（或读失败）之后才显示表单。 */
+const lockChecked = ref(false)
 
 async function loadLockStatus() {
   try {
@@ -161,6 +171,8 @@ async function loadLockStatus() {
     lock.default_hint = String(data?.default_hint || '')
   } catch {
     // 同上：读不到不挡路。
+  } finally {
+    lockChecked.value = true
   }
 }
 

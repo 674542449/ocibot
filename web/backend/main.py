@@ -10,7 +10,7 @@ import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -56,6 +56,27 @@ if _STARTUP_BLOCK is None:
         webssh,
     )
     from web.backend.schemas import HealthOut
+
+def _may_see_version(request: "Request") -> bool:
+    """/api/health 的版本号给不给：本机 / 内网 / 认不出的来源给，公网来源只给已登录的。"""
+    from web.backend import client_ip
+
+    addr = client_ip.parse_ip(client_ip.from_request(request))
+    if addr is None or not addr.is_global:
+        return True
+    from web.backend.auth import COOKIE_NAME, decode_token
+
+    token = request.cookies.get(COOKIE_NAME) or ""
+    auth = request.headers.get("authorization") or ""
+    if not token and auth.lower().startswith("bearer "):
+        token = auth[7:].strip()
+    if not token:
+        return False
+    try:
+        return bool(decode_token(token).get("sub"))
+    except Exception:  # noqa: BLE001 - 无效 / 过期的凭证就是没登录
+        return False
+
 
 # Built frontend (web/frontend/dist). When present, the API process serves the
 # SPA directly — single-service deployment without a separate static host.
@@ -245,9 +266,16 @@ def create_app() -> FastAPI:
     app.include_router(system.router, prefix="/api")
     app.include_router(admin.router, prefix="/api")
 
-    @app.get("/api/health", response_model=HealthOut, tags=["system"])
-    def health() -> HealthOut:
-        return HealthOut(status="ok", version=settings.app_version, app=settings.app_name)
+    @app.get("/api/health", response_model=HealthOut, response_model_exclude_none=True, tags=["system"])
+    def health(request: Request) -> HealthOut:
+        """``version`` 只给能确认身份的人看：服务器本机 / 内网（README 和 install.sh 里那条
+        ``curl http://127.0.0.1:8000/api/health``，以及容器 healthcheck、面板内更新）和已登录
+        的用户。外网未登录的访客只拿到 ok —— 仓库是公开的，版本号等于告诉对方这里跑的是
+        哪一份源码、有哪些防护。"""
+        show = _may_see_version(request)
+        return HealthOut(
+            status="ok", version=settings.app_version if show else None, app=settings.app_name
+        )
 
     # Registered before security_headers so it ends up *inside* it: a rejected
     # request still gets the hardening headers on its 403.

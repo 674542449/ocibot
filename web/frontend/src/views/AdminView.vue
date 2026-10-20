@@ -179,11 +179,8 @@
         <h3 style="margin: 0">登录锁屏</h3>
         <span class="badge" :class="lockEnabled ? 'running' : ''">{{ lockEnabled ? '已开启' : '未开启' }}</span>
       </div>
-      <p class="muted" style="margin: 0; font-size: 12px">
-        开启后，登录页先显示锁屏，输对锁屏密码才出现账号密码框；服务端登录接口同样要求先解锁，直接调接口的爆破脚本连账号密码都试不了。
-        锁屏页上会写「默认密码为 {{ lockDecoy }}」—— 那是诱饵，<b>输入 {{ lockDecoy }} 的 IP 会被直接封禁</b>（你自己也别输）。
-        解锁后 {{ lockTtl }} 分钟内要完成登录。忘了锁屏密码：在服务器上执行 <code>bash scripts/install.sh lock-off</code>。
-      </p>
+      <!-- 说明文字由管理员接口下发，不写在这里：打包出来的 JS 不用登录就能下载。 -->
+      <p class="muted" style="margin: 0; font-size: 12px; white-space: pre-line">{{ lockHelp }}</p>
       <div class="row" style="align-items: flex-end">
         <div class="field" style="max-width: 220px">
           <label>{{ lockEnabled ? '新的锁屏密码' : '锁屏密码' }}</label>
@@ -205,12 +202,8 @@
         <h3 style="margin: 0">IP 封禁</h3>
         <button :disabled="banBusy" @click="loadBans">刷新</button>
       </div>
-      <p class="muted" style="margin: 0; font-size: 12px">
-        User-Agent 命中下面某一行、不带 User-Agent（开关打开时）、或用诱饵用户名登录（面板里没有这个账号时）的请求，来源 IP
-        会被立即封禁，之后它的所有请求都返回 403；IPv6 地址封它所在的整个 /64（否则换个地址就能接着试）。内网 / 本机 / Cloudflare
-        节点 / 白名单（OCIBOT_IP_BAN_ALLOWLIST）地址永远不封，已经被封的 IP 写进白名单后也会放行。
-        被封在外面时，在服务器上执行 <code>bash scripts/install.sh unban 你的IP</code>。
-      </p>
+      <!-- 规则说明同样由管理员接口下发（见上面「登录锁屏」那条注释）。 -->
+      <p class="muted" style="margin: 0; font-size: 12px; white-space: pre-line">{{ banHelp.intro }}</p>
       <div v-if="banViewer" style="font-size: 13px">
         面板看到的你的 IP：<b>{{ banViewer.your_ip }}</b>
         <span v-if="banViewer.via_cloudflare" class="muted">（经 Cloudflare 节点 {{ banViewer.peer_ip }}，已取真实 IP）</span>
@@ -224,20 +217,16 @@
         <div class="field">
           <label>封禁的 User-Agent（每行一个）</label>
           <textarea v-model="banUaText" rows="6" spellcheck="false"></textarea>
-          <p class="muted" style="margin: 0.25rem 0 0; font-size: 12px">
-            普通一行：完全等于才封（区分大小写），如 <code>curl/8.14.1</code>。<br />
-            <code>~</code> 开头：UA 里包含这段文字就封（不分大小写、不管版本号），如 <code>~python-requests</code>。<br />
-            会误伤正常浏览器的规则（如 <code>~mozilla</code>）保存时会被拒绝。
-          </p>
+          <p class="muted" style="margin: 0.25rem 0 0; font-size: 12px; white-space: pre-line">{{ banHelp.ua_rules }}</p>
         </div>
         <div class="field">
-          <label>诱饵用户名（每行一个，不区分大小写）</label>
+          <label>{{ banHelp.usernames_label || '用户名规则' }}</label>
           <textarea v-model="banNameText" rows="4" spellcheck="false"></textarea>
         </div>
       </div>
       <label class="choice">
         <input v-model="banEmptyUa" type="checkbox" />
-        <span>不带 User-Agent 的请求也封（浏览器一定会带 UA，空的只有脚本和扫描器）</span>
+        <span>{{ banHelp.empty_ua_label || '不带 User-Agent 的请求' }}</span>
       </label>
       <div class="row">
         <button class="primary" :disabled="banBusy" @click="saveBanRules">保存规则</button>
@@ -451,16 +440,14 @@ async function load() {
 
 // ---- 登录锁屏
 const lockEnabled = ref(false)
-const lockDecoy = ref('123456')
-const lockTtl = ref(30)
+const lockHelp = ref('')
 const lockPassword = ref('')
 const lockPassword2 = ref('')
 const lockBusy = ref(false)
 
 function applyLock(data: any) {
   lockEnabled.value = !!data?.enabled
-  if (data?.decoy_password) lockDecoy.value = data.decoy_password
-  if (data?.unlock_ttl_min) lockTtl.value = data.unlock_ttl_min
+  if (data?.help) lockHelp.value = data.help
 }
 
 async function loadLock() {
@@ -476,10 +463,6 @@ async function saveLock() {
   error.value = ''
   if (lockPassword.value !== lockPassword2.value) {
     error.value = '两次输入的锁屏密码不一致'
-    return
-  }
-  if (lockPassword.value === lockDecoy.value) {
-    error.value = `${lockDecoy.value} 是诱饵密码（输入它的人会被封 IP），不能用作锁屏密码`
     return
   }
   lockBusy.value = true
@@ -530,16 +513,12 @@ let banRulesShown = JSON.stringify(['', '', true])
 
 const allBansSelected = computed(() => bans.value.length > 0 && bans.value.every((b) => banSelected.has(b.ip)))
 
+// 原因名称也由管理员接口下发（同上：别把规则写进公开的 JS）。
+const banReasonLabels = ref<Record<string, string>>({})
+const banHelp = ref<Record<string, string>>({})
+
 function banReasonLabel(r: string) {
-  return (
-    ({
-      user_agent: '封禁 UA',
-      empty_user_agent: '没有 UA',
-      honeypot_username: '诱饵用户名',
-      manual: '手动封禁',
-      lock_decoy: '锁屏诱饵密码',
-    } as Record<string, string>)[r] || r
-  )
+  return banReasonLabels.value[r] || r
 }
 
 function banRulesForm() {
@@ -571,6 +550,8 @@ async function loadBans() {
     banTotal.value = data.total || 0
     banViewer.value = data.viewer || null
     banRecommended.value = data.recommended_user_agents || []
+    banReasonLabels.value = data.reason_labels || {}
+    banHelp.value = data.help || {}
     if (banRulesForm() === banRulesShown) {
       banUaText.value = (data.rules?.user_agents || []).join('\n')
       banNameText.value = (data.rules?.usernames || []).join('\n')

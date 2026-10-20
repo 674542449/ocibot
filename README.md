@@ -390,7 +390,7 @@ ocibot/
 | 现象 | 处理 |
 |------|------|
 | 页面打不开 | `./scripts/install.sh status`；`docker compose logs api --tail=100` |
-| 更新后版本不变 | `curl -s http://127.0.0.1:8000/api/health`；浏览器强刷；确认 `OCIBOT_HOST_REPO` 为绝对路径 |
+| 更新后版本不变 | `curl -s http://127.0.0.1:8000/api/health`；浏览器强刷；确认 `OCIBOT_HOST_REPO` 为绝对路径。从外网、未登录访问时 `/api/health` 不返回版本号（有意为之），要在服务器上看或登录后看 |
 | 容量重试不跑 | 侧栏 Worker 离线提示；检查 worker 容器日志 |
 | 登录限流异常 | 直连部署保持 `OCIBOT_TRUST_PROXY=0`；反代需覆盖客户端 IP 头后再开启 |
 | 打开面板只看到 `{"detail":"该 IP 已被封禁"}` | 你的 IP 被自动封禁了（UA 命中封禁规则，或用诱饵用户名登录过）。在服务器上 `bash scripts/install.sh unban 你的IP`，10 秒内生效；以后把自己的 IP 写进 `OCIBOT_IP_BAN_ALLOWLIST` |

@@ -103,6 +103,31 @@ BROWSER_SAMPLES: tuple[str, ...] = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/130.0.0.0 Safari/537.36",
 )
+# 管理页「IP 封禁」卡片上的说明和原因名称。只经管理员接口下发、不写进前端代码 ——
+# 打包出来的 JS 不用登录就能下载，规则怎么触发写在那里等于公开。
+ADMIN_HELP = {
+    "intro": (
+        "User-Agent 命中下面某一行、不带 User-Agent（开关打开时）、或用诱饵用户名登录（面板里没有这个"
+        "账号时）的请求，来源 IP 会被立即封禁，之后它的所有请求都返回 403；IPv6 地址封它所在的整个 /64。"
+        "内网 / 本机 / Cloudflare 节点 / 白名单（OCIBOT_IP_BAN_ALLOWLIST）地址永远不封，已经被封的 IP "
+        "写进白名单后也会放行。被封在外面时，在服务器上执行 bash scripts/install.sh unban 你的IP。"
+    ),
+    "ua_rules": (
+        "普通一行：完全等于才封（区分大小写），如 curl/8.14.1。\n"
+        "~ 开头：UA 里包含这段文字就封（不分大小写、不管版本号），如 ~python-requests。\n"
+        "会误伤正常浏览器的规则（如 ~mozilla）保存时会被拒绝。"
+    ),
+    "usernames_label": "诱饵用户名（每行一个，不区分大小写；面板里真有这个账号时不生效）",
+    "empty_ua_label": "不带 User-Agent 的请求也封（浏览器一定会带 UA，空的只有脚本和扫描器）",
+}
+REASON_LABELS = {
+    "user_agent": "封禁 UA",
+    "empty_user_agent": "没有 UA",
+    "honeypot_username": "诱饵用户名",
+    "manual": "手动封禁",
+    "lock_decoy": "锁屏诱饵密码",
+}
+
 REFRESH_SEC = 10.0
 # 新封、还没确认写进数据库的 IP 在内存里钉住多久（见 _Cache.add）。
 LOCAL_PIN_SEC = 600.0

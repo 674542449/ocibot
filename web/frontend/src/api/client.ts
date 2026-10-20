@@ -195,9 +195,8 @@ export function wsUrl(path: string): string {
   return `${proto}//${location.host}${base}`
 }
 
+/** 登录 / 注册的应答。会话凭证只在 HttpOnly Cookie 里，不进正文（脚本读不到它）。 */
 export type TokenResponse = {
-  access_token: string
-  token_type: string
   username: string
 }
 

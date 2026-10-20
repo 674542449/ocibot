@@ -211,3 +211,64 @@ def test_the_command_line_turns_it_off(capsys):
     with SessionLocal() as db:
         assert lock_screen.enabled(db) is False
     assert "已关闭" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------- 0.4.146 检查出的问题
+
+
+def test_an_unlock_is_used_up_by_a_successful_login():
+    """解锁凭证以前 30 分钟内一直有效：登录成功、点退出，回到登录页时锁屏不再出现
+    （看起来像锁屏没生效），这 30 分钟里同一个浏览器还可以反复登录而不用再过锁屏。"""
+    _enable()
+    c = _client()
+    assert c.post("/api/auth/unlock", json={"password": LOCK_PW}).status_code == 200
+    assert _login(c).status_code == 200
+    assert c.get("/api/auth/lock-status").json()["unlocked"] is False
+    r = _login(c)
+    assert r.status_code == 403 and r.json()["detail"] == lock_screen.UNLOCK_REQUIRED
+
+
+def test_the_two_step_verification_round_trip_keeps_the_unlock():
+    """开了两步验证的账号要发两次登录请求（第一次答 totp_required）。第一次不算登录成功，
+    解锁不能在那时被用掉，否则第二次（带验证码）又被锁屏挡回去。"""
+    import pyotp
+
+    from web.backend.crypto_util import encrypt_text
+
+    secret = pyotp.random_base32()
+    with SessionLocal() as db:
+        u = db.query(User).filter(User.username == _USER).one()
+        u.totp_enabled, u.totp_secret_encrypted = True, encrypt_text(secret)
+        db.commit()
+    try:
+        _enable()
+        c = _client()
+        assert c.post("/api/auth/unlock", json={"password": LOCK_PW}).status_code == 200
+        first = _login(c, _USER)
+        assert first.status_code != 200 and first.json()["detail"] == "totp_required"
+        second = c.post("/api/auth/login",
+                        json={"username": _USER, "password": _PW, "totp_code": pyotp.TOTP(secret).now()})
+        assert second.status_code == 200, second.text
+    finally:
+        with SessionLocal() as db:
+            u = db.query(User).filter(User.username == _USER).one()
+            u.totp_enabled, u.totp_secret_encrypted = False, ""
+            db.commit()
+
+
+def test_logins_stopped_by_the_lock_still_show_up_in_the_audit_log():
+    """开锁屏之后，直接调登录接口的脚本在锁屏这一步就被挡掉 —— 以前一条审计都不留，审计页
+    的「登录失败」从此一片安静，看起来像攻击停了。每个 IP 每 5 分钟记一行，不让刷屏。"""
+    from web.backend.routers.auth import _login_blocked_audit_limiter
+
+    with _login_blocked_audit_limiter._lock:  # 进程级单例，别的测试可能已经记过这个 IP
+        _login_blocked_audit_limiter._hits.clear()
+    _enable()
+    c = _client("8.8.4.4")
+    for _ in range(5):
+        r = c.post("/api/auth/login", json={"username": "root", "password": "whatever1"})
+        assert r.status_code == 403
+    with SessionLocal() as db:
+        rows = [r for r in db.query(AuditLog).filter(AuditLog.action == "auth.login_locked").all()
+                if "8.8.4.4" in (r.detail or "")]
+    assert len(rows) == 1

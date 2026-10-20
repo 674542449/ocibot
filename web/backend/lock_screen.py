@@ -31,6 +31,19 @@ MAX_LENGTH = 128
 # 登录页拿到这个 detail 就切回锁屏（和 'totp_required' 同一种约定）。
 UNLOCK_REQUIRED = "unlock_required"
 
+# 管理页「登录锁屏」卡片上的说明。放在服务端、只经管理员接口下发，**不写进前端代码**：
+# 打包出来的 JS 不用登录就能下载，写在那里等于告诉所有人锁屏页上的默认密码是诱饵。
+ADMIN_HELP = (
+    "开启后，登录页先显示锁屏，输对锁屏密码才出现账号密码框；服务端登录接口同样要求先解锁，"
+    "直接调接口的爆破脚本连账号密码都试不了。锁屏页上会写「默认密码为 {decoy}」—— 那是诱饵，"
+    "输入 {decoy} 的 IP 会被直接封禁（你自己也别输）。解锁只管一次登录，{ttl} 分钟内要完成。"
+    "忘了锁屏密码：在服务器上执行 bash scripts/install.sh lock-off。"
+)
+
+
+def admin_help() -> str:
+    return ADMIN_HELP.format(decoy=DECOY_PASSWORD, ttl=UNLOCK_TTL_MIN)
+
 
 def _stored_hash(db: Session) -> str:
     from web.backend.meta import KEY_LOCK_PASSWORD_HASH, get_meta
@@ -141,6 +154,11 @@ def _cookie_attrs() -> dict[str, Any]:
 
 def set_unlock_cookie(response: Any, token: str) -> None:
     response.set_cookie(key=UNLOCK_COOKIE, value=token, max_age=UNLOCK_TTL_MIN * 60, **_cookie_attrs())
+
+
+def clear_unlock_cookie(response: Any) -> None:
+    """登录成功 / 退出时收回解锁凭证（属性要和下发时一致，浏览器才会删）。"""
+    response.delete_cookie(key=UNLOCK_COOKIE, **_cookie_attrs())
 
 
 # ---------------------------------------------------------------- 命令行

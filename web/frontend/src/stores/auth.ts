@@ -6,7 +6,6 @@ import { resetTenantLock, setLockedTenantFromSession } from '@/stores/tenantLock
 export const useAuthStore = defineStore('auth', () => {
   // Auth is the server's HttpOnly cookie. We keep only the username (for display
   // and an optimistic isLoggedIn), and validate the real session via refreshMe().
-  const token = ref<string | null>(null)
   const username = ref<string | null>(localStorage.getItem('ocibot_username'))
   const isAdmin = ref(false)
   const totpEnabled = ref(false)
@@ -15,14 +14,12 @@ export const useAuthStore = defineStore('auth', () => {
   const isLoggedIn = computed(() => !!username.value)
 
   function setSession(data: TokenResponse) {
-    // The token is never stored (the cookie carries auth); keep it in-memory only.
-    token.value = data.access_token
+    // 会话凭证只在 HttpOnly Cookie 里，服务端不再把它放进应答正文，这里也不碰它。
     username.value = data.username
     localStorage.setItem('ocibot_username', data.username)
   }
 
   function clearLocal() {
-    token.value = null
     username.value = null
     isAdmin.value = false
     totpEnabled.value = false
@@ -105,7 +102,6 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   return {
-    token,
     username,
     isAdmin,
     totpEnabled,

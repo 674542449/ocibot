@@ -67,8 +67,12 @@ class TotpSetupOut(BaseModel):
 
 
 class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
+    """登录 / 注册 / 改密码的应答。
+
+    会话凭证（JWT）只放在 HttpOnly Cookie 里，**不进应答正文**：正文能被页面里的任何脚本
+    读到（浏览器扩展、万一出现的 XSS），而 HttpOnly 就是为了让脚本碰不到它。前端本来也
+    不用它 —— 以前拿到之后只是存在内存里，从没读过。"""
+
     username: str
 
 
@@ -599,5 +603,6 @@ class MessageOut(BaseModel):
 
 class HealthOut(BaseModel):
     status: str
-    version: str
+    # 只给服务器本机 / 内网和已登录的人看（见 main.py::health）；外网未登录的访客没有这个字段。
+    version: Optional[str] = None
     app: str

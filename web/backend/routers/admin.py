@@ -258,6 +258,8 @@ def list_ip_bans(
         "total": total,
         "rules": ip_ban.get_rules(db),
         "recommended_user_agents": list(ip_ban.RECOMMENDED_USER_AGENTS),
+        "help": ip_ban.ADMIN_HELP,
+        "reason_labels": ip_ban.REASON_LABELS,
         "viewer": _viewer(request),
     }
 
@@ -337,6 +339,7 @@ def _lock_state(db: Session) -> dict[str, Any]:
         "enabled": lock_screen.enabled(db),
         "decoy_password": lock_screen.DECOY_PASSWORD,
         "unlock_ttl_min": lock_screen.UNLOCK_TTL_MIN,
+        "help": lock_screen.admin_help(),
     }
 
 

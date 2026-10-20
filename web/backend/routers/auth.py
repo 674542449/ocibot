@@ -157,7 +157,11 @@ def _issue(response: Response, user: User) -> TokenResponse:
         user_id=user.id, username=user.username, token_version=int(user.token_version or 1)
     )
     set_auth_cookie(response, token)
-    return TokenResponse(access_token=token, username=user.username)
+    # 登录锁屏的解锁凭证是「一次登录」用的：登录成功就收回。以前它 30 分钟内一直有效，
+    # 登录后点退出、回到登录页时锁屏不再出现，同一个浏览器还能反复登录而不用再过锁屏。
+    # 两步验证的第一次请求（答 totp_required）走不到这里，凭证留给第二次。
+    lock_screen.clear_unlock_cookie(response)
+    return TokenResponse(username=user.username)
 
 
 def _verify_totp(user: User, code: str) -> bool:
@@ -187,9 +191,25 @@ def _verify_totp(user: User, code: str) -> bool:
     return pyotp.TOTP(secret).verify((code or "").strip().replace(" ", ""), valid_window=1)
 
 
-def _require_unlocked(request: Request, db: Session) -> None:
-    if not lock_screen.request_unlocked(request, db):
-        raise HTTPException(status_code=403, detail=lock_screen.UNLOCK_REQUIRED)
+def _require_unlocked(request: Request, db: Session, ip: str) -> None:
+    if lock_screen.request_unlocked(request, db):
+        return
+    # 被锁屏挡掉的也要留痕：开锁屏之后直接调接口的脚本全在这一步被拦，不记的话审计页
+    # 的登录失败从此一片安静，看起来像攻击停了。每个 IP 每 5 分钟一行，不让它刷屏。
+    if _login_blocked_audit_limiter.check(f"login-locked:{ip}")[0]:
+        write_audit(
+            db,
+            owner_id=None,
+            action="auth.login_locked",
+            target=request.url.path,
+            detail={
+                "ip": ip,
+                "reason": "unlock_required",
+                "ua": (request.headers.get("user-agent") or "").strip()[:200],
+                "suppress_window_sec": 300,
+            },
+        )
+    raise HTTPException(status_code=403, detail=lock_screen.UNLOCK_REQUIRED)
 
 
 @router.get("/lock-status")
@@ -259,7 +279,7 @@ def register(
     db: Annotated[Session, Depends(get_db)],
 ) -> TokenResponse:
     ip = _client_ip(request)
-    _require_unlocked(request, db)
+    _require_unlocked(request, db, ip)
     ok, retry = register_ip_limiter.check(f"reg:{ip}")
     if not ok:
         raise HTTPException(
@@ -371,7 +391,7 @@ def login(
 
     # 登录锁屏：开着的话先要有解锁凭证，直接调接口的脚本连账号密码都试不了。
     # 放在诱饵用户名之后：拿 admin 来试的，不管有没有解锁都先封掉。
-    _require_unlocked(request, db)
+    _require_unlocked(request, db, ip)
 
     ok_ip, retry_ip = login_ip_limiter.check(f"login-ip:{ip}")
     # 限流键要用**归一化后**的用户名。
@@ -477,6 +497,7 @@ def set_locked_tenant(
 @router.post("/logout")
 def logout(response: Response, user: Annotated[User, Depends(get_current_user)]) -> dict:
     clear_auth_cookie(response)
+    lock_screen.clear_unlock_cookie(response)
     return {"message": "已退出", "username": user.username}
 
 
