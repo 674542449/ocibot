@@ -834,6 +834,27 @@ do_uninstall() {
   log "已停止。仓库目录仍在：$REPO_DIR"
 }
 
+# IP 封禁（web/backend/ip_ban.py）：被封在面板外面时从服务器上解封。
+#   unban 1.2.3.4 [5.6.7.8 ...]   解封这些 IP
+#   unban --all                    清空封禁列表
+#   bans                           列出被封禁的 IP
+# API 进程最多 10 秒后读到变化，不需要重启。
+do_bans() {
+  ensure_docker
+  ensure_repo
+  link_root_env
+  if [ "${1:-}" = "list" ]; then
+    compose exec -T api python -m web.backend.ip_ban list
+  elif [ "${2:-}" = "--all" ]; then
+    compose exec -T api python -m web.backend.ip_ban clear
+  elif [ -n "${2:-}" ]; then
+    shift
+    compose exec -T api python -m web.backend.ip_ban unban "$@"
+  else
+    die "用法: $0 unban <IP> [<IP> ...]   或   $0 unban --all"
+  fi
+}
+
 cmd="${1:-install}"
 case "$cmd" in
   install|up) do_install ;;
@@ -852,9 +873,16 @@ case "$cmd" in
     ;;
   update-on)  do_update_toggle 1 ;;
   update-off) do_update_toggle 0 ;;
+  unban)      do_bans unban "${@:2}" ;;
+  bans)       do_bans list ;;
   *)
     cat <<EOF
-用法: $0 {install|update|status|uninstall|domain <域名>|ip|update-on|update-off}
+用法: $0 {install|update|status|uninstall|domain <域名>|ip|update-on|update-off|unban <IP>|bans}
+
+IP 封禁（被封在面板外面时用）:
+  $0 unban 1.2.3.4              解封这个 IP（可以一次写多个）
+  $0 unban --all                清空封禁列表
+  $0 bans                       列出被封禁的 IP
 
 访问方式（装完后可随时互换，不影响数据）:
   $0 domain panel.example.com   域名 + 自动 HTTPS（内置 Caddy 签证书，不需要另装反代）

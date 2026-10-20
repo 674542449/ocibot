@@ -38,6 +38,7 @@ except InsecureSecretsError as exc:  # 只接这一种；其它启动错误仍�
 
 if _STARTUP_BLOCK is None:
     from web.backend.body_limit import BodySizeLimitMiddleware
+    from web.backend.ip_ban import IpBanMiddleware
     from web.backend.origin_guard import UNSAFE_METHODS, origin_allowed
     from web.backend.db import SessionLocal, init_db
     from web.backend.routers import (
@@ -285,6 +286,12 @@ def create_app() -> FastAPI:
                     status_code=403,
                 )
         return await call_next(request)
+
+    # IP 封禁（ip_ban.py）。注册在 csrf_origin_guard 之后、security_headers 之前：
+    # 于是它在跨站校验**外面**先跑（被封的 IP 不管带什么 Origin 都先挡掉，命中封禁 UA
+    # 的请求也不会因为先被跨站校验拒掉而漏封），又在 security_headers **里面**，403 照样
+    # 带上加固响应头。纯 ASGI 实现，WebSocket（网页终端）也一并拦。
+    app.add_middleware(IpBanMiddleware)
 
     # 启动时算一次。dist 是构建进镜像的（Dockerfile 里 COPY，不是挂载），
     # 所以 HTML 和进程是同一个不可变单元，不存在算完之后文件又变了的情况。

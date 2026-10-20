@@ -477,6 +477,8 @@ business layer that the web backend imports. Changes in this pass:
 | Root password tag visibility | Inherited | Returned once on create; hashed into cloud-init, not stored in plaintext. |
 | Outbound webhook/SMTP targets | Mitigated (0.4.6) | User-supplied webhook/Bark/SMTP hosts are DNS-resolved and blocked if private/loopback/link-local/metadata; no redirect following; `trust_env=False`. |
 | X-Forwarded-For trust | Mitigated (0.4.6) | Default `OCIBOT_TRUST_PROXY=0`. Enable only behind a proxy that overwrites client IP headers. |
+| CF-Connecting-IP trust | Accepted (0.4.143) | `client_ip.py` takes the visitor IP from `CF-Connecting-IP` only when the peer is in Cloudflare's published ranges, so a direct-to-origin client cannot forge it. Gap: Cloudflare WARP egress addresses sit inside those ranges, so a WARP user reaching the origin directly could set the header (to dodge the login limiter or frame another IP for an IP ban). Close it at the origin firewall by only admitting Cloudflare ranges on 80/443; `OCIBOT_TRUST_CLOUDFLARE=0` turns the header off entirely. |
+| IP ban self-lockout | Mitigated (0.4.143) | Auto-bans never touch non-global, Cloudflare or `OCIBOT_IP_BAN_ALLOWLIST` addresses; the admin API refuses to ban the caller's own IP or save a UA rule matching the caller's UA; `install.sh unban <IP>` works from the server when locked out. |
 | WebSSH query JWT | Fixed (0.4.6) | Query-string tokens removed; cookie or Authorization Bearer only. |
 | First-admin race | Mitigated (0.4.6) | PostgreSQL advisory lock + re-count; unique username constraint remains. |
 

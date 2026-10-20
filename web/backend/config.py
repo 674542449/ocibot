@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     # /api/health 正是操作员确认"更新有没有装上"的唯一手段（README 排障表第一行），
     # test_version_bump.py 也看不见这种偏差。ClassVar 不参与 pydantic 解析，任何环境
     # 变量都改不动它。
-    app_version: ClassVar[str] = "0.4.142"
+    app_version: ClassVar[str] = "0.4.143"
 
     # bcrypt 的工作因子。生产**不要**调低 —— 12 轮约 190ms 一次哈希,正是它让
     # 在线爆破不划算。这个旋钮存在只有一个用途:测试套件里 172 次建用户的 fixture
@@ -134,6 +134,16 @@ class Settings(BaseSettings):
     # Trust X-Forwarded-For / X-Real-IP for rate-limit client IP. Enable only when
     # the panel sits behind a reverse proxy that overwrites these headers.
     trust_proxy: bool = Field(default=False, alias="OCIBOT_TRUST_PROXY")
+
+    # 面板在 Cloudflare 后面时，连接来源是 Cloudflare 节点，真实访客 IP 在
+    # CF-Connecting-IP 里。只在来源**确实是 Cloudflare 公布的 IP 段**时才采用这个头
+    # （见 client_ip.py），直连源站的人伪造它不起作用。不在 Cloudflare 后面的部署不受
+    # 影响：来源不是 Cloudflare 段，这个头一律忽略。
+    trust_cloudflare: bool = Field(default=True, alias="OCIBOT_TRUST_CLOUDFLARE")
+
+    # 自动封禁永远不封的地址，逗号分隔的 IP 或 CIDR（如 1.2.3.4,2001:db8::/32）。
+    # 内网 / 本机 / Cloudflare 节点地址本来就不封，这里放你自己常用的公网 IP。
+    ip_ban_allowlist: str = Field(default="", alias="OCIBOT_IP_BAN_ALLOWLIST")
 
     # 默认 fail closed：内置默认密钥就写在公开仓库里，而主密钥只经一次无盐 SHA-256
     # 就成为 Fernet 密钥 —— 用默认值起面板，等于任何拿到数据库的人都能解出全部 OCI

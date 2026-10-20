@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.4.143 — 2026-10-20
+
+IP 封禁：UA 精确匹配 `curl/8.14.1` / `Mozilla/5.0`、或用 `admin` 登录的 IP 直接封。
+同时修正 Cloudflare 后面的真实 IP 识别。
+
+### 功能
+
+- **自动封禁 IP。** 下面两种情况，来源 IP 立即被封，之后它的所有请求（网页、接口、网页终端）
+  一律返回 403：
+  - User-Agent **完全等于** `curl/8.14.1` 或 `Mozilla/5.0`（区分大小写、精确匹配；真实浏览器的
+    长 UA、`curl/8.14.0` 之类相近的都不受影响）；
+  - 用诱饵用户名 `admin` 登录（大小写、全角写法都算）。在限流之前判断，第一次尝试就封。
+    **面板里真有一个叫 admin 的账号时这条不生效** —— 否则封的是账号主人自己。
+- **管理页「IP 封禁」**：查看被封的 IP（原因、触发时的 UA / 用户名、时间），勾选或全选批量解封，
+  手动封禁某个 IP；两条规则的列表可以改（攻击者换了 UA 就加一行）。还显示「面板看到的你的 IP」，
+  用来确认真实 IP 识别是否正确。
+- **防止把自己锁在外面**：内网 / 本机 / 保留地址、Cloudflare 节点地址、`OCIBOT_IP_BAN_ALLOWLIST`
+  里的地址永远不封；手动封禁拒绝封你自己当前的 IP；规则里写进你自己浏览器的 UA 会被拒绝保存。
+  真被封了：在服务器上 `bash scripts/install.sh unban 你的IP`（或 `unban --all` 清空），10 秒内生效。
+- 封禁列表存在数据库里，重启不丢；每次封禁 / 解封都记审计日志。
+
+### 修复
+
+- **【高】在 Cloudflare 后面时，面板看到的「访客 IP」全是 Cloudflare 节点。** 内置 Caddy 只会把
+  它的直接来源（Cloudflare 节点）写进 X-Forwarded-For，于是：登录限流按节点计数 —— 攻击者刷满
+  之后，你自己从同一个节点登录也被 429；审计日志里的登录 IP 全是节点 IP；按 IP 封禁会把节点连同
+  经过它的所有人一起封掉。现在来源是 Cloudflare 公布的 IP 段时，改用 Cloudflare 加的
+  `CF-Connecting-IP`（真实访客 IP）。这个头只在来源确实是 Cloudflare 时才采用，直连源站的人
+  伪造它没用。不在 Cloudflare 后面的部署不受影响。`OCIBOT_TRUST_CLOUDFLARE=0` 可关闭。
+
+### 维护
+
+- 新增 `web/backend/client_ip.py`（登录限流、审计、封禁共用的真实 IP 判断）、
+  `web/backend/ip_ban.py`（规则、封禁表、纯 ASGI 中间件、命令行）；新表 `ip_bans`（启动时自动建）。
+- `install.sh` 新增 `unban <IP>`、`unban --all`、`bans`。
+- `tests/test_ip_ban.py` 31 条：精确匹配与相近 UA、内网 / 本机 / Cloudflare / 白名单不封、
+  WebSocket 也拦、重启后仍生效、诱饵用户名各种写法、真有 admin 账号时不封、Cloudflare 后封真实
+  访客而不是节点、伪造 CF 头无效、登录限流按真实访客计数、管理接口与自我保护、命令行解封。
+- `web/AUDIT.md` 记下 CF-Connecting-IP 的已知缺口（WARP 出口在 Cloudflare 段内）及对策。
+
+### 升级
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.143
+```
+
+建议同时把你自己常用的公网 IP 写进 `web/.env` 的 `OCIBOT_IP_BAN_ALLOWLIST`，再
+`bash scripts/install.sh update` 让它生效。
+
 ## 0.4.142 — 2026-10-17
 
 检查 0.4.141（等级查询精简版、注册天数）修掉 3 处问题。

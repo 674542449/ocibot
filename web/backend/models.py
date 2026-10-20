@@ -261,6 +261,26 @@ class SshHostKey(Base):
     )
 
 
+class IpBan(Base):
+    """被封禁的访客 IP（web/backend/ip_ban.py）。
+
+    封禁中间件对这些地址的所有请求一律返回 403。命中「封禁 UA」或用诱饵用户名登录时
+    自动写入，也可以在管理页手动添加 / 解封，或在服务器上
+    ``bash scripts/install.sh unban <IP>``。没有过期时间：解封之前一直有效。
+    """
+
+    __tablename__ = "ip_bans"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # 规范写法（client_ip.normalize_ip），唯一 —— 同一个 IP 同时触发两次只留一行。
+    ip: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    # user_agent | honeypot_username | manual
+    reason: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+    # 触发时的 UA / 用户名 / 操作的管理员，给人看的。
+    detail: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class AppMeta(Base):
     """Simple key-value for bootstrap flags."""
 

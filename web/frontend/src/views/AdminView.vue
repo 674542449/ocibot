@@ -173,11 +173,83 @@
         </tbody>
       </table>
     </div>
+
+    <div class="card stack">
+      <div class="row" style="justify-content: space-between; align-items: center">
+        <h3 style="margin: 0">IP 封禁</h3>
+        <button :disabled="banBusy" @click="loadBans">刷新</button>
+      </div>
+      <p class="muted" style="margin: 0; font-size: 12px">
+        User-Agent 完全等于下面某一行的请求、或用诱饵用户名登录（面板里没有这个账号时），来源 IP 会被立即封禁，之后它的所有请求都返回
+        403。内网 / 本机 / Cloudflare 节点 / 白名单（OCIBOT_IP_BAN_ALLOWLIST）地址永远不封。被封在外面时，在服务器上执行
+        <code>bash scripts/install.sh unban 你的IP</code>。
+      </p>
+      <div v-if="banViewer" style="font-size: 13px">
+        面板看到的你的 IP：<b>{{ banViewer.your_ip }}</b>
+        <span v-if="banViewer.via_cloudflare" class="muted">（经 Cloudflare 节点 {{ banViewer.peer_ip }}，已取真实 IP）</span>
+        <div v-if="banViewer.your_ip_exempt" class="badge warn" style="margin-top: 0.35rem; white-space: normal">
+          面板没有识别出公网 IP（{{ banViewer.your_ip_exempt }}）。如果你是从外网访问的，说明真实 IP 没有传到面板，自动封禁不会生效 ——
+          检查反代 / Cloudflare 配置（见 README 故障排查表）。
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="field">
+          <label>封禁的 User-Agent（每行一个，完全匹配，区分大小写）</label>
+          <textarea v-model="banUaText" rows="4" spellcheck="false"></textarea>
+        </div>
+        <div class="field">
+          <label>诱饵用户名（每行一个，不区分大小写）</label>
+          <textarea v-model="banNameText" rows="4" spellcheck="false"></textarea>
+        </div>
+      </div>
+      <div class="row">
+        <button class="primary" :disabled="banBusy" @click="saveBanRules">保存规则</button>
+        <input v-model="manualBanIp" placeholder="手动封禁 IP，如 1.2.3.4" style="max-width: 260px" @keyup.enter="manualBan" />
+        <button :disabled="banBusy || !manualBanIp.trim()" @click="manualBan">封禁</button>
+      </div>
+
+      <div class="row" style="justify-content: space-between; align-items: center">
+        <span class="muted" style="font-size: 12px">
+          共 {{ banTotal }} 个被封禁的 IP<span v-if="banTotal > bans.length">（显示最近 {{ bans.length }} 个）</span>
+        </span>
+        <button :disabled="banBusy || banSelected.size === 0" @click="unbanSelected">
+          解封所选（{{ banSelected.size }}）
+        </button>
+      </div>
+      <div v-if="bans.length" class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th style="width: 32px">
+                <input type="checkbox" :checked="allBansSelected" title="全选" @change="toggleAllBans" />
+              </th>
+              <th>IP</th>
+              <th>原因</th>
+              <th>详情</th>
+              <th>封禁时间</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="b in bans" :key="b.ip">
+              <td><input type="checkbox" :checked="banSelected.has(b.ip)" @change="toggleBan(b.ip)" /></td>
+              <td style="font-family: monospace">{{ b.ip }}</td>
+              <td>{{ banReasonLabel(b.reason) }}</td>
+              <td class="muted" style="font-size: 12px; word-break: break-all">{{ b.detail || '—' }}</td>
+              <td class="muted" style="font-size: 12px">{{ fmt(b.created_at) }}</td>
+              <td><button :disabled="banBusy" @click="unban([b.ip])">解封</button></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p v-else class="muted" style="margin: 0; font-size: 12px">目前没有被封禁的 IP。</p>
+    </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import api from '@/api/client'
 import Icon from '@/components/Icon.vue'
 import { useAuthStore } from '@/stores/auth'
@@ -335,7 +407,111 @@ async function load() {
   allowOpenRegistration.value = !!s.data.allow_open_registration
   settingsSource.value = s.data.source
   meId.value = me.data.id
-  await loadUpdate()
+  await Promise.all([loadUpdate(), loadBans()])
+}
+
+// ---- IP 封禁（只读写面板自己的数据库，不请求 Oracle，所以随页面一起加载）
+type IpBanRow = { ip: string; reason: string; detail: string; created_at: string }
+const bans = ref<IpBanRow[]>([])
+const banTotal = ref(0)
+const banViewer = ref<any>(null)
+const banUaText = ref('')
+const banNameText = ref('')
+const manualBanIp = ref('')
+const banBusy = ref(false)
+const banSelected = reactive(new Set<string>())
+
+const allBansSelected = computed(() => bans.value.length > 0 && bans.value.every((b) => banSelected.has(b.ip)))
+
+function banReasonLabel(r: string) {
+  return ({ user_agent: '封禁 UA', honeypot_username: '诱饵用户名', manual: '手动封禁' } as Record<string, string>)[r] || r
+}
+
+function lines(text: string) {
+  return text
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+}
+
+async function loadBans() {
+  try {
+    const { data } = await api.get('/admin/ip-bans')
+    bans.value = data.bans || []
+    banTotal.value = data.total || 0
+    banViewer.value = data.viewer || null
+    banUaText.value = (data.rules?.user_agents || []).join('\n')
+    banNameText.value = (data.rules?.usernames || []).join('\n')
+    // 只保留还在列表里的勾选。
+    for (const ip of [...banSelected]) if (!bans.value.some((b) => b.ip === ip)) banSelected.delete(ip)
+  } catch (e: any) {
+    error.value = e?.message || '读取封禁列表失败'
+  }
+}
+
+async function saveBanRules() {
+  error.value = ''
+  banBusy.value = true
+  try {
+    await api.put('/admin/ip-ban-rules', {
+      user_agents: lines(banUaText.value),
+      usernames: lines(banNameText.value),
+    })
+    msg.value = '封禁规则已保存'
+    await loadBans()
+  } catch (e: any) {
+    error.value = e?.message || '保存失败'
+  } finally {
+    banBusy.value = false
+  }
+}
+
+async function manualBan() {
+  const ip = manualBanIp.value.trim()
+  if (!ip) return
+  error.value = ''
+  banBusy.value = true
+  try {
+    const { data } = await api.post('/admin/ip-bans', { ip })
+    msg.value = `已封禁 ${data.ip}`
+    manualBanIp.value = ''
+    await loadBans()
+  } catch (e: any) {
+    error.value = e?.message || '封禁失败'
+  } finally {
+    banBusy.value = false
+  }
+}
+
+async function unban(ips: string[]) {
+  if (!ips.length) return
+  if (ips.length > 1 && !confirm(`解封所选的 ${ips.length} 个 IP？`)) return
+  error.value = ''
+  banBusy.value = true
+  try {
+    const { data } = await api.post('/admin/ip-bans/unban', { ips })
+    msg.value = data.message || '已解封'
+    for (const ip of ips) banSelected.delete(ip)
+    await loadBans()
+  } catch (e: any) {
+    error.value = e?.message || '解封失败'
+  } finally {
+    banBusy.value = false
+  }
+}
+
+function unbanSelected() {
+  return unban([...banSelected])
+}
+
+function toggleBan(ip: string) {
+  if (banSelected.has(ip)) banSelected.delete(ip)
+  else banSelected.add(ip)
+}
+
+function toggleAllBans() {
+  if (allBansSelected.value) banSelected.clear()
+  else for (const b of bans.value) banSelected.add(b.ip)
 }
 
 async function saveSettings() {

@@ -7,7 +7,7 @@ from app.oci_client import safe_error_text
 import secrets
 from typing import Annotated, Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -19,7 +19,7 @@ from web.backend.db import get_db
 from web.backend.meta import KEY_OPEN_REGISTRATION, get_meta, set_meta
 from web.backend.schemas import UtcDatetime
 from web.backend.models import Tenant, User
-from web.backend import self_update
+from web.backend import client_ip, ip_ban, self_update
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -203,6 +203,114 @@ def put_admin_settings(
         detail=str(body.allow_open_registration),
     )
     return AdminSettingsOut(allow_open_registration=body.allow_open_registration, source="db")
+
+
+# ---------------------------------------------------------------------------
+# IP 封禁（web/backend/ip_ban.py）
+# ---------------------------------------------------------------------------
+
+
+class IpBanOut(BaseModel):
+    ip: str
+    reason: str
+    detail: str
+    created_at: Optional[UtcDatetime] = None
+
+
+class IpBanRules(BaseModel):
+    user_agents: list[str] = Field(default_factory=list, max_length=ip_ban.MAX_RULES)
+    usernames: list[str] = Field(default_factory=list, max_length=ip_ban.MAX_RULES)
+
+
+class IpBanAdd(BaseModel):
+    ip: str = Field(min_length=1, max_length=64)
+
+
+class IpBanRemove(BaseModel):
+    ips: list[str] = Field(min_length=1, max_length=1000)
+
+
+def _viewer(request: Request) -> dict[str, Any]:
+    """面板眼里的「你」：用来确认真实 IP 识别对不对（在 Cloudflare / 反代后面尤其要看）。"""
+    peer = request.client.host if request.client else ""
+    resolved = client_ip.from_request(request)
+    return {
+        "your_ip": resolved,
+        "peer_ip": peer,
+        "via_cloudflare": client_ip.is_cloudflare(peer),
+        "your_ip_exempt": ip_ban.exempt_reason(resolved),
+        "user_agent": (request.headers.get("user-agent") or "")[:200],
+    }
+
+
+@router.get("/ip-bans")
+def list_ip_bans(
+    request: Request,
+    admin: Annotated[User, Depends(get_admin_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    _ = admin
+    rows, total = ip_ban.list_bans(db)
+    return {
+        "bans": [IpBanOut(**r).model_dump(mode="json") for r in rows],
+        "total": total,
+        "rules": ip_ban.get_rules(db),
+        "viewer": _viewer(request),
+    }
+
+
+@router.post("/ip-bans")
+def add_ip_ban(
+    body: IpBanAdd,
+    request: Request,
+    admin: Annotated[User, Depends(get_admin_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    ip = client_ip.normalize_ip(body.ip)
+    if ip == client_ip.from_request(request):
+        raise HTTPException(status_code=400, detail="这是你当前的 IP，封了你自己也进不来")
+    banned, message = ip_ban.ban_ip(
+        db, ip, reason="manual", detail=f"管理员 {admin.username} 手动封禁", actor_id=admin.id
+    )
+    if not banned:
+        raise HTTPException(status_code=400, detail=f"不能封禁 {ip}：{message}")
+    return {"ok": True, "ip": ip, "message": message}
+
+
+@router.post("/ip-bans/unban")
+def remove_ip_bans(
+    body: IpBanRemove,
+    admin: Annotated[User, Depends(get_admin_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    removed = ip_ban.unban_ips(db, body.ips, actor_id=admin.id)
+    return {"ok": True, "removed": removed, "message": f"已解封 {len(removed)} 个 IP"}
+
+
+@router.put("/ip-ban-rules")
+def put_ip_ban_rules(
+    body: IpBanRules,
+    request: Request,
+    admin: Annotated[User, Depends(get_admin_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    # 自己的浏览器 UA 写进去的话，保存后的下一个请求就把自己封了（除非 IP 本来免封）。
+    mine = (request.headers.get("user-agent") or "").strip()
+    if mine and mine in {u.strip() for u in body.user_agents}:
+        if not ip_ban.exempt_reason(client_ip.from_request(request)):
+            raise HTTPException(
+                status_code=400,
+                detail="列表里有你当前浏览器的 User-Agent，保存后你自己会被立即封禁",
+            )
+    rules = ip_ban.set_rules(db, user_agents=body.user_agents, usernames=body.usernames)
+    write_audit(
+        db,
+        owner_id=admin.id,
+        action="admin.ip_ban_rules",
+        target="ip_ban_rules",
+        detail=rules,
+    )
+    return {"ok": True, "rules": rules}
 
 
 # ---------------------------------------------------------------------------

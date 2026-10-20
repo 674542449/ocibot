@@ -13,6 +13,9 @@ from web.backend.models import AppMeta
 KEY_WORKER_HEARTBEAT = "worker_heartbeat"  # ISO timestamp, updated by worker every tick
 KEY_WORKER_ID = "worker_heartbeat_worker_id"
 KEY_OPEN_REGISTRATION = "allow_open_registration"  # "true"/"false"; overrides env when set
+# IP 封禁规则（ip_ban.py），每行一个；没设置过时用 ip_ban 里的默认值。
+KEY_BAN_USER_AGENTS = "ip_ban_user_agents"
+KEY_BAN_USERNAMES = "ip_ban_usernames"
 
 
 def get_meta(db: Session, key: str) -> Optional[str]:

@@ -177,6 +177,9 @@ const ACTION_LABELS: Record<string, string> = {
   'admin.reset_password': '重置用户密码',
   'admin.settings': '修改面板设置',
   'admin.self_update': '一键更新',
+  'admin.ip_ban_rules': '修改 IP 封禁规则',
+  'security.ip_banned': '封禁 IP',
+  'security.ip_unbanned': '解封 IP',
 }
 
 /** 电源操作的 action 是拼出来的：`instance.power.SOFTSTOP`。 */

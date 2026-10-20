@@ -219,6 +219,8 @@ docker compose up -d --build
 | `OCIBOT_ALLOW_OPEN_REGISTRATION` | 默认 `0` | 首用户后是否开放注册 |
 | `OCIBOT_TRUST_PROXY` | 默认 `0` | 是否信任 `X-Forwarded-For`（仅反代后开启） |
 | `OCIBOT_FORWARDED_ALLOW_IPS` | 反代地址/CIDR | 允许携带代理头的来源，默认回环；勿用 `*` |
+| `OCIBOT_TRUST_CLOUDFLARE` | 默认 `1` | 来源是 Cloudflare 节点时，按 `CF-Connecting-IP` 取真实访客 IP（只认 Cloudflare 公布的 IP 段，直连伪造无效）。登录限流、审计日志、IP 封禁都用它 |
+| `OCIBOT_IP_BAN_ALLOWLIST` | 默认空 | 永不自动封禁的 IP / CIDR，逗号分隔。建议写上你自己常用的公网 IP |
 | `OCIBOT_API_WORKERS` | 默认 `1` | API 进程数。这个负载是等 OCI 网络不是烧 CPU，加进程不会更快，每个多占约 158 MB |
 | `OCIBOT_PORT` | 默认 `8000` | 宿主机映射端口 |
 | `OCIBOT_BIND` | 反代后设 `127.0.0.1` | 端口绑定的宿主机网卡，默认 `0.0.0.0` |
@@ -391,6 +393,8 @@ ocibot/
 | 更新后版本不变 | `curl -s http://127.0.0.1:8000/api/health`；浏览器强刷；确认 `OCIBOT_HOST_REPO` 为绝对路径 |
 | 容量重试不跑 | 侧栏 Worker 离线提示；检查 worker 容器日志 |
 | 登录限流异常 | 直连部署保持 `OCIBOT_TRUST_PROXY=0`；反代需覆盖客户端 IP 头后再开启 |
+| 打开面板只看到 `{"detail":"该 IP 已被封禁"}` | 你的 IP 被自动封禁了（UA 命中封禁规则，或用诱饵用户名登录过）。在服务器上 `bash scripts/install.sh unban 你的IP`，10 秒内生效；以后把自己的 IP 写进 `OCIBOT_IP_BAN_ALLOWLIST` |
+| 管理页「IP 封禁」里「你的 IP」是 172.x / 10.x 之类内网地址 | 面板没拿到真实 IP，自动封禁不会生效。域名模式（内置 Caddy）和 Cloudflare 都不用额外配置；自建反代要开 `OCIBOT_TRUST_PROXY=1` 并把反代地址写进 `OCIBOT_FORWARDED_ALLOW_IPS` |
 | 私钥解密失败 | `OCIBOT_MASTER_KEY` 被更换；需用旧密钥或重新导入租户 / 恢复备份 |
 | compose 报 `POSTGRES_PASSWORD 未设置` | `web/.env` 里写一个随机值，并确认项目根有 `.env` → `web/.env` 的软链（以前这里会静默回落到内置默认密码） |
 | API 起不来，日志说 `insecure defaults` / `must be at least 24 characters` | `OCIBOT_MASTER_KEY` / `OCIBOT_JWT_SECRET` 还是空的或太短，用 `openssl rand -hex 48` 生成 |

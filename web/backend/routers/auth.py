@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from web.backend import ip_ban
 from web.backend.audit import write_audit
 from web.backend.auth import (
     clear_auth_cookie,
@@ -123,10 +124,22 @@ def _client_ip(request: Request) -> str:
     ProxyHeadersMiddleware only when OCIBOT_TRUST_PROXY=1, and only for peers in
     OCIBOT_FORWARDED_ALLOW_IPS, and that middleware already walks the header
     right-to-left skipping trusted hops. One parser, one policy.
+
+    在那之上只多一层 Cloudflare：来源是 Cloudflare 节点时换成 CF-Connecting-IP 里的
+    真实访客 IP（只认 Cloudflare 公布的段，见 client_ip.py）。封禁中间件用同一个函数，
+    限流桶、审计日志和封禁说的是同一个 IP。
     """
-    if request.client:
-        return request.client.host or "unknown"
-    return "unknown"
+    from web.backend import client_ip
+
+    return client_ip.from_request(request)
+
+
+def _account_named(db: Session, raw: str, folded: str) -> bool:
+    """面板里有没有这个名字的账号（原样、忽略大小写、或归一化后相同都算）。"""
+    names = {n.lower() for n in (raw, folded) if n}
+    if not names:
+        return False
+    return db.scalar(select(User.id).where(func.lower(User.username).in_(names)).limit(1)) is not None
 
 
 def open_registration_allowed(db: Session) -> bool:
@@ -274,6 +287,20 @@ def login(
             target=audit_username(username) if username else "(empty)",
             detail={"ip": ip, "reason": reason, "ua": agent, **extra},
         )
+
+    # 诱饵用户名（默认 admin）：面板里**没有**这个账号，却有人拿它来登录 —— 只有照着
+    # 字典爆破的脚本会这么做，直接封 IP。放在限流之前：第一次尝试就封，不等它刷满限流。
+    # 真有一个这个名字的账号时不生效，否则封掉的是账号主人自己。
+    folded = normalize_username(username)
+    if ip_ban.is_honeypot_username(folded) and not _account_named(db, username, folded):
+        banned, _why = ip_ban.ban_ip(
+            db,
+            ip,
+            reason="honeypot_username",
+            detail=f"用户名={audit_username(username)} UA={agent}",
+        )
+        if banned:
+            raise HTTPException(status_code=403, detail=ip_ban.BANNED_DETAIL)
 
     ok_ip, retry_ip = login_ip_limiter.check(f"login-ip:{ip}")
     # 限流键要用**归一化后**的用户名。
