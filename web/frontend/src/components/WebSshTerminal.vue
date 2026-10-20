@@ -21,9 +21,26 @@
     <div v-else class="stack">
       <div class="row" style="justify-content: space-between">
         <span class="muted" style="font-size: 12px">{{ status || (phase === 'live' ? '已连接' : '连接中…') }}</span>
-        <button class="danger" @click="disconnect">断开</button>
+        <div class="row" style="gap: 0.4rem">
+          <button type="button" :disabled="!hasSelection" @click="copySelection">复制选中</button>
+          <button type="button" :disabled="phase !== 'live'" @click="pasteFromClipboard">粘贴</button>
+          <button class="danger" @click="disconnect">断开</button>
+        </div>
       </div>
+      <p class="muted" style="margin: 0; font-size: 12px">
+        复制：选中文字后按 Ctrl+C 或单击右键；粘贴：Ctrl+V 或单击右键（没选中文字时）。没有选中文字时 Ctrl+C 仍是中断（^C）。
+      </p>
       <div ref="termEl" class="term-host"></div>
+      <!-- 浏览器不允许网页直接读剪贴板时（http 访问、拒绝了权限、Firefox）用这个框：
+           在普通输入框里粘贴哪儿都行（包括手机长按），再发到终端。 -->
+      <div v-if="pasteBoxOpen" class="stack">
+        <label class="muted" style="font-size: 12px">把要粘贴的内容贴到下面，再点「发送到终端」</label>
+        <textarea ref="pasteBoxEl" v-model="pasteBoxText" rows="4" spellcheck="false"></textarea>
+        <div class="row">
+          <button class="primary" type="button" :disabled="!pasteBoxText" @click="sendPasteBox">发送到终端</button>
+          <button type="button" @click="closePasteBox">取消</button>
+        </div>
+      </div>
       <div v-if="error" class="error-box">{{ error }}</div>
     </div>
   </div>
@@ -36,6 +53,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import api, { wsUrl } from '@/api/client'
 import SshCredentialFields, { type SshCredModel } from '@/components/SshCredentialFields.vue'
+import { showToast, writeClipboard } from '@/utils/toast'
 
 const props = defineProps<{
   tenantId: string
@@ -92,9 +110,122 @@ let socket: WebSocket | null = null
 let resizeObserver: ResizeObserver | null = null
 let authSent = false
 
+// ---- 复制 / 粘贴
+//
+// xterm.js 在 Windows / Linux 上把 Ctrl+C、Ctrl+V 当成发给服务器的控制键（^C 中断、
+// ^V 字面量），于是在终端里既复制不出来也粘贴不进去。这里接管：
+//   * 有选中文字时 Ctrl+C（以及 Ctrl+Shift+C、Ctrl+Insert）复制；没选中时 Ctrl+C 照旧是中断；
+//   * Ctrl+V（以及 Ctrl+Shift+V、Shift+Insert）交给浏览器原生粘贴 —— xterm 自己的输入框
+//     收到 paste 事件后照常发给服务器。原生粘贴不需要剪贴板权限，http 访问也能用；
+//   * 右键：有选中就复制；没选中且浏览器允许读剪贴板（https）就直接粘贴，否则留给浏览器
+//     自己的右键菜单（选「粘贴」即可，xterm 会把输入框挪到鼠标下）。
+// Mac 上 Cmd+C / Cmd+V 本来就不归 xterm 管，浏览器原生处理。
+const hasSelection = ref(false)
+const pasteBoxOpen = ref(false)
+const pasteBoxText = ref('')
+const pasteBoxEl = ref<HTMLTextAreaElement | null>(null)
+let contextMenuHost: HTMLElement | null = null
+
+async function copySelection() {
+  const text = term?.getSelection() || ''
+  if (!text) return
+  const ok = await writeClipboard(text)
+  // 只报字数不回显内容：终端输出可能就是密钥、密码之类。
+  showToast(ok ? `已复制 ${text.length} 个字符` : '复制失败（浏览器限制），请改用右键菜单复制', ok ? 'ok' : 'err')
+  term?.clearSelection()
+  term?.focus()
+}
+
+function pasteText(text: string) {
+  if (!text || !term || phase.value !== 'live') return
+  // term.paste 会处理换行（\r\n → \r）和括号粘贴模式（远端 shell 开了的话，多行粘贴不会被
+  // 一行一行地立刻执行），然后经 onData 发给服务器。
+  term.paste(text)
+  term.focus()
+}
+
+/** 浏览器允不允许网页直接读剪贴板：只有 https / localhost 这类安全上下文里才有。 */
+function canReadClipboard(): boolean {
+  return window.isSecureContext && typeof navigator.clipboard?.readText === 'function'
+}
+
+async function pasteFromClipboard() {
+  // navigator.clipboard.readText 只在 https（安全上下文）里有，首次会弹权限询问；
+  // http 访问、拒绝权限、Firefox 都读不到 —— 那就给一个输入框让用户自己粘进去。
+  if (canReadClipboard()) {
+    try {
+      const text = await navigator.clipboard.readText()
+      if (text) {
+        pasteText(text)
+        return
+      }
+    } catch {
+      /* 退回输入框 */
+    }
+  }
+  openPasteBox()
+}
+
+async function openPasteBox() {
+  pasteBoxText.value = ''
+  pasteBoxOpen.value = true
+  await nextTick()
+  pasteBoxEl.value?.focus()
+}
+
+function closePasteBox() {
+  pasteBoxOpen.value = false
+  pasteBoxText.value = ''
+  term?.focus()
+}
+
+function sendPasteBox() {
+  pasteText(pasteBoxText.value)
+  closePasteBox()
+}
+
+function onTerminalKey(e: KeyboardEvent): boolean {
+  if (e.type !== 'keydown' || !term) return true
+  const key = e.key.toLowerCase()
+  const ctrlOnly = e.ctrlKey && !e.altKey && !e.metaKey
+  // 复制：Ctrl+Shift+C 总是复制；Ctrl+C 只在有选中时复制，否则仍发 ^C 中断。
+  if (ctrlOnly && key === 'c' && (e.shiftKey || term.hasSelection())) {
+    e.preventDefault()
+    void copySelection()
+    return false
+  }
+  if (ctrlOnly && e.key === 'Insert' && term.hasSelection()) {
+    e.preventDefault()
+    void copySelection()
+    return false
+  }
+  // 粘贴：不让 xterm 把它当控制键，也**不** preventDefault —— 让浏览器做原生粘贴。
+  if (ctrlOnly && key === 'v') return false
+  if (e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey && e.key === 'Insert') return false
+  return true
+}
+
+function onTerminalContextMenu(e: MouseEvent) {
+  if (!term) return
+  if (term.hasSelection()) {
+    e.preventDefault()
+    void copySelection()
+    return
+  }
+  if (phase.value === 'live' && canReadClipboard()) {
+    e.preventDefault()
+    void pasteFromClipboard()
+  }
+  // 否则不拦：浏览器自己的右键菜单里有「粘贴」。
+}
+
 function disposeTerm() {
   resizeObserver?.disconnect()
   resizeObserver = null
+  contextMenuHost?.removeEventListener('contextmenu', onTerminalContextMenu)
+  contextMenuHost = null
+  hasSelection.value = false
+  pasteBoxOpen.value = false
   try {
     term?.dispose()
   } catch {
@@ -140,6 +271,12 @@ async function ensureTerm() {
   term.loadAddon(fit)
   term.open(termEl.value)
   fit.fit()
+  term.attachCustomKeyEventHandler(onTerminalKey)
+  term.onSelectionChange(() => {
+    hasSelection.value = !!term?.hasSelection()
+  })
+  contextMenuHost = termEl.value
+  contextMenuHost.addEventListener('contextmenu', onTerminalContextMenu)
   term.onData((data) => {
     if (socket && socket.readyState === WebSocket.OPEN && phase.value === 'live') {
       socket.send(data)

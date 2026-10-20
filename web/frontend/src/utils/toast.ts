@@ -102,7 +102,8 @@ function copyViaExecCommand(text: string): boolean {
   }
 }
 
-async function writeClipboard(text: string): Promise<boolean> {
+/** 只写剪贴板、不弹提示（网页终端用：复制的可能是敏感输出，不该回显在提示条里）。 */
+export async function writeClipboard(text: string): Promise<boolean> {
   // Prefer modern API when available and likely to succeed (secure context).
   if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
     try {
