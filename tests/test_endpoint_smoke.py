@@ -351,6 +351,7 @@ def test_every_endpoint_is_wired() -> None:
             "/api/jobs/capacity",
             f"/api/tenants/{tid}", f"/api/tenants/{tid}/instances",
             f"/api/tenants/{tid}/instances/{iid}", f"/api/tenants/{tid}/account",
+            f"/api/tenants/{tid}/instances/{iid}/root-password",
             f"/api/tenants/{tid}/tier",
             f"/api/tenants/{tid}/usage", f"/api/tenants/{tid}/free-quota",
             f"/api/tenants/{tid}/invoices", f"/api/tenants/{tid}/trial-credits",

@@ -533,7 +533,7 @@ def subscribe_tenant_region(
         session = get_session_for_row(row)
         result = session.subscribe_region(wanted)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"开通副区失败：{exc}") from exc
+        raise HTTPException(status_code=502, detail=f"开通副区失败：{safe_error_text(exc)}") from exc
     if not result.ok:
         write_audit(
             db,

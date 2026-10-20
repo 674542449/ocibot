@@ -301,9 +301,9 @@ class InstanceOut(BaseModel):
     ipv6_addresses: list[str] = Field(default_factory=list)
     boot_volume_size_in_gbs: Optional[int] = None
     free_tier_tag: str = ""
-    # root password recorded on the instance's freeform tags at launch, when the
-    # instance was created in password mode. Empty for key-mode instances.
-    root_password: str = ""
+    # 实例标签里有没有记 root 密码（密码模式创建时写入，可在列表上改）。密码本身不在这里，
+    # 要看时走 GET /tenants/{id}/instances/{iid}/root-password。
+    has_root_password: bool = False
     # 终止保护（OCI freeform tag ocibot_protected）。开启后 terminate 路由直接拒绝。
     protected: bool = False
     # Oracle Cloud Agent 的监控插件是否被禁用。None = 实例没返回 agent_config，

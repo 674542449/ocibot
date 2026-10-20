@@ -246,6 +246,12 @@ def safe_error_text(exc: BaseException) -> str:
             f"{remaining or '约 30 秒后自动恢复。'}"
             "这与 API Key、IAM 策略、Compartment 配置都无关，稍后重试即可。"
         )
+    if type(exc).__module__.split(".", 1)[0] == "sqlalchemy":
+        # 数据库驱动的报错原文带着 SQL 语句、表名列名和绑定参数（可能就是别的行的数据），
+        # 不能原样送到浏览器。原文记进服务端日志 —— 路由是 raise HTTPException(...) from exc，
+        # 那条链不会被自动打出来，不在这里记就哪儿都没有了。
+        logging.getLogger("ocibot.errors").error("database error", exc_info=exc)
+        return "数据库操作失败，详情见服务器日志"
     return _scrub_ocids(str(exc))
 
 

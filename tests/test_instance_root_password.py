@@ -1,9 +1,9 @@
-"""Root password surfaced from the instance's freeform tags.
+"""Root password memo on the instance's freeform tags.
 
-Password-mode launches already wrote the generated password to the
-ocibot_root_password freeform tag; nothing read it back, so the panel showed it
-exactly once at creation and then lost it. The tag rides along with the instance
-object, so exposing it costs no extra OCI call.
+Password-mode launches write the generated password to the ocibot_root_password
+freeform tag. Since 0.4.150 the list / detail payloads only say WHETHER one is
+recorded (``has_root_password``); the plaintext is fetched on demand from
+GET .../root-password (audited) instead of riding along with every list refresh.
 """
 
 from __future__ import annotations
@@ -35,23 +35,28 @@ def _info(**kw) -> InstanceInfo:
     return InstanceInfo(**base)
 
 
-def test_password_from_the_tag_reaches_the_api_payload():
+def test_a_recorded_password_is_flagged_but_not_sent():
     info = _info(freeform_tags={"ocibot_managed": "true", ROOT_PASSWORD_TAG: "Hunter2-Hunter2"})
-    assert instance_to_dict(info)["root_password"] == "Hunter2-Hunter2"
+    out = instance_to_dict(info)
+    assert out["has_root_password"] is True
+    assert "Hunter2-Hunter2" not in repr(out)
 
 
 def test_key_mode_instance_has_no_password():
-    """Key-mode launches never write the tag; the column must render empty, not
-    show some other tag's value."""
+    """Key-mode launches never write the tag; another tag must not count as one."""
     info = _info(freeform_tags={"ocibot_managed": "true", "ocibot_ssh_user": "root"})
-    assert instance_to_dict(info)["root_password"] == ""
+    assert instance_to_dict(info)["has_root_password"] is False
 
 
 def test_instance_without_any_tags_does_not_raise():
-    assert instance_to_dict(_info(freeform_tags={}))["root_password"] == ""
+    assert instance_to_dict(_info(freeform_tags={}))["has_root_password"] is False
 
 
 def test_non_string_tag_value_is_coerced():
     """Tags come back from the SDK; a surprising type must not break the list."""
     info = _info(freeform_tags={ROOT_PASSWORD_TAG: 12345})
-    assert instance_to_dict(info)["root_password"] == "12345"
+    assert instance_to_dict(info)["has_root_password"] is True
+
+
+def test_a_blank_tag_is_not_a_password():
+    assert instance_to_dict(_info(freeform_tags={ROOT_PASSWORD_TAG: "  "}))["has_root_password"] is False

@@ -27,7 +27,6 @@ def system_status(
     user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
 ) -> dict[str, Any]:
-    _ = user
     settings = get_settings()
     raw = get_meta(db, KEY_WORKER_HEARTBEAT) or ""
     worker_id = get_meta(db, KEY_WORKER_ID) or ""
@@ -47,19 +46,26 @@ def system_status(
     import os
 
     git_sha = (os.environ.get("OCIBOT_GIT_SHA") or "").strip() or "unknown"
-    return {
+    out: dict[str, Any] = {
         "worker_alive": alive,
-        "worker_id": worker_id,
         "heartbeat_age_sec": heartbeat_age,
         "stale_after_sec": stale_after,
         "server_time": now.isoformat(),
         "app_version": settings.app_version,
-        "git_sha": git_sha,
         # False = the worker makes no background Oracle calls, so capacity retry and
         # power schedules will not fire. Surfaced so a job that never runs is
         # explainable instead of a mystery.
         "background_oci": bool(settings.worker_background_oci),
-        # 提示里要写的环境变量名由这里给（只有登录后才拿得到），不写进前端代码 ——
-        # 前端 JS 不用登录就能下载，变量名等于报出软件身份。
-        "background_oci_env": "OCIBOT_WORKER_BACKGROUND_OCI",
     }
+    if user.is_admin:
+        # 部署细节只给管理员：Worker 的主机标识、代码提交号、配置项名字。多用户面板里
+        # 的普通用户用不上，也不该知道服务器上跑的是哪个容器、哪一次提交。
+        # 环境变量名由这里给而不写进前端代码 —— 前端 JS 不用登录就能下载。
+        out.update(
+            {
+                "worker_id": worker_id,
+                "git_sha": git_sha,
+                "background_oci_env": "OCIBOT_WORKER_BACKGROUND_OCI",
+            }
+        )
+    return out

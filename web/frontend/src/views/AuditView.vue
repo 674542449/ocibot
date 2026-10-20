@@ -128,6 +128,7 @@ const ACTION_LABELS: Record<string, string> = {
   'instance.protect': '开启终止保护',
   'instance.unprotect': '解除终止保护',
   'instance.root_password_note': '修改密码备注',
+  'instance.root_password_view': '查看 root 密码',
   'instance.console_output': '抓取引导日志',
   'firewall.open_all': '放行全部端口',
   'firewall.clear': '清空防火墙规则',

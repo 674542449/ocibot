@@ -17,6 +17,7 @@ from app.oci_client import (
     safe_error_text,
     OCIClientError,
     POWER_ACTIONS,
+    ROOT_PASSWORD_TAG,
     TERMINATE_PROTECT_TAG,
     is_capacity_message,
 )
@@ -173,7 +174,7 @@ def list_instances(
     except OCIClientError as exc:
         raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"列出实例失败: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"列出实例失败: {safe_error_text(exc)}") from exc
 
 
 @router.get("/instances", response_model=list[InstanceOut])
@@ -333,6 +334,37 @@ def rename_instance(
         raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
+
+
+@router.get("/tenants/{tenant_id}/instances/{instance_id}/root-password")
+def get_root_password_note(
+    tenant_id: str,
+    instance_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    """点「显示 / 复制」时才取 root 密码备注。列表 / 详情接口只说有没有，不带明文。
+
+    每次查看记一条审计：密码明文离开服务端的每一次都该有据可查。
+    """
+    row = _tenant_or_404(db, user.id, tenant_id)
+    try:
+        session = get_session_for_row(row)
+        info = session.get_instance(instance_id, resolve_ips=False)
+        tags = getattr(info, "freeform_tags", None) or {}
+        password = str(tags.get(ROOT_PASSWORD_TAG, "") or "") if isinstance(tags, dict) else ""
+    except OCIClientError as exc:
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
+    write_audit(
+        db,
+        owner_id=user.id,
+        action="instance.root_password_view",
+        target=instance_id,
+        detail={"tenant": row.name, "found": bool(password)},
+    )
+    return {"root_password": password}
 
 
 @router.post(
@@ -718,7 +750,7 @@ def account_invoices(
     except OCIClientError as exc:
         raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"读取账单失败: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"读取账单失败: {safe_error_text(exc)}") from exc
 
 
 @router.get("/tenants/{tenant_id}/usage")
@@ -788,7 +820,7 @@ def free_quota(
     except OCIClientError as exc:
         raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"读取免费额度失败: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"读取免费额度失败: {safe_error_text(exc)}") from exc
 
 
 @router.post("/tenants/{tenant_id}/launch-quota-check")
@@ -868,7 +900,7 @@ def launch_quota_check(
     except OCIClientError as exc:
         raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"校验免费额度失败: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"校验免费额度失败: {safe_error_text(exc)}") from exc
 
     out = guard.to_dict()
     out["free_only_mode"] = free_only
@@ -938,7 +970,7 @@ def launch_meta(
     except OCIClientError as exc:
         raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"加载创建元数据失败: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"加载创建元数据失败: {safe_error_text(exc)}") from exc
 
 
 @router.post("/tenants/{tenant_id}/launch-meta/refresh")
@@ -970,7 +1002,7 @@ def launch_meta_refresh(
     except OCIClientError as exc:
         raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"启动加载失败: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"启动加载失败: {safe_error_text(exc)}") from exc
 
 
 @router.get("/tenants/{tenant_id}/launch-meta/status")
@@ -991,7 +1023,7 @@ def launch_meta_status(
         session = get_session_for_row(row)
         return launch_meta_state(session, row.id)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"读取加载状态失败: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"读取加载状态失败: {safe_error_text(exc)}") from exc
 
 
 @router.post("/tenants/{tenant_id}/launch", response_model=LaunchInstanceResult)
@@ -1104,7 +1136,7 @@ def launch_instance(
         except Exception as exc:  # noqa: BLE001
             # A quota-read failure must not surface as an unhandled 500 (this branch
             # previously re-raised HTTPException only, so anything else escaped).
-            raise HTTPException(status_code=502, detail=f"校验免费额度失败: {exc}") from exc
+            raise HTTPException(status_code=502, detail=f"校验免费额度失败: {safe_error_text(exc)}") from exc
 
         # Pre-launch: IPv6 + managed NSG (desktop parity)
         try:
@@ -1117,7 +1149,7 @@ def launch_instance(
         except (ValueError, OCIClientError) as exc:
             raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
         except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status_code=502, detail=f"准备网络/NSG 失败: {exc}") from exc
+            raise HTTPException(status_code=502, detail=f"准备网络/NSG 失败: {safe_error_text(exc)}") from exc
 
         def _audit_launch(ok: bool, message: str, instance_id: str = "", job_id: str = "") -> None:
             write_audit(

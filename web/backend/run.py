@@ -38,6 +38,8 @@ def main() -> None:
         proxy_headers=trust_proxy,
         forwarded_allow_ips=forwarded_allow_ips,
         timeout_keep_alive=30,
+        # 不发 `server: uvicorn`：告诉外人后台用的是什么服务器软件没有任何好处。
+        server_header=False,
         ws="websockets",
     )
 

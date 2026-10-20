@@ -177,7 +177,7 @@ def create_capacity_job(
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"校验免费额度失败: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"校验免费额度失败: {safe_error_text(exc)}") from exc
 
     interval = clamp_retry_interval(body.interval_sec or DEFAULT_RETRY_INTERVAL_SEC)
     max_attempts = clamp_max_attempts(body.max_attempts or DEFAULT_MAX_ATTEMPTS)

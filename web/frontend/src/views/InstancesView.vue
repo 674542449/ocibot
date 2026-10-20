@@ -172,7 +172,7 @@
               <!-- 密码模式创建时写在实例标签里；密钥模式没有这个值。
                    默认打码，点一下才显示 —— 列表常开着，也常被截图。 -->
               <div class="pwd-wrap">
-                <template v-if="ins.root_password">
+                <template v-if="ins.has_root_password">
                   <span
                     class="copyable pwd-cell"
                     :title="revealed.has(ins.id) ? '单击复制 root 密码' : '单击显示 root 密码'"
@@ -180,7 +180,7 @@
                     tabindex="0"
                     @click="onPasswordClick(ins, $event)"
                     @keydown.enter.prevent="onPasswordClick(ins)"
-                  >{{ revealed.has(ins.id) ? ins.root_password : '••••••••' }}</span>
+                  >{{ revealed.has(ins.id) ? passwords.get(ins.id) : '••••••••' }}</span>
                 </template>
                 <span v-else class="muted">—</span>
                 <!-- Editable because the note is written once at launch and goes
@@ -190,7 +190,7 @@
                 <button
                   type="button"
                   class="ghost pwd-edit"
-                  :title="ins.root_password ? '修改密码备注' : '记录 root 密码'"
+                  :title="ins.has_root_password ? '修改密码备注' : '记录 root 密码'"
                   :aria-label="`${ins.display_name} 密码备注`"
                   :disabled="pwdBusy === ins.id"
                   @click="editPassword(ins)"
@@ -653,15 +653,39 @@ async function loadTenantsInner() {
 
 /** 已点开显示明文的实例 id。刷新列表不清空，避免每次刷新又要重点一遍。 */
 const revealed = reactive(new Set<string>())
+/** 点「显示」时才向服务端要的密码（列表接口不带明文），按实例 id 存在这一页的内存里。 */
+const passwords = reactive(new Map<string, string>())
+
+async function fetchPassword(ins: Instance): Promise<string | null> {
+  const cached = passwords.get(ins.id)
+  if (cached !== undefined) return cached
+  try {
+    const { data } = await api.get<{ root_password: string }>(
+      `/tenants/${ins.tenant_id || tenantId.value}/instances/${ins.id}/root-password`,
+    )
+    const value = String(data?.root_password || '')
+    passwords.set(ins.id, value)
+    return value
+  } catch (e: any) {
+    showToast(e?.message || '读取密码失败', 'err', 5000)
+    return null
+  }
+}
 
 /** 第一次点显示，之后点复制。 */
 async function onPasswordClick(ins: Instance, ev?: MouseEvent) {
-  if (!ins.root_password) return
+  if (!ins.has_root_password) return
   if (!revealed.has(ins.id)) {
-    revealed.add(ins.id)
+    pwdBusy.value = ins.id
+    try {
+      if ((await fetchPassword(ins)) !== null) revealed.add(ins.id)
+    } finally {
+      pwdBusy.value = ''
+    }
     return
   }
-  await copyText(ins.root_password, 'root 密码已复制')
+  const value = passwords.get(ins.id)
+  if (value) await copyText(value, 'root 密码已复制')
   void ev
 }
 
@@ -677,7 +701,18 @@ const pwdBusy = ref('')
  * character apart and the consequences of confusing them are not.
  */
 async function editPassword(ins: Instance) {
-  const current = ins.root_password || ''
+  // 有备注时先把现值取回来填进输入框（列表接口不带明文）。
+  let current = ''
+  if (ins.has_root_password) {
+    pwdBusy.value = ins.id
+    try {
+      const value = await fetchPassword(ins)
+      if (value === null) return
+      current = value
+    } finally {
+      pwdBusy.value = ''
+    }
+  }
   const next = window.prompt(
     `记录 ${ins.display_name} 的 root 密码。\n` +
       `仅更新面板显示，不会修改服务器上的密码。\n` +
@@ -699,8 +734,12 @@ async function editPassword(ins: Instance) {
     }
     // Update in place rather than reloading the whole list: a full refresh here
     // would spend an Oracle round trip per row to redisplay one changed cell.
-    ins.root_password = value
-    if (!value) revealed.delete(ins.id)
+    ins.has_root_password = !!value
+    if (value) passwords.set(ins.id, value)
+    else {
+      passwords.delete(ins.id)
+      revealed.delete(ins.id)
+    }
     showToast(data.message || '已更新密码备注', 'ok', 2500)
   } catch (e: any) {
     showToast(e?.message || '更新失败', 'err', 5000)

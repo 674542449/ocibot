@@ -285,8 +285,9 @@ export type Instance = {
   ipv6_addresses: string[]
   boot_volume_size_in_gbs: number | null
   free_tier_tag: string
-  /** 创建时若选了 root 密码模式，密码会写进实例标签，这里带回来。密钥模式为空。 */
-  root_password: string
+  /** 实例标签里有没有记 root 密码。密码本身不随列表下发，
+   *  要看时 GET /tenants/{id}/instances/{iid}/root-password（每次查看记审计）。 */
+  has_root_password: boolean
   /** 终止保护。存在 OCI 实例的 freeform tag 上，所以面板重装后
    *  依然有效，在 Oracle 控制台里也看得见。开启时后端的 terminate 直接返回 409。 */
   protected: boolean

@@ -74,12 +74,12 @@ def instance_to_dict(info: InstanceInfo, *, tenant_id: str = "", tenant_name: st
         "ipv6_addresses": list(info.ipv6_addresses or []),
         "boot_volume_size_in_gbs": info.boot_volume_gb,
         "free_tier_tag": free_tier_tag(info.shape),
-        # Written at launch for password-mode instances (see ROOT_PASSWORD_TAG).
-        # It rides along with the instance object, so surfacing it costs no extra
-        # OCI call. Plaintext by nature: an OCI freeform tag is readable by anyone
-        # with instance-read on the tenancy.
-        "root_password": str(
-            (getattr(info, "freeform_tags", None) or {}).get(ROOT_PASSWORD_TAG, "") or ""
+        # 只说「有没有记」，不带密码本身（0.4.150）。以前列表 / 详情接口把每台实例的
+        # root 密码备注明文一起下发：页面上虽然打码，响应正文里却是明文，开发者工具、
+        # 浏览器扩展、代理日志都看得到，而且每次刷新列表都发一遍。现在点「显示 / 复制」
+        # 时才单独取（GET .../root-password，记审计）。
+        "has_root_password": bool(
+            str((getattr(info, "freeform_tags", None) or {}).get(ROOT_PASSWORD_TAG, "") or "").strip()
         ),
         # 终止保护。用 OCI freeform tag 存，不用面板本地的列：面板重装或数据库
         # 恢复之后这个标记还在，而且在 Oracle 控制台里也看得见，不会变成只有本

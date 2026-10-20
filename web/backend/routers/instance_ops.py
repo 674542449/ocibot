@@ -124,7 +124,7 @@ def list_console(
         info = session.get_instance(instance_id, resolve_ips=False)
         raw = session.list_console_connections(instance_id, info.compartment_id)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"读取控制台连接失败：{exc}") from exc
+        raise HTTPException(status_code=502, detail=f"读取控制台连接失败：{safe_error_text(exc)}") from exc
     conns, error = _unpack_console_list(raw)
     if error:
         # An empty list with ok:true would be read as "none exist"; say it failed.
