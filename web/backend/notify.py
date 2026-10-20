@@ -394,6 +394,9 @@ def _send_webhook(config: dict[str, Any], title: str, body: str) -> tuple[bool, 
     headers = {}
     secret = str(config.get("secret") or "").strip()
     if secret:
+        # 新名字不带产品名（设置页上要写出这个头名，而前端代码是公开下载的）；旧名字照发，
+        # 已经按 X-OCIBot-Secret 校验的接收端不用改。
+        headers["X-Webhook-Secret"] = secret
         headers["X-OCIBot-Secret"] = secret
     with httpx.Client(**_HTTP_CLIENT_KW) as client:
         status, _payload = _post(

@@ -110,3 +110,84 @@ def test_the_admin_api_supplies_the_explanations_instead():
     bans = c.get("/api/admin/ip-bans").json()
     assert bans["help"]["intro"] and bans["help"]["ua_rules"]
     assert bans["reason_labels"]["lock_decoy"]
+
+
+# ---------------------------------------------------------------- 不暴露产品名（0.4.149）
+
+FRONTEND = ROOT / "web" / "frontend"
+_KEYWORD = re.compile(r"ocibot", re.I)
+
+
+def _public_frontend_files():
+    """会进打包产物、或原样发给访客的文件（vite.config.ts 之类的构建配置不算）。"""
+    yield FRONTEND / "index.html"
+    for path in (FRONTEND / "public").iterdir():
+        yield path
+    for path in FRONTEND_SRC.rglob("*"):
+        if path.suffix in {".vue", ".ts", ".js", ".css", ".html", ".json"}:
+            yield path
+
+
+def test_the_public_frontend_never_names_the_product():
+    """登录页、图标、manifest、打包出来的 JS 谁都能下载。产品名（连同带它的存储键名、
+    响应头名、环境变量名、文件名）一出现，拿去公开仓库一搜就知道这是什么、有哪些防护。"""
+    hits = []
+    for path in _public_frontend_files():
+        data = path.read_bytes()
+        text = data.decode("utf-8", "ignore")
+        for m in _KEYWORD.finditer(text):
+            line = text.count("\n", 0, m.start()) + 1
+            hits.append(f"{path.relative_to(ROOT)}:{line}")
+    assert not hits, "前端公开文件里出现了产品名：\n" + "\n".join(hits)
+
+
+def test_the_built_bundle_never_names_the_product():
+    dist = FRONTEND / "dist"
+    if not (dist / "index.html").is_file():
+        pytest.skip("前端没构建过（web/frontend/dist 不存在）")
+    hits = [str(p.relative_to(ROOT)) for p in dist.rglob("*")
+            if p.is_file() and _KEYWORD.search(p.read_bytes().decode("utf-8", "ignore"))]
+    assert not hits, "打包产物里出现了产品名（是不是没重新构建？）：\n" + "\n".join(hits)
+    # 发出去的 index.html 不带注释（源码注释里有内部路径，拿去一搜就能找到仓库）。
+    assert "<!--" not in (dist / "index.html").read_text(encoding="utf-8")
+
+
+def test_unauthenticated_responses_never_name_the_product():
+    outsider = TestClient(app, client=("8.8.8.8", 5100))
+    health = outsider.get("/api/health")
+    assert health.json() == {"status": "ok"}
+    for r in (
+        outsider.get("/api/auth/lock-status"),
+        outsider.post("/api/auth/login", json={"username": "nobody-x", "password": "whatever1"}),
+        outsider.post("/api/auth/login", json={"username": "u"}, headers={"origin": "https://evil.example"}),
+    ):
+        assert not _KEYWORD.search(r.text), r.text
+        for name, value in r.headers.items():
+            assert not _KEYWORD.search(name) and not _KEYWORD.search(value), (name, value)
+    # 服务器本机照样看得到（README 的 curl 127.0.0.1、install.sh、容器健康检查）。
+    local = TestClient(app, client=("127.0.0.1", 5100)).get("/api/health").json()
+    assert local["version"] and local["app"]
+
+
+# ---------------------------------------------------------------- 部署脚本的自检请求
+
+
+def test_deploy_probes_of_the_public_address_never_use_curls_default_user_agent():
+    """部署脚本从服务器自己探测公网地址时，面板看到的来源是服务器自己的公网 IP；curl 的
+    默认 UA（Debian 13 是 curl/8.14.1）正好在 IP 封禁的默认规则里 —— 一次 HTTPS 自检就会
+    把服务器自己的 IP 封掉。打公网地址（https://域名、http://公网IP）的 curl 必须带 -A。"""
+    offenders = []
+    for script in ("scripts/install.sh", "scripts/setup-proxy.sh"):
+        text = (ROOT / script).read_text(encoding="utf-8")
+        for n, line in enumerate(text.splitlines(), 1):
+            joined = line
+            if line.rstrip().endswith("\\"):
+                joined = line + " " + text.splitlines()[n]  # 续行
+            # verify_public_https 里用的是 "$url"（= https://域名/api/health）。
+            if "curl" not in line or ("/api/health" not in joined and '"$url"' not in joined):
+                continue
+            if "127.0.0.1" in joined or "${API_CT}" in joined:
+                continue  # 本机 / 容器网络：来源是内网地址，本来就不封
+            if " -A " not in line:
+                offenders.append(f"{script}:{n}: {line.strip()}")
+    assert not offenders, "\n".join(offenders)

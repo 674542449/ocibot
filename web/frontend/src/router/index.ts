@@ -130,7 +130,7 @@ router.beforeEach(async (to) => {
  * exactly once: if the reload does not fix it, the cause is not a stale chunk
  * and looping would hide the real error.
  */
-const RELOAD_FLAG = 'ocibot_chunk_reload'
+const RELOAD_FLAG = 'panel_chunk_reload'
 
 router.onError((err, to) => {
   const msg = String((err as Error)?.message || err)

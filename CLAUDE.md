@@ -85,6 +85,16 @@ unmapping one again fails the suite instead of production.
   admin-only API; `tests/test_frontend_exposure.py` fails if it reappears in
   `web/frontend/src`. Login responses carry no session token in the body — it lives
   only in the HttpOnly cookie.
+- Nothing an outsider can fetch names the product: no "OCIBot" in the login page,
+  icons, manifest or anywhere in the frontend bundle (storage keys, response header
+  names, download filenames, env-var hints all use neutral names or come from an
+  authenticated API), the shipped `index.html` has its comments stripped at build
+  time (vite.config.ts), and unauthenticated responses (`/api/health`, auth routes,
+  the cross-site 403) never mention it. `tests/test_frontend_exposure.py` enforces
+  this. Server-internal names (env vars, Python modules, cookie names) are fine.
+- Deploy scripts that probe the panel's *public* address from the server itself
+  send `-A deploy-healthcheck/1`: the panel sees the server's own public IP, and
+  curl's default UA (curl/8.14.1 on Debian 13) is in the default IP-ban rules.
 
 ## Security review history
 

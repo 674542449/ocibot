@@ -72,7 +72,7 @@
             <input v-model="addConfig.url" placeholder="https://..." />
           </div>
           <div class="field">
-            <label>Secret 头（可选，X-OCIBot-Secret）</label>
+            <label>Secret 头（可选，X-Webhook-Secret）</label>
             <input v-model="addConfig.secret" />
           </div>
         </div>

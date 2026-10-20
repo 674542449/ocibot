@@ -605,4 +605,4 @@ class HealthOut(BaseModel):
     status: str
     # 只给服务器本机 / 内网和已登录的人看（见 main.py::health）；外网未登录的访客没有这个字段。
     version: Optional[str] = None
-    app: str
+    app: Optional[str] = None

@@ -8,17 +8,18 @@
 
     <header class="brand" aria-hidden="true">
       <img class="mark" src="/logo.svg" width="26" height="26" alt="" />
-      <span class="brand-name">OCIBOT</span>
+      <span class="brand-name">控制台</span>
     </header>
 
+    <!-- 登录页不写产品名，也不列功能清单：这一页谁都能打开，产品名或一串特有的功能名
+         拿去公开仓库一搜就知道这是什么软件、有哪些防护。 -->
     <main class="stack-area">
       <section class="hero">
         <h1 class="wordmark">
-          <span class="line">OCIBOT</span>
+          <span class="line">云资源</span>
           <span class="line accent">控制台</span>
         </h1>
-        <p class="lede">多账号 · 多区域云资源管理</p>
-        <p class="modules">实例 · 存储 · 网络 · 容量重试 · WebSSH · 备份</p>
+        <p class="lede">请登录以继续</p>
       </section>
 
       <section class="panel">
@@ -341,14 +342,6 @@ async function submit() {
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
-}
-
-.modules {
-  margin: 0.5rem 0 0;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  letter-spacing: 0.04em;
-  color: var(--muted);
 }
 
 .dot.down {

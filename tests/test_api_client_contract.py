@@ -7,7 +7,7 @@
 0.4.111 用一个 fetch 封装替掉了 axios（入口包 -24%，那是唯一阻塞首屏的包）。
 替换必须逐字复刻四件调用方依赖的事，而每一件失灵都是**静默**的：
 
-  1. `headers` 是小写普通对象 —— 两处直接下标取 `res.headers['x-ocibot-reread']`，
+  1. `headers` 是小写普通对象 —— 两处直接下标取 `res.headers['x-reread']`，
      给 Headers 实例的话取到 undefined，「这次是 Oracle 瞬时故障」的提示就没了。
   2. `err.response = {status, data}` —— BackupView 靠 `data instanceof Blob` 解析
      导出失败的正文，LaunchView 靠 `status` 区分「被拒」和「响应丢了」。

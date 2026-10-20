@@ -172,15 +172,22 @@ def _login(client: TestClient, headers: dict[str, str]):
     )
 
 
-def test_middleware_rejects_a_cross_site_post():
+def test_middleware_rejects_a_cross_site_post(caplog):
+    import logging
+
     from web.backend.main import app
 
-    with TestClient(app) as c:
-        r = _login(c, {"origin": "https://evil.example.net"})
+    with caplog.at_level(logging.WARNING, logger="ocibot.web"):
+        with TestClient(app) as c:
+            r = _login(c, {"origin": "https://evil.example.net"})
     assert r.status_code == 403, r.text
-    # The message has to say what to do: if a reverse proxy rewrote Host, this
-    # looks like the entire panel breaking and the fix is not guessable.
-    assert "OCIBOT_CORS_ORIGINS" in r.json()["detail"]
+    # The fix still has to be findable: if a reverse proxy rewrote Host, this
+    # looks like the entire panel breaking. It goes to the server log, not the
+    # response — anyone can trigger this response, and the config name would tell
+    # them which software this is (0.4.149).
+    assert "OCIBOT_CORS_ORIGINS" in caplog.text
+    assert "OCIBOT" not in r.json()["detail"]
+    assert "README" in r.json()["detail"]
 
 
 def test_middleware_allows_a_same_origin_post():

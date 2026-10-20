@@ -245,11 +245,13 @@ def create_app() -> FastAPI:
         # 于是一份被拒绝的读取又会被渲染成「你没有实例」。
         # X-Ocibot-Reread 同理：实例详情「首读 404、复读成功」的说明走这一对头，
         # 不 expose 的话跨源部署下这条解释永远到不了用户眼前。
+        # 名字刻意不带产品名：前端代码里要写这些头名，而前端 JS 不用登录就能下载。
         expose_headers=[
-            "X-Ocibot-Partial",
-            "X-Ocibot-Partial-Reason",
-            "X-Ocibot-Reread",
-            "X-Ocibot-Reread-Reason",
+            "X-Partial",
+            "X-Partial-Reason",
+            "X-Reread",
+            "X-Reread-Reason",
+            "X-Backup-Notice",
         ],
     )
 
@@ -268,13 +270,16 @@ def create_app() -> FastAPI:
 
     @app.get("/api/health", response_model=HealthOut, response_model_exclude_none=True, tags=["system"])
     def health(request: Request) -> HealthOut:
-        """``version`` 只给能确认身份的人看：服务器本机 / 内网（README 和 install.sh 里那条
+        """``version`` / ``app`` 只给能确认身份的人看：服务器本机 / 内网（README 和 install.sh 里那条
         ``curl http://127.0.0.1:8000/api/health``，以及容器 healthcheck、面板内更新）和已登录
         的用户。外网未登录的访客只拿到 ok —— 仓库是公开的，版本号等于告诉对方这里跑的是
         哪一份源码、有哪些防护。"""
         show = _may_see_version(request)
+        # app 名同样只给这些人：公网未登录的访客只看到 ok，认不出这是什么软件。
         return HealthOut(
-            status="ok", version=settings.app_version if show else None, app=settings.app_name
+            status="ok",
+            version=settings.app_version if show else None,
+            app=settings.app_name if show else None,
         )
 
     # Registered before security_headers so it ends up *inside* it: a rejected
@@ -294,7 +299,9 @@ def create_app() -> FastAPI:
                 forwarded_host=request.headers.get("x-forwarded-host") or "",
             ):
                 log.warning(
-                    "rejected cross-site %s %s: origin=%r host=%r x-forwarded-host=%r",
+                    "rejected cross-site %s %s: origin=%r host=%r x-forwarded-host=%r — if this is "
+                    "the panel's own address behind a reverse proxy, add it to OCIBOT_CORS_ORIGINS "
+                    "(emergency: OCIBOT_ORIGIN_CHECK=0)",
                     request.method,
                     request.url.path,
                     origin,
@@ -303,12 +310,13 @@ def create_app() -> FastAPI:
                 )
                 # Say what to do about it: if a reverse proxy rewrote Host this
                 # looks like the whole panel breaking, and the fix is not guessable.
+                # 回给请求方的话不点名配置项：任何人发一个带外站 Origin 的 POST 就能拿到
+                # 这句，环境变量名等于报出软件身份。怎么修写在上面那行日志和 README 里。
                 return JSONResponse(
                     {
                         "detail": (
                             "跨站请求被拒绝：请求的 Origin 与本站不一致。若这是反向代理配置"
-                            "问题，请把面板的公开地址（如 https://panel.example.com）加入 "
-                            "OCIBOT_CORS_ORIGINS；应急可设 OCIBOT_ORIGIN_CHECK=0。"
+                            "问题，见服务器日志和 README 故障排查表。"
                         )
                     },
                     status_code=403,

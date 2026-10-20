@@ -154,7 +154,7 @@ def test_home_screen_icons_are_pngs_of_the_right_size():
 
 def test_the_manifest_points_at_icons_that_exist():
     data = json.loads(_read(MANIFEST))
-    assert data["name"] == "OCIBot"
+    assert data["name"] == "控制台"
     sizes = {}
     for icon in data["icons"]:
         path = PUBLIC / icon["src"].lstrip("/")
@@ -215,7 +215,7 @@ def test_the_backend_serves_the_icons_with_the_right_types():
         r = c.get("/manifest.webmanifest")
         assert r.status_code == 200
         assert r.headers["content-type"].startswith("application/manifest+json")
-        assert r.json()["name"] == "OCIBot"
+        assert r.json()["name"] == "控制台"
         for name in ("apple-touch-icon.png", "icon-192.png", "icon-512.png"):
             r = c.get("/" + name)
             assert r.status_code == 200, name

@@ -25,7 +25,7 @@
       <strong>⚠ 后台 OCI 请求已关闭，本页任务不会执行</strong>
       <p class="muted" style="margin: 0.3rem 0 0; font-size: 12px">
         任务可以照常创建和保存，但 Worker 不会去调用 Oracle，抢机不会触发。
-        要恢复：在 <code>web/.env</code> 里设 <code>OCIBOT_WORKER_BACKGROUND_OCI=1</code>
+        要恢复：在 <code>web/.env</code> 里设 <code>{{ backgroundOciEnv }}=1</code>
         后执行 <code>docker compose up -d</code>。
       </p>
     </div>
@@ -137,11 +137,14 @@ const attempts = ref<Record<string, Attempt[]>>({})
 const openLog = ref('')
 /** 后台 OCI 是否被关掉；关掉时本页的任务永远不会跑，必须说清楚。 */
 const backgroundOff = ref(false)
+// 环境变量名由服务端给，不写在前端代码里（前端 JS 不用登录就能下载）。
+const backgroundOciEnv = ref('')
 
 async function checkBackground() {
   try {
     const { data } = await api.get('/system/status')
     backgroundOff.value = data.background_oci === false
+    backgroundOciEnv.value = String(data.background_oci_env || '')
   } catch {
     // 状态读不到不是本页的重点，静默即可
   }

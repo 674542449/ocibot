@@ -136,11 +136,11 @@ def test_a_transient_recovery_is_reported_not_silently_swallowed():
     import pathlib
 
     routes = pathlib.Path("web/backend/routers/instances.py").read_text(encoding="utf-8")
-    assert "X-Ocibot-Reread" in routes
+    assert "X-Reread" in routes
     main = pathlib.Path("web/backend/main.py").read_text(encoding="utf-8")
-    assert "X-Ocibot-Reread" in main, "自定义响应头不 expose，跨源部署下前端读不到"
+    assert "X-Reread" in main, "自定义响应头不 expose，跨源部署下前端读不到"
     ui = pathlib.Path("web/frontend/src/views/InstanceDetailView.vue").read_text(encoding="utf-8")
-    assert "x-ocibot-reread" in ui
+    assert "x-reread" in ui
 
 
 def test_the_note_lives_on_the_result_not_on_the_shared_session():

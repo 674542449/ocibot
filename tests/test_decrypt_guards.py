@@ -123,7 +123,7 @@ def test_export_skips_the_undecryptable_row_and_still_saves_the_healthy_ones():
         _login(c, "decguard-export")
         r = c.post("/api/backup/export", json={"password": "Str0ng-backup-pass"})
     assert r.status_code == 200, r.text
-    notice = json.loads(unquote(r.headers["X-OCIBot-Backup-Notice"]))
+    notice = json.loads(unquote(r.headers["X-Backup-Notice"]))
     assert notice["exported"] == 1
     assert [item["name"] for item in notice["skipped"]] == ["decguard-broken"]
     assert "无法解密" in notice["skipped"][0]["reason"]

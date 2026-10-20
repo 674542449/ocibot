@@ -444,7 +444,7 @@
       <details>
         <summary class="muted" style="cursor: pointer; font-size: 13px">高级：首次启动脚本（cloud-init）</summary>
         <div class="field" style="margin-top: 0.5rem">
-          <label>Shell 脚本，实例首次启动时以 root 执行一次（日志在 /var/log/ocibot-user-script.log）</label>
+          <label>Shell 脚本，实例首次启动时以 root 执行一次（日志在 /var/log/user-script.log）</label>
           <textarea
             v-model="form.user_data"
             rows="5"

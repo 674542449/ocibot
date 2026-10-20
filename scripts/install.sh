@@ -388,16 +388,21 @@ check_dns() {
 # 不能用 `curl -fsS`：-f 只在 400 及以上失败，308 会被当成成功返回空 body ——
 # 于是明文回源导致的重定向死循环会被报成「HTTPS 已就绪 ✓」，恰好是操作者最需要
 # 被告知的那一种坏法。这里认状态码，并在 30x 指回同一个 https 地址时点破成因。
+# 从服务器自己探测公网地址时用的 User-Agent。不能用 curl 的默认值：这个请求绕到公网再
+# 回来，面板看到的来源是服务器自己的公网 IP，而 curl/8.14.1（Debian 13 自带的版本）正好
+# 在 IP 封禁的默认规则里 —— 一次 HTTPS 检查就会把服务器自己的 IP 封掉。
+PROBE_UA="deploy-healthcheck/1"
+
 verify_public_https() {
   local domain="$1" url="https://$1/api/health" code loc
-  code="$(curl -s -o /dev/null -m 15 -w '%{http_code}' "$url" 2>/dev/null || echo 000)"
+  code="$(curl -s -A "$PROBE_UA" -o /dev/null -m 15 -w '%{http_code}' "$url" 2>/dev/null || echo 000)"
   case "$code" in
     200)
       log "HTTPS 已就绪 ✓（https://$domain）"
       return 0
       ;;
     30*)
-      loc="$(curl -sI -m 15 "$url" 2>/dev/null | tr -d '\r' | sed -n 's/^[Ll]ocation: //p' | tail -n1)"
+      loc="$(curl -sI -A "$PROBE_UA" -m 15 "$url" 2>/dev/null | tr -d '\r' | sed -n 's/^[Ll]ocation: //p' | tail -n1)"
       case "$loc" in
         https://"$domain"/*)
           warn "HTTPS 返回 $code 且跳回自己（Location: $loc）—— 这是重定向死循环"
@@ -678,7 +683,7 @@ do_switch_mode() {
     local ready=0
     for i in $(seq 1 20); do
       # 静默探一次，只在最后一次把结论和成因打出来 —— 中途的失败是正常的等待过程。
-      if [ "$(curl -s -o /dev/null -m 10 -w '%{http_code}' \
+      if [ "$(curl -s -A "$PROBE_UA" -o /dev/null -m 10 -w '%{http_code}' \
                 "https://${PANEL_DOMAIN}/api/health" 2>/dev/null || echo 000)" = "200" ]; then
         ready=1
         break

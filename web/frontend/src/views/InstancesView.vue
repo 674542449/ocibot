@@ -614,7 +614,7 @@ function exportCsv() {
   // 开头的 BOM 不能省：Windows 上的 Excel 没有它就按 ANSI 读，
   // 中文的实例名 / 租户名全部乱码。
   const blob = new Blob(['﻿' + lines.join('\n')], { type: 'text/csv;charset=utf-8' })
-  downloadBlob(blob, `ocibot-instances-${new Date().toISOString().slice(0, 10)}.csv`)
+  downloadBlob(blob, `instances-${new Date().toISOString().slice(0, 10)}.csv`)
   showToast(`已导出 ${rows.length} 行`, 'ok')
 }
 
@@ -750,9 +750,9 @@ async function load() {
     // 读取会返回空数组，页面照样渲染「暂无实例。请先在「租户」添加 API」——
     // 把权限问题说成空账号，还让人去做一件早就做过的事。部分成功更隐蔽：
     // 列表看着正常，只是少了几台。
-    const partial = res.headers?.['x-ocibot-partial']
+    const partial = res.headers?.['x-partial']
     partialWarn.value = partial
-      ? decodeURIComponent(String(res.headers?.['x-ocibot-partial-reason'] || '')) ||
+      ? decodeURIComponent(String(res.headers?.['x-partial-reason'] || '')) ||
         '部分 compartment 读取失败'
       : ''
   } catch (e: any) {

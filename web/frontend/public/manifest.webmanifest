@@ -1,6 +1,6 @@
 {
-  "name": "OCIBot",
-  "short_name": "OCIBot",
+  "name": "控制台",
+  "short_name": "控制台",
   "description": "Oracle Cloud 多租户实例管理面板",
   "start_url": "/",
   "display": "standalone",

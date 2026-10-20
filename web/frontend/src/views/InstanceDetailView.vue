@@ -115,7 +115,7 @@
         </button>
       </div>
       <p v-if="instance?.protected" class="muted" style="margin: 0.4rem 0 0; font-size: 12px">
-        🔒 已开启终止保护。标记存在 Oracle 的实例标签上（<code>ocibot_protected</code>），
+        🔒 已开启终止保护。标记存在 Oracle 的实例标签上，
         面板重装后依然有效，在 Oracle 控制台里也看得见。
       </p>
     </div>
@@ -1113,7 +1113,7 @@ const loading = ref(false)
 const acting = ref(false)
 const error = ref('')
 const msg = ref('')
-// 「首读 404、复读成功」的说明（X-Ocibot-Reread 响应头）。见 loadInstance。
+// 「首读 404、复读成功」的说明（X-Reread 响应头）。见 loadInstance。
 const rereadNote = ref('')
 const tab = ref<
   'metrics' | 'console' | 'bootlog' | 'webssh' | 'firewall' | 'network' | 'volume'
@@ -1742,8 +1742,8 @@ async function loadInstance() {
   // 不显示的话这个修复是**隐形**的：页面只是有时候慢一点，而「我账号是满权限的
   // API，有时候点会出问题，有时候又好好的」这个困惑原封不动。显示出来，用户才知道
   // 那次是 Oracle 侧的瞬时故障，不用再去翻自己的 IAM 策略。
-  rereadNote.value = res.headers?.['x-ocibot-reread']
-    ? decodeURIComponent(String(res.headers?.['x-ocibot-reread-reason'] || '')) ||
+  rereadNote.value = res.headers?.['x-reread']
+    ? decodeURIComponent(String(res.headers?.['x-reread-reason'] || '')) ||
       '首次读取失败、重读后成功 —— 本次是瞬时故障'
     : ''
   instance.value = data

@@ -59,4 +59,7 @@ def system_status(
         # power schedules will not fire. Surfaced so a job that never runs is
         # explainable instead of a mystery.
         "background_oci": bool(settings.worker_background_oci),
+        # 提示里要写的环境变量名由这里给（只有登录后才拿得到），不写进前端代码 ——
+        # 前端 JS 不用登录就能下载，变量名等于报出软件身份。
+        "background_oci_env": "OCIBOT_WORKER_BACKGROUND_OCI",
     }

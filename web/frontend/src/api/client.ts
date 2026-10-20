@@ -12,7 +12,7 @@
  *   1. 泛型方法 `get<T>()` —— 24 处这么写，去掉泛型会炸出 30 个 TS2558。
  *   2. `headers` 是**普通对象、键全小写**，不是 Headers 实例 ——
  *      InstanceDetailView 和 InstancesView 直接下标取
- *      `res.headers['x-ocibot-reread']`；给 Headers 实例的话取到的是 undefined，
+ *      `res.headers['x-reread']`；给 Headers 实例的话取到的是 undefined，
  *      而且是**静默**的（那两处是「这次读是不是瞬时故障/部分失败」的提示）。
  *   3. 抛出的错误上要挂 `err.response = { status, data }` —— BackupView 靠
  *      `e.response.data instanceof Blob` 解析导出失败的正文，LaunchView 靠
@@ -93,8 +93,15 @@ function messageFrom(data: any, fallback: string): string {
   return fallback
 }
 
+/**
+ * 浏览器里记登录用户名的键。名字刻意不带产品名：前端代码不用登录就能下载，键名会被看到。
+ * 放在这里（而不是单独一个模块）是因为 client.ts 不 import 任何东西 —— test/client.check.mjs
+ * 直接编译这一个文件来跑。
+ */
+export const USERNAME_KEY = 'panel_username'
+
 function on401(path: string) {
-  localStorage.removeItem('ocibot_username')
+  localStorage.removeItem(USERNAME_KEY)
   // 初次的 /auth/me 探测交给路由守卫处理；只有会话中途过期才硬跳转，
   // 并把当前位置带上，登录完能回到原地。
   if (!path.endsWith('/auth/me') && !location.pathname.startsWith('/login')) {
@@ -280,7 +287,7 @@ export type Instance = {
   free_tier_tag: string
   /** 创建时若选了 root 密码模式，密码会写进实例标签，这里带回来。密钥模式为空。 */
   root_password: string
-  /** 终止保护。存在 OCI 的 freeform tag `ocibot_protected` 上，所以面板重装后
+  /** 终止保护。存在 OCI 实例的 freeform tag 上，所以面板重装后
    *  依然有效，在 Oracle 控制台里也看得见。开启时后端的 terminate 直接返回 409。 */
   protected: boolean
   /** Oracle Cloud Agent 的监控插件是否被禁用 —— 也就是「监控页为什么一片空白」

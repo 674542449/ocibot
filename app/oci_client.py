@@ -1107,7 +1107,7 @@ def build_root_cloud_init(
             script_lines.insert(0, "#!/bin/bash")
         lines.extend(
             [
-                "  - path: /var/lib/ocibot-user-script.sh",
+                "  - path: /var/lib/user-script.sh",
                 "    owner: root:root",
                 "    permissions: '0700'",
                 "    content: |",
@@ -1146,7 +1146,7 @@ def build_root_cloud_init(
     if script:
         # Run last so the user script sees final SSH/firewall state; log for debugging.
         commands.append(
-            "bash /var/lib/ocibot-user-script.sh > /var/log/ocibot-user-script.log 2>&1 || true"
+            "bash /var/lib/user-script.sh > /var/log/user-script.log 2>&1 || true"
         )
     lines.extend(f"  - {command}" for command in commands)
     raw = "\n".join(lines) + "\n"

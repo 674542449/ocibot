@@ -15,7 +15,7 @@ import { transformSync } from 'esbuild'
 const here = path.dirname(fileURLToPath(import.meta.url))
 const srcPath = path.join(here, '..', 'src', 'utils', 'tier.ts')
 const js = transformSync(readFileSync(srcPath, 'utf8'), { loader: 'ts', format: 'esm' }).code
-const out = path.join(mkdtempSync(path.join(tmpdir(), 'ocibot-tier-')), 'tier.mjs')
+const out = path.join(mkdtempSync(path.join(tmpdir(), 'panel-tier-')), 'tier.mjs')
 writeFileSync(out, js)
 const { tierLabel, tierBadgeClass, accountAge, upgradeStateLabel } = await import(pathToFileURL(out).href)
 

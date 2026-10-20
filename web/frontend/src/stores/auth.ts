@@ -1,12 +1,12 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import api, { type TokenResponse } from '@/api/client'
+import api, { type TokenResponse, USERNAME_KEY } from '@/api/client'
 import { resetTenantLock, setLockedTenantFromSession } from '@/stores/tenantLock'
 
 export const useAuthStore = defineStore('auth', () => {
   // Auth is the server's HttpOnly cookie. We keep only the username (for display
   // and an optimistic isLoggedIn), and validate the real session via refreshMe().
-  const username = ref<string | null>(localStorage.getItem('ocibot_username'))
+  const username = ref<string | null>(localStorage.getItem(USERNAME_KEY))
   const isAdmin = ref(false)
   const totpEnabled = ref(false)
   const sessionChecked = ref(false)
@@ -16,7 +16,7 @@ export const useAuthStore = defineStore('auth', () => {
   function setSession(data: TokenResponse) {
     // 会话凭证只在 HttpOnly Cookie 里，服务端不再把它放进应答正文，这里也不碰它。
     username.value = data.username
-    localStorage.setItem('ocibot_username', data.username)
+    localStorage.setItem(USERNAME_KEY, data.username)
   }
 
   function clearLocal() {
@@ -26,7 +26,7 @@ export const useAuthStore = defineStore('auth', () => {
     // Otherwise the next account signing in on this browser would open every
     // page on the previous operator's default tenant.
     resetTenantLock()
-    localStorage.removeItem('ocibot_username')
+    localStorage.removeItem(USERNAME_KEY)
   }
 
   async function logout() {
@@ -72,9 +72,9 @@ export const useAuthStore = defineStore('auth', () => {
    */
   function takeBootMe(): Promise<Me | null> | null {
     const w = window as any
-    const p = w.__ocibotMe
+    const p = w.__meProbe
     if (!p) return null
-    w.__ocibotMe = null
+    w.__meProbe = null
     return p
   }
 
@@ -91,7 +91,7 @@ export const useAuthStore = defineStore('auth', () => {
       // The default tenant lives with the account, so it arrives with the session
       // rather than being read out of this browser's storage.
       setLockedTenantFromSession(String(data.locked_tenant_id || ''))
-      localStorage.setItem('ocibot_username', data.username)
+      localStorage.setItem(USERNAME_KEY, data.username)
       return true
     } catch {
       clearLocal()

@@ -161,9 +161,9 @@ def list_instances(
         # 换成对象会同时打破前端契约和 TS 类型。
         tree_errors = list(getattr(session, "_last_tree_errors", []) or [])
         if tree_errors and response is not None:
-            response.headers["X-Ocibot-Partial"] = "1"
+            response.headers["X-Partial"] = "1"
             # header 只能装 latin-1，错误里几乎一定有中文，所以百分号编码。
-            response.headers["X-Ocibot-Partial-Reason"] = quote(
+            response.headers["X-Partial-Reason"] = quote(
                 f"{len(tree_errors)} 处 compartment 读取失败：{tree_errors[0]}"[:400]
             )
         return [
@@ -216,9 +216,9 @@ def get_instance(
         # 加字段会同时打破前端契约和 TS 类型（同 X-Ocibot-Partial 的理由）。
         note = str(getattr(info, "read_note", "") or "")
         if note and response is not None:
-            response.headers["X-Ocibot-Reread"] = "1"
+            response.headers["X-Reread"] = "1"
             # header 只能装 latin-1，中文必须百分号编码。
-            response.headers["X-Ocibot-Reread-Reason"] = quote(note[:400])
+            response.headers["X-Reread-Reason"] = quote(note[:400])
         return InstanceOut(**instance_to_dict(info, tenant_id=row.id, tenant_name=row.name))
     except OCIClientError as exc:
         raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc

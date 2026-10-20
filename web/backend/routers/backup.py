@@ -259,7 +259,7 @@ def export_encrypted_zip(
         )
     buf.seek(0)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    filename = f"ocibot-backup-{stamp}.zip"
+    filename = f"backup-{stamp}.zip"
     write_audit(
         db,
         owner_id=user.id,
@@ -276,7 +276,7 @@ def export_encrypted_zip(
         media_type="application/zip",
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
-            "X-OCIBot-Backup-Notice": _notice_header(
+            "X-Backup-Notice": _notice_header(
                 {
                     "format": BACKUP_ENVELOPE_VERSION,
                     "exported": len(tenants_payload),

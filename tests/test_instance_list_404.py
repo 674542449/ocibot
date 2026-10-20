@@ -344,7 +344,7 @@ def test_a_permanent_failure_says_it_was_re_read():
 
 def test_a_transient_failure_leaves_a_trace_instead_of_being_silent():
     """复读成功不该是一次「侥幸通过」—— _last_tree_errors 会被路由渲染成
-    X-Ocibot-Partial 响应头，前端据此挂提示条。"""
+    X-Partial 响应头，前端据此挂提示条。"""
     from app.oci_client import transient_404_note
 
     src = _code_only(TenantSession.list_instances_tree)

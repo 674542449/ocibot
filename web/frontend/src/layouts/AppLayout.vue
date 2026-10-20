@@ -8,7 +8,7 @@
       </button>
       <img class="mobile-mark" src="/logo.svg" width="26" height="26" alt="" />
       <div class="mobile-brand">
-        <span class="title">OCIBot</span>
+        <span class="title">控制台</span>
         <span class="muted small">{{ pageTitle }}</span>
       </div>
     </header>
@@ -19,7 +19,7 @@
              全站只有这一个标记（底板 + 白色环与核心）。以前这里内联了一份跟随
              --accent 的无底板字形，结果侧边栏、登录页、favicon 三处长得各不一样。
              改标记见 scripts/make_favicon.py，tests/test_brand_mark.py 钉着各处。 -->
-        <img class="brand-mark" src="/logo.svg" width="34" height="34" alt="OCIBot" />
+        <img class="brand-mark" src="/logo.svg" width="34" height="34" alt="" />
         <button
           type="button"
           class="icon-btn sidebar-close"
@@ -114,7 +114,7 @@
            allowed to call Oracle. Without saying so, a capacity-retry job that
            never fires looks like a bug. -->
       <div v-if="workerChecked && workerAlive && !backgroundOci" class="worker-banner bg-off">
-        后台 OCI 请求已关闭（<code>OCIBOT_WORKER_BACKGROUND_OCI=0</code>）。
+        后台 OCI 请求已关闭（<code>{{ backgroundOciEnv }}=0</code>）。
         抢机任务<strong>不会执行</strong>，面板只在你操作时请求 Oracle。
       </div>
       <div v-if="workerChecked && !workerAlive" class="error-box worker-banner">
@@ -189,6 +189,8 @@ function isNavActive(item: NavItem): boolean {
 
 const workerAlive = ref(true)
 const backgroundOci = ref(true)
+// 环境变量名由服务端给（登录后才拿得到），不写在前端代码里。
+const backgroundOciEnv = ref('')
 const workerChecked = ref(false)
 const heartbeatText = ref('从未收到心跳')
 const buildLabel = ref('')
@@ -207,6 +209,7 @@ async function checkWorker() {
     workerAlive.value = !!data.worker_alive
     // Absent on an older backend -> assume on, matching the shipped default.
     backgroundOci.value = data.background_oci !== false
+    backgroundOciEnv.value = String(data.background_oci_env || '')
     if (data.heartbeat_age_sec == null) {
       heartbeatText.value = '从未收到心跳'
     } else {
@@ -643,7 +646,7 @@ onBeforeUnmount(() => {
     padding-top: max(0.4rem, env(safe-area-inset-top));
   }
 
-  /* 手机顶栏也放同一个标记：以前这里只有「OCIBot」两个字，是全站唯一
+  /* 手机顶栏也放同一个标记：以前这里只有面板名两个字，是全站唯一
      没有 logo 的入口。 */
   .mobile-mark {
     display: block;

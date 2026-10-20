@@ -163,7 +163,9 @@ fi
 
 PUBIP="$(curl -fsS -m 5 https://api.ipify.org 2>/dev/null || true)"
 if [ -n "$PUBIP" ]; then
-  if curl -fsS -m 5 "http://${PUBIP}:8000/api/health" >/dev/null 2>&1; then
+  # 固定的 UA：从自己的公网 IP 打过来，curl 默认 UA（如 curl/8.14.1）会命中面板的
+  # IP 封禁规则，把服务器自己的 IP 封掉（同 install.sh 的 PROBE_UA）。
+  if curl -fsS -A "deploy-healthcheck/1" -m 5 "http://${PUBIP}:8000/api/health" >/dev/null 2>&1; then
     warn "自检 2/2：公网仍能直连 8000 端口 ✗（明文面板还暴露着）"
     ok=0
   else

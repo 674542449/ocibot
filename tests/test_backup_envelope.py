@@ -201,7 +201,7 @@ def test_the_response_tells_the_ui_what_the_file_actually_is():
     _seed_tenant(owner, "bkenv-notice-tenant")
     with _client("bkenv-notice") as c:
         r = c.post("/api/backup/export", json={"password": _GOOD_BACKUP_PASSWORD})
-    notice = json.loads(unquote(r.headers["X-OCIBot-Backup-Notice"]))
+    notice = json.loads(unquote(r.headers["X-Backup-Notice"]))
     assert notice["exported"] >= 1
     assert notice["skipped"] == []
     # 界面上必须说清楚这份文件等同于甲骨文账号本身，而不是「配置备份」。

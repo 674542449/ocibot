@@ -23,7 +23,7 @@ const js = transformSync(readFileSync(srcPath, 'utf8'), {
   loader: 'ts',
   format: 'esm',
 }).code
-const out = path.join(mkdtempSync(path.join(tmpdir(), 'ocibot-client-')), 'client.mjs')
+const out = path.join(mkdtempSync(path.join(tmpdir(), 'panel-client-')), 'client.mjs')
 writeFileSync(out, js)
 
 
@@ -44,8 +44,8 @@ const server = http.createServer((req, res) => {
     seen.push({ url: req.url, method: req.method, headers: req.headers, body })
     const p = req.url.split('?')[0]
     if (p === '/api/echo') {
-      res.writeHead(200, { 'content-type': 'application/json', 'x-ocibot-reread': '1',
-                           'X-Ocibot-Reread-Reason': 'boom' })
+      res.writeHead(200, { 'content-type': 'application/json', 'x-reread': '1',
+                           'X-Reread-Reason': 'boom' })
       res.end(JSON.stringify({ ok: true, url: req.url }))
     } else if (p === '/api/blob') {
       res.writeHead(200, { 'content-type': 'application/zip' })
@@ -91,8 +91,8 @@ function check(name, cond, extra = '') {
 // 2. headers 是小写普通对象，可下标取。
 {
   const r = await api.get('/echo')
-  check('headers 小写普通对象', r.headers['x-ocibot-reread'] === '1'
-    && r.headers['x-ocibot-reread-reason'] === 'boom')
+  check('headers 小写普通对象', r.headers['x-reread'] === '1'
+    && r.headers['x-reread-reason'] === 'boom')
 }
 // 3. JSON 请求体带 content-type。
 {

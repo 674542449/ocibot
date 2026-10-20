@@ -90,7 +90,7 @@
         <div v-if="!updateInfo.capabilities?.can_apply" class="error-box" style="font-size: 13px">
           当前环境无法在线更新（需要 Docker 部署并挂载宿主机仓库与 docker.sock）。
           请 SSH 执行：
-          <code>cd ~/ocibot && bash scripts/install.sh update</code>
+          进入安装目录后执行 <code>bash scripts/install.sh update</code>
           <div class="muted" style="margin-top: 0.35rem; font-size: 12px">
             enabled={{ updateInfo.capabilities?.enabled }} · host_dir={{
               updateInfo.capabilities?.host_dir_exists

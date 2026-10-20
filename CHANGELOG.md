@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.4.149 — 2026-10-20
+
+外人能看到的地方一律不出现产品名；修掉部署脚本会把服务器自己的 IP 封掉的问题。
+
+### 修复
+
+- **【中】`install.sh domain` 的 HTTPS 自检会把服务器自己的 IP 封掉。** 自检从服务器上
+  `curl https://你的域名/api/health`，请求绕到公网（或 Cloudflare）再回来，面板看到的来源是
+  服务器自己的公网 IP，而 curl 的默认 UA 在 Debian 13 上正好是 `curl/8.14.1` —— IP 封禁的
+  默认规则。于是执行一次 `install.sh domain <域名>` 就把服务器自己封了（自检报「返回 403」）。
+  `setup-proxy.sh` 探测公网 8000 端口的那一下同理。`install.sh update` / `status` 只探
+  `127.0.0.1`，不受影响。现在这几处自检固定带 `User-Agent: deploy-healthcheck/1`。
+  **如果服务器 IP 已经在封禁列表里**，在管理页解封，或在服务器上
+  `bash scripts/install.sh unban 服务器公网IP`。
+
+### 功能
+
+- **外人能看到的地方不再出现产品名。** 登录页、浏览器标签标题、图标、manifest、打包出来的
+  所有前端 JS，以及不登录就能拿到的接口应答，都不再出现「OCIBot」：
+  - 登录页改成通用的「云资源 控制台 / 请登录以继续」，去掉了功能清单（一串特有的功能名同样
+    一搜就能找到仓库）；
+  - 发出去的 `index.html` 在打包时去掉注释（源码注释里有内部路径）；图标 SVG 去掉注释；
+  - 浏览器存储键名、响应头（`X-Partial`、`X-Reread`、`X-Backup-Notice`）、下载文件名
+    （`backup-…zip`、`instances-…csv`）换成中性名字；页面上要写的环境变量名改由登录后的接口给；
+  - `/api/health` 对外网未登录的访客只回 `{"status":"ok"}`（应用名和版本号都不给）；
+  - 跨站请求被拒时，回给请求方的话不再点名配置项（怎么修写进服务器日志）。
+- Webhook 通知的 Secret 头新增 `X-Webhook-Secret`，设置页显示这个名字；**旧的 `X-OCIBot-Secret`
+  照发**，已经按旧名字校验的接收端不用改。
+- 新开实例的启动脚本改放 `/var/lib/user-script.sh`，日志在 `/var/log/user-script.log`
+  （已有实例不受影响）。
+- 更新后第一次打开面板会自动按新的键名记下用户名，**不需要重新登录**。
+
+### 维护
+
+- `tests/test_frontend_exposure.py`：前端公开文件、打包产物、未登录接口应答都不许出现产品名；
+  部署脚本打公网地址的自检必须带 `-A`（去掉一处就失败，已验证）。CLAUDE.md 记下这两条。
+
+### 升级
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.149（在服务器上执行才显示版本号）
+```
+
 ## 0.4.148 — 2026-10-20
 
 前台不暴露敏感信息：登录相关的判断全在服务端；去掉公开 JS 里的蜜罐说明、登录应答里的会话凭证、对外的版本号。
