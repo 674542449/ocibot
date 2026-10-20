@@ -28,7 +28,8 @@
       </div>
     </div>
 
-    <div v-if="error" class="error-box">{{ error }}</div>
+    <!-- 弹窗开着时错误显示在弹窗里（见下）：这里会被遮罩盖住，失败了等于什么都没发生。 -->
+    <div v-if="error && !showForm" class="error-box">{{ error }}</div>
 
     <div class="card table-wrap">
       <table>
@@ -277,8 +278,11 @@
         >
           <div class="tenant-modal-head">
             <h3 style="margin: 0">{{ editingId ? '编辑租户' : '粘贴原始 API 添加租户' }}</h3>
-            <button type="button" class="ghost tenant-modal-close" aria-label="关闭" @click="closeForm">✕</button>
+            <button type="button" class="ghost tenant-modal-close" aria-label="关闭" @click="closeFormGuarded">✕</button>
           </div>
+          <!-- 表单里所有出错（导入 / 保存失败、私钥文件不对、剪贴板为空、解析失败）都写进
+               error。页面顶部那个错误框被遮罩盖着，必须在弹窗里也显示。 -->
+          <div v-if="error" class="error-box">{{ error }}</div>
 
     <!-- Create: paste-first -->
     <div v-if="!editingId" class="stack">
@@ -358,7 +362,7 @@ key_file=~/.oci/oci_api_key.pem"
         <button type="button" @click="showManual = !showManual">
           {{ showManual ? '收起手动表单' : '改用手动填写' }}
         </button>
-        <button @click="showForm = false">取消</button>
+        <button @click="closeForm">取消</button>
       </div>
 
       <!-- Optional manual fallback -->
@@ -461,7 +465,7 @@ key_file=~/.oci/oci_api_key.pem"
         <button class="primary" :disabled="saving" @click="saveManual">
           {{ saving ? '保存中…' : '保存' }}
         </button>
-        <button @click="showForm = false">取消</button>
+        <button @click="closeForm">取消</button>
       </div>
     </div>
         </div>
@@ -510,13 +514,31 @@ const editingId = ref<string | null>(null)
 const saving = ref(false)
 const modalEl = ref<HTMLElement | null>(null)
 
-function closeForm() {
-  showForm.value = false
+/** 打开弹窗那一刻的表单内容，用来判断有没有没保存的修改。 */
+let formSnapshot = ''
+
+function formState() {
+  return JSON.stringify([paste, form])
 }
 
-/** Esc 关弹窗；保存进行中不关（关了也拦不住那次请求，只会让结果无处显示）。 */
+function closeForm() {
+  showForm.value = false
+  error.value = ''
+}
+
+/** ✕ / Esc 关弹窗：填了东西没保存的话先问一句（重新点「添加租户」会清空表单）。
+ *  「取消」按钮是明确的放弃，不问。 */
+function closeFormGuarded() {
+  if (formState() !== formSnapshot && !confirm('放弃这次填写、还没保存的内容？')) return
+  closeForm()
+}
+
+/** Esc 关弹窗。保存进行中不关（关了也拦不住那次请求，只会让结果无处显示）；
+ *  输入法正在选字时的 Esc 是取消候选词，不是关窗口。 */
 function onModalKey(e: KeyboardEvent) {
-  if (e.key === 'Escape' && showForm.value && !saving.value) closeForm()
+  if (e.key !== 'Escape' || !showForm.value || saving.value) return
+  if (e.isComposing || e.keyCode === 229) return
+  closeFormGuarded()
 }
 
 // 弹窗开着时锁住背后的页面滚动，并把焦点放进第一个输入框。
@@ -524,6 +546,7 @@ watch(showForm, async (open) => {
   document.body.style.overflow = open ? 'hidden' : ''
   if (open) {
     await nextTick()
+    formSnapshot = formState()
     modalEl.value?.querySelector<HTMLElement>('textarea, input')?.focus()
   }
 })
@@ -857,6 +880,7 @@ async function pickPemForForm() {
 }
 
 function openCreate() {
+  error.value = ''
   editingId.value = null
   resetForm()
   resetPaste()
@@ -864,6 +888,7 @@ function openCreate() {
 }
 
 function openEdit(t: Tenant) {
+  error.value = ''
   editingId.value = t.id
   form.name = t.name
   form.user_ocid = t.user_ocid
@@ -905,6 +930,10 @@ async function pasteFromClipboard() {
 
 async function parseOnly() {
   error.value = ''
+  if (!paste.api_text.trim()) {
+    error.value = '请先粘贴 OCI 配置文本'
+    return
+  }
   try {
     const { data } = await api.post<ParsePreview>('/tenants/parse', {
       api_text: paste.api_text,
@@ -932,6 +961,11 @@ async function parseOnly() {
 
 async function importPaste() {
   error.value = ''
+  // 空着点保存，服务端回的是一句英文校验报错（String should have at least 1 character）。
+  if (!paste.api_text.trim()) {
+    error.value = '请先粘贴 OCI 配置文本（或点「改用手动填写」）'
+    return
+  }
   saving.value = true
   try {
     const { data } = await api.post<Tenant>('/tenants/import', {

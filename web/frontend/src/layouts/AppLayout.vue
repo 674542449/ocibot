@@ -114,7 +114,7 @@
            allowed to call Oracle. Without saying so, a capacity-retry job that
            never fires looks like a bug. -->
       <div v-if="workerChecked && workerAlive && !backgroundOci" class="worker-banner bg-off">
-        后台 OCI 请求已关闭（<code>{{ backgroundOciEnv }}=0</code>）。
+        后台 OCI 请求已关闭<template v-if="backgroundOciEnv">（<code>{{ backgroundOciEnv }}=0</code>）</template>。
         抢机任务<strong>不会执行</strong>，面板只在你操作时请求 Oracle。
       </div>
       <div v-if="workerChecked && !workerAlive" class="error-box worker-banner">

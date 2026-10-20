@@ -25,8 +25,12 @@
       <strong>⚠ 后台 OCI 请求已关闭，本页任务不会执行</strong>
       <p class="muted" style="margin: 0.3rem 0 0; font-size: 12px">
         任务可以照常创建和保存，但 Worker 不会去调用 Oracle，抢机不会触发。
-        要恢复：在 <code>web/.env</code> 里设 <code>{{ backgroundOciEnv }}=1</code>
-        后执行 <code>docker compose up -d</code>。
+        <!-- 配置项名字只有管理员拿得到（/system/status）；普通用户改不了服务器配置。 -->
+        <template v-if="backgroundOciEnv">
+          要恢复：在 <code>web/.env</code> 里设 <code>{{ backgroundOciEnv }}=1</code>
+          后执行 <code>docker compose up -d</code>。
+        </template>
+        <template v-else>要恢复请联系面板管理员。</template>
       </p>
     </div>
 
