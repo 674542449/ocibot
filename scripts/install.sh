@@ -68,14 +68,17 @@ ensure_docker() {
 
 # 小内存机器（如 2 核 1 GB）在服务器上现场构建镜像会把内存耗尽：前端打包、安装 Oracle
 # 的 Python SDK、数据库同时挤在 1 GB 里，没有交换空间的话内核来不及回收，整机卡死。
-# 内存 + 交换空间不足 3 GB 时，自动加一个 2 GB 的交换文件（/swapfile，写进 /etc/fstab，
+# 内存 + 交换空间不足 2.5 GB 时，自动加一个 2 GB 的交换文件（/swapfile，写进 /etc/fstab，
 # 重启后仍然有效）。不想要的话：OCIBOT_NO_SWAP=1 bash install.sh …
 ensure_build_memory() {
   local mem_kb swap_kb free_kb
   mem_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
   swap_kb="$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
   [ "${mem_kb:-0}" -gt 0 ] 2>/dev/null || return 0
-  if [ $((mem_kb + swap_kb)) -ge $((3 * 1024 * 1024)) ]; then
+  # 门槛 2.5 GB 而不是 3 GB：标称 1 GB 的云服务器系统里只看得到 950 MB 左右，加上 2 GB
+  # 交换空间是 2.9 GB —— 门槛定 3 GB 的话，已经加过 2 GB 的机器还会被再加一个。
+  local need_kb=$((2560 * 1024))
+  if [ $((mem_kb + swap_kb)) -ge "$need_kb" ]; then
     return 0
   fi
   local mem_mb=$((mem_kb / 1024))
@@ -87,30 +90,46 @@ ensure_build_memory() {
     warn "内存只有 ${mem_mb} MB 且交换空间不足，构建镜像时可能卡死。请用 root 运行本脚本（会自动加 2 GB 交换空间），或手动加交换空间"
     return 0
   fi
-  if [ -e /swapfile ]; then
-    # 以前加过但没启用（比如 fstab 被改过）：启用它就行，不重复创建。
-    swapon /swapfile 2>/dev/null || true
-    return 0
+  # 已有 /swapfile：没启用就启用它。启用之后（或本来就启用着）还是不够 —— 不少 VPS 镜像
+  # 自带的只有 512 MB，1 GB + 0.5 GB 构建照样卡死 —— 就另建一个 /swapfile2，原来那个不动。
+  local swap_path=/swapfile
+  if [ -e "$swap_path" ]; then
+    if ! awk -v p="$swap_path" '$1 == p {f = 1} END {exit !f}' /proc/swaps 2>/dev/null; then
+      if swapon "$swap_path" 2>/dev/null; then
+        log "已启用现有的交换文件 ${swap_path}"
+      else
+        warn "现有的 ${swap_path} 无法启用（可能不是有效的交换文件），请检查；先另建一个交换文件"
+      fi
+    fi
+    swap_kb="$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    if [ $((mem_kb + swap_kb)) -ge "$need_kb" ]; then
+      return 0
+    fi
+    swap_path=/swapfile2
+    if [ -e "$swap_path" ]; then
+      swapon "$swap_path" 2>/dev/null || warn "现有的 ${swap_path} 也无法启用，交换空间仍不足，构建时可能卡死"
+      return 0
+    fi
   fi
   free_kb="$(df -Pk / 2>/dev/null | awk 'NR==2 {print $4}')"
   if [ "${free_kb:-0}" -lt $((3 * 1024 * 1024)) ]; then
     warn "内存只有 ${mem_mb} MB，本想加 2 GB 交换空间，但根分区剩余不足 3 GB，跳过。构建时可能卡死"
     return 0
   fi
-  log "内存只有 ${mem_mb} MB，构建镜像时会被耗尽：创建 2 GB 交换文件 /swapfile …"
-  if ! fallocate -l 2G /swapfile 2>/dev/null; then
-    dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none || { rm -f /swapfile; warn "创建交换文件失败，跳过"; return 0; }
+  log "内存只有 ${mem_mb} MB，构建镜像时会被耗尽：创建 2 GB 交换文件 ${swap_path} …"
+  if ! fallocate -l 2G "$swap_path" 2>/dev/null; then
+    dd if=/dev/zero of="$swap_path" bs=1M count=2048 status=none || { rm -f "$swap_path"; warn "创建交换文件失败，跳过"; return 0; }
   fi
-  chmod 600 /swapfile
-  if ! mkswap /swapfile >/dev/null 2>&1 || ! swapon /swapfile 2>/dev/null; then
+  chmod 600 "$swap_path"
+  if ! mkswap "$swap_path" >/dev/null 2>&1 || ! swapon "$swap_path" 2>/dev/null; then
     # 某些文件系统（如 btrfs 默认设置）不支持交换文件。
-    swapoff /swapfile 2>/dev/null || true
-    rm -f /swapfile
+    swapoff "$swap_path" 2>/dev/null || true
+    rm -f "$swap_path"
     warn "当前文件系统不支持交换文件，跳过。构建时可能卡死"
     return 0
   fi
-  grep -q '^/swapfile ' /etc/fstab 2>/dev/null || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-  log "已启用 2 GB 交换空间（重启后仍有效）"
+  grep -q "^${swap_path} " /etc/fstab 2>/dev/null || echo "${swap_path} none swap sw 0 0" >> /etc/fstab
+  log "已启用 2 GB 交换空间 ${swap_path}（重启后仍有效）"
 }
 
 # 一个一个构建镜像。并行构建 api 和 worker 等于同时跑两份前端打包、两份依赖安装，
@@ -823,9 +842,17 @@ do_update() {
   ensure_docker
   ensure_repo
   if [ "${OCIBOT_SKIP_GIT:-0}" = "1" ]; then
-    log "跳过 git 同步（OCIBOT_SKIP_GIT=1，代码已由面板拉取）"
+    log "跳过 git 同步（OCIBOT_SKIP_GIT=1，代码已是最新）"
   elif [ -d "$REPO_DIR/.git" ]; then
     sync_repo_to_origin
+    # 用刚同步下来的新版脚本把更新做完。正在运行的这个 bash 一开始就把整个 install.sh
+    # 读进来了，接着往下跑的是**旧版**的构建逻辑 —— 新版里对更新流程的修复永远晚一个版本
+    # 才生效（0.4.155 的小内存保护就是这样，在带来它的那次更新里没有起作用）。
+    # OCIBOT_SKIP_GIT=1 让新脚本跳过同步，不会再进到这里。
+    if [ -f "$REPO_DIR/scripts/install.sh" ]; then
+      log "用刚同步的新版脚本继续更新…"
+      exec env OCIBOT_SKIP_GIT=1 OCIBOT_DIR="$REPO_DIR" bash "$REPO_DIR/scripts/install.sh" update
+    fi
   else
     warn "目录无 .git，仅重建当前文件树（不会拉 GitHub 新代码）"
   fi
