@@ -66,6 +66,67 @@ ensure_docker() {
   detect_compose
 }
 
+# 小内存机器（如 2 核 1 GB）在服务器上现场构建镜像会把内存耗尽：前端打包、安装 Oracle
+# 的 Python SDK、数据库同时挤在 1 GB 里，没有交换空间的话内核来不及回收，整机卡死。
+# 内存 + 交换空间不足 3 GB 时，自动加一个 2 GB 的交换文件（/swapfile，写进 /etc/fstab，
+# 重启后仍然有效）。不想要的话：OCIBOT_NO_SWAP=1 bash install.sh …
+ensure_build_memory() {
+  local mem_kb swap_kb free_kb
+  mem_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+  swap_kb="$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+  [ "${mem_kb:-0}" -gt 0 ] 2>/dev/null || return 0
+  if [ $((mem_kb + swap_kb)) -ge $((3 * 1024 * 1024)) ]; then
+    return 0
+  fi
+  local mem_mb=$((mem_kb / 1024))
+  if [ "${OCIBOT_NO_SWAP:-0}" = "1" ]; then
+    warn "内存只有 ${mem_mb} MB 且交换空间不足，构建镜像时可能卡死（已按 OCIBOT_NO_SWAP=1 跳过自动加交换空间）"
+    return 0
+  fi
+  if [ "$(id -u)" -ne 0 ]; then
+    warn "内存只有 ${mem_mb} MB 且交换空间不足，构建镜像时可能卡死。请用 root 运行本脚本（会自动加 2 GB 交换空间），或手动加交换空间"
+    return 0
+  fi
+  if [ -e /swapfile ]; then
+    # 以前加过但没启用（比如 fstab 被改过）：启用它就行，不重复创建。
+    swapon /swapfile 2>/dev/null || true
+    return 0
+  fi
+  free_kb="$(df -Pk / 2>/dev/null | awk 'NR==2 {print $4}')"
+  if [ "${free_kb:-0}" -lt $((3 * 1024 * 1024)) ]; then
+    warn "内存只有 ${mem_mb} MB，本想加 2 GB 交换空间，但根分区剩余不足 3 GB，跳过。构建时可能卡死"
+    return 0
+  fi
+  log "内存只有 ${mem_mb} MB，构建镜像时会被耗尽：创建 2 GB 交换文件 /swapfile …"
+  if ! fallocate -l 2G /swapfile 2>/dev/null; then
+    dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none || { rm -f /swapfile; warn "创建交换文件失败，跳过"; return 0; }
+  fi
+  chmod 600 /swapfile
+  if ! mkswap /swapfile >/dev/null 2>&1 || ! swapon /swapfile 2>/dev/null; then
+    # 某些文件系统（如 btrfs 默认设置）不支持交换文件。
+    swapoff /swapfile 2>/dev/null || true
+    rm -f /swapfile
+    warn "当前文件系统不支持交换文件，跳过。构建时可能卡死"
+    return 0
+  fi
+  grep -q '^/swapfile ' /etc/fstab 2>/dev/null || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  log "已启用 2 GB 交换空间（重启后仍有效）"
+}
+
+# 一个一个构建镜像。并行构建 api 和 worker 等于同时跑两份前端打包、两份依赖安装，
+# 小内存机器会被挤爆。两者构建参数相同，第二个几乎全部命中缓存，不再多花时间和内存。
+build_images() {
+  local svc
+  for svc in api worker; do
+    log "构建 ${svc} 镜像…"
+    if [ "${1:-}" = "--pull" ]; then
+      compose build --pull "$svc" || compose build "$svc"
+    else
+      compose build "$svc"
+    fi
+  done
+}
+
 ensure_repo() {
   if [ -d "$REPO_DIR/.git" ]; then
     log "已有仓库：$REPO_DIR"
@@ -638,10 +699,12 @@ do_install() {
   choose_access_mode
   apply_access_mode
   export_build_env
+  ensure_build_memory
   log "构建并启动（PostgreSQL + API + Worker）…"
   compose up -d --build db
   sync_db_password
-  compose up -d --build
+  build_images
+  compose up -d
   log "等待健康检查…"
   local i
   for i in $(seq 1 40); do
@@ -768,9 +831,10 @@ do_update() {
   fi
   ensure_env
   export_build_env
+  ensure_build_memory
   log "重新构建并滚动更新（无缓存前端层）…"
   # --pull refreshes base images; build runs with current tree after hard reset.
-  compose build --pull api worker || compose build api worker
+  build_images --pull
   # Bring the database up and align its password BEFORE the api starts, otherwise
   # an install whose volume predates the .env link would hand api the new password
   # while the role still has the old one.

@@ -602,11 +602,15 @@ else
 fi
 log() {{ echo "[ocibot-update] $*"; }}
 log "panel update begin repo=$REPO project=$PROJECT sha=$SHA"
-log "step: docker compose build api worker"
-if ! docker compose -f "$REPO/docker-compose.yml" -p "$PROJECT" "$@" build --pull api worker; then
-  log "build --pull failed; retry without --pull"
-  docker compose -f "$REPO/docker-compose.yml" -p "$PROJECT" "$@" build api worker
-fi
+# 一个一个构建：并行构建 api 和 worker 等于同时跑两份前端打包、两份依赖安装，
+# 1 GB 内存的机器会被挤爆（同 install.sh 的 build_images）。参数一致，worker 命中缓存。
+for svc in api worker; do
+  log "step: docker compose build $svc"
+  if ! docker compose -f "$REPO/docker-compose.yml" -p "$PROJECT" "$@" build --pull "$svc"; then
+    log "build --pull $svc failed; retry without --pull"
+    docker compose -f "$REPO/docker-compose.yml" -p "$PROJECT" "$@" build "$svc"
+  fi
+done
 log "step: docker compose up -d (full stack)"
 docker compose -f "$REPO/docker-compose.yml" -p "$PROJECT" "$@" up -d
 log "restart done"

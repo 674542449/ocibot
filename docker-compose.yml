@@ -169,7 +169,11 @@ services:
     build:
       context: .
       dockerfile: web/Dockerfile
+      # 构建参数和 api 一字不差：两者是同一份 Dockerfile，参数一致时 worker 的每一层都
+      # 命中 api 刚建好的缓存，不会再跑一遍前端打包和依赖安装（小内存机器上那会把内存挤爆）。
       args:
+        OCIBOT_GIT_SHA: ${OCIBOT_GIT_SHA:-unknown}
+        FRONTEND_CACHE_BUST: ${OCIBOT_GIT_SHA:-unknown}
         NODE_IMAGE: ${OCIBOT_NODE_IMAGE:-node:22-alpine}
         PYTHON_IMAGE: ${OCIBOT_PYTHON_IMAGE:-python:3.12-slim}
         DOCKER_CLI_IMAGE: ${OCIBOT_DOCKER_CLI_IMAGE:-docker:27-cli}

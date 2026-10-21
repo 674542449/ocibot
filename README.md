@@ -390,6 +390,7 @@ ocibot/
 | 现象 | 处理 |
 |------|------|
 | 页面打不开 | `./scripts/install.sh status`；`docker compose logs api --tail=100` |
+| 小内存机器（如 1 GB）安装 / 更新时卡死、SSH 断开 | 构建镜像把内存耗尽了。先在云控制台重启服务器，再重新运行安装 / 更新命令：内存 + 交换空间不足 3 GB 时脚本会自动加 2 GB 交换文件（`/swapfile`，需 root，根分区要有 3 GB 空闲；`OCIBOT_NO_SWAP=1` 可跳过） |
 | 更新后版本不变 | `curl -s http://127.0.0.1:8000/api/health`；浏览器强刷；确认 `OCIBOT_HOST_REPO` 为绝对路径。从外网、未登录访问时 `/api/health` 不返回版本号（有意为之），要在服务器上看或登录后看 |
 | 容量重试不跑 | 侧栏 Worker 离线提示；检查 worker 容器日志 |
 | 登录限流异常 | 直连部署保持 `OCIBOT_TRUST_PROXY=0`；反代需覆盖客户端 IP 头后再开启 |
