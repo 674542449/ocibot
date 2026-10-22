@@ -116,15 +116,17 @@ def test_images_are_built_one_at_a_time(tmp_path):
     calls = tmp_path / "calls"
     script = f"""
 set -euo pipefail
-log() {{ :; }}
+log() {{ echo "$*"; }}
 compose() {{ echo "$*" >> {calls.as_posix()!r}; }}
 {_function("build_images")}
 build_images --pull
 """
-    out = subprocess.run([BASH, "-c", script], check=True, capture_output=True, text=True)
-    # --pull 只给 api：基础镜像它刚刷新过，worker 再拉只是多问一遍 Docker Hub（0.4.158）。
-    assert calls.read_text().split("\n")[:2] == ["build --pull api", "build worker"]
-    assert out.returncode == 0
+    out = subprocess.run([BASH, "-c", script], check=True, capture_output=True, encoding="utf-8")
+    # 两个都要 --pull（0.4.159）：不带时 BuildKit 优先用本机那份基础镜像，而 api 的 --pull
+    # 不会更新它，本机有旧镜像时 worker 就建在旧镜像上、缓存全部落空。
+    assert calls.read_text().split("\n")[:2] == ["build --pull api", "build --pull worker"]
+    for svc in ("api", "worker"):
+        assert f"{svc} 镜像构建完成，用时" in out.stdout, "更新慢时要看得出慢在哪一步"
 
 
 def test_install_and_update_use_the_low_memory_path():
@@ -204,7 +206,7 @@ def _run_panel_update(tmp_path, *, fail_worker=False):
     stubs = f"""
 docker() {{
   echo "$*" | sed 's/.* -p ocibot //' >> {calls.as_posix()!r}
-  case "$*" in *"build worker") [ {int(fail_worker)} = 0 ] ;; esac
+  case "$*" in *" worker") [ {int(fail_worker)} = 0 ] ;; esac
 }}
 sleep() {{ :; }}
 wget() {{ :; }}
@@ -215,17 +217,19 @@ wget() {{ :; }}
     return proc, calls.read_text().splitlines()
 
 
-def test_the_in_panel_update_pulls_base_images_once(tmp_path):
+def test_the_in_panel_update_pulls_both_images_the_same_way(tmp_path):
+    """0.4.158 只给 api --pull。不带 --pull 时 BuildKit 优先用本机那份基础镜像，而 api 的
+    --pull 不会更新它 —— 本机有旧的 python:3.12-slim 时 worker 建在旧镜像上，缓存全部落空。"""
     proc, calls = _run_panel_update(tmp_path)
     assert proc.returncode == 0, proc.stderr
-    assert calls[:3] == ["build --pull api", "build worker", "up -d"]
+    assert calls[:3] == ["build --pull api", "build --pull worker", "up -d"]
 
 
 def test_a_failed_worker_build_stops_the_in_panel_update(tmp_path):
-    """worker 不带 --pull 也失败时没有可以退回的：和原来一样退出，不拿旧镜像去启动。"""
+    """worker 带不带 --pull 都失败时没有可以退回的：退出，不拿旧镜像去启动。"""
     proc, calls = _run_panel_update(tmp_path, fail_worker=True)
     assert proc.returncode != 0
-    assert calls == ["build --pull api", "build worker"]
+    assert calls == ["build --pull api", "build --pull worker", "build worker"]
 
 
 # ---------------------------------------------------------------- 0.4.155 检查出的问题

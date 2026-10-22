@@ -135,21 +135,22 @@ ensure_build_memory() {
 # 一个一个构建镜像。并行构建 api 和 worker 等于同时跑两份前端打包、两份依赖安装，
 # 小内存机器会被挤爆。两者构建参数相同，第二个几乎全部命中缓存，不再多花时间和内存。
 #
-# --pull 只给第一个：基础镜像 api 那次已经刷新过，worker 再 --pull 只是把 Docker Hub 再问
-# 一遍（匿名拉取有次数限制，国内访问也慢），什么也换不来。每个镜像打印用时，更新慢的话
-# 一眼看得出慢在哪。
+# 两个镜像必须用同一种方式取基础镜像（都带 --pull 或都不带）。不带 --pull 时 BuildKit 优先用
+# 本机 docker 镜像列表里的那份，而 --pull 拉到的新版**不会**更新那份 —— 本机若躺着一个旧的
+# python:3.12-slim（手动拉过、别的项目用过、旧版构建器留下的），只给 api --pull 的话 worker
+# 就建在旧镜像上：一层缓存都用不上，整个镜像（装依赖、打包前端）重来一遍，两个容器的系统也不
+# 一样（0.4.158 这样改过，0.4.159 改回）。每个镜像打印用时，更新慢的话一眼看得出慢在哪。
 build_images() {
-  local svc t0 pull="${1:-}"
+  local svc t0
   for svc in api worker; do
     log "构建 ${svc} 镜像…"
     t0=$SECONDS
-    if [ "$pull" = "--pull" ]; then
+    if [ "${1:-}" = "--pull" ]; then
       compose build --pull "$svc" || compose build "$svc"
     else
       compose build "$svc"
     fi
     log "${svc} 镜像构建完成，用时 $((SECONDS - t0)) 秒"
-    pull=""
   done
 }
 
