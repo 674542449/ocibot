@@ -35,9 +35,14 @@ COPY web/frontend/package.json web/frontend/package-lock.json ./
 # --ignore-scripts：依赖的 install 钩子不在构建期执行任意代码。
 RUN npm ci --ignore-scripts
 COPY web/frontend ./
-# Bust layer cache when only source files change under some builders.
-ARG FRONTEND_CACHE_BUST=1
-RUN echo "frontend_cache_bust=${FRONTEND_CACHE_BUST}" && npm run build
+# 前端没改就直接用上次打包的结果。COPY 的缓存按文件内容算：web/frontend 里任何一个
+# 文件变了，这一步自然会重跑。
+#
+# 这里原来带着一个取值为 git 提交号的 FRONTEND_CACHE_BUST，提交号每次更新都变，于是
+# 只改了后端的更新也要把前端整个重新打包一遍 —— 2 核机器上一两分钟，1 GB 内存的机器上
+# 要九分钟（用户贴的日志里 `COPY web/frontend ./` 明明是 CACHED，打包仍跑了 548 秒）。
+# 真要强制重来：docker compose build --no-cache。
+RUN npm run build
 
 # docker CLI 从官方镜像里取，而不是 curl 一个 tgz 下来。
 #
@@ -115,10 +120,6 @@ RUN python -m compileall -q /app/app /app/web/backend
 
 COPY --from=frontend /src/dist /app/web/frontend/dist
 
-# Build-time commit (compose / CI can override with --build-arg)
-ARG OCIBOT_GIT_SHA=unknown
-ENV OCIBOT_GIT_SHA=${OCIBOT_GIT_SHA}
-
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 # 默认 1 个 worker。
@@ -156,6 +157,12 @@ RUN groupadd --system --gid 10001 ocibot \
        --home-dir /home/ocibot --create-home --shell /usr/sbin/nologin ocibot
 ENV HOME=/home/ocibot
 USER 10001:10001
+
+# Build-time commit (compose / CI can override with --build-arg)
+# 放在最后：提交号每次更新都变，它后面的每一步都不能用缓存。以前它在 groupadd /
+# useradd 那个 RUN 之前，每次更新都白跑一遍。
+ARG OCIBOT_GIT_SHA=unknown
+ENV OCIBOT_GIT_SHA=${OCIBOT_GIT_SHA}
 
 EXPOSE 8000
 

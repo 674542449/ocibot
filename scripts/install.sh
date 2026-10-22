@@ -134,15 +134,22 @@ ensure_build_memory() {
 
 # 一个一个构建镜像。并行构建 api 和 worker 等于同时跑两份前端打包、两份依赖安装，
 # 小内存机器会被挤爆。两者构建参数相同，第二个几乎全部命中缓存，不再多花时间和内存。
+#
+# --pull 只给第一个：基础镜像 api 那次已经刷新过，worker 再 --pull 只是把 Docker Hub 再问
+# 一遍（匿名拉取有次数限制，国内访问也慢），什么也换不来。每个镜像打印用时，更新慢的话
+# 一眼看得出慢在哪。
 build_images() {
-  local svc
+  local svc t0 pull="${1:-}"
   for svc in api worker; do
     log "构建 ${svc} 镜像…"
-    if [ "${1:-}" = "--pull" ]; then
+    t0=$SECONDS
+    if [ "$pull" = "--pull" ]; then
       compose build --pull "$svc" || compose build "$svc"
     else
       compose build "$svc"
     fi
+    log "${svc} 镜像构建完成，用时 $((SECONDS - t0)) 秒"
+    pull=""
   done
 }
 
@@ -859,7 +866,7 @@ do_update() {
   ensure_env
   export_build_env
   ensure_build_memory
-  log "重新构建并滚动更新（无缓存前端层）…"
+  log "重新构建并滚动更新（前端没改时直接用上次打包的结果）…"
   # --pull refreshes base images; build runs with current tree after hard reset.
   build_images --pull
   # Bring the database up and align its password BEFORE the api starts, otherwise

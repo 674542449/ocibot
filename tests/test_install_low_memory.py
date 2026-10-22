@@ -1,10 +1,11 @@
-"""小内存机器（2 核 1 GB）安装时卡死（0.4.155）。
+"""小内存机器（2 核 1 GB）安装时卡死（0.4.155），以及每次更新都很慢（0.4.158）。
 
 在服务器上现场构建镜像会把 1 GB 内存耗尽：api 和 worker 两个镜像并行构建 = 同时跑两份
-前端打包、两份 Oracle SDK 安装，没有交换空间时整机卡死。守住三件事：
-  * install.sh 在内存 + 交换空间不足 3 GB 时自动加 2 GB 交换文件（各种跳过条件不误加）；
+前端打包、两份 Oracle SDK 安装，没有交换空间时整机卡死。守住这几件事：
+  * install.sh 在内存 + 交换空间不足 2.5 GB 时自动加 2 GB 交换文件（各种跳过条件不误加）；
   * install.sh 和面板内一键更新都是一个一个构建，不并行；
-  * worker 的构建参数和 api 一字不差 —— 否则第二个镜像不命中缓存，又要整份重建。
+  * worker 的构建参数和 api 一字不差 —— 否则第二个镜像不命中缓存，又要整份重建；
+  * 前端没改就不重新打包：不能有随提交号变化的参数落在前端那一段。
 """
 
 from __future__ import annotations
@@ -120,8 +121,10 @@ compose() {{ echo "$*" >> {calls.as_posix()!r}; }}
 {_function("build_images")}
 build_images --pull
 """
-    subprocess.run([BASH, "-c", script], check=True, capture_output=True, text=True)
-    assert calls.read_text().split("\n")[:2] == ["build --pull api", "build --pull worker"]
+    out = subprocess.run([BASH, "-c", script], check=True, capture_output=True, text=True)
+    # --pull 只给 api：基础镜像它刚刷新过，worker 再拉只是多问一遍 Docker Hub（0.4.158）。
+    assert calls.read_text().split("\n")[:2] == ["build --pull api", "build worker"]
+    assert out.returncode == 0
 
 
 def test_install_and_update_use_the_low_memory_path():
@@ -146,6 +149,83 @@ def test_worker_and_api_build_with_identical_arguments():
     compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
     api, worker = compose["services"]["api"]["build"], compose["services"]["worker"]["build"]
     assert api == worker
+
+
+# ---------------------------------------------------------------- 0.4.158 每次更新都很慢
+
+
+DOCKERFILE = (ROOT / "web" / "Dockerfile").read_text(encoding="utf-8")
+
+
+def _instructions(text: str) -> list[str]:
+    return [s for s in (line.strip() for line in text.splitlines()) if s and not s.startswith("#")]
+
+
+def test_a_backend_only_update_does_not_rebuild_the_frontend():
+    """前端那一段以前带着 FRONTEND_CACHE_BUST=<git 提交号>：提交号每次更新都变，只改了后端
+    的更新也要把前端整个重新打包。用户贴的日志里 `COPY web/frontend ./` 是 CACHED（前端
+    一个字没改），打包却跑了 548 秒。COPY 的缓存按内容算，前端真改了自然会重跑。"""
+    frontend = DOCKERFILE.split("AS frontend", 1)[1].split("\nFROM ", 1)[0]
+    lines = _instructions(frontend)
+    assert not [s for s in lines if s.startswith("ARG")], "前端那一段不能有构建参数"
+    assert not [s for s in lines if "${" in s], "前端那一段不能引用会变的参数"
+    for name in ("docker-compose.yml", "web/docker-compose.yml"):
+        assert "FRONTEND_CACHE_BUST" not in (ROOT / name).read_text(encoding="utf-8"), name
+
+
+def test_only_the_commit_sha_follows_the_commit():
+    yaml = pytest.importorskip("yaml")
+    for name in ("docker-compose.yml", "web/docker-compose.yml"):
+        compose = yaml.safe_load((ROOT / name).read_text(encoding="utf-8"))
+        for svc, spec in compose["services"].items():
+            for key, value in ((spec.get("build") or {}).get("args") or {}).items():
+                if "OCIBOT_GIT_SHA" in str(value):
+                    assert key == "OCIBOT_GIT_SHA", f"{name} {svc}.{key} 随提交号变化，会让缓存失效"
+
+
+def test_the_commit_sha_comes_after_every_build_step():
+    """提交号每次更新都变，它后面的每一步都用不上缓存。以前它在 groupadd / useradd 那个
+    RUN 前面，每次更新都白跑一遍。"""
+    final = DOCKERFILE.rsplit("\nFROM ", 1)[1]
+    lines = _instructions(final)
+    at = next(i for i, s in enumerate(lines) if s.startswith("ARG OCIBOT_GIT_SHA"))
+    assert not [s for s in lines[at:] if s.startswith(("RUN", "COPY", "ADD"))]
+
+
+def _run_panel_update(tmp_path, *, fail_worker=False):
+    from web.backend import self_update
+
+    repo, host = tmp_path / "repo", tmp_path / "host"
+    repo.mkdir()
+    host.mkdir()
+    script = self_update._write_restart_script(host, repo.as_posix(), "ocibot", "deadbeef")
+    calls = tmp_path / "calls"
+    calls.write_text("")
+    stubs = f"""
+docker() {{
+  echo "$*" | sed 's/.* -p ocibot //' >> {calls.as_posix()!r}
+  case "$*" in *"build worker") [ {int(fail_worker)} = 0 ] ;; esac
+}}
+sleep() {{ :; }}
+wget() {{ :; }}
+"""
+    proc = subprocess.run(
+        [BASH, "-c", stubs + script.read_text(encoding="utf-8")], capture_output=True, text=True
+    )
+    return proc, calls.read_text().splitlines()
+
+
+def test_the_in_panel_update_pulls_base_images_once(tmp_path):
+    proc, calls = _run_panel_update(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert calls[:3] == ["build --pull api", "build worker", "up -d"]
+
+
+def test_a_failed_worker_build_stops_the_in_panel_update(tmp_path):
+    """worker 不带 --pull 也失败时没有可以退回的：和原来一样退出，不拿旧镜像去启动。"""
+    proc, calls = _run_panel_update(tmp_path, fail_worker=True)
+    assert proc.returncode != 0
+    assert calls == ["build --pull api", "build worker"]
 
 
 # ---------------------------------------------------------------- 0.4.155 检查出的问题
