@@ -391,6 +391,10 @@ _COMPARTMENT_WORKERS = 5
 # 最多五块，所以 5 就到顶。这条路径在抢机重试前每次都走一遍，并发度再高只会
 # 更快撞上 per-tenancy 限流 —— 而那正是抢机循环要抢的同一份额度。
 _QUOTA_READ_WORKERS = 5
+# 等级查询的四条读取（区域订阅 / 订阅记录 / 升级记录 / 根区间），4 就到顶。
+_TIER_READ_WORKERS = 4
+# 账号级读取（订阅记录、升级记录）的超时：连接 5 秒、读 30 秒。SDK 默认是 10 / 60。
+_ACCOUNT_READ_TIMEOUT = (5.0, 30.0)
 
 from app.config_store import TenantConfig
 
@@ -533,6 +537,22 @@ def cb_kwargs(service: str, tenant_id: str) -> dict:
     return kw
 
 
+def account_cb_kwargs(service: str, tenant_id: str) -> dict:
+    """订阅记录（Tenant Manager）、升级记录（OSP Gateway）这两个 client 的 kwargs。
+
+    和 cb_kwargs 一样每租户 × 每服务一个熔断器，只是重试收敛到 3 次 / 20 秒、超时缩短
+    （_ACCOUNT_READ_TIMEOUT）。两条都走主区端点，常常跨洲；默认策略连网络错误也重试
+    8 次、退避到 30 秒、总长 600 秒，主区端点不通（TLS 被重置、代理拦截）时一次「等级
+    查询」要白等一两分钟，_subscription_records 才轮到换租户所在区域的端点 —— 那条退路
+    基本等不到。这是用户点了按钮才读的参考信息，读不到就快点说读不到。
+    """
+    return {
+        **cb_kwargs(service, tenant_id),
+        "retry_strategy": sdk_bounded_paged_retry_strategy(),
+        "timeout": _ACCOUNT_READ_TIMEOUT,
+    }
+
+
 def _is_circuit_breaker_error(exc: Any) -> bool:
     """CircuitBreakerError **不是** ServiceError 的子类，所以到处都接不住它。"""
     try:
@@ -545,6 +565,8 @@ def _is_circuit_breaker_error(exc: Any) -> bool:
 
 def sdk_bounded_paged_retry_strategy() -> Any:
     """给 `oci.pagination.list_call_get_all_results` 用的**收敛**重试策略。
+
+    account_cb_kwargs 那两个账号级 client 也用它（理由见那里）。
 
     分页助手自己**硬编码**又套了一层 DEFAULT_RETRY_STRATEGY，和 client 层那个相乘：
     最坏 8 x 8 = 64 次真实调用、~600 秒卡在一个 HTTP 请求里 —— 正在跟抢机重试循环
@@ -8169,10 +8191,23 @@ class TenantSession:
         判定，两处说法不会走散。``a1_core_values`` 是调用方已经读到的 A1 核数限额；
         传 None 表示没读，需要时（新号、在主区）由这里只按名字查那一条。
         """
-        # 先读区域订阅：既是「准备中」的依据之一，也顺带把主区记进缓存，后面订阅记录、
-        # 升级记录要用主区时就不用再问一次。
-        region_subs = self._read_region_subscriptions()
-        sub_verdict, sub_note, sub_details = self._detect_subscription_tier()
+        # 四条读取互不依赖，一起发 —— 以前一条接一条，要等五六次往返，其中两条还跨洲：
+        #   区域订阅：「准备中」的依据之一，顺带把主区记进缓存；
+        #   订阅记录、升级记录：等级和升级状态，两条都走主区端点；
+        #   根区间：注册日期和租户状态。
+        # 只有一处先后：会话里还没有主区时，订阅记录、升级记录要等区域订阅回来再发 ——
+        # 它们要的就是那个主区，先发的话会各自再问一次（多两次调用）。
+        with ThreadPoolExecutor(max_workers=_TIER_READ_WORKERS) as pool:
+            root_f = pool.submit(self._read_root_compartment)
+            regions_f = pool.submit(self._read_region_subscriptions)
+            if not getattr(self, "_home_region_name", None):
+                regions_f.result()
+            sub_f = pool.submit(self._detect_subscription_tier)
+            upgrade_f = pool.submit(self.get_upgrade_status)
+            region_subs = regions_f.result()
+            sub_verdict, sub_note, sub_details = sub_f.result()
+            upgrade = upgrade_f.result()
+            root = root_f.result()
         info: dict[str, Any] = {"subscription": sub_details}
         if sub_verdict == "paid":
             info["tier"] = "已升级 / 付费（PAYG）"
@@ -8191,7 +8226,6 @@ class TenantSession:
                 "Allow group <你的组> to inspect subscriptions in tenancy"
             )
         # 升级状态（升级中 / 升级失败 / 已升级）。读不到不影响上面的结论。
-        upgrade = self.get_upgrade_status()
         up = dict(upgrade.data or {}) if upgrade.ok else {}
         info["upgrade"] = up if upgrade.ok else {"error": upgrade.message}
         state = str(up.get("upgrade_state") or "")
@@ -8220,7 +8254,7 @@ class TenantSession:
                 )
         # 账号是否已就绪（刚注册、Oracle 还在开通）。放在最后：开通没完成时这是最要紧的
         # 一条，盖过上面的等级文字；tier_code 不动 —— 额度保护照旧按订阅记录判定。
-        setup = self._account_setup_state(sub_details, a1_core_values, region_subs)
+        setup = self._account_setup_state(sub_details, a1_core_values, region_subs, root)
         info["setup"] = setup
         if setup["state"] == "PROVISIONING":
             info["tier"] = "准备中（Oracle 还在开通账号）"
@@ -8240,6 +8274,13 @@ class TenantSession:
         """
         info = self._account_tier_info(None)
         return OperationResult(ok=True, message="已读取账号等级", data=info)
+
+    def _read_root_compartment(self) -> Any:
+        """根区间（OCID 就是租户 OCID）：注册日期和租户状态都在它上面。读不到返回 None。"""
+        try:
+            return self.identity.get_compartment((self.tenant.tenancy_ocid or "").strip()).data
+        except Exception:  # noqa: BLE001 - 读不到就少一个依据
+            return None
 
     def _read_region_subscriptions(self) -> Optional[list]:
         """现读一次区域订阅（不用缓存：要看各区域的开通状态）。读不到返回 None。
@@ -8313,7 +8354,7 @@ class TenantSession:
             client = SubscriptionServiceClient(
                 cfg,
                 **self._signer_kw,
-                **cb_kwargs("osp_subscription", str(getattr(self.tenant, "id", "") or "")),
+                **account_cb_kwargs("osp_subscription", str(getattr(self.tenant, "id", "") or "")),
             )
             resp = client.list_subscriptions(osp_home_region=home, compartment_id=tenancy)
         except ServiceError as exc:
@@ -8353,6 +8394,7 @@ class TenantSession:
         sub_details: dict,
         quota_values: Optional[list[float]],
         region_subs: Optional[list],
+        root: Any,
     ) -> dict[str, Any]:
         """账号是否已就绪：刚注册的账号 Oracle 要先开通一阵，这期间很多操作都会失败。
 
@@ -8367,6 +8409,7 @@ class TenantSession:
         ``quota_values``：A1 核数限额里 Oracle 真给了数值的那些（空值不算 0）；None 表示
         调用方没读，只在这条用得上（新号、在主区）时才按名字查一次。
         ``region_subs``：调用方现读的区域订阅列表，读失败为 None。
+        ``root``：调用方读到的根区间（_read_root_compartment），读失败为 None。
         最后一条只能在主区看：在副区行上读、账号又还在 7 天内时，这条做不了，此时不下
         「已就绪」的结论（返回空串）—— 状态是记到整个账号的，副区那一次读不能把主区读出的
         「准备中」改回去。
@@ -8376,7 +8419,6 @@ class TenantSession:
         """
         from datetime import datetime, timedelta, timezone
 
-        tenancy = (self.tenant.tenancy_ocid or "").strip()
         reasons: list[str] = []
         known = False
 
@@ -8387,14 +8429,11 @@ class TenantSession:
                 reasons.append("订阅记录状态为 CREATING（Oracle 还在开通订阅）")
 
         registered = None
-        try:
-            root = self.identity.get_compartment(tenancy).data
+        if root is not None:
             known = True
             if str(getattr(root, "lifecycle_state", "") or "").upper() == "CREATING":
                 reasons.append("租户状态为 CREATING（Oracle 还在创建租户）")
             registered = getattr(root, "time_created", None)
-        except Exception:  # noqa: BLE001 - 读不到就少一个依据
-            pass
 
         home_name = ""
         home = next((s for s in region_subs or [] if getattr(s, "is_home_region", False)), None)
@@ -9416,7 +9455,7 @@ class TenantSession:
                 client = SubscriptionClient(
                     self._config_for_region(region),
                     **self._signer_kw,
-                    **cb_kwargs("subscription", str(getattr(self.tenant, "id", "") or "")),
+                    **account_cb_kwargs("subscription", str(getattr(self.tenant, "id", "") or "")),
                 )
                 resp = client.list_subscriptions(compartment_id=tenancy, entity_version="V1")
                 items = list(getattr(resp.data, "items", None) or [])

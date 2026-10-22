@@ -208,3 +208,113 @@ def test_a_non_utc_registration_time_is_stored_as_utc(monkeypatch):
     stored = db.get(Tenant, "p").registered_at
     stored = stored if stored.tzinfo else stored.replace(tzinfo=timezone.utc)
     assert stored == datetime(2026, 10, 5, 3, 0, tzinfo=timezone.utc)
+
+
+# ---------------------------------------------------------------- 0.4.157 等级查询提速
+
+
+def _gate(monkeypatch, s, gate, *, region_subs=True, compartment=True, oracle=True, seen=None):
+    """让选中的几条读取先在 ``gate`` 上碰头：一条接一条发的话，第一条就等到超时。"""
+    import oci.osp_gateway as osp
+    import oci.tenant_manager_control_plane as tmcp
+
+    seen = seen if seen is not None else {}
+    identity = s._identity
+    real_regions, real_root = identity.list_region_subscriptions, identity.get_compartment
+
+    def regions(t):
+        if region_subs:
+            gate.wait()
+        return real_regions(t)
+
+    def root(cid):
+        if compartment:
+            gate.wait()
+        return real_root(cid)
+
+    s._identity = SimpleNamespace(
+        get_tenancy=identity.get_tenancy, get_compartment=root, list_region_subscriptions=regions
+    )
+    Sub, Osp = tmcp.SubscriptionClient, osp.SubscriptionServiceClient
+
+    class GatedSub(Sub):
+        def __init__(self, cfg, **kw):
+            seen.setdefault("sub", []).append((cfg["region"], kw))
+            super().__init__(cfg, **kw)
+
+        def list_subscriptions(self, *a, **k):
+            if oracle:
+                gate.wait()
+            return super().list_subscriptions(*a, **k)
+
+    class GatedOsp(Osp):
+        def __init__(self, cfg, **kw):
+            seen.setdefault("osp", []).append((cfg["region"], kw))
+            super().__init__(cfg, **kw)
+
+        def list_subscriptions(self, osp_home_region, compartment_id, **k):
+            seen.setdefault("osp_home", []).append(osp_home_region)
+            if oracle:
+                gate.wait()
+            return super().list_subscriptions(osp_home_region, compartment_id, **k)
+
+    monkeypatch.setattr(tmcp, "SubscriptionClient", GatedSub)
+    monkeypatch.setattr(osp, "SubscriptionServiceClient", GatedOsp)
+    return seen
+
+
+def _all_read(data):
+    return (
+        data["tier_code"] == "free"
+        and data["setup"]["state"] == "READY"
+        and data["setup"]["registered_at"]
+        and "error" not in data["upgrade"]
+    )
+
+
+def test_the_tier_reads_go_out_together(monkeypatch):
+    """以前区域订阅、订阅记录、升级记录、根区间一条接一条地发，要等五六次往返，
+    其中两条还跨洲走主区端点。会话里已有主区时，四条应该同时在路上。"""
+    import threading
+
+    s = _session(monkeypatch, registered_days_ago=30)
+    s._home_region_name = "ap-tokyo-1"
+    _gate(monkeypatch, s, threading.Barrier(4, timeout=5))
+    assert _all_read(s.get_tier_status().data)
+
+
+def test_a_cold_session_learns_the_home_region_first(monkeypatch):
+    """还没有主区时，订阅记录、升级记录要等区域订阅回来 —— 它们要走的就是主区端点，
+    先发就会落到租户自己的区域、各自再问一次主区。根区间不用等，和区域订阅一起发。"""
+    import threading
+
+    s = _session(monkeypatch, registered_days_ago=30, region="ap-osaka-1", home="ap-tokyo-1")
+    count = {"n": 0}
+    real = s._identity.list_region_subscriptions
+
+    def counted(t):
+        count["n"] += 1
+        return real(t)
+
+    s._identity.list_region_subscriptions = counted
+    seen = _gate(monkeypatch, s, threading.Barrier(2, timeout=5), oracle=False)
+    assert _all_read(s.get_tier_status().data)
+    assert count["n"] == 1
+    assert [r for r, _ in seen["sub"]] == ["ap-tokyo-1"]
+    assert [r for r, _ in seen["osp"]] == ["ap-tokyo-1"] and seen["osp_home"] == ["ap-tokyo-1"]
+
+
+def test_account_reads_give_up_quickly(monkeypatch):
+    """订阅记录、升级记录的 client 以前用默认重试：连网络错误也重试 8 次、总长 600 秒。
+    主区端点不通时一次等级查询要白等一两分钟，换区域的那条退路基本等不到。"""
+    import threading
+
+    s = _session(monkeypatch, registered_days_ago=30)
+    seen = _gate(monkeypatch, s, threading.Barrier(1), region_subs=False, compartment=False, oracle=False)
+    s.get_tier_status()
+    for key in ("sub", "osp"):
+        (_region, kw), = seen[key]
+        attempts = [c.max_attempts for c in kw["retry_strategy"].checkers.checkers if hasattr(c, "max_attempts")]
+        assert attempts == [3], key
+        assert kw["timeout"] == (5.0, 30.0), key
+        assert "circuit_breaker_strategy" in kw, "每租户 × 每服务的熔断器不能丢"
