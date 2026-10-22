@@ -184,13 +184,13 @@ prebuilt_image_ref() {
 
 # 这个提交的镜像有了没有。推送后 GitHub 要构建几分钟，紧接着运行 update 时它可能还没好 ——
 # 只在这个仓库确实发过镜像（有 :main）时才等；从没发过（没公开、没开 Actions）就不等。
+# 返回 0：有了；1：仓库发过镜像，但等不到这个提交的；2：:main 也问不到 —— 仓库没发过镜像，
+# 或者 docker 命令行连不上镜像仓库（manifest inspect 走的是命令行自己的网络设置，不是 docker
+# 服务的：只给 docker 服务配了代理的机器上它会失败，下载却能成功），由调用方直接试着下载一次。
 wait_for_prebuilt() {
   local img="$1" ref="$2" waited=0 max="${OCIBOT_PREBUILT_WAIT:-600}"
   docker manifest inspect "$img" >/dev/null 2>&1 && return 0
-  if ! docker manifest inspect "${ref}:main" >/dev/null 2>&1; then
-    log "没有找到预构建镜像 ${ref}（没公开、网络不通，或仓库没开 GitHub Actions），改为在本机构建"
-    return 1
-  fi
+  docker manifest inspect "${ref}:main" >/dev/null 2>&1 || return 2
   log "这个提交的镜像 GitHub 还在构建，最多等 $((max / 60)) 分钟…（不想等：OCIBOT_PREBUILT=0）"
   while [ "$waited" -lt "$max" ]; do
     sleep 30
@@ -204,7 +204,7 @@ wait_for_prebuilt() {
 # 用预构建镜像：下载、核对镜像里记录的提交号、打上 compose 认的名字。返回非 0 表示没用上，
 # 调用方退回本机构建。
 use_prebuilt_images() {
-  local mode ref sha img got name
+  local mode ref sha img got name found=0 rc=0
   mode="${OCIBOT_PREBUILT:-$(get_env_kv OCIBOT_PREBUILT)}"
   if [ "$mode" = "0" ]; then
     log "OCIBOT_PREBUILT=0：不用预构建镜像，在本机构建"
@@ -226,11 +226,26 @@ use_prebuilt_images() {
     return 1
   fi
   img="${ref}:${sha}"
-  wait_for_prebuilt "$img" "$ref" || return 1
+  # `|| rc=$?` 而不是接着读 $?：不管调用方在不在 if 里，set -e 都不会因为返回 2 把安装停掉。
+  wait_for_prebuilt "$img" "$ref" || rc=$?
+  case $rc in
+    0) found=1 ;;
+    2) log "查不到预构建镜像的信息，直接试着下载一次…" ;;
+    *) return 1 ;;
+  esac
   log "下载预构建镜像 ${img} …"
   if ! docker pull "$img"; then
-    warn "下载预构建镜像失败，改为在本机构建"
-    return 1
+    if [ "$found" != 1 ]; then
+      log "没有找到预构建镜像 ${ref}（没公开、网络不通，或仓库没开 GitHub Actions），改为在本机构建"
+      return 1
+    fi
+    # 确定有这个镜像，多半是网络断在半路：再试一次，已经下完的层不用重下。退回本机构建正是
+    # 1 GB 的机器扛不住的那条路，值得多试这一次。
+    log "下载中断，再试一次…"
+    if ! docker pull "$img"; then
+      warn "下载预构建镜像失败，改为在本机构建"
+      return 1
+    fi
   fi
   # 标签可以被重新指向；烤进镜像里的提交号才说明它是从哪份代码构建的。
   got="$(docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$img" 2>/dev/null \

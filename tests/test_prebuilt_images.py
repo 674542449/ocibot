@@ -79,10 +79,17 @@ prebuilt_image_ref
 # ---------------------------------------------------------------- 下载 / 核对 / 退回
 
 
-def _run(tmp_path, *, have_main=True, sha_after=0, pull_ok=True, baked=SHA, env_kv=None, **env):
-    calls, polls = tmp_path / "calls", tmp_path / "polls"
+def _run(
+    tmp_path, *, have_main=True, exists=True, sha_after=0, cli_reach=True, pull_failures=0,
+    baked=SHA, env_kv=None, **env,
+):
+    """``exists``：仓库里有没有这个提交的镜像；``sha_after``：第几次问起才有（模拟还在构建）；
+    ``cli_reach``：docker 命令行连不连得上镜像仓库（manifest inspect）；``pull_failures``：
+    前几次下载失败（模拟断在半路）。下载只看镜像在不在，不看命令行连不连得上 —— 走的是 docker 服务。"""
+    calls, polls, pulls = tmp_path / "calls", tmp_path / "polls", tmp_path / "pulls"
     calls.write_text("")
     polls.write_text("0")
+    pulls.write_text("0")
     kv = "".join(f"    {k}) echo '{v}' ;;\n" for k, v in (env_kv or {}).items())
     script = f"""
 set -euo pipefail
@@ -102,11 +109,16 @@ docker() {{
   echo "$*" >> {calls.as_posix()!r}
   case "$1 $2" in
     "manifest inspect")
+      [ {int(cli_reach)} = 1 ] || return 1
       case "$3" in
         *:main) [ {int(have_main)} = 1 ] ;;
-        *) n=$(cat {polls.as_posix()!r}); echo $((n + 1)) > {polls.as_posix()!r}; [ "$n" -ge {sha_after} ] ;;
+        *) n=$(cat {polls.as_posix()!r}); echo $((n + 1)) > {polls.as_posix()!r}
+           [ {int(exists)} = 1 ] && [ "$n" -ge {sha_after} ] ;;
       esac ;;
-    "pull "*) [ {int(pull_ok)} = 1 ] ;;
+    "pull "*)
+      [ {int(exists)} = 1 ] || return 1
+      p=$(cat {pulls.as_posix()!r}); echo $((p + 1)) > {pulls.as_posix()!r}
+      [ "$p" -ge {pull_failures} ] ;;
     "image inspect") printf 'PATH=/usr/bin\\nOCIBOT_GIT_SHA=%s\\n' '{baked}' ;;
     *) : ;;
   esac
@@ -136,12 +148,24 @@ def test_an_image_built_from_other_code_is_not_used(tmp_path):
     assert not [c for c in calls if c.startswith("tag ")]
 
 
+def _pulls(calls):
+    return [c for c in calls if c.startswith("pull ")]
+
+
 def test_a_repository_without_images_falls_back_at_once(tmp_path):
-    """没公开 / 没开 Actions / fork：:main 都没有，就别干等十分钟。"""
-    out, calls, polls = _run(tmp_path, have_main=False, sha_after=10**6)
-    assert "RESULT=fallback" in out
+    """没公开 / 没开 Actions / fork：:main 都没有，就别干等十分钟。直接下载试一次（失败得很快）。"""
+    out, calls, polls = _run(tmp_path, have_main=False, exists=False)
+    assert "RESULT=fallback" in out and "没有找到预构建镜像" in out
     assert polls == 1
-    assert not [c for c in calls if c.startswith("pull ")]
+    assert len(_pulls(calls)) == 1, "不存在的镜像不用重试"
+
+
+def test_a_cli_that_cannot_reach_the_registry_still_downloads(tmp_path):
+    """manifest inspect 走 docker 命令行自己的网络设置；只给 docker 服务配了代理的机器上它会失败，
+    下载（走 docker 服务）却能成功。以前这种机器直接退回本机构建。"""
+    out, calls, _ = _run(tmp_path, cli_reach=False)
+    assert "RESULT=used" in out
+    assert len(_pulls(calls)) == 1
 
 
 def test_a_fresh_push_is_waited_for(tmp_path):
@@ -156,13 +180,49 @@ def test_the_wait_is_bounded(tmp_path):
     out, calls, polls = _run(tmp_path, sha_after=10**6, OCIBOT_PREBUILT_WAIT="90")
     assert "RESULT=fallback" in out
     assert polls == 1 + 3
-    assert not [c for c in calls if c.startswith("pull ")]
+    assert not _pulls(calls)
+
+
+def test_an_interrupted_download_is_retried_once(tmp_path):
+    """退回本机构建正是 1 GB 的机器扛不住的那条路；断在半路再试一次，已下完的层不用重下。"""
+    out, calls, _ = _run(tmp_path, pull_failures=1)
+    assert "RESULT=used" in out
+    assert len(_pulls(calls)) == 2
 
 
 def test_a_failed_download_falls_back(tmp_path):
-    out, calls, _ = _run(tmp_path, pull_ok=False)
+    out, calls, _ = _run(tmp_path, pull_failures=99)
     assert "RESULT=fallback" in out
+    assert len(_pulls(calls)) == 2
     assert not [c for c in calls if c.startswith("tag ")]
+
+
+def test_a_registry_the_cli_cannot_reach_does_not_abort_the_install(tmp_path):
+    """wait_for_prebuilt 返回 2 后要接着去「直接下载一次」。不放在 if 里调用时，`wait_for_prebuilt
+    …; case $?` 这种写法会被 set -e 当场停掉，下载那一步根本走不到。"""
+    script = f"""
+set -euo pipefail
+log() {{ :; }}
+warn() {{ :; }}
+APP_IMAGES="ocibot-api:latest ocibot-worker:latest"
+OCIBOT_GIT_SHA={SHA}
+REPO_DIR=/repo
+git() {{ echo https://github.com/674542449/ocibot.git; }}
+get_env_kv() {{ :; }}
+docker() {{
+  case "$1 $2" in
+    "manifest inspect") return 1 ;;
+    "image inspect") printf 'OCIBOT_GIT_SHA=%s\\n' {SHA} ;;
+    *) : ;;
+  esac
+}}
+{_function("prebuilt_image_ref")}
+{_function("wait_for_prebuilt")}
+{_function("use_prebuilt_images")}
+use_prebuilt_images
+echo still-running
+"""
+    assert _bash(script).split() == ["still-running"]
 
 
 @pytest.mark.parametrize("where", ["env", "web/.env"])

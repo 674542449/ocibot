@@ -98,7 +98,10 @@
             有新版本。请 SSH 到服务器，进入安装目录后执行
             <code>bash scripts/install.sh update</code>，完成后刷新本页，「当前版本」会变成新的。
           </template>
-          <template v-else-if="updateInfo.remote?.sha">已是最新版本，不需要操作。</template>
+          <!-- 远程版本是上次点「检查更新」时存下的，打开页面不会重新去问 GitHub，所以带上时间。 -->
+          <template v-else-if="updateInfo.remote?.sha">
+            上次检查（{{ fmt(updateInfo.checked_at) }}）时已是最新版本，不需要操作；隔了一段时间的话再点「检查更新」确认。
+          </template>
           <template v-else>
             点「检查更新」看有没有新版本；有的话 SSH 到服务器，进入安装目录后执行
             <code>bash scripts/install.sh update</code>。
