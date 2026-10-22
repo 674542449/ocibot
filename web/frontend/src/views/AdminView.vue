@@ -18,7 +18,7 @@
           <p class="muted" style="margin: 0.25rem 0 0; font-size: 12px">
             定位宿主机仓库目录，执行与 SSH 相同的
             <code>bash scripts/install.sh update</code>
-            （拉代码 + 构建 + 重启，保留数据库与密钥）。
+            （拉代码 + 换上新镜像 + 重启，保留数据库与密钥）。
           </p>
         </div>
         <div class="row update-actions">
@@ -87,10 +87,29 @@
           <span v-if="updateInfo.message" class="muted">{{ updateInfo.message }}</span>
         </div>
 
-        <div v-if="!updateInfo.capabilities?.can_apply" class="error-box" style="font-size: 13px">
-          当前环境无法在线更新（需要 Docker 部署并挂载宿主机仓库与 docker.sock）。
-          请 SSH 执行：
-          进入安装目录后执行 <code>bash scripts/install.sh update</code>
+        <!-- 一键更新用不了时说清楚现在该不该动手。以前不管是不是最新都显示同一个红框「请 SSH
+             执行 update」，SSH 更新完回来一看还是它，像是没更新成功。 -->
+        <div
+          v-if="!updateInfo.capabilities?.can_apply"
+          :class="updateInfo.update_available ? 'error-box' : ''"
+          style="font-size: 13px"
+        >
+          <template v-if="updateInfo.update_available">
+            有新版本。请 SSH 到服务器，进入安装目录后执行
+            <code>bash scripts/install.sh update</code>，完成后刷新本页，「当前版本」会变成新的。
+          </template>
+          <template v-else-if="updateInfo.remote?.sha">已是最新版本，不需要操作。</template>
+          <template v-else>
+            点「检查更新」看有没有新版本；有的话 SSH 到服务器，进入安装目录后执行
+            <code>bash scripts/install.sh update</code>。
+          </template>
+          <div class="muted" style="margin-top: 0.35rem; font-size: 12px">
+            <template v-if="!updateInfo.capabilities?.enabled">
+              面板里的「一键更新」默认关闭：打开它要把 docker.sock 交给面板，等于宿主机 root 权限。
+              确实需要时在服务器上执行 <code>bash scripts/install.sh update-on</code>。
+            </template>
+            <template v-else>面板里的「一键更新」已打开，但当前环境用不了，检测结果：</template>
+          </div>
           <div class="muted" style="margin-top: 0.35rem; font-size: 12px">
             enabled={{ updateInfo.capabilities?.enabled }} · host_dir={{
               updateInfo.capabilities?.host_dir_exists
