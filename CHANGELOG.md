@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.4.163 — 2026-10-22
+
+一键卸载。
+
+### 功能
+
+- **一键卸载：** `curl -fsSL https://raw.githubusercontent.com/674542449/ocibot/main/scripts/install.sh | bash -s uninstall`，
+  不用先进安装目录（在安装目录里 `bash scripts/install.sh uninstall` 也一样）。停止并删除容器、删除面板镜像，
+  然后**只问一件事：数据删不删** —— 只有它删了就回不来。
+  - 直接回车 = 保留：数据库卷和安装目录都留着，重新运行安装命令一切照旧。`web/.env` 里的主密钥和数据库
+    要一起留 —— 数据库里的 OCI 私钥是用它加密的。
+  - 输入「删除」= 彻底删除：再删数据库卷、HTTPS 证书卷、安装目录（含 `web/.env`）和下载的数据库 / Caddy /
+    docker 命令行镜像（还有别的容器在用的删不掉，正好）。只有这两个字算数，`y`、`yes` 都按保留。
+  - 没有终端可问时按保留；`OCIBOT_PURGE_DATA=1` 表示彻底删除，不再询问。
+  - 只删认得出是本面板的目录（有 `docker-compose.yml` 且 `name: ocibot`、`scripts/install.sh`、
+    `web/backend/config.py`），家目录和根目录一律不删。`curl | bash` 时不拿「当前目录的上一级」当安装目录。
+  - 安装目录已经被删了、`web/.env` 丢了、`docker compose down` 报错时，也按 compose 项目标签把容器、网络
+    （删除时还有数据卷）清掉；面板内一键更新留下的辅助容器一起清。
+  - 结束时说明没动的东西：Docker 本身、防火墙放行的 80/443、安装时加的交换文件（附手动删除的命令）；
+    彻底删除时提示构建缓存可用 `docker builder prune` 清掉。
+
+### 修复
+
+- 以前的 `uninstall` 开头会检查 Docker、没有就**安装 Docker**，也要求安装目录还在（不在就去克隆一份或报错
+  退出）。卸载时这两件事都不该发生。
+- 以前的 `uninstall` 只停容器：面板镜像、安装目录（含主密钥）都留在机器上，`OCIBOT_PURGE_DATA=1` 也只多删
+  数据卷。
+
+### 维护
+
+- 新增 `tests/test_uninstall.py`（15 条）：默认保留、只认「删除」、彻底删除的范围、`OCIBOT_PURGE_DATA=1`
+  不询问、目录不在也能清容器、别人的目录 / 家目录不删、没有 Docker 时不装、不调用 ensure_docker /
+  ensure_repo、项目名与 compose 一致、README 写了一键卸载命令。
+- README 新增「卸载」一节；`docs/REDEPLOY.md` 的「旧机器彻底不要了」改用一键卸载。
+- Windows 的 `install.ps1 uninstall` 没改（仍只停容器）。
+
+### 升级
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update
+curl -s http://127.0.0.1:8000/api/health   # 应为 0.4.163（在服务器上执行）
+```
+
 ## 0.4.162 — 2026-10-22
 
 检查 0.4.160（预构建镜像）和 0.4.161（管理页更新提示）修掉 3 处问题。退回本机构建正是 1 GB 的机器扛不住

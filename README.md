@@ -167,8 +167,32 @@ irm https://raw.githubusercontent.com/674542449/ocibot/main/scripts/install.ps1 
 | `./scripts/install.sh ip` | 切换回 IP + 端口直连 |
 | `./scripts/install.sh update-on` | 打开面板内一键更新（挂 `docker.sock`，管理员 ≈ 宿主机 root） |
 | `./scripts/install.sh update-off` | 关闭面板内一键更新 |
-| `./scripts/install.sh uninstall` | 停止服务（默认保留数据卷） |
-| `OCIBOT_PURGE_DATA=1 ./scripts/install.sh uninstall` | 停止并删除数据卷 |
+| `./scripts/install.sh uninstall` | 卸载，会问要不要连数据一起删（见下方「卸载」） |
+| `OCIBOT_PURGE_DATA=1 ./scripts/install.sh uninstall` | 卸载并删除所有数据，不再询问 |
+
+### 卸载
+
+一条命令，不用先进安装目录：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/674542449/ocibot/main/scripts/install.sh | bash -s uninstall
+```
+
+（已经在安装目录里的话：`bash scripts/install.sh uninstall`，效果一样。）
+
+它会停止并删除容器、删除面板镜像，然后**只问一件事：数据删不删**。
+
+- **直接回车 = 保留数据**：数据库（用户、租户和 OCI 私钥、抢机任务、审计日志）和安装目录都留着。
+  以后重新运行安装命令，一切照旧。安装目录里的 `web/.env` 有主密钥，数据库里的 OCI 私钥是用它
+  加密的 —— **两者要一起留**，只留数据库等于数据也没了。
+- **输入「删除」= 彻底删除**：再删数据库、HTTPS 证书、安装目录（含 `web/.env`）和下载的镜像。
+  **无法恢复**，需要的话先在面板里导出备份。
+
+没有终端可问时（比如在脚本里调用）按保留处理；要不问直接删，前面加 `OCIBOT_PURGE_DATA=1`。
+安装目录已经被删了、只剩容器在跑时也能用，它会按标签把残留的容器清掉。
+
+不会动的：Docker 本身、防火墙放行的 80/443、安装时加的交换文件 —— 它们可能另有用处，卸载结束时
+会提示怎么手动处理。
 
 ---
 

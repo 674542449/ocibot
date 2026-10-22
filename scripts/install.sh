@@ -1060,19 +1060,157 @@ do_status() {
   print_access_summary
 }
 
-do_uninstall() {
-  ensure_docker
-  ensure_repo
-  link_root_env   # 同 do_status：compose 插值需要项目根的 .env
-  warn "将停止容器。默认保留 PostgreSQL 数据卷 ocibot_pg。"
-  # 显式带上 tls profile：如果 web/.env 里没有 COMPOSE_PROFILES=tls（例如手工改过），
-  # 不带这个参数会把 caddy 留在后台继续占着 80/443。
-  compose --profile tls down
-  if [ "${OCIBOT_PURGE_DATA:-0}" = "1" ]; then
-    warn "OCIBOT_PURGE_DATA=1 → 删除数据卷"
-    compose --profile tls down -v
+# ---------------------------------------------------------------- 卸载
+#
+# 一键卸载：curl -fsSL …/scripts/install.sh | bash -s uninstall（在安装目录里 bash scripts/install.sh
+# uninstall 也一样）。不用先进到安装目录，也不要求代码还在：找不到安装目录时按 compose 项目标签清理。
+#
+# 只问一件事：数据删不删 —— 只有它删了就回不来。
+#   保留（默认，直接回车）：删掉容器和面板镜像；数据库卷和安装目录都留着。web/.env 里的主密钥必须和
+#     数据库一起留：数据库里的 OCI 私钥是用它加密的，只留一个等于两个都没了。重新运行安装命令即可恢复。
+#   删除（输入「删除」两个字）：再删数据库卷、HTTPS 证书卷、安装目录（含 web/.env）和下载的镜像。
+# 没有终端可问时（比如在 CI 里）按保留处理；OCIBOT_PURGE_DATA=1 表示删除，不再询问。
+# 不动：Docker 本身、防火墙放行的 80/443、安装时加的交换文件 —— 都可能另有用处，结束时说明怎么手动处理。
+
+PANEL_PROJECT="ocibot"   # docker-compose.yml 顶上的 name:
+
+have_docker() { command -v docker >/dev/null 2>&1; }
+
+have_compose() {
+  if docker compose version >/dev/null 2>&1; then
+    COMPOSE="docker compose"
+  elif command -v docker-compose >/dev/null 2>&1; then
+    COMPOSE="docker-compose"
+  else
+    return 1
   fi
-  log "已停止。仓库目录仍在：$REPO_DIR"
+}
+
+# 这个目录是不是本面板的安装目录。删目录之前必须确认 —— 认错一次就是删了别人的东西。
+is_panel_dir() {
+  local d="$1"
+  [ -n "$d" ] && [ -f "$d/docker-compose.yml" ] && [ -f "$d/scripts/install.sh" ] \
+    && [ -f "$d/web/backend/config.py" ] && grep -qx "name: ${PANEL_PROJECT}" "$d/docker-compose.yml"
+}
+
+# 找安装目录：OCIBOT_DIR（默认 ~/ocibot），其次是本脚本所在的仓库；找不到输出空。和 ensure_repo 不同，
+# 这里绝不克隆、也不报错退出 —— 卸载不需要代码也能清理容器。
+find_panel_dir() {
+  local here=""
+  if is_panel_dir "$REPO_DIR"; then
+    (cd "$REPO_DIR" && pwd -P)
+    return 0
+  fi
+  # 只认真实存在的脚本文件：curl | bash 时 BASH_SOURCE 是空的，dirname 得到的「.」会指到当前目录的
+  # 上一级 —— 那可能是任何东西。
+  if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P)" || here=""
+    if is_panel_dir "$here"; then
+      printf '%s\n' "$here"
+      return 0
+    fi
+  fi
+  return 0
+}
+
+# docker <种类> 按过滤条件列出来再删；一个都没有时什么也不做。尽力而为，删不掉的说一声。
+remove_docker_objects() {
+  local kind="$1" filter="$2" ids
+  # 容器要用 ps -a：container ls 只列正在运行的，已经停了的（比如跑完的更新辅助容器）会漏掉。
+  if [ "$kind" = "container" ]; then
+    ids="$(docker ps -aq --filter "$filter" 2>/dev/null || true)"
+  else
+    ids="$(docker "$kind" ls -q --filter "$filter" 2>/dev/null || true)"
+  fi
+  [ -n "$ids" ] || return 0
+  # $ids 不加引号：就是要按空白拆成多个 ID。
+  if [ "$kind" = "container" ]; then
+    docker rm -f $ids >/dev/null 2>&1 || warn "有容器没删掉（$filter）"
+  else
+    docker "$kind" rm $ids >/dev/null 2>&1 || warn "有 ${kind} 没删掉（$filter），可能还有别的容器在用"
+  fi
+}
+
+do_uninstall() {
+  local dir purge=0 ans real img images=""
+  dir="$(find_panel_dir)"
+  if [ "${OCIBOT_PURGE_DATA:-0}" = "1" ]; then
+    purge=1
+    warn "OCIBOT_PURGE_DATA=1：卸载并删除所有数据"
+  else
+    warn "将卸载面板：停止并删除容器，删除面板镜像。"
+    warn "要不要连数据一起删？数据库（用户、租户和 OCI 私钥、抢机任务、审计日志）、HTTPS 证书${dir:+、安装目录 ${dir}（含 web/.env 里的主密钥）}都会被删掉，无法恢复。"
+    ans="$(ask '输入「删除」连数据一起删；直接回车只卸载、保留数据（以后重新运行安装命令即可恢复）： ')"
+    if [ "$ans" = "删除" ]; then
+      purge=1
+    fi
+  fi
+
+  if ! have_docker; then
+    warn "没有找到 Docker，跳过容器、镜像和数据卷"
+  else
+    if [ -n "$dir" ]; then
+      REPO_DIR="$dir"
+      # 第三方镜像以 web/.env 里钉的为准，要在删目录之前读。
+      images="$(get_env_kv OCIBOT_POSTGRES_IMAGE) $(get_env_kv OCIBOT_CADDY_IMAGE) $(get_env_kv OCIBOT_DOCKER_CLI_IMAGE)"
+    fi
+    if [ -n "$dir" ] && [ -f "$dir/web/.env" ] && have_compose; then
+      link_root_env   # compose 插值需要项目根的 .env（POSTGRES_PASSWORD 是必填的）
+      # 显式带上 tls profile：web/.env 里没有 COMPOSE_PROFILES=tls（例如手工改过）时，不带它会把
+      # caddy 留在后台继续占着 80/443。
+      if [ "$purge" = 1 ]; then
+        compose --profile tls down -v --remove-orphans || warn "docker compose down 没有完全成功，下面按标签再清一遍"
+      else
+        compose --profile tls down --remove-orphans || warn "docker compose down 没有完全成功，下面按标签再清一遍"
+      fi
+    fi
+    # 按标签再清一遍：安装目录已经删了、web/.env 丢了、compose 报错时，容器和网络也不会留下。
+    # 面板内一键更新的辅助容器带的是自己的标签。
+    remove_docker_objects container "label=com.docker.compose.project=${PANEL_PROJECT}"
+    remove_docker_objects container "label=ocibot.self-update=1"
+    remove_docker_objects network "label=com.docker.compose.project=${PANEL_PROJECT}"
+    if [ "$purge" = 1 ]; then
+      remove_docker_objects volume "label=com.docker.compose.project=${PANEL_PROJECT}"
+      # 早期版本建的卷可能没有标签，按名字再删一次。
+      docker volume rm "${PANEL_PROJECT}_pg" "${PANEL_PROJECT}_caddy_data" "${PANEL_PROJECT}_caddy_config" >/dev/null 2>&1 || true
+      log "已删除数据卷（数据库、HTTPS 证书）"
+    fi
+    # 面板镜像总是删：重新安装时会重新下载。第三方镜像（数据库、Caddy、docker 命令行）只在彻底删除时删，
+    # 还有别的容器在用的会删不掉，正好。
+    for img in $APP_IMAGES; do
+      docker image rm "$img" >/dev/null 2>&1 || true
+    done
+    if [ "$purge" = 1 ]; then
+      for img in $images postgres:16-alpine caddy:2-alpine docker:27-cli; do
+        docker image rm "$img" >/dev/null 2>&1 || true
+      done
+    fi
+    log "已删除容器和面板镜像"
+  fi
+
+  if [ "$purge" = 1 ] && [ -n "$dir" ]; then
+    real="$(cd "$dir" && pwd -P)"
+    if [ "$real" = "/" ] || [ "$real" = "$(cd ~ && pwd -P)" ]; then
+      warn "安装目录就是 ${real}，太危险，不删，请手动处理"
+    elif cd / && rm -rf -- "$real"; then
+      log "已删除安装目录 $real"
+    else
+      warn "安装目录没删干净：$real（里面可能有 root 建的文件，用 root 再删一次）"
+    fi
+  fi
+
+  log "卸载完成。"
+  if [ "$purge" != 1 ]; then
+    log "  数据保留着：数据卷 ${PANEL_PROJECT}_pg${dir:+、安装目录 $dir（含 web/.env 主密钥，两者要一起留）}"
+    log "  重新安装（数据还在）：运行原来的安装命令即可"
+  fi
+  log "  没动的：Docker 本身、防火墙放行的 80/443（别的服务可能在用）"
+  if awk 'NR > 1 && $1 ~ /^\/swapfile2?$/ {f = 1} END {exit !f}' /proc/swaps 2>/dev/null; then
+    log "  交换文件 /swapfile 也还在。是安装时加的、不再需要的话：swapoff /swapfile && rm /swapfile，再删掉 /etc/fstab 里那一行"
+  fi
+  if [ "$purge" = 1 ]; then
+    log "  在本机构建过镜像的话，构建缓存还占着磁盘：docker builder prune"
+  fi
 }
 
 # IP 封禁（web/backend/ip_ban.py）：被封在面板外面时从服务器上解封。
@@ -1152,7 +1290,10 @@ IP 封禁（被封在面板外面时用）:
   OCIBOT_PORT         映射端口（默认 8000，需与 web/.env 一致）
   OCIBOT_ACCESS_MODE  ip | domain（非交互安装时指定，省去询问）
   OCIBOT_DOMAIN       域名（配合 OCIBOT_ACCESS_MODE=domain）
-  OCIBOT_PURGE_DATA   卸载时删库（=1）
+  OCIBOT_PURGE_DATA   卸载时连数据一起删（数据库、证书、安装目录），不再询问（=1）
+
+一键卸载（不用先进安装目录；会问要不要连数据一起删，直接回车 = 保留）:
+  curl -fsSL https://raw.githubusercontent.com/674542449/ocibot/main/scripts/install.sh | bash -s uninstall
 EOF
     exit 1
     ;;

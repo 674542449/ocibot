@@ -186,10 +186,13 @@ cat ~/ocibot/web/.env
 确认新机器一切正常后再动旧的。彻底不要了就：
 
 ```bash
-cd ~/ocibot && OCIBOT_PURGE_DATA=1 ./scripts/install.sh uninstall
+curl -fsSL https://raw.githubusercontent.com/674542449/ocibot/main/scripts/install.sh | bash -s uninstall
 ```
 
-> 这会**删除数据库卷**，旧面板的数据就没了。确认新机器没问题再执行。
+问到「要不要连数据一起删」时输入 `删除`。
+
+> 这会**删除数据库卷和整个安装目录**（含 `web/.env` 里的主密钥），旧面板的数据就没了。
+> 确认新机器没问题再执行。
 
 ---
 
