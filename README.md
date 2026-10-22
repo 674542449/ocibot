@@ -132,7 +132,14 @@ irm https://raw.githubusercontent.com/674542449/ocibot/main/scripts/install.ps1 
 .\scripts\install.ps1 update
 ```
 
-更新会拉取代码、重建镜像并滚动重启，**保留 PostgreSQL 数据卷与 `web/.env` 密钥**。
+更新会拉取代码、换上新镜像并滚动重启，**保留 PostgreSQL 数据卷与 `web/.env` 密钥**。
+
+**镜像默认直接下载，不在服务器上构建。** 每次推送到 `main`，GitHub Actions 会把镜像构建好
+（x86 和 ARM 各一份）发到 `ghcr.io`；安装 / 更新时下载和本机代码**同一个提交**的那份，并核对
+镜像里记录的提交号。服务器上不用打包前端、不用装 Oracle SDK，**1 核 1 GB 也能装**，更新也只
+下载变了的几层。刚推送完立刻更新时，镜像可能还在构建，脚本会等它（最多 10 分钟）。下载不到时
+（网络不通、`web/.env` 里钉了基础镜像、自己 fork 的仓库没开 Actions……）自动退回本机构建，
+和以前一样。想一律本机构建：`OCIBOT_PREBUILT=0`。
 
 **面板内「一键更新」默认关闭**，需要显式打开：
 
@@ -227,7 +234,10 @@ docker compose up -d --build
 | `OCIBOT_WORKER_BACKGROUND_OCI` | 默认 `1` | 设 `0` 则 Worker 完全不主动发起云 API 请求；容量重试任务将**不执行**（面板会明确提示） |
 | `OCIBOT_UPDATE_ENABLED` | 默认 `0` | 面板内自更新。改这一行不够，用 `install.sh update-on/update-off`：它同时决定要不要叠加 `docker-compose.update.yml`（`docker.sock` + 可写仓库） |
 | `OCIBOT_HOST_REPO` | 宿主机绝对路径 | 自更新绑定的代码目录（关闭自更新时以只读方式挂载，仅用于显示版本） |
-| `OCIBOT_NODE_IMAGE` / `OCIBOT_PYTHON_IMAGE` | 建议钉 `@sha256:` | 构建用基础镜像。默认是可变标签，每次更新都会重新拉 |
+| `OCIBOT_PREBUILT` | 默认自动 | `0` = 一律在本机构建；`1` = 即使钉了基础镜像也用 GitHub 预先构建好的镜像。默认用预构建的，钉了基础镜像时按钉的版本本机构建 |
+| `OCIBOT_IMAGE` | 默认按 git 远程地址推出 | 预构建镜像的仓库，如 `ghcr.io/674542449/ocibot` |
+| `OCIBOT_PREBUILT_WAIT` | 默认 `600` | 刚推送、这个提交的镜像还在构建时最多等几秒，等不到就本机构建 |
+| `OCIBOT_NODE_IMAGE` / `OCIBOT_PYTHON_IMAGE` | 建议钉 `@sha256:` | 本机构建用的基础镜像。默认是可变标签，每次更新都会重新拉。钉了它们就不再用预构建镜像（预构建的用的是构建当时的最新版） |
 | `OCIBOT_POSTGRES_IMAGE` / `OCIBOT_CADDY_IMAGE` / `OCIBOT_DOCKER_CLI_IMAGE` | 建议钉 `@sha256:` | 运行用镜像，同上 |
 
 安装脚本会生成随机密钥并默认开启 `OCIBOT_REQUIRE_SECURE_SECRETS=1`。
@@ -318,6 +328,11 @@ npm run build
   `/api/health` 的版本号是运维确认「更新到底生效没有」的唯一手段
 - **不要删除数据库里还存在的列**：`_ensure_schema()` 只加列不删列，功能下线时保留映射，
   否则老库的 INSERT 会因 NOT NULL 失败（详见 `CLAUDE.md`）
+- **预构建镜像**：推送到 `main` 会触发 `.github/workflows/image.yml`，构建 x86 / ARM 两份镜像发到
+  `ghcr.io/<owner>/<repo>`，标签是完整提交号（外加 `:main`）。**第一次发布后要手动把这个包改成
+  公开一次**，服务器才能不登录就下载：GitHub 右上角头像 → Your profile → Packages → 点这个包 →
+  Package settings → 最下面 Danger Zone → Change visibility → Public。没改之前服务器会自动
+  退回本机构建，不会出错，只是慢
 - 更多「刻意这样设计、不要改回去」的约定见 [CLAUDE.md](CLAUDE.md)
 
 ### 品牌标记与图标
@@ -339,6 +354,7 @@ npm run build
 
 ```
 ocibot/
+├── .github/workflows/image.yml # 推送到 main 后构建 x86 / ARM 镜像发到 ghcr.io（服务器直接下载）
 ├── app/                        # OCI 业务层（SDK 调用、额度计算、格式化），与 Web 共用
 ├── web/
 │   ├── backend/                # FastAPI 应用、Worker、认证、通知、自更新
@@ -390,8 +406,8 @@ ocibot/
 | 现象 | 处理 |
 |------|------|
 | 页面打不开 | `./scripts/install.sh status`；`docker compose logs api --tail=100` |
-| 小内存机器（如 1 GB）安装 / 更新时卡死、SSH 断开 | 构建镜像把内存耗尽了。先在云控制台重启服务器，再重新运行安装 / 更新命令：内存 + 交换空间不足 2.5 GB 时脚本会自动加 2 GB 交换文件（`/swapfile`，已有一个小的就另建 `/swapfile2`；需 root，根分区要有 3 GB 空闲；`OCIBOT_NO_SWAP=1` 可跳过） |
-| 更新很慢 | 更新日志里每个镜像都会打印「构建完成，用时 N 秒」，先看慢在哪一步。0.4.158 起只改了后端的更新不再重新打包前端；改了前端的那次仍要打包，1 GB 内存的机器上这一步可能要好几分钟。另外更新会刷新基础镜像：Node 镜像出新版时（大约每隔几周）前端也会重新打包，Python 镜像出新版时依赖也要重装 —— 不想这样就把 `OCIBOT_NODE_IMAGE` / `OCIBOT_PYTHON_IMAGE` 钉成 `@sha256:`（见上面的配置表） |
+| 小内存机器（如 1 GB）安装 / 更新时卡死、SSH 断开 | 在本机构建镜像把内存耗尽了。先在云控制台重启服务器，再重新运行安装 / 更新命令。0.4.160 起默认下载预先构建好的镜像，不在本机构建；日志里出现「改为在本机构建」说明没下载到，看它前面一行的原因。仍要本机构建时：内存 + 交换空间不足 2.5 GB 时脚本会自动加 2 GB 交换文件（`/swapfile`，已有一个小的就另建 `/swapfile2`；需 root，根分区要有 3 GB 空闲；`OCIBOT_NO_SWAP=1` 可跳过） |
+| 更新很慢 | 先看日志里有没有「已用上预构建镜像」—— 有的话慢在下载，没有的话是在本机构建（原因在「改为在本机构建」那一行）。本机构建时每个镜像都会打印「构建完成，用时 N 秒」。0.4.158 起只改了后端的更新不再重新打包前端；改了前端的那次仍要打包，1 GB 内存的机器上这一步可能要好几分钟。另外更新会刷新基础镜像：Node 镜像出新版时（大约每隔几周）前端也会重新打包，Python 镜像出新版时依赖也要重装 —— 不想这样就把 `OCIBOT_NODE_IMAGE` / `OCIBOT_PYTHON_IMAGE` 钉成 `@sha256:`（见上面的配置表） |
 | 更新后版本不变 | `curl -s http://127.0.0.1:8000/api/health`；浏览器强刷；确认 `OCIBOT_HOST_REPO` 为绝对路径。从外网、未登录访问时 `/api/health` 不返回版本号（有意为之），要在服务器上看或登录后看 |
 | 容量重试不跑 | 侧栏 Worker 离线提示；检查 worker 容器日志 |
 | 登录限流异常 | 直连部署保持 `OCIBOT_TRUST_PROXY=0`；反代需覆盖客户端 IP 头后再开启 |

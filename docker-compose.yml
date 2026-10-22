@@ -50,6 +50,10 @@ services:
     #   - "5432:5432"
 
   api:
+    # 镜像名写明（就是 compose 默认会起的名字，已有安装不受影响），不靠默认命名规则：
+    # install.sh 用 GitHub 预先构建好的镜像时（use_prebuilt_images），就是把它打上这两个
+    # 名字（scripts/install.sh 的 APP_IMAGES，两处要一致），compose 看到镜像已在就不在本机构建。
+    image: ocibot-api:latest
     build:
       context: .
       dockerfile: web/Dockerfile
@@ -165,6 +169,7 @@ services:
     restart: unless-stopped
 
   worker:
+    image: ocibot-worker:latest
     build:
       context: .
       dockerfile: web/Dockerfile

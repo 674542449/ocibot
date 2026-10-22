@@ -20,6 +20,8 @@ COMPOSE="docker compose"
 # 空值表示「沿用 web/.env 里已有的设置」，update/status 不会因此改动配置。
 ACCESS_MODE="${OCIBOT_ACCESS_MODE:-}"
 PANEL_DOMAIN="${OCIBOT_DOMAIN:-}"
+# docker-compose.yml 里 api / worker 的 image:，两处要一致。
+APP_IMAGES="ocibot-api:latest ocibot-worker:latest"
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m %s\n' "$*"; }
@@ -151,6 +153,118 @@ build_images() {
       compose build "$svc"
     fi
     log "${svc} 镜像构建完成，用时 $((SECONDS - t0)) 秒"
+  done
+}
+
+# ---------------------------------------------------------------- 预构建镜像
+#
+# 推送到 main 后，GitHub Actions 把镜像构建好（x86 和 ARM 各一份）发到 ghcr.io，标签是完整的
+# 提交号（.github/workflows/image.yml）。安装 / 更新时先下载和本机代码**同一个提交**的那份：
+# 服务器上不用打包前端、不用装 Oracle SDK，1 核 1 GB 也装得上，更新也只下载变了的几层。
+# 下载不到（没公开、网络不通、fork 没开 Actions、刚推送还在构建又等不到）才退回本机构建。
+#   OCIBOT_PREBUILT=0          一律本机构建；=1 即使钉了基础镜像也用预构建的
+#   OCIBOT_IMAGE=ghcr.io/…     换一个镜像仓库（默认按 git 远程地址推出来）
+#   OCIBOT_PREBUILT_WAIT=600   刚推送、镜像还在构建时最多等几秒
+
+# 镜像仓库：OCIBOT_IMAGE（环境变量或 web/.env），否则由 origin 推出 ghcr.io/<owner>/<repo>
+# （ghcr 只认小写）。不是 GitHub 上的仓库就推不出来，返回 1。
+prebuilt_image_ref() {
+  local ref url path
+  ref="${OCIBOT_IMAGE:-$(get_env_kv OCIBOT_IMAGE)}"
+  if [ -n "$ref" ]; then
+    printf '%s\n' "$ref"
+    return 0
+  fi
+  url="$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null || true)"
+  path="$(printf '%s' "$url" | sed -nE 's#^(https://([^@/]+@)?github\.com/|(ssh://)?git@github\.com[:/])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/?$#\4#p')"
+  path="${path%.git}"
+  [ -n "$path" ] || return 1
+  printf 'ghcr.io/%s\n' "$(printf '%s' "$path" | tr '[:upper:]' '[:lower:]')"
+}
+
+# 这个提交的镜像有了没有。推送后 GitHub 要构建几分钟，紧接着运行 update 时它可能还没好 ——
+# 只在这个仓库确实发过镜像（有 :main）时才等；从没发过（没公开、没开 Actions）就不等。
+wait_for_prebuilt() {
+  local img="$1" ref="$2" waited=0 max="${OCIBOT_PREBUILT_WAIT:-600}"
+  docker manifest inspect "$img" >/dev/null 2>&1 && return 0
+  if ! docker manifest inspect "${ref}:main" >/dev/null 2>&1; then
+    log "没有找到预构建镜像 ${ref}（没公开、网络不通，或仓库没开 GitHub Actions），改为在本机构建"
+    return 1
+  fi
+  log "这个提交的镜像 GitHub 还在构建，最多等 $((max / 60)) 分钟…（不想等：OCIBOT_PREBUILT=0）"
+  while [ "$waited" -lt "$max" ]; do
+    sleep 30
+    waited=$((waited + 30))
+    docker manifest inspect "$img" >/dev/null 2>&1 && return 0
+  done
+  warn "等了 $((max / 60)) 分钟还没好（可到 GitHub 仓库的 Actions 页面看构建是否失败），改为在本机构建"
+  return 1
+}
+
+# 用预构建镜像：下载、核对镜像里记录的提交号、打上 compose 认的名字。返回非 0 表示没用上，
+# 调用方退回本机构建。
+use_prebuilt_images() {
+  local mode ref sha img got name
+  mode="${OCIBOT_PREBUILT:-$(get_env_kv OCIBOT_PREBUILT)}"
+  if [ "$mode" = "0" ]; then
+    log "OCIBOT_PREBUILT=0：不用预构建镜像，在本机构建"
+    return 1
+  fi
+  # web/.env 里钉了基础镜像（@sha256:…）的人要的是「按钉的版本构建」，预构建的镜像用的是
+  # 构建当时的最新版，不能悄悄换掉。确实想用就写 OCIBOT_PREBUILT=1。
+  if [ "$mode" != "1" ] && [ -n "$(get_env_kv OCIBOT_NODE_IMAGE)$(get_env_kv OCIBOT_PYTHON_IMAGE)$(get_env_kv OCIBOT_DOCKER_CLI_IMAGE)" ]; then
+    log "web/.env 里钉了构建用的基础镜像，按钉的版本在本机构建（要用预构建镜像：OCIBOT_PREBUILT=1）"
+    return 1
+  fi
+  if ! ref="$(prebuilt_image_ref)"; then
+    log "代码不是从 GitHub 拉的，没有预构建镜像，在本机构建"
+    return 1
+  fi
+  sha="${OCIBOT_GIT_SHA:-}"
+  if ! printf '%s' "$sha" | grep -qE '^[0-9a-f]{40}$'; then
+    log "读不到完整的提交号，在本机构建"
+    return 1
+  fi
+  img="${ref}:${sha}"
+  wait_for_prebuilt "$img" "$ref" || return 1
+  log "下载预构建镜像 ${img} …"
+  if ! docker pull "$img"; then
+    warn "下载预构建镜像失败，改为在本机构建"
+    return 1
+  fi
+  # 标签可以被重新指向；烤进镜像里的提交号才说明它是从哪份代码构建的。
+  got="$(docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$img" 2>/dev/null \
+    | sed -n 's/^OCIBOT_GIT_SHA=//p' | head -n 1)"
+  if [ "$got" != "$sha" ]; then
+    warn "预构建镜像里记录的提交号（${got:-没有}）和本机代码（${sha}）对不上，不用它，改为在本机构建"
+    docker image rm "$img" >/dev/null 2>&1 || true
+    return 1
+  fi
+  for name in $APP_IMAGES; do
+    if ! docker tag "$img" "$name"; then
+      warn "给镜像打上名字 ${name} 失败，改为在本机构建"
+      return 1
+    fi
+  done
+  # 只去掉下载用的这个标签，镜像本身留给上面两个名字。
+  docker image rm "$img" >/dev/null 2>&1 || true
+  log "已用上预构建镜像，不用在本机构建"
+}
+
+# 换镜像前记下 api / worker 正在用的镜像，换完删掉其中已经没有名字的（被新版顶掉的旧版），
+# 免得每次更新都在磁盘上多留一份。还有名字或还在用的删不掉，也不该删。
+remember_app_images() {
+  # $APP_IMAGES 不加引号：就是要按空格拆成两个名字。
+  OLD_APP_IMAGES="$( { docker image inspect --format '{{.Id}}' $APP_IMAGES 2>/dev/null || true; } \
+    | sort -u | tr '\n' ' ')"
+}
+
+remove_replaced_app_images() {
+  local id
+  for id in ${OLD_APP_IMAGES:-}; do
+    if [ "$(docker image inspect --format '{{len .RepoTags}}' "$id" 2>/dev/null)" = "0" ]; then
+      docker image rm "$id" >/dev/null 2>&1 || true
+    fi
   done
 }
 
@@ -726,12 +840,16 @@ do_install() {
   choose_access_mode
   apply_access_mode
   export_build_env
-  ensure_build_memory
   log "构建并启动（PostgreSQL + API + Worker）…"
   compose up -d --build db
   sync_db_password
-  build_images
+  remember_app_images
+  if ! use_prebuilt_images; then
+    ensure_build_memory
+    build_images
+  fi
   compose up -d
+  remove_replaced_app_images
   log "等待健康检查…"
   local i
   for i in $(seq 1 40); do
@@ -866,16 +984,20 @@ do_update() {
   fi
   ensure_env
   export_build_env
-  ensure_build_memory
-  log "重新构建并滚动更新（前端没改时直接用上次打包的结果）…"
-  # --pull refreshes base images; build runs with current tree after hard reset.
-  build_images --pull
+  remember_app_images
+  if ! use_prebuilt_images; then
+    ensure_build_memory
+    log "重新构建并滚动更新（前端没改时直接用上次打包的结果）…"
+    # --pull refreshes base images; build runs with current tree after hard reset.
+    build_images --pull
+  fi
   # Bring the database up and align its password BEFORE the api starts, otherwise
   # an install whose volume predates the .env link would hand api the new password
   # while the role still has the old one.
   compose up -d db
   sync_db_password
   compose up -d
+  remove_replaced_app_images
   log "更新完成。请验证："
   log "  curl -fsS http://127.0.0.1:${OCIBOT_PORT:-8000}/api/health"
   log "  期望 version 为最新（当前源码 app_version 见 web/backend/config.py）"

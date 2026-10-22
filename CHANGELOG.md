@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.4.160 — 2026-10-22
+
+1 核 1 GB 的服务器也能安装：镜像改为 GitHub 预先构建好，服务器直接下载。
+
+### 功能
+
+- **预构建镜像。** 新增 `.github/workflows/image.yml`：每次推送到 `main`，在 x86 和 ARM（甲骨文的 AMD 和
+  Ampere A1）两种机器上各构建一份镜像，合成一个多架构镜像发到 `ghcr.io/<owner>/<repo>`，标签是完整的
+  提交号。`install.sh` 安装 / 更新时先下载和本机代码**同一个提交**的那份，核对镜像里记录的提交号，
+  打上 compose 认的名字（`ocibot-api` / `ocibot-worker`），就不在服务器上打包前端、装 Oracle SDK 了 ——
+  1 GB 内存不再卡死，也不用加交换空间，更新只下载变了的几层。
+  - 刚推送完立刻更新时，这个提交的镜像可能还在构建：仓库发过镜像（有 `:main`）就等它，最多 10 分钟
+    （`OCIBOT_PREBUILT_WAIT`）。
+  - 下载不到时自动退回本机构建，和以前一样（这时才按需加交换空间）：网络不通、包没公开、fork 没开
+    Actions、镜像里的提交号对不上、`OCIBOT_PREBUILT=0`。
+  - `web/.env` 里钉了构建用的基础镜像（`OCIBOT_NODE_IMAGE` 等）时也本机构建：钉版的人要的是按钉的版本
+    构建，预构建镜像用的是构建当时的最新版，不能悄悄换掉。确实想用就写 `OCIBOT_PREBUILT=1`。
+  - 镜像仓库默认按 git 远程地址推出（fork 用自己的），可用 `OCIBOT_IMAGE` 改。
+- 换上新镜像后，删掉被它顶掉、已经没有名字的旧镜像，免得每次更新都在磁盘上多留一份（以前本机构建也会
+  留下，一直没清）。
+- 面板内一键更新走的是宿主机上的 `install.sh update`，同样先用预构建镜像。
+
+### 维护
+
+- `docker-compose.yml` 写明 api / worker 的镜像名（就是 compose 原本默认起的名字，已有安装不受影响）。
+- 工作流：权限最小（顶层 `{}`，构建只给 `contents: read` + `packages: write`），第三方 Action 钉在提交上，
+  两种架构先按摘要推送、最后一步才打提交号标签，半成品不会以提交号的名义出现。
+- 新增 `tests/test_prebuilt_images.py`（25 条）：仓库地址推导、用上 / 核对 / 各种退回、等待有上限、
+  名字与 compose 一致、只删被顶掉的旧镜像、工作流两种架构和权限。
+
+### 升级
+
+**仓库主人需要做一次：** 推送后等 GitHub 仓库的 Actions 页面里 `image` 跑完（第一次约 10 分钟，之后有
+缓存会快很多），然后把这个包改成公开：GitHub 右上角头像 → Your profile → Packages → `ocibot` →
+Package settings → 最下面 Danger Zone → Change visibility → Public。改之前服务器会退回本机构建，
+不会出错。
+
+```bash
+cd ~/ocibot && bash scripts/install.sh update   # 日志里应出现「已用上预构建镜像」
+curl -s http://127.0.0.1:8000/api/health        # 应为 0.4.160（在服务器上执行）
+```
+
+全新安装命令不变（README「快速安装」）。
+
 ## 0.4.159 — 2026-10-22
 
 检查 0.4.158（更新提速）修掉 1 处问题，补正 1 处说法。
