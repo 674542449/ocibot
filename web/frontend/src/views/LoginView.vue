@@ -281,8 +281,8 @@ async function submit() {
   position: absolute;
   inset: 0;
   background:
-    radial-gradient(120% 80% at 50% 45%, transparent 30%, rgba(9, 10, 15, 0.85) 78%),
-    linear-gradient(90deg, rgba(9, 10, 15, 0.5) 0%, transparent 35%, transparent 55%, rgba(9, 10, 15, 0.92) 88%);
+    radial-gradient(120% 80% at 50% 45%, transparent 30%, rgba(242, 243, 245, 0.85) 78%),
+    linear-gradient(90deg, rgba(242, 243, 245, 0.5) 0%, transparent 35%, transparent 55%, rgba(242, 243, 245, 0.92) 88%);
 }
 
 /* ------------------------------------------------------------------ chrome */
@@ -337,18 +337,18 @@ async function submit() {
 
 .line.accent {
   /* The one gradient on the page, on the one phrase that carries the idea:
-     lime through fluorescent into emerald. Every stop is far past the 3:1
-     large-text threshold on the night-black page — #A3E635 13.1, #CCFF00 16.8,
-     #10B981 7.8. */
-  background: linear-gradient(96deg, #a3e635 0%, #ccff00 50%, #10b981 100%);
+     Element blue, from the deeper text blue through #409EFF and back. Both ends
+     clear the 3:1 large-text threshold on the #F2F3F5 page (#2470BD 4.58,
+     #337ECC 3.79); #409EFF in the middle is 2.50 there, fine at this size. */
+  background: linear-gradient(96deg, #2470bd 0%, #409eff 55%, #337ecc 100%);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
 }
 
 .dot.down {
-  background: var(--danger);
-  box-shadow: 0 0 0 3px rgba(248, 113, 113, 0.2);
+  background: var(--danger-fill);
+  box-shadow: 0 0 0 3px rgba(245, 108, 108, 0.2);
 }
 
 .lede {
@@ -368,7 +368,7 @@ async function submit() {
   border: 1px solid var(--border);
   border-radius: 16px;
   padding: clamp(1.25rem, 2.5vw, 1.9rem);
-  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.08);
 }
 
 .form-head h2 {
@@ -482,8 +482,8 @@ async function submit() {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: var(--ok);
-  box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.2);
+  background: var(--ok-fill);
+  box-shadow: 0 0 0 3px rgba(103, 194, 58, 0.2);
 }
 
 /* -------------------------------------------------------------- responsive */

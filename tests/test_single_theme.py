@@ -1,5 +1,5 @@
-"""面板只有一套配色，没有切换：0.4.165 起是深色（电光莱姆绿 + 极夜黑）。0.4.119 移除的是
-「亮 / 暗两套主题 + 切换按钮」，现在仍然只有一套。
+"""面板只有一套配色，没有切换：0.4.166 起是 Element 配色（浅色）。0.4.119 移除的是
+「亮 / 暗两套主题 + 切换按钮」，之后换过几次配色，但一直只有一套。
 
 这条测试防的是「半个暗色模式」回来：没有切换按钮、也没人设置 data-theme，但某个
 组件里又写了 `html[data-theme='dark'] …` 规则 —— 那种规则永远不会生效，只是死代码，
@@ -49,8 +49,8 @@ def test_no_global_html_selector_in_scoped_styles():
 def test_the_page_declares_one_scheme_only():
     css = _read(FRONTEND / "src/styles.css")
     root = css.split(":root {", 1)[1].split("}", 1)[0]
-    # 深色：表单控件、滚动条、下拉菜单跟着变暗。
-    assert "color-scheme: dark" in root
-    # 主调是电光莱姆绿（0.4.165 起；0.4.164 是珊瑚红 #ff5a5f，再之前是陶土橙 #ae4f2b）。
-    assert "--accent: #a3e635" in root
+    assert "color-scheme: light" in root
+    # 主色是 Element 蓝（0.4.166 起；0.4.165 是莱姆绿 #a3e635、0.4.164 是珊瑚红 #ff5a5f，
+    # 再之前是陶土橙 #ae4f2b）。
+    assert "--accent: #409eff" in root
     assert "prefers-color-scheme" not in css

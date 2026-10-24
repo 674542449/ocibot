@@ -163,8 +163,8 @@ onMounted(() => {
 
     for (const s of STARS) {
       ctx.globalAlpha = s.a
-      // 夜空里的细尘：石板灰，透明度沿用原来的随机值。
-      ctx.fillStyle = '#64748b'
+      // 浅灰页面上的细尘：Element 的 #C0C4CC，透明度沿用原来的随机值。
+      ctx.fillStyle = '#c0c4cc'
       ctx.beginPath()
       ctx.arc(s.x * w, s.y * h, s.r, 0, Math.PI * 2)
       ctx.fill()
@@ -188,7 +188,7 @@ onMounted(() => {
             started = true
           } else ctx.lineTo(q.x, q.y)
         }
-        ctx.strokeStyle = front ? 'rgba(148,163,184,0.16)' : 'rgba(148,163,184,0.05)'
+        ctx.strokeStyle = front ? 'rgba(48,49,51,0.12)' : 'rgba(48,49,51,0.04)'
         ctx.stroke()
       }
     }
@@ -212,16 +212,16 @@ onMounted(() => {
           started = true
         } else ctx.lineTo(q.x, q.y)
       }
-      ctx.strokeStyle = 'rgba(163,230,53,0.35)'
+      ctx.strokeStyle = 'rgba(64,158,255,0.35)'
       ctx.lineWidth = 1
       ctx.stroke()
 
-      // 沿弧线跑的光点用更亮的荧光绿，和莱姆绿的弧线分得开。
+      // 沿弧线跑的光点用 Element 的成功绿，和蓝色的弧线分得开。
       const phase = ((t * 0.0004 + i * 0.137) % 1 + 1) % 1
       const q = proj(arcPoint(a, b, phase, 0.22))
       if (q.z >= -0.15) {
         ctx.globalAlpha = 0.9
-        ctx.fillStyle = '#ccff00'
+        ctx.fillStyle = '#67c23a'
         ctx.beginPath()
         ctx.arc(q.x, q.y, 1.7 * q.k, 0, Math.PI * 2)
         ctx.fill()
@@ -236,7 +236,7 @@ onMounted(() => {
       const glow = 0.5 + 0.5 * Math.sin(t * 0.0022 + i * 0.9)
       const r = (front ? 2.1 : 1.2) * q.k
       ctx.globalAlpha = front ? 0.55 + 0.45 * glow : 0.16
-      ctx.fillStyle = front ? '#a3e635' : '#64748b'
+      ctx.fillStyle = front ? '#409eff' : '#c0c4cc'
       ctx.beginPath()
       ctx.arc(q.x, q.y, r, 0, Math.PI * 2)
       ctx.fill()
@@ -244,8 +244,8 @@ onMounted(() => {
         ctx.globalAlpha = (glow - 0.75) * 0.9
         ctx.beginPath()
         ctx.arc(q.x, q.y, r * 3.2, 0, Math.PI * 2)
-        // 节点亮起时的光晕用次要辅助色冷翠绿。
-        ctx.fillStyle = '#10b981'
+        // 节点亮起时的光晕用浅一档的蓝。
+        ctx.fillStyle = '#79bbff'
         ctx.fill()
       }
     }

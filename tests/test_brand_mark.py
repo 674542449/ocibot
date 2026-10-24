@@ -34,16 +34,16 @@ GENERATOR = pathlib.Path("scripts/make_favicon.py")
 
 # 圆环：中线半径 11、线宽 4.2，不填充 —— 标记的主体。
 _RING = re.compile(
-    r'<circle\s+cx="16"\s+cy="16"\s+r="11"\s+fill="none"\s+stroke="#090a0f"\s+stroke-width="4\.2"'
+    r'<circle\s+cx="16"\s+cy="16"\s+r="11"\s+fill="none"\s+stroke="#ffffff"\s+stroke-width="4\.2"'
 )
 # 同心的实心核心，半径与环的线宽相同，粗细一致。
-_CORE = re.compile(r'<circle\s+cx="16"\s+cy="16"\s+r="4\.2"\s+fill="#090a0f"')
+_CORE = re.compile(r'<circle\s+cx="16"\s+cy="16"\s+r="4\.2"\s+fill="#ffffff"')
 # 字形收到 78% 并居中：16 - 16*0.78 = 3.52。
 _INSET = re.compile(r"translate\(3\.52 3\.52\)\s*scale\(0\.78\)")
-# 莱姆绿底板 + 极夜黑字形（0.4.165 起；0.4.164 是珊瑚红 + 白字形，再之前是陶土橙），
-# 与生成脚本里的 BRAND / GLYPH 同色。莱姆绿上白字形只有 1.5:1，所以字形是深色的。
-BRAND_HEX = "#a3e635"
-GLYPH_HEX = "#090a0f"
+# Element 蓝底板 + 白色字形（0.4.166 起；0.4.165 是莱姆绿 + 黑字形，0.4.164 是珊瑚红，再之前
+# 是陶土橙），与生成脚本里的 BRAND / GLYPH 同色。
+BRAND_HEX = "#409eff"
+GLYPH_HEX = "#ffffff"
 _TILE = re.compile(r'<rect\s+width="32"\s+height="32"\s+rx="7"\s+fill="' + BRAND_HEX + '"')
 
 

@@ -365,7 +365,7 @@ onBeforeUnmount(() => {
 .sidebar {
   display: flex;
   flex-direction: column;
-  /* 容器色 #12151E：页面是极夜黑 #090A0F，侧边栏靠这一档深碳灰和内容区分开。 */
+  /* 白色侧边栏落在 #F2F3F5 的页面上，和 Element 管理后台一样。 */
   background: var(--panel);
   border-right: 1px solid var(--border);
   position: sticky;
@@ -431,7 +431,7 @@ onBeforeUnmount(() => {
 }
 
 /* 标记本身就是品牌，旁边不再有文字，所以它得自己撑住这块区域。
-   就是 /logo.svg 本身（自带莱姆绿底板），不加投影、不加悬停变色 —— 全站各处
+   就是 /logo.svg 本身（自带 Element 蓝底板），不加投影、不加悬停变色 —— 全站各处
    看到的必须是同一个图形。 */
 .brand-mark {
   width: 34px;
@@ -507,17 +507,19 @@ onBeforeUnmount(() => {
     box-shadow 0.12s ease;
 }
 
+/* Element 菜单：悬停浅蓝底。 */
 .nav a:hover {
-  background: var(--row-hover);
+  background: var(--accent-soft);
   color: var(--heading);
 }
 
 
 
-/* 选中项：暗莱姆绿底 + 标题白字 + 莱姆绿图标和选中条。 */
+/* Element 菜单选中项：浅蓝底 + 蓝字 + 蓝色图标和选中条（字用深一档的 --accent-text，
+   #409EFF 本身在浅蓝底上只有 2.5:1）。 */
 .nav a.nav-active {
   background: var(--accent-soft);
-  color: var(--heading);
+  color: var(--accent-text);
   font-weight: 600;
   border-color: transparent;
   box-shadow: none;
@@ -673,7 +675,7 @@ onBeforeUnmount(() => {
     display: block;
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.6);
+    background: rgba(0, 0, 0, 0.5);
     z-index: 50;
   }
 
@@ -690,7 +692,7 @@ onBeforeUnmount(() => {
     transform: translateX(-105%);
     transition: transform 0.2s ease;
     border-right: 1px solid var(--border);
-    /* Opaque, same #12151E as the desktop column. Here it is a drawer floating
+    /* Opaque, white like the desktop column. Here it is a drawer floating
        over the content — with no background of its own (as it once was) the
        labels rendered straight onto the page and the scrim behind it, which
        left the text unreadable against the backdrop. */

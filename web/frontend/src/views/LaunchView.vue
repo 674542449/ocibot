@@ -1674,7 +1674,7 @@ onMounted(async () => {
   transition: width 0.2s ease;
 }
 .quota-fill.warn {
-  background: var(--warn);
+  background: var(--warn-fill);
 }
 /* "full" = the whole free allowance is in use. That is the normal end state of
    a free account, so it is not painted as danger. */
@@ -1684,24 +1684,24 @@ onMounted(async () => {
 }
 .quota-fill.critical,
 .quota-fill.over {
-  background: var(--danger, #e5484d);
+  background: var(--danger-fill);
 }
 /* What THIS launch would add — hatched so it reads as "not yet real". */
 .quota-need {
   background: repeating-linear-gradient(
     45deg,
-    var(--warn) 0 4px,
+    var(--warn-fill) 0 4px,
     transparent 4px 8px
   );
-  background-color: color-mix(in srgb, var(--warn) 35%, transparent);
+  background-color: color-mix(in srgb, var(--warn-fill) 35%, transparent);
 }
 .quota-need.is-over {
   background: repeating-linear-gradient(
     45deg,
-    var(--danger, #e5484d) 0 4px,
+    var(--danger-fill) 0 4px,
     transparent 4px 8px
   );
-  background-color: color-mix(in srgb, var(--danger, #e5484d) 35%, transparent);
+  background-color: color-mix(in srgb, var(--danger-fill) 35%, transparent);
 }
 .quota-nums {
   font-size: 12px;
@@ -1729,10 +1729,10 @@ onMounted(async () => {
   background: var(--accent);
 }
 .q-dot-need {
-  background: var(--warn);
+  background: var(--warn-fill);
 }
 .q-dot-need.is-over {
-  background: var(--danger, #e5484d);
+  background: var(--danger-fill);
 }
 .password-reveal {
   border: 1px solid var(--warn);

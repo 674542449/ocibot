@@ -436,11 +436,11 @@
               :y="barY(pt.amount)"
               :width="barW"
               :height="Math.max(0, barBaseY - barY(pt.amount))"
-              fill="#a3e635"
+              fill="#409eff"
               opacity="0.85"
             />
           </g>
-          <line x1="0" :y1="barBaseY" :x2="svgW" :y2="barBaseY" stroke="#636c80" />
+          <line x1="0" :y1="barBaseY" :x2="svgW" :y2="barBaseY" stroke="#dcdfe6" />
         </svg>
         <div class="row muted" style="font-size: 11px; justify-content: space-between">
           <span>{{ usage.daily[0]?.date }}</span>
@@ -995,42 +995,46 @@ onMounted(async () => {
   border-radius: 999px;
   font-size: 12px;
   font-weight: 650;
-  /* 胶囊底色都是亮色（绿 / 琥珀 / 橙 / 红），白字看不清，用极夜黑。 */
-  color: var(--on-accent);
 }
+/* 进度条（.gauge-fill）用 Element 的原色状态色；带字的胶囊和徽章用 Element 浅色标签的样子
+   （浅底 + 深一档的字）—— 原色上放白字只有 2.2～2.9:1，看不清。 */
 .st-ok {
-  background: var(--ok);
+  background: var(--ok-fill);
 }
 /* Fully used, not over. Same colour family as ok — a free account that has used
    its whole allowance is in the expected state, not a fault to act on. */
 .st-full {
-  background: var(--ok);
+  background: var(--ok-fill);
   opacity: 0.72;
 }
 .st-warn {
-  background: var(--warn);
+  background: var(--warn-fill);
 }
-/* 介于 warn（琥珀）和 over（红）之间：橙色，深色字 8.7:1。 */
+/* 介于 warn（橙）和 over（红）之间：浅红（Element 危险色的 light-3）。 */
 .st-critical {
-  background: #fb923c;
+  background: #f89898;
 }
 .st-over {
-  background: var(--danger);
-  color: var(--on-accent);
+  background: var(--danger-fill);
 }
 .badge.st-ok,
-.badge.st-full {
+.badge.st-full,
+.q-pill.st-ok,
+.q-pill.st-full {
   background: var(--ok-soft);
   color: var(--ok);
   border-color: transparent;
 }
-.badge.st-warn {
+.badge.st-warn,
+.q-pill.st-warn {
   background: var(--warn-soft);
   color: var(--warn);
   border-color: transparent;
 }
 .badge.st-critical,
-.badge.st-over {
+.badge.st-over,
+.q-pill.st-critical,
+.q-pill.st-over {
   background: var(--danger-soft);
   color: var(--danger);
   border-color: transparent;

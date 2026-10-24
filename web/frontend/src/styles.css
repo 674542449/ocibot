@@ -1,65 +1,71 @@
-/* 电光莱姆绿 + 极夜黑（0.4.165 起，深色；之前 0.4.164 是珊瑚红浅色，再之前是 Claude 风格的
- * 暖色纸面）。只有这一套配色，没有切换 —— 0.4.119 移除的「暗色模式开关」不会回来。
+/* Element（Element Plus）配色（0.4.166 起，浅色；之前 0.4.165 是莱姆绿深色、0.4.164 是珊瑚红、
+ * 再之前是 Claude 风格的暖色纸面）。只有这一套配色，没有切换。
  *
- *   主调      #A3E635   电光莱姆绿：主按钮、高亮文字、链接、进度条、导航选中、品牌标记
- *   荧光      #CCFF00   更亮的荧光绿：登录页渐变、地球上跑动的光点
- *   底色      #090A0F   极夜黑：页面
- *   容器      #12151E   深碳灰：卡片、侧边栏、弹窗，搭配 #1F2430 的细描边
- *   次要辅助  #10B981   冷翠绿：成功状态、次级图表
- *   文字      标题 #F8FAFC / 正文 #94A3B8 / 弱化 #7C8BA1
+ *   主色      #409EFF   Element 蓝：主按钮、进度条、导航选中条、图标、品牌标记
+ *   成功      #67C23A / 警告 #E6A23C / 危险 #F56C6C   —— Element 的状态色，用在进度条、状态点等图形
+ *   页面      #F2F3F5   卡片 / 侧边栏 / 输入框 #FFFFFF，次级面 #F5F7FA（表头、分段按钮、代码）
+ *   描边      卡片 #E4E7ED / 输入框和按钮 #DCDFE6，悬停 #C0C4CC
+ *   文字      标题 #303133 / 正文 #606266 / 弱化 #6B6E72
  *
- * 深色底上亮色当文字都够清楚：莱姆绿在底色上 13:1、卡片上 12:1，所以链接、焦点框、导航选中条
- * 直接用 --accent。反过来要当心的是**亮色上面的字**：莱姆绿、成功绿、琥珀、红这些填充上
- * 放白字几乎看不见（莱姆绿上白字 1.5:1），按钮和状态胶囊上的字一律用 --on-accent（极夜黑，
- * 莱姆绿上 13:1）。
- * 所有组合（标题、正文、弱化文字、主调、状态色、亮色上的深色字、控件边框、图表线）都用脚本
- * 算过对比度，tests/test_palette_contrast.py 从这里读变量再算一遍。
+ * Element 的亮色当**小字**不够清楚：#409EFF 在白底上 2.78:1、#67C23A 2.24、#E6A23C 2.19、
+ * #F56C6C 2.90，正文要 4.5:1；它自己的次要文字 #909399 也只有 3.08。所以按钮、进度条、选中条、
+ * 图标这些**图形**照 Element 原色用，**文字**用同色系深一档的颜色：
+ *   链接 / 选中项文字 --accent-text #2470BD（白底 5.09，页面底色 4.58，选中底 4.62）
+ *   成功 / 警告 / 危险文字 #3D7A22 / #9A6200 / #C43838（白底与各自浅底都 ≥ 4.75）
+ *   弱化文字 #6B6E72（代替 #909399：白底 5.12，页面底色 4.61，次级面 4.77）
+ * 键盘焦点框用 Element 的「按下」蓝 #337ECC（白底 4.20、页面底色 3.79，过图形的 3:1）。
+ * 主按钮的白字是 2.78:1 —— 这就是 Element 按钮的样子，按原样做。
+ * tests/test_palette_contrast.py 从这里读变量再算一遍对比度。
  */
 :root {
-  color-scheme: dark;
-  --bg: #090a0f;
+  color-scheme: light;
+  --bg: #f2f3f5;
   --bg-glow-1: transparent;
   --bg-glow-2: transparent;
-  --panel: #12151e;
-  --panel-solid: #12151e;
-  /* 比容器亮一档的次级面：表头、分段按钮底、代码、复制胶囊。 */
-  --panel-2: #181c27;
-  --border: #1f2430;
-  /* 控件边框要过 WCAG 1.4.11 的非文本 3:1：底色 3.75、容器 3.46、次级面 3.23、输入框 3.61。
-   * #1F2430 那条细描边只有 1.2:1，当控件边框按钮会「看不见边」。 */
-  --border-strong: #636c80;
-  --glass-border: #1f2430;
+  --panel: #ffffff;
+  --panel-solid: #ffffff;
+  /* 次级面：表头、分段按钮底、代码、复制胶囊（Element 的 fill-color-light）。 */
+  --panel-2: #f5f7fa;
+  --border: #e4e7ed;
+  /* 输入框和按钮的边框，Element 的 border-color；悬停加深到 border-color-hover。 */
+  --border-strong: #dcdfe6;
+  --border-hover: #c0c4cc;
+  --glass-border: #e4e7ed;
   --glass-highlight: 0 0 transparent;
-  --heading: #f8fafc;
-  --text: #94a3b8;
-  --muted: #7c8ba1;
-  --text-secondary: #94a3b8;
-  --accent: #a3e635;
-  --accent-hover: #bef264;
-  --accent-text: #a3e635;
-  --accent-text-hover: #bef264;
-  /* 亮色填充（主按钮、状态胶囊、危险按钮悬停）上的字。 */
-  --on-accent: #090a0f;
-  /* 莱姆绿按 15% / 35% 叠在容器色上：悬停底、输入框焦点光圈 / 悬停描边。 */
-  --accent-soft: #283421;
-  --accent-soft-2: #455e26;
-  --highlight: #ccff00;
-  --secondary: #10b981;
-  --danger: #f87171;
-  --danger-soft: #35232a;
-  --ok: #10b981;
-  --ok-soft: #122e2d;
-  --warn: #fbbf24;
-  --warn-soft: #352e1f;
+  --heading: #303133;
+  --text: #606266;
+  --muted: #6b6e72;
+  --text-secondary: #606266;
+  --accent: #409eff;
+  --accent-hover: #79bbff;
+  --accent-active: #337ecc;
+  --accent-text: #2470bd;
+  --accent-text-hover: #1a5a9e;
+  /* 主按钮、危险按钮悬停上的字。 */
+  --on-accent: #ffffff;
+  /* Element 的 primary light-9 / light-7：悬停底、选中底、输入框焦点光圈 / 悬停描边。 */
+  --accent-soft: #ecf5ff;
+  --accent-soft-2: #c6e2ff;
+  /* 状态色：--ok / --warn / --danger 是文字用的（深一档），*-fill 是 Element 原色，给进度条、
+     状态点这些图形用；*-soft 是 Element 的浅底（标签、提示框）。 */
+  --danger: #c43838;
+  --danger-fill: #f56c6c;
+  --danger-soft: #fef0f0;
+  --ok: #3d7a22;
+  --ok-fill: #67c23a;
+  --ok-soft: #f0f9eb;
+  --warn: #9a6200;
+  --warn-fill: #e6a23c;
+  --warn-soft: #fdf6ec;
   /* 只声明一次：这两个键原本在本块里各写了两遍，后一份覆盖前一份，
    * 改前一份不会有任何效果 —— 是个专门用来浪费一轮排查的写法。 */
-  --input-bg: #0d1017;
-  --row-hover: #171b26;
-  /* Effects */
+  --input-bg: #ffffff;
+  --row-hover: #f5f7fa;
+  /* Effects —— Element 的浅阴影。 */
   --radius: 8px;
   --radius-lg: 12px;
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
-  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.5);
+  --shadow-sm: 0 2px 12px rgba(0, 0, 0, 0.06);
+  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.12);
   --blur: 0px;
   /* Labelled sidebar: an icon alone does not name a destination. */
   --sidebar-w: 240px;
@@ -107,9 +113,9 @@ a:hover {
   color: var(--accent-text-hover);
 }
 
-/* 选中文字：半透明的莱姆绿底，字用标题白。 */
+/* 选中文字：半透明的 Element 蓝底，字用标题色。 */
 ::selection {
-  background: rgba(163, 230, 53, 0.3);
+  background: rgba(64, 158, 255, 0.22);
   color: var(--heading);
 }
 
@@ -124,7 +130,8 @@ textarea {
 button {
   cursor: pointer;
   border: 1px solid var(--border-strong);
-  background: transparent;
+  /* Element 的默认按钮是白底，放在灰色页面上也是一个完整的按钮。 */
+  background: var(--panel);
   color: var(--text);
   border-radius: var(--radius);
   padding: 0.45rem 0.95rem;
@@ -139,12 +146,14 @@ button {
 
 /* 只写一次。以前这里还有第二条 `background: rgba(255,255,255,0.82)` 把它盖掉，
    改这一条不会有任何效果。 */
+/* Element 默认按钮的悬停：浅蓝底、浅蓝边、蓝字。 */
 button:hover:not(:disabled) {
-  background: var(--row-hover);
+  background: var(--accent-soft);
   border-color: var(--accent-soft-2);
+  color: var(--accent-text);
 }
 
-/* 莱姆绿上放白字只有 1.5:1，按钮字用极夜黑（13:1）。 */
+/* Element 主按钮：蓝底白字，悬停变浅（#79BBFF）。 */
 button.primary {
   background: var(--accent);
   border-color: transparent;
@@ -195,7 +204,6 @@ textarea {
   width: 100%;
   background: var(--input-bg);
   border: 1px solid var(--border-strong);
-  /* 填进去的值用标题白，和旁边灰色的说明文字分得开。 */
   color: var(--heading);
   border-radius: var(--radius);
   padding: 0.5rem 0.75rem;
@@ -215,7 +223,7 @@ textarea {
 input:hover,
 select:hover,
 textarea:hover {
-  border-color: var(--border-strong);
+  border-color: var(--border-hover);
 }
 
 input:focus,
@@ -440,7 +448,7 @@ tr:hover td {
 .error-box {
   white-space: pre-line;
   background: var(--danger-soft);
-  border: 1px solid rgba(248, 113, 113, 0.25);
+  border: 1px solid rgba(245, 108, 108, 0.25);
   color: var(--danger);
   padding: 0.7rem 0.9rem;
   border-radius: var(--radius-lg);
@@ -452,7 +460,7 @@ tr:hover td {
 .success-box {
   white-space: pre-line;
   background: var(--ok-soft);
-  border: 1px solid rgba(16, 185, 129, 0.25);
+  border: 1px solid rgba(103, 194, 58, 0.25);
   color: var(--ok);
   padding: 0.7rem 0.9rem;
   border-radius: var(--radius-lg);
@@ -780,12 +788,13 @@ h3 {
 
 /* Keyboard focus was visible on exactly one class before this. Anyone driving
    the panel from the keyboard — which is how you use a terminal-adjacent tool —
-   had no idea what was selected. The lime is 11:1 or better on every dark
-   surface. It is not used for any machine state — success is the bluer emerald
-   #10B981, warn is amber, danger is red — so a focus ring can never be mistaken
-   for status. */
+   had no idea what was selected. The ring is Element's pressed blue #337ECC,
+   not #409EFF: that one is only 2.78:1 on white, under the 3:1 a focus
+   indicator needs; #337ECC is 4.20 on white and 3.79 on the page grey. Blue is
+   not used for any machine state — success is green, warn is orange, danger is
+   red — so a focus ring can never be mistaken for status. */
 :where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--accent-active);
   outline-offset: 2px;
   border-radius: var(--radius);
 }

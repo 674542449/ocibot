@@ -1,11 +1,12 @@
-"""配色的对比度（0.4.165 电光莱姆绿 + 极夜黑，深色）。
+"""配色的对比度（0.4.166 Element 配色，浅色）。
 
-直接从 styles.css 的 :root 读变量再算 WCAG 对比度，改一个颜色就会知道它压没压线：
-标题 / 正文 / 弱化文字 / 莱姆绿文字 / 状态色 4.5:1，控件边框 / 图表线这类图形 3:1。
+直接从 styles.css 的 :root 读变量再算 WCAG 对比度，改一个颜色就会知道它压没压线。
 
-深色底上要当心的是反过来的那一面：**亮色填充上面的字**。莱姆绿上白字只有 1.5:1，成功绿、
-琥珀、红这些胶囊上的白字也都不到 3:1 —— 按钮和状态胶囊上的字一律用 --on-accent（极夜黑）。
-0.4.164 之前是浅色主题，那些地方写的都是 `color: #fff`，换深色时最容易漏改的就是它们。
+Element 的亮色当**小字**不够清楚：#409EFF 在白底上 2.78:1、#67C23A 2.24、#E6A23C 2.19、
+#F56C6C 2.90，它自己的次要文字 #909399 也只有 3.08（正文要 4.5:1）。这套配色的规矩是：
+按钮、进度条、状态点这些**图形**用 Element 原色（--accent、--*-fill），**文字**用深一档的
+（--accent-text、--ok / --warn / --danger、--muted）。最容易改坏的就是「顺手把文字也写成原色」，
+下面两条扫描专门防这个。
 """
 
 from __future__ import annotations
@@ -45,28 +46,24 @@ SURFACES = ("bg", "panel", "panel-2", "input-bg", "row-hover")
 @pytest.mark.parametrize(
     "fg, bg, need",
     [
-        # 文字 4.5:1，在每一种深色面上
+        # 文字 4.5:1，在每一种浅色面上
         *[(fg, s, 4.5) for fg in ("heading", "text", "muted", "accent-text") for s in SURFACES],
-        ("text", "accent-soft", 4.5),  # 导航选中项
         ("heading", "accent-soft", 4.5),
-        ("accent-text", "accent-soft", 4.5),  # 提示条、删除保护徽章
+        ("text", "accent-soft", 4.5),
+        ("accent-text", "accent-soft", 4.5),  # 导航选中项、提示条、删除保护徽章
+        ("accent-text-hover", "panel", 4.5),
         ("danger", "panel", 4.5),
         ("danger", "danger-soft", 4.5),
         ("ok", "panel", 4.5),
-        ("ok", "ok-soft", 4.5),
+        ("ok", "ok-soft", 4.5),  # 状态徽章、用量胶囊
         ("warn", "panel", 4.5),
         ("warn", "warn-soft", 4.5),
-        # 亮色填充上的字
-        ("on-accent", "accent", 4.5),  # 主按钮
-        ("on-accent", "accent-hover", 4.5),
-        ("on-accent", "danger", 4.5),  # 危险按钮悬停、超额胶囊
-        ("on-accent", "ok", 4.5),  # 用量胶囊
-        ("on-accent", "warn", 4.5),
-        ("on-accent", "#fb923c", 4.5),  # 临界胶囊（AccountView .st-critical）
-        # 图形 3:1
-        *[("border-strong", s, 3.0) for s in SURFACES],
-        ("accent", "panel-2", 3.0),  # 焦点框、选中条、进度条
-        ("secondary", "panel", 3.0),  # 次级图表
+        ("on-accent", "danger", 4.5),  # 危险按钮悬停
+        ("#ffffff", "heading", 4.5),  # 深色提示框
+        # 键盘焦点框是图形，3:1
+        ("accent-active", "panel", 3.0),
+        ("accent-active", "bg", 3.0),
+        ("accent-active", "panel-2", 3.0),
     ],
 )
 def test_contrast(fg, bg, need):
@@ -74,20 +71,33 @@ def test_contrast(fg, bg, need):
     assert r >= need, f"{fg} {_c(fg)} 在 {bg} {_c(bg)} 上只有 {r:.2f}:1，要 {need}:1"
 
 
-def test_the_palette_is_the_one_asked_for():
-    assert TOKENS["accent"] == "#a3e635"
-    assert TOKENS["bg"] == "#090a0f"
-    assert TOKENS["panel"] == "#12151e" and TOKENS["border"] == "#1f2430"
-    assert TOKENS["secondary"] == "#10b981" and TOKENS["ok"] == "#10b981"
-    assert TOKENS["heading"] == "#f8fafc" and TOKENS["text"] == "#94a3b8"
+def test_the_palette_is_element():
+    assert TOKENS["accent"] == "#409eff"
+    assert (TOKENS["ok-fill"], TOKENS["warn-fill"], TOKENS["danger-fill"]) == ("#67c23a", "#e6a23c", "#f56c6c")
+    assert TOKENS["bg"] == "#f2f3f5" and TOKENS["panel"] == "#ffffff" and TOKENS["panel-2"] == "#f5f7fa"
+    assert TOKENS["border"] == "#e4e7ed" and TOKENS["border-strong"] == "#dcdfe6"
+    assert TOKENS["heading"] == "#303133" and TOKENS["text"] == "#606266"
 
 
-def test_no_white_text_on_bright_fills():
-    """浅色主题时写下的 `color: #fff` 在深色主题里都落在亮色填充上 —— 白字在莱姆绿上 1.5:1，
-    在成功绿上 2.5:1，基本看不见。亮色填充上的字用 --on-accent。"""
-    offenders = []
+def _rules(pattern: str) -> list[str]:
+    hits = []
     for p in [*FRONTEND.rglob("*.vue"), *FRONTEND.rglob("*.css")]:
+        selector = ""
         for i, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
-            if re.search(r"(?<![-\w])color:\s*(#fff\b|#ffffff\b|white\b)", line):
-                offenders.append(f"{p}:{i}: {line.strip()}")
-    assert not offenders, offenders
+            if line.rstrip().endswith("{"):
+                selector = line
+            if re.search(pattern, line) and "ico" not in selector:
+                hits.append(f"{p}:{i}: {line.strip()}")
+    return hits
+
+
+def test_element_blue_is_never_used_as_text():
+    """#409EFF 当文字在白底上只有 2.78:1。color: 用 --accent-text。图标除外（选择器带 ico 的规则）：
+    SVG 图标用 currentColor 画，是图形不是文字。"""
+    assert not _rules(r"(?<![-\w])color:\s*var\(--accent\)"), _rules(r"(?<![-\w])color:\s*var\(--accent\)")
+
+
+def test_bright_status_fills_are_never_used_as_text():
+    """--ok-fill / --warn-fill / --danger-fill 是 Element 原色，当文字只有 2.2～2.9:1。"""
+    hits = _rules(r"(?<![-\w])color:\s*var\(--(ok|warn|danger)-fill\)")
+    assert not hits, hits

@@ -1217,7 +1217,7 @@ onMounted(async () => {
   position: fixed;
   inset: 0;
   z-index: 100;
-  background: rgba(0, 0, 0, 0.6);
+  background: rgba(0, 0, 0, 0.5);
   display: flex;
   align-items: flex-start;
   justify-content: center;
@@ -1227,7 +1227,7 @@ onMounted(async () => {
 .tenant-modal {
   width: min(760px, 100%);
   margin: 0;
-  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.12);
 }
 .tenant-modal-head {
   display: flex;
