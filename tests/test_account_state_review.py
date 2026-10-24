@@ -106,6 +106,7 @@ def test_pointing_a_tenant_at_another_account_forgets_the_cached_states(monkeypa
         private_key_encrypted=encrypt_text(TEST_PEM),
         account_tier="paid", upgrade_state="UPGRADED", setup_state="PROVISIONING",
         registered_at=datetime(2026, 10, 1, tzinfo=timezone.utc),
+        home_region="ap-tokyo-1",
     )
     now = datetime.now(timezone.utc)
     db.add(Tenant(id="p", owner_id="u1", name="p", region="ap-tokyo-1", created_at=now, updated_at=now, **creds))
@@ -119,6 +120,7 @@ def test_pointing_a_tenant_at_another_account_forgets_the_cached_states(monkeypa
     # 只改名字：缓存照留。
     tr.update_tenant("p", TenantUpdate(name="p2"), user, db)
     assert db.get(Tenant, "p").setup_state == "PROVISIONING"
+    assert db.get(Tenant, "p").home_region == "ap-tokyo-1"
 
     new_tenancy = "ocid1.tenancy.oc1..zzzzaaaabbbbccccddddeeeeffffgggghhhh"
     out = tr.update_tenant("p", TenantUpdate(tenancy_ocid=new_tenancy), user, db)
@@ -126,4 +128,6 @@ def test_pointing_a_tenant_at_another_account_forgets_the_cached_states(monkeypa
         row = db.get(Tenant, tid)
         assert (row.account_tier, row.upgrade_state, row.setup_state) == ("", "", ""), tid
         assert row.registered_at is None, tid
+        # 主区也是上一个账号的：不清的话新会话会把它当「已确认的主区」用（0.4.168）。
+        assert row.home_region == "", tid
     assert out.setup_state == "" and out.trial_expires_at is None

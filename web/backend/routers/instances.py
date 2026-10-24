@@ -20,6 +20,7 @@ from app.oci_client import (
     ROOT_PASSWORD_TAG,
     TERMINATE_PROTECT_TAG,
     is_capacity_message,
+    is_region_name,
 )
 from web.backend.audit import write_audit
 from web.backend.auth import get_current_user
@@ -660,6 +661,11 @@ def _account_state_fields(data: dict) -> dict[str, Any]:
         registered = _parse_registered_at(setup.get("registered_at"))
         if registered is not None:
             fields["registered_at"] = registered
+    # 只收真的问出来的主区（home_region_confirmed，猜的给的是空串）。记进库之后，新会话直接把它
+    # 当「已确认」用（TenantSession._seed_home_region），所以这里不能放进任何猜测。
+    home = str(data.get("home_region_confirmed") or "")
+    if is_region_name(home):
+        fields["home_region"] = home
     return fields
 
 

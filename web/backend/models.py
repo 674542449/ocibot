@@ -92,6 +92,11 @@ class Tenant(Base):
     # 「查询试用积分」时顺手记下。租户列表据此显示注册天数和试用积分到期（注册 + 30 天），
     # 不用再问 Oracle。可空且没有默认值：没查过的行就是 NULL，前端不显示。
     registered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 账号的主区（region_name，如 ap-tokyo-1）。只在真的从 Oracle 问出来时才写（「等级查询」/
+    # 「刷新用量」顺手记下），整个账号（主租户 + 副区）一起记。主区是注册时定的、之后不会变，
+    # 所以新建会话时直接拿它当「已确认的主区」用，省掉每个会话第一次都要先问一轮主区
+    # （等级查询因此从三轮往返变成一轮）。换 Tenancy OCID 时清空。"" = 还没问出来过。
+    home_region: Mapped[str] = mapped_column(String(32), default="", nullable=False)
     # Hard-enforce the Always-Free caps for this tenant, regardless of whether Oracle
     # reports the account as paid. Defaults ON: an upgraded/PAYG account that only
     # wants free resources is the common case, and inferring intent from account_tier

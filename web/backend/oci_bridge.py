@@ -38,6 +38,8 @@ def tenant_row_to_config(row: Tenant) -> TenantConfig:
         enabled=bool(row.enabled),
         color=row.color or "#3B82F6",
         account_tier=row.account_tier or "",
+        # 以前问出来的主区：新会话直接用，不用每次先问一轮（TenantSession._seed_home_region）。
+        home_region=getattr(row, "home_region", "") or "",
     )
 
 

@@ -318,3 +318,142 @@ def test_account_reads_give_up_quickly(monkeypatch):
         assert attempts == [3], key
         assert kw["timeout"] == (5.0, 30.0), key
         assert "circuit_breaker_strategy" in kw, "每租户 × 每服务的熔断器不能丢"
+
+
+# ---------------------------------------------------------------- 0.4.168 单次查询再快一点
+
+
+def _subscriptions(monkeypatch, payment_model, tier=""):
+    """订阅列表只给付费模式；完整记录（GetSubscription）给 subscription_tier，并记下被读了几次。"""
+    import oci.tenant_manager_control_plane as tmcp
+
+    calls = {"get": 0}
+
+    class Sub:
+        def __init__(self, cfg, **_kw):
+            pass
+
+        def list_subscriptions(self, compartment_id, **_kw):
+            item = SimpleNamespace(payment_model=payment_model, id="sub1", lifecycle_state="ACTIVE")
+            return SimpleNamespace(data=SimpleNamespace(items=[item]))
+
+        def get_subscription(self, subscription_id, **_kw):
+            calls["get"] += 1
+            return SimpleNamespace(data=SimpleNamespace(subscription_tier=tier, promotion=None))
+
+    monkeypatch.setattr(tmcp, "SubscriptionClient", Sub)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "payment_model, tier, expected, reads",
+    [
+        ("Free Trial", "", "free", 0),
+        ("Pay as you go", "", "paid", 0),
+        # 付费模式判断不出来，才去读完整记录补判。
+        ("", "FREETIER", "free", 1),
+        ("Something new", "PAYG", "paid", 1),
+    ],
+)
+def test_the_full_record_is_read_only_when_the_payment_model_cannot_decide(
+    monkeypatch, payment_model, tier, expected, reads
+):
+    """完整记录要等列表回来才能发，是等级查询里最长的那一串。付费模式够判的时候不读它，
+    每次查询少等一轮跨区往返。"""
+    s = _session(monkeypatch, registered_days_ago=30)
+    calls = _subscriptions(monkeypatch, payment_model, tier)
+    assert s.get_tier_status().data["tier_code"] == expected
+    assert calls["get"] == reads
+
+
+def test_trial_credits_still_read_the_full_record(monkeypatch):
+    """积分金额只在完整记录里：试用积分照旧一律读。"""
+    s = _session(monkeypatch, registered_days_ago=30)
+    calls = _subscriptions(monkeypatch, "Free Trial")
+    pairs, error = s._subscription_records()
+    assert error == "" and calls["get"] == 1 and pairs[0][1] is not None
+
+
+def test_a_remembered_home_region_is_used_without_asking():
+    from app.oci_client import TenantSession
+
+    def boom(*_a, **_k):
+        raise AssertionError("记下的主区够用了，不该再问 Oracle")
+
+    s = TenantSession.__new__(TenantSession)
+    s.tenant = SimpleNamespace(home_region="ap-tokyo-1", region="ap-osaka-1", tenancy_ocid="t")
+    s._identity = SimpleNamespace(list_region_subscriptions=boom)
+    s._seed_home_region()
+    assert s.home_region_confirmed() == "ap-tokyo-1"
+
+
+@pytest.mark.parametrize("value", ["", "evil", "AP-TOKYO-1", "ap-tokyo-1/../x", "ap-tokyo-1 x"])
+def test_a_malformed_home_region_is_not_trusted(value):
+    """库被手改过之类：格式不对就不当「已确认」用，退回现问。"""
+    from app.oci_client import TenantSession
+
+    s = TenantSession.__new__(TenantSession)
+    s.tenant = SimpleNamespace(home_region=value)
+    s._seed_home_region()
+    assert getattr(s, "_home_region_name", None) is None
+    assert not getattr(s, "_home_region_resolved", False)
+
+
+def test_a_new_session_starts_with_the_remembered_home_region():
+    """真的建一个会话：TenantConfig.home_region 一进来就是已确认的主区。"""
+    pytest.importorskip("oci")
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    from app.config_store import TenantConfig
+    from app.oci_client import TenantSession
+
+    pem = (
+        rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        .private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL,
+                       serialization.NoEncryption())
+        .decode()
+    )
+    cfg = TenantConfig(
+        id="t1", name="T", user_ocid="ocid1.user.oc1..".ljust(40, "a"),
+        tenancy_ocid="ocid1.tenancy.oc1..".ljust(40, "a"),
+        fingerprint="11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00",
+        region="ap-osaka-1", private_key_pem=pem, home_region="ap-tokyo-1",
+    )
+    session = TenantSession(cfg)
+    try:
+        assert session._home_region_name == "ap-tokyo-1"
+        assert session._home_region_resolved is True
+    finally:
+        session.close()
+
+
+def test_with_a_remembered_home_region_the_first_query_starts_everything_at_once(monkeypatch):
+    """以前每个新会话的第一次查询都要先问一轮主区（面板重启、账号等级一变都会重建会话）。"""
+    import threading
+
+    s = _session(monkeypatch, registered_days_ago=30)
+    s.tenant.home_region = "ap-tokyo-1"
+    s._seed_home_region()
+    _gate(monkeypatch, s, threading.Barrier(4, timeout=5))
+    assert _all_read(s.get_tier_status().data)
+
+
+def test_only_a_confirmed_home_region_is_reported_for_caching(monkeypatch):
+    """区域订阅读失败时 _home_region() 会退回租户自己填的 region —— 那是猜的，不能记进库。"""
+    ok = _session(monkeypatch, registered_days_ago=30, region="ap-osaka-1", home="ap-tokyo-1")
+    assert ok.get_tier_status().data["home_region_confirmed"] == "ap-tokyo-1"
+    failed = _session(monkeypatch, registered_days_ago=30, identity_fails=True)
+    assert failed.get_tier_status().data["home_region_confirmed"] == ""
+
+
+def test_the_tier_route_remembers_the_home_region_for_the_whole_account(monkeypatch):
+    from web.backend.models import Tenant
+    from web.backend.routers import instances as r
+
+    db = _db()
+    _route(monkeypatch, db, "c1", "get_tier_status", {"home_region_confirmed": "ap-tokyo-1"})
+    assert [db.get(Tenant, t).home_region for t in ("p", "c1", "c2")] == ["ap-tokyo-1"] * 3
+    assert db.get(Tenant, "other").home_region == ""
+    for bad in ("", "evil", "ap-tokyo-1\n"):
+        assert "home_region" not in r._account_state_fields({"home_region_confirmed": bad})

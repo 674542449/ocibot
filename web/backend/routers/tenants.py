@@ -357,6 +357,8 @@ def update_tenant(
             target.upgrade_state_details = ""
             target.setup_state = ""
             target.registered_at = None
+            # 主区也是上一个账号的。不清的话新会话会把它当「已确认的主区」用。
+            target.home_region = ""
 
     row.updated_at = datetime.now(timezone.utc)
     db.commit()
@@ -613,6 +615,7 @@ def subscribe_tenant_region(
                 upgrade_state_details=parent.upgrade_state_details or "",
                 setup_state=parent.setup_state or "",
                 registered_at=parent.registered_at,
+                home_region=parent.home_region or "",
                 free_only_mode=False,
             )
             db.add(child)

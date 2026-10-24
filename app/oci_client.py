@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence, Union
 
 # 每一次 OCI 失败都在这里留一条服务端记录。
 #
@@ -163,6 +163,20 @@ def _usage_item_cost(item: Any) -> float:
         return float(cost or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _tier_from_texts(values: list[str]) -> str:
+    """订阅的付费模式 / 层级文字 → "paid" / "free" / "unknown"。付费的关键字优先。
+
+    _detect_subscription_tier 的最终判定和「列表里的付费模式够不够判、要不要再读完整记录」
+    用的是这同一条规则，两处不会说法不一。
+    """
+    blob = " ".join(values).lower()
+    if any(k in blob for k in ("pay as you go", "payg", "monthly", "annual", "commit")):
+        return "paid"
+    if any(k in blob for k in ("free", "trial", "promo")):
+        return "free"
+    return "unknown"
 
 
 def _as_list(value: Any) -> list:
@@ -393,6 +407,13 @@ _COMPARTMENT_WORKERS = 5
 _QUOTA_READ_WORKERS = 5
 # 等级查询的四条读取（区域订阅 / 订阅记录 / 升级记录 / 根区间），4 就到顶。
 _TIER_READ_WORKERS = 4
+# 区域名（如 ap-tokyo-1），和 web/backend/quota_guard.py 的 _REGION_ID 同一个写法。
+_HOME_REGION_RE = re.compile(r"^[a-z]{2,3}-[a-z]+-\d+$")
+
+
+def is_region_name(value: str) -> bool:
+    """像不像一个区域名（如 ap-tokyo-1）。要记进库、再拿来当「已确认的主区」用的值先过这一道。"""
+    return bool(_HOME_REGION_RE.fullmatch(value or ""))
 # 账号级读取（订阅记录、升级记录）的超时：连接 5 秒、读 30 秒。SDK 默认是 10 / 60。
 _ACCOUNT_READ_TIMEOUT = (5.0, 30.0)
 
@@ -1450,7 +1471,23 @@ class TenantSession:
         self._config: dict = {}
         # Per-compartment scan errors from the most recent list_instances_tree call.
         self._last_tree_errors: list[str] = []
+        self._seed_home_region()
         self._build()
+
+    def _seed_home_region(self) -> None:
+        """会话一建好就用库里记下的主区（TenantConfig.home_region），记成「已确认」。
+
+        库里那个值只会是以前**真的从 Oracle 问出来**的（web/backend/routers/instances.py 的
+        _account_state_fields 只收 home_region_confirmed，猜的不收），而主区是账号注册时定的、
+        之后不会变 —— 所以它和这次再问一遍得到的答案一样。直接用它：等级查询的几条读取一开始就
+        能同时发出（以前每个新会话都要先问一轮主区，而账号等级一变会话就会重建），
+        home_region_confirmed()、账单换主区端点、副区闸门也都不用再问。
+        格式不对的值（库被手改过）不用，退回老路：现问。
+        """
+        home = (getattr(self.tenant, "home_region", "") or "").strip()
+        if is_region_name(home):
+            self._home_region_name = home
+            self._home_region_resolved = True
 
     # 会话共用的签名器。真实会话在 _build 里赋值;测试里用 TenantSession.__new__
     # 造的裸对象没走过 _build,所以这里给一个类级缺省,让 _signer_kw 能安全降级。
@@ -8262,6 +8299,14 @@ class TenantSession:
                 "账号还没准备好：" + "；".join(setup["reasons"]) + "。开通完成前创建实例等操作多半会失败，"
                 "等 Oracle 开通完成（通常会发邮件通知）后再点「等级查询」更新。" + (info.get("tier_reason") or "")
             )
+        # 问出来的主区，交给调用方记进库（以后新会话直接用，见 _seed_home_region）。只在真的
+        # 问出来时给：区域订阅读失败时 _home_region() 会退回租户自己填的 region，那是猜的，记了
+        # 就会被当成「已确认」—— 副区闸门在最需要它的时候拿到一个错的主区。
+        info["home_region_confirmed"] = (
+            str(getattr(self, "_home_region_name", "") or "")
+            if getattr(self, "_home_region_resolved", False)
+            else ""
+        )
         return info
 
     def get_tier_status(self) -> OperationResult:
@@ -9427,7 +9472,9 @@ class TenantSession:
         )
 
     def _subscription_records(
-        self, regions: Optional[list[str]] = None
+        self,
+        regions: Optional[list[str]] = None,
+        full: Union[bool, Callable[[list], bool]] = True,
     ) -> tuple[list[tuple[Any, Any, str]], str]:
         """账号的订阅记录：``([(列表里的那条, 完整记录或 None, 读完整记录的错误), ...], 错误说明)``。
 
@@ -9435,6 +9482,9 @@ class TenantSession:
         promotion / start_date；单条读失败不影响其余的，对应位置给 None 并带上原因 ——
         原因必须带出来，吞掉它就是 0.4.135 那个「明明有积分却显示没有」的 bug。
         错误说明为空串表示列表读取成功（列表可能为空）。
+
+        ``full``：要不要读完整记录。可以是一个函数，拿到列表之后再决定 —— 等级识别只在列表里的
+        付费模式判断不出等级时才读（见 _detect_subscription_tier）；试用积分要积分金额，一律读。
 
         依次试 ``regions``（默认主区、再租户所在区域）：网络不可达就换下一个端点，
         Oracle 明确拒绝（ServiceError）就不再试 —— 换个区域也一样会被拒。
@@ -9476,24 +9526,25 @@ class TenantSession:
                 return [], "订阅服务网络不可达"
             return [], f"订阅查询失败：{str(last_exc)[:60]}"
 
+        want_full = full(items) if callable(full) else bool(full)
         pairs: list[tuple[Any, Any, str]] = []
         for item in items:
-            full = None
+            record = None
             read_error = ""
             sub_id = getattr(item, "id", "") or ""
-            if sub_id and client is not None:
+            if want_full and sub_id and client is not None:
                 try:
                     # 不能传 entity_version：SDK 的 get_subscription 只认 retry_strategy /
                     # opc_request_id 等几个参数，多传一个就直接抛 ValueError("unknown
                     # kwargs")。0.4.135 之前这里一直传着它、异常又被吞掉，完整记录一条都
                     # 没读到过 —— 试用积分永远显示「没有」，等级识别里的 subscription_tier /
                     # promotion 也从没生效过。list_subscriptions 才接受 entity_version。
-                    full = client.get_subscription(subscription_id=sub_id).data
+                    record = client.get_subscription(subscription_id=sub_id).data
                 except ServiceError as exc:
                     read_error = _format_service_error(exc)
                 except Exception as exc:  # noqa: BLE001
                     read_error = safe_error_text(exc)
-            pairs.append((item, full, read_error))
+            pairs.append((item, record, read_error))
         return pairs, ""
 
     def _detect_subscription_tier(
@@ -9513,7 +9564,18 @@ class TenantSession:
         region.
         """
         details: dict = {}
-        pairs, error = self._subscription_records(regions)
+        # 完整记录（GetSubscription）只在列表里的付费模式判断不出等级时才读。等级本来就是靠
+        # 付费模式认的（0.4.135 之前完整记录一条都没读到过，等级照样认得出来），完整记录多出的
+        # subscription_tier 只用来补判。它要等列表回来才能发，是等级查询里最长的那一串：
+        # 省掉它，每次查询少等一轮跨区往返。升级成付费、而付费模式还没跟上的少见情况，
+        # _account_tier_info 里的升级记录（OSP）照样会认成付费。
+        pairs, error = self._subscription_records(
+            regions,
+            full=lambda items: _tier_from_texts(
+                [str(getattr(i, "payment_model", "") or "") for i in items]
+            )
+            == "unknown",
+        )
         if error:
             return "unknown", error, details
         if not pairs:
@@ -9545,11 +9607,11 @@ class TenantSession:
         details["subscription_tiers"] = tiers
         details["lifecycle_states"] = lifecycle_states
         details["promotion_active"] = promo_active
-        blob = " ".join(payment_models + tiers).lower()
         summary = "、".join([v for v in (payment_models + tiers) if v]) or "无"
-        if any(k in blob for k in ("pay as you go", "payg", "monthly", "annual", "commit")):
+        verdict = _tier_from_texts(payment_models + tiers)
+        if verdict == "paid":
             return "paid", f"订阅付费模式：{summary}", details
-        if any(k in blob for k in ("free", "trial", "promo")):
+        if verdict == "free":
             return "free", f"订阅层级：{summary}", details
         return "unknown", f"订阅信息：{summary}", details
 

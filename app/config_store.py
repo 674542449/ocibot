@@ -367,6 +367,9 @@ class TenantConfig:
     # Cached account tier so the sidebar can show it without a network call:
     # "paid" | "free" | "" (unknown / not yet detected)
     account_tier: str = ""
+    # 从 Oracle 问出来过的主区（region_name）。非空时会话直接当作已确认的主区，不再先问一轮。
+    # 只能填真的问出来的值 —— 猜的（比如租户自己填的 region）不行，见 TenantSession._home_region。
+    home_region: str = ""
     created_at: str = field(default_factory=_utc_now_iso)
     updated_at: str = field(default_factory=_utc_now_iso)
 
