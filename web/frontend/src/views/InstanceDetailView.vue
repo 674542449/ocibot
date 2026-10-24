@@ -212,7 +212,7 @@
                 :cy="metricHover[key]!.y"
                 r="4"
                 :fill="metricColor(key)"
-                stroke="#fff"
+                stroke="#12151e"
                 stroke-width="1.5"
               />
               <line
@@ -1786,16 +1786,15 @@ function metricLabel(k: string) {
     } as Record<string, string>
   )[k]
 }
-/** 四条曲线用互相分得开的四个色相：主色珊瑚红、靛蓝、绿、琥珀（明黄本身在白底上只有
- *  1.67:1，画线看不清，用同族深一点的琥珀），每个在白底上都 ≥ 3:1（图形的非文本对比度）：
- *  3.05 / 6.29 / 5.02 / 3.19。 */
+/** 四条曲线用互相分得开的四个色相：主调莱姆绿、天蓝、冷翠绿、琥珀，每个在深碳灰的卡片上都
+ *  远超 3:1（图形的非文本对比度）：12.1 / 7.2 / 7.2 / 10.9。 */
 function metricColor(k: string) {
   return (
     {
-      cpu: '#ff5a5f',
-      memory: '#4f46e5',
-      net_in: '#15803d',
-      net_out: '#d97706',
+      cpu: '#a3e635',
+      memory: '#60a5fa',
+      net_in: '#10b981',
+      net_out: '#fbbf24',
     } as Record<string, string>
   )[k]
 }
@@ -3104,8 +3103,8 @@ watch([tenantId, instanceId], async () => {
   z-index: 2;
   padding: 0.3rem 0.5rem;
   border-radius: 10px;
-  background: var(--heading);
-  color: #fff;
+  background: var(--panel-2);
+  color: var(--heading);
   border: 1px solid rgba(255, 255, 255, 0.16);
   box-shadow: var(--shadow-md);
   white-space: nowrap;

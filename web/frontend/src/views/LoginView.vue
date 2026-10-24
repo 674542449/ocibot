@@ -281,8 +281,8 @@ async function submit() {
   position: absolute;
   inset: 0;
   background:
-    radial-gradient(120% 80% at 50% 45%, transparent 30%, rgba(255, 255, 255, 0.85) 78%),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.5) 0%, transparent 35%, transparent 55%, rgba(255, 255, 255, 0.92) 88%);
+    radial-gradient(120% 80% at 50% 45%, transparent 30%, rgba(9, 10, 15, 0.85) 78%),
+    linear-gradient(90deg, rgba(9, 10, 15, 0.5) 0%, transparent 35%, transparent 55%, rgba(9, 10, 15, 0.92) 88%);
 }
 
 /* ------------------------------------------------------------------ chrome */
@@ -337,10 +337,10 @@ async function submit() {
 
 .line.accent {
   /* The one gradient on the page, on the one phrase that carries the idea:
-     coral into vibrant orange. Every stop stays at 3:1 or better on white
-     (large-text threshold) — #FF5A5F 3.05, #F4622F 3.17, #E8452F 3.94. The
-     orange is #F4622F rather than #FF6B35, which is only 2.84 there. */
-  background: linear-gradient(96deg, #ff5a5f 0%, #f4622f 50%, #e8452f 100%);
+     lime through fluorescent into emerald. Every stop is far past the 3:1
+     large-text threshold on the night-black page — #A3E635 13.1, #CCFF00 16.8,
+     #10B981 7.8. */
+  background: linear-gradient(96deg, #a3e635 0%, #ccff00 50%, #10b981 100%);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
@@ -348,7 +348,7 @@ async function submit() {
 
 .dot.down {
   background: var(--danger);
-  box-shadow: 0 0 0 3px rgba(185, 28, 28, 0.16);
+  box-shadow: 0 0 0 3px rgba(248, 113, 113, 0.2);
 }
 
 .lede {
@@ -368,7 +368,7 @@ async function submit() {
   border: 1px solid var(--border);
   border-radius: 16px;
   padding: clamp(1.25rem, 2.5vw, 1.9rem);
-  box-shadow: 0 24px 60px rgba(30, 27, 75, 0.1);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
 }
 
 .form-head h2 {
@@ -428,7 +428,7 @@ async function submit() {
   font-weight: 600;
   background: var(--accent);
   border-color: transparent;
-  color: #fff;
+  color: var(--on-accent);
 }
 
 .submit:hover:not(:disabled) {
@@ -483,7 +483,7 @@ async function submit() {
   height: 6px;
   border-radius: 50%;
   background: var(--ok);
-  box-shadow: 0 0 0 3px rgba(21, 128, 61, 0.16);
+  box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.2);
 }
 
 /* -------------------------------------------------------------- responsive */

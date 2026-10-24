@@ -261,9 +261,9 @@ async function ensureTerm() {
     fontSize: 13,
     fontFamily: 'Consolas, "Courier New", monospace',
     // 终端刻意保持深底 —— 这不是「暗色模式」：服务器上的程序输出 ANSI 颜色时默认
-    // 背景是深色的，浅底上的黄 / 青字几乎看不见。底色用面板的支撑色深紫蓝 #1E1B4B。
+    // 背景是深色的，浅底上的黄 / 青字几乎看不见。底色和面板一样用极夜黑 #090A0F。
     theme: {
-      background: '#1e1b4b',
+      background: '#090a0f',
       foreground: '#f8fafc',
     },
   })
@@ -434,7 +434,7 @@ onBeforeUnmount(() => {
   min-height: 220px;
   width: 100%;
   max-width: 100%;
-  background: #1e1b4b;
+  background: #090a0f;
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 4px;

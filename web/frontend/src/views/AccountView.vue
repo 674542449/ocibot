@@ -436,11 +436,11 @@
               :y="barY(pt.amount)"
               :width="barW"
               :height="Math.max(0, barBaseY - barY(pt.amount))"
-              fill="#ff5a5f"
+              fill="#a3e635"
               opacity="0.85"
             />
           </g>
-          <line x1="0" :y1="barBaseY" :x2="svgW" :y2="barBaseY" stroke="#8a8796" />
+          <line x1="0" :y1="barBaseY" :x2="svgW" :y2="barBaseY" stroke="#636c80" />
         </svg>
         <div class="row muted" style="font-size: 11px; justify-content: space-between">
           <span>{{ usage.daily[0]?.date }}</span>
@@ -995,7 +995,8 @@ onMounted(async () => {
   border-radius: 999px;
   font-size: 12px;
   font-weight: 650;
-  color: #fff;
+  /* 胶囊底色都是亮色（绿 / 琥珀 / 橙 / 红），白字看不清，用极夜黑。 */
+  color: var(--on-accent);
 }
 .st-ok {
   background: var(--ok);
@@ -1009,14 +1010,13 @@ onMounted(async () => {
 .st-warn {
   background: var(--warn);
 }
-/* 介于 warn（琥珀）和 over（深红）之间，而且不能和珊瑚红的强调色撞色 —— 用偏紫的覆盆子红。
-   白字 6.5:1。 */
+/* 介于 warn（琥珀）和 over（红）之间：橙色，深色字 8.7:1。 */
 .st-critical {
-  background: #a3365a;
+  background: #fb923c;
 }
 .st-over {
   background: var(--danger);
-  color: #fff;
+  color: var(--on-accent);
 }
 .badge.st-ok,
 .badge.st-full {

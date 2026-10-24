@@ -34,14 +34,16 @@ GENERATOR = pathlib.Path("scripts/make_favicon.py")
 
 # 圆环：中线半径 11、线宽 4.2，不填充 —— 标记的主体。
 _RING = re.compile(
-    r'<circle\s+cx="16"\s+cy="16"\s+r="11"\s+fill="none"\s+stroke="#fff"\s+stroke-width="4\.2"'
+    r'<circle\s+cx="16"\s+cy="16"\s+r="11"\s+fill="none"\s+stroke="#090a0f"\s+stroke-width="4\.2"'
 )
 # 同心的实心核心，半径与环的线宽相同，粗细一致。
-_CORE = re.compile(r'<circle\s+cx="16"\s+cy="16"\s+r="4\.2"\s+fill="#fff"')
+_CORE = re.compile(r'<circle\s+cx="16"\s+cy="16"\s+r="4\.2"\s+fill="#090a0f"')
 # 字形收到 78% 并居中：16 - 16*0.78 = 3.52。
 _INSET = re.compile(r"translate\(3\.52 3\.52\)\s*scale\(0\.78\)")
-# 珊瑚红底板（0.4.164 起；之前是陶土橙 #c6613f），与生成脚本里的 BRAND 同色。
-BRAND_HEX = "#ff5a5f"
+# 莱姆绿底板 + 极夜黑字形（0.4.165 起；0.4.164 是珊瑚红 + 白字形，再之前是陶土橙），
+# 与生成脚本里的 BRAND / GLYPH 同色。莱姆绿上白字形只有 1.5:1，所以字形是深色的。
+BRAND_HEX = "#a3e635"
+GLYPH_HEX = "#090a0f"
 _TILE = re.compile(r'<rect\s+width="32"\s+height="32"\s+rx="7"\s+fill="' + BRAND_HEX + '"')
 
 
@@ -83,6 +85,7 @@ def test_the_generator_uses_that_same_geometry():
     assert ns["GLYPH_INSET"] == 0.78
     assert round(16 - 16 * ns["GLYPH_INSET"], 2) == 3.52
     assert "#%02x%02x%02x" % ns["BRAND"] == BRAND_HEX
+    assert "#%02x%02x%02x" % ns["GLYPH"] == GLYPH_HEX
     # 旧标记（缺口 + 方块）的参数不能残留：残留说明有人只改了一半。
     for stale in ("GAP_CENTER", "GAP_HALF", "NODE_ANG", "NODE_SIZE"):
         assert stale not in ns, stale

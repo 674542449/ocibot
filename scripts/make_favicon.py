@@ -32,7 +32,7 @@ PNG（Vista 以后所有浏览器都认），加起来比引一个库还短。
 这一个标记：侧边栏、手机顶栏、登录页都直接引用 /logo.svg，favicon.svg 与它逐字相同。
 tests/test_brand_mark.py 把这几处钉在一起。
 
-标记「环与核心」：珊瑚红圆角底板 + 白色圆环 + 同心实心圆点。环 = 云上的资源池，
+标记「环与核心」：莱姆绿圆角底板 + 极夜黑圆环 + 同心实心圆点。环 = 云上的资源池，
 核心 = 面板管着的那台机器。
 """
 
@@ -52,8 +52,8 @@ TILE_R = 7.0                      # 底板圆角
 # 16 - 16*0.78 = 3.52，所以 SVG 里平移 3.52 保持居中。
 GLYPH_INSET = 0.78
 
-BRAND = (0xFF, 0x5A, 0x5F)        # 珊瑚红 #ff5a5f，与 logo.svg / favicon.svg 的底板同色；
-WHITE = (0xFF, 0xFF, 0xFF)        # 白字形 3.05:1（图形的门槛是 3:1）
+BRAND = (0xA3, 0xE6, 0x35)        # 莱姆绿 #a3e635，与 logo.svg / favicon.svg 的底板同色
+GLYPH = (0x09, 0x0A, 0x0F)        # 字形极夜黑 #090a0f：13.1:1。莱姆绿上的白字形只有 1.5:1
 ICO_SIZES = (16, 32, 48, 64)
 
 _OUT = pathlib.Path(__file__).resolve().parents[1] / "web/frontend/public/favicon.ico"
@@ -104,7 +104,7 @@ def render(size: int, ss: int = 4, *, rounded: bool = True) -> list[list[tuple[i
                 row.append((0, 0, 0, 0))
                 continue
             row.append(
-                tuple(int(BRAND[i] * (1 - mix) + WHITE[i] * mix) for i in range(3))
+                tuple(int(BRAND[i] * (1 - mix) + GLYPH[i] * mix) for i in range(3))
                 + (int(a * 255),)
             )
         rows.append(row)

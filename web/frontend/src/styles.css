@@ -1,62 +1,65 @@
-/* 珊瑚红 + 明黄 + 深紫蓝（0.4.164 起；之前是 Claude 风格的暖色纸面，暗色模式 0.4.119 已移除）
+/* 电光莱姆绿 + 极夜黑（0.4.165 起，深色；之前 0.4.164 是珊瑚红浅色，再之前是 Claude 风格的
+ * 暖色纸面）。只有这一套配色，没有切换 —— 0.4.119 移除的「暗色模式开关」不会回来。
  *
- *   主色      #FF5A5F   珊瑚红：主按钮、导航选中条、品牌标记、图表主线
- *   辅助色    #FBBF24   明黄：提示类徽章、登录页的高亮点
- *   支撑色    #1E1B4B   深紫蓝：标题、悬浮提示、终端底色 —— 用深色压住跳脱的亮色
- *   底色      #FFFFFF   页面、卡片、输入框
- *   局部底色  #FFF5F5   侧边栏、表头、分段按钮底等次级面
- *   文字      标题 #1E1B4B / 正文 #4B5563 / 弱化 #6B7280
+ *   主调      #A3E635   电光莱姆绿：主按钮、高亮文字、链接、进度条、导航选中、品牌标记
+ *   荧光      #CCFF00   更亮的荧光绿：登录页渐变、地球上跑动的光点
+ *   底色      #090A0F   极夜黑：页面
+ *   容器      #12151E   深碳灰：卡片、侧边栏、弹窗，搭配 #1F2430 的细描边
+ *   次要辅助  #10B981   冷翠绿：成功状态、次级图表
+ *   文字      标题 #F8FAFC / 正文 #94A3B8 / 弱化 #7C8BA1
  *
- * 珊瑚红本身当**文字**用不够清楚：白底上只有 3.05:1（正文要 4.5:1），所以链接、选中的
- * 标签页这类珊瑚色小字用深一档的 --accent-text #C62A31（白底 5.56、局部底色 5.20、悬停底
- * 4.76）。按钮、选中条、焦点框、图表这些是图形，门槛是 3:1：珊瑚红在白底上 3.05 刚好够，
- * 落在局部底色上只有 2.85 —— 所以侧边栏选中项的底色是白的，焦点框用 --accent-hover
- * （白底 3.71、局部底色 3.47）。
- * 主按钮上的白字是 3.05:1，按指定的主色做；按钮字是 13px 半粗，低于正文 4.5:1 的标准。
- * 所有组合（正文、次要文字、弱化文字、强调色、状态色、控件边框、焦点框、图表线）都用
- * 脚本算过对比度。
+ * 深色底上亮色当文字都够清楚：莱姆绿在底色上 13:1、卡片上 12:1，所以链接、焦点框、导航选中条
+ * 直接用 --accent。反过来要当心的是**亮色上面的字**：莱姆绿、成功绿、琥珀、红这些填充上
+ * 放白字几乎看不见（莱姆绿上白字 1.5:1），按钮和状态胶囊上的字一律用 --on-accent（极夜黑，
+ * 莱姆绿上 13:1）。
+ * 所有组合（标题、正文、弱化文字、主调、状态色、亮色上的深色字、控件边框、图表线）都用脚本
+ * 算过对比度，tests/test_palette_contrast.py 从这里读变量再算一遍。
  */
 :root {
-  color-scheme: light;
-  --bg: #ffffff;
+  color-scheme: dark;
+  --bg: #090a0f;
   --bg-glow-1: transparent;
   --bg-glow-2: transparent;
-  --panel: #ffffff;
-  --panel-solid: #ffffff;
-  --panel-2: #fff5f5;
-  --border: #f1e3e4;
-  /* 控件边框要过 WCAG 1.4.11 的非文本 3:1：白底上 3.51、局部底色上 3.28。
-   * 发丝线级别的浅色只有 1.2:1 左右，按钮会「看不见边」。 */
-  --border-strong: #8a8796;
-  --glass-border: #f1e3e4;
+  --panel: #12151e;
+  --panel-solid: #12151e;
+  /* 比容器亮一档的次级面：表头、分段按钮底、代码、复制胶囊。 */
+  --panel-2: #181c27;
+  --border: #1f2430;
+  /* 控件边框要过 WCAG 1.4.11 的非文本 3:1：底色 3.75、容器 3.46、次级面 3.23、输入框 3.61。
+   * #1F2430 那条细描边只有 1.2:1，当控件边框按钮会「看不见边」。 */
+  --border-strong: #636c80;
+  --glass-border: #1f2430;
   --glass-highlight: 0 0 transparent;
-  --heading: #1e1b4b;
-  --text: #4b5563;
-  --muted: #6b7280;
-  --text-secondary: #4b5563;
-  --accent: #ff5a5f;
-  --accent-hover: #f0454b;
-  --accent-text: #c62a31;
-  --accent-text-hover: #9f1f26;
-  --accent-soft: #ffe8e9;
-  --accent-soft-2: #ffc2c4;
-  --highlight: #fbbf24;
-  --highlight-soft: #fef3c7;
-  --danger: #b91c1c;
-  --danger-soft: #fee2e2;
-  --ok: #15803d;
-  --ok-soft: #dcfce7;
-  --warn: #b45309;
-  --warn-soft: #fef3c7;
+  --heading: #f8fafc;
+  --text: #94a3b8;
+  --muted: #7c8ba1;
+  --text-secondary: #94a3b8;
+  --accent: #a3e635;
+  --accent-hover: #bef264;
+  --accent-text: #a3e635;
+  --accent-text-hover: #bef264;
+  /* 亮色填充（主按钮、状态胶囊、危险按钮悬停）上的字。 */
+  --on-accent: #090a0f;
+  /* 莱姆绿按 15% / 35% 叠在容器色上：悬停底、输入框焦点光圈 / 悬停描边。 */
+  --accent-soft: #283421;
+  --accent-soft-2: #455e26;
+  --highlight: #ccff00;
+  --secondary: #10b981;
+  --danger: #f87171;
+  --danger-soft: #35232a;
+  --ok: #10b981;
+  --ok-soft: #122e2d;
+  --warn: #fbbf24;
+  --warn-soft: #352e1f;
   /* 只声明一次：这两个键原本在本块里各写了两遍，后一份覆盖前一份，
    * 改前一份不会有任何效果 —— 是个专门用来浪费一轮排查的写法。 */
-  --input-bg: #ffffff;
-  --row-hover: #fff5f5;
+  --input-bg: #0d1017;
+  --row-hover: #171b26;
   /* Effects */
   --radius: 8px;
   --radius-lg: 12px;
-  --shadow-sm: 0 1px 2px rgba(30, 27, 75, 0.06);
-  --shadow-md: 0 8px 24px rgba(30, 27, 75, 0.1);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.5);
   --blur: 0px;
   /* Labelled sidebar: an icon alone does not name a destination. */
   --sidebar-w: 240px;
@@ -104,9 +107,9 @@ a:hover {
   color: var(--accent-text-hover);
 }
 
-/* 选中文字用辅助色明黄的浅色，字保持深紫蓝。 */
+/* 选中文字：半透明的莱姆绿底，字用标题白。 */
 ::selection {
-  background: var(--highlight-soft);
+  background: rgba(163, 230, 53, 0.3);
   color: var(--heading);
 }
 
@@ -141,17 +144,18 @@ button:hover:not(:disabled) {
   border-color: var(--accent-soft-2);
 }
 
+/* 莱姆绿上放白字只有 1.5:1，按钮字用极夜黑（13:1）。 */
 button.primary {
   background: var(--accent);
   border-color: transparent;
-  color: #fff;
+  color: var(--on-accent);
   box-shadow: none;
 }
 
 button.primary:hover:not(:disabled) {
   background: var(--accent-hover);
   border-color: transparent;
-  color: #fff;
+  color: var(--on-accent);
 }
 
 button.danger {
@@ -163,7 +167,7 @@ button.danger {
 
 button.danger:hover:not(:disabled) {
   background: var(--danger);
-  color: #fff;
+  color: var(--on-accent);
   border-color: var(--danger);
 }
 
@@ -191,7 +195,8 @@ textarea {
   width: 100%;
   background: var(--input-bg);
   border: 1px solid var(--border-strong);
-  color: var(--text);
+  /* 填进去的值用标题白，和旁边灰色的说明文字分得开。 */
+  color: var(--heading);
   border-radius: var(--radius);
   padding: 0.5rem 0.75rem;
   min-height: 36px;
@@ -435,7 +440,7 @@ tr:hover td {
 .error-box {
   white-space: pre-line;
   background: var(--danger-soft);
-  border: 1px solid rgba(185, 28, 28, 0.18);
+  border: 1px solid rgba(248, 113, 113, 0.25);
   color: var(--danger);
   padding: 0.7rem 0.9rem;
   border-radius: var(--radius-lg);
@@ -447,7 +452,7 @@ tr:hover td {
 .success-box {
   white-space: pre-line;
   background: var(--ok-soft);
-  border: 1px solid rgba(21, 128, 61, 0.18);
+  border: 1px solid rgba(16, 185, 129, 0.25);
   color: var(--ok);
   padding: 0.7rem 0.9rem;
   border-radius: var(--radius-lg);
@@ -548,7 +553,7 @@ label.choice.muted,
 .copyable:focus-visible {
   outline: none;
   box-shadow: 0 0 0 3px var(--accent-soft);
-  border-color: var(--accent-hover);
+  border-color: var(--accent);
 }
 .copyable.empty {
   cursor: default;
@@ -775,13 +780,12 @@ h3 {
 
 /* Keyboard focus was visible on exactly one class before this. Anyone driving
    the panel from the keyboard — which is how you use a terminal-adjacent tool —
-   had no idea what was selected. The ring is --accent-hover, not --accent: the
-   coral itself is only 2.85:1 on the #FFF5F5 surfaces (sidebar, table headers),
-   below the 3:1 a focus indicator needs; one shade deeper is 3.47 there and 3.71
-   on white. It is not used for any machine state — danger is a darker crimson,
-   warn is amber — so a focus ring can never be mistaken for status. */
+   had no idea what was selected. The lime is 11:1 or better on every dark
+   surface. It is not used for any machine state — success is the bluer emerald
+   #10B981, warn is amber, danger is red — so a focus ring can never be mistaken
+   for status. */
 :where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
-  outline: 2px solid var(--accent-hover);
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
   border-radius: var(--radius);
 }

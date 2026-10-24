@@ -365,8 +365,8 @@ onBeforeUnmount(() => {
 .sidebar {
   display: flex;
   flex-direction: column;
-  /* 局部底色 #FFF5F5：页面是白的，侧边栏靠这一点粉白和内容区分开。 */
-  background: var(--panel-2);
+  /* 容器色 #12151E：页面是极夜黑 #090A0F，侧边栏靠这一档深碳灰和内容区分开。 */
+  background: var(--panel);
   border-right: 1px solid var(--border);
   position: sticky;
   top: 0;
@@ -410,7 +410,7 @@ onBeforeUnmount(() => {
   padding: 0.3rem 0.5rem;
   border: 1px solid var(--border);
   border-radius: 8px;
-  background: var(--panel);
+  background: var(--panel-2);
   font-size: 12px;
 }
 .lock-ico {
@@ -431,7 +431,7 @@ onBeforeUnmount(() => {
 }
 
 /* 标记本身就是品牌，旁边不再有文字，所以它得自己撑住这块区域。
-   就是 /logo.svg 本身（自带珊瑚红底板），不加投影、不加悬停变色 —— 全站各处
+   就是 /logo.svg 本身（自带莱姆绿底板），不加投影、不加悬停变色 —— 全站各处
    看到的必须是同一个图形。 */
 .brand-mark {
   width: 34px;
@@ -507,21 +507,20 @@ onBeforeUnmount(() => {
     box-shadow 0.12s ease;
 }
 
-/* 侧边栏本身就是 #FFF5F5（= --row-hover），悬停要再深一档才看得出来。 */
 .nav a:hover {
-  background: var(--accent-soft);
+  background: var(--row-hover);
   color: var(--heading);
 }
 
 
 
-/* 选中项是白底：落在粉白的侧边栏上一眼能看出来，珊瑚色图标在白底上也够 3:1。 */
+/* 选中项：暗莱姆绿底 + 标题白字 + 莱姆绿图标和选中条。 */
 .nav a.nav-active {
-  background: var(--panel);
+  background: var(--accent-soft);
   color: var(--heading);
   font-weight: 600;
-  border-color: var(--border);
-  box-shadow: var(--shadow-sm);
+  border-color: transparent;
+  box-shadow: none;
 }
 
 .nav a.nav-active::before {
@@ -533,9 +532,7 @@ onBeforeUnmount(() => {
   width: 3px;
   height: 18px;
   border-radius: 0 2px 2px 0;
-  /* 这条在选中项左边外侧，落在侧边栏的 #FFF5F5 上：珊瑚红本身只有 2.85:1，
-     深一档的 --accent-hover 是 3.47:1。 */
-  background: var(--accent-hover);
+  background: var(--accent);
 }
 
 .nav a.nav-active .nav-ico {
@@ -582,7 +579,7 @@ onBeforeUnmount(() => {
 }
 
 .ghost-btn:hover:not(:disabled) {
-  background: var(--accent-soft);
+  background: var(--row-hover);
   color: var(--heading);
   border-color: transparent;
 }
@@ -620,7 +617,7 @@ onBeforeUnmount(() => {
 }
 
 .icon-btn:hover:not(:disabled) {
-  background: var(--accent-soft);
+  background: var(--row-hover);
   border-color: transparent;
 }
 
@@ -676,7 +673,7 @@ onBeforeUnmount(() => {
     display: block;
     position: fixed;
     inset: 0;
-    background: rgba(30, 27, 75, 0.4);
+    background: rgba(0, 0, 0, 0.6);
     z-index: 50;
   }
 
@@ -693,11 +690,11 @@ onBeforeUnmount(() => {
     transform: translateX(-105%);
     transition: transform 0.2s ease;
     border-right: 1px solid var(--border);
-    /* Opaque, same #FFF5F5 as the desktop column. Here it is a drawer floating
+    /* Opaque, same #12151E as the desktop column. Here it is a drawer floating
        over the content — with no background of its own (as it once was) the
-       labels rendered straight onto the page and the scrim behind it, which left
-       dark text on a dark backdrop at 1.05:1. Effectively invisible. */
-    background: var(--panel-2);
+       labels rendered straight onto the page and the scrim behind it, which
+       left the text unreadable against the backdrop. */
+    background: var(--panel);
     box-shadow: var(--shadow-md);
   }
 
