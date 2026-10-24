@@ -1005,6 +1005,10 @@ onMounted(async () => {
    its whole allowance is in the expected state, not a fault to act on. */
 .st-full {
   background: var(--ok-fill);
+}
+/* 只淡化进度条。以前写在 .st-full 上，同名的状态胶囊和徽章也跟着淡到 72% —— 浅底深字的
+   标签一淡，字只剩 2.8:1 左右，看不清。 */
+.gauge-fill.st-full {
   opacity: 0.72;
 }
 .st-warn {

@@ -97,6 +97,17 @@ def test_element_blue_is_never_used_as_text():
     assert not _rules(r"(?<![-\w])color:\s*var\(--accent\)"), _rules(r"(?<![-\w])color:\s*var\(--accent\)")
 
 
+def test_only_the_usage_bar_is_faded_when_full():
+    """「用满」只淡化进度条。.st-full 同时用在状态胶囊和徽章上（浅底深字），整体调到 72% 透明度后
+    字只剩 2.8:1 左右（0.4.166 的检查里发现）。"""
+    vue = (FRONTEND / "views" / "AccountView.vue").read_text(encoding="utf-8")
+    style = vue[vue.index("<style") :]
+    for m in re.finditer(r"([^{}]*)\{([^}]*)\}", style):
+        selector, body = m.group(1).strip(), m.group(2)
+        if "opacity" in body and "st-full" in selector:
+            assert selector.splitlines()[-1].strip() == ".gauge-fill.st-full", selector
+
+
 def test_bright_status_fills_are_never_used_as_text():
     """--ok-fill / --warn-fill / --danger-fill 是 Element 原色，当文字只有 2.2～2.9:1。"""
     hits = _rules(r"(?<![-\w])color:\s*var\(--(ok|warn|danger)-fill\)")

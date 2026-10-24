@@ -392,7 +392,7 @@ onBeforeUnmount(() => {
 .worker-banner.bg-off {
   margin: 0 0.75rem 0.5rem;
   padding: 0.4rem 0.55rem;
-  border: 1px solid var(--warn);
+  border: 1px solid var(--warn-fill);
   border-radius: 8px;
   font-size: 12px;
   color: var(--text-secondary);

@@ -341,7 +341,7 @@
       <div
         v-else-if="!fwLoading && fwGroups.length"
         class="muted"
-        style="font-size: 12px; border-left: 3px solid var(--ok, #3a8); padding-left: 0.6rem"
+        style="font-size: 12px; border-left: 3px solid var(--ok-fill); padding-left: 0.6rem"
       >
         ✅ 下面这张表就是这台服务器实际开放的端口 —— 在这里删一条，就真的少一个端口。
       </div>

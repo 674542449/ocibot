@@ -1735,7 +1735,7 @@ onMounted(async () => {
   background: var(--danger-fill);
 }
 .password-reveal {
-  border: 1px solid var(--warn);
+  border: 1px solid var(--warn-fill);
 }
 /* Fixed width so a batch's rows line up and the passwords stay comparable at a
    glance instead of shifting with each instance name's length. */
