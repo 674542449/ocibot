@@ -436,11 +436,11 @@
               :y="barY(pt.amount)"
               :width="barW"
               :height="Math.max(0, barBaseY - barY(pt.amount))"
-              fill="#c6613f"
+              fill="#ff5a5f"
               opacity="0.85"
             />
           </g>
-          <line x1="0" :y1="barBaseY" :x2="svgW" :y2="barBaseY" stroke="#8c897f" />
+          <line x1="0" :y1="barBaseY" :x2="svgW" :y2="barBaseY" stroke="#8a8796" />
         </svg>
         <div class="row muted" style="font-size: 11px; justify-content: space-between">
           <span>{{ usage.daily[0]?.date }}</span>
@@ -1009,8 +1009,8 @@ onMounted(async () => {
 .st-warn {
   background: var(--warn);
 }
-/* 介于 warn（琥珀）和 over（红）之间，而且不能和陶土橙的强调色撞色 —— 用覆盆子红。
-   白字 6.4:1。 */
+/* 介于 warn（琥珀）和 over（深红）之间，而且不能和珊瑚红的强调色撞色 —— 用偏紫的覆盆子红。
+   白字 6.5:1。 */
 .st-critical {
   background: #a3365a;
 }

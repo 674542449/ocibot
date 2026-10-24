@@ -1217,7 +1217,7 @@ onMounted(async () => {
   position: fixed;
   inset: 0;
   z-index: 100;
-  background: rgba(20, 20, 19, 0.45);
+  background: rgba(30, 27, 75, 0.45);
   display: flex;
   align-items: flex-start;
   justify-content: center;
@@ -1227,7 +1227,7 @@ onMounted(async () => {
 .tenant-modal {
   width: min(760px, 100%);
   margin: 0;
-  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.25);
+  box-shadow: 0 24px 64px rgba(30, 27, 75, 0.25);
 }
 .tenant-modal-head {
   display: flex;
@@ -1318,7 +1318,7 @@ onMounted(async () => {
   min-width: 8rem;
 }
 .protect-badge {
-  color: var(--accent);
+  color: var(--accent-text);
   background: var(--accent-soft);
   /* 徽章之间可以换行，徽章自己不能从中间断成「删除 / 保护」两行。 */
   white-space: nowrap;

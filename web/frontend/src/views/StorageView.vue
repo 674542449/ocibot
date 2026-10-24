@@ -297,7 +297,7 @@
               </tr>
               <tr v-for="b in buckets" :key="b.name">
                 <td>
-                  <button type="button" style="background: none; border: none; color: var(--accent); padding: 0" @click="openBucket(b.name)">
+                  <button type="button" style="background: none; border: none; color: var(--accent-text); padding: 0" @click="openBucket(b.name)">
                     {{ b.name }}
                   </button>
                 </td>

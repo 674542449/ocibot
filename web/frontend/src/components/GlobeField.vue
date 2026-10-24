@@ -163,8 +163,8 @@ onMounted(() => {
 
     for (const s of STARS) {
       ctx.globalAlpha = s.a
-      // 纸面上的细尘，不是星空：暖灰，透明度沿用原来的随机值。
-      ctx.fillStyle = '#a8a294'
+      // 白底上的细尘，不是星空：带一点深紫蓝的浅灰，透明度沿用原来的随机值。
+      ctx.fillStyle = '#a9a7c4'
       ctx.beginPath()
       ctx.arc(s.x * w, s.y * h, s.r, 0, Math.PI * 2)
       ctx.fill()
@@ -188,7 +188,7 @@ onMounted(() => {
             started = true
           } else ctx.lineTo(q.x, q.y)
         }
-        ctx.strokeStyle = front ? 'rgba(61,60,55,0.2)' : 'rgba(61,60,55,0.06)'
+        ctx.strokeStyle = front ? 'rgba(30,27,75,0.18)' : 'rgba(30,27,75,0.06)'
         ctx.stroke()
       }
     }
@@ -212,15 +212,16 @@ onMounted(() => {
           started = true
         } else ctx.lineTo(q.x, q.y)
       }
-      ctx.strokeStyle = 'rgba(198,97,63,0.28)'
+      ctx.strokeStyle = 'rgba(255,90,95,0.32)'
       ctx.lineWidth = 1
       ctx.stroke()
 
+      // 沿弧线跑的光点用活力橙，和珊瑚色的弧线分得开。
       const phase = ((t * 0.0004 + i * 0.137) % 1 + 1) % 1
       const q = proj(arcPoint(a, b, phase, 0.22))
       if (q.z >= -0.15) {
         ctx.globalAlpha = 0.9
-        ctx.fillStyle = '#c6613f'
+        ctx.fillStyle = '#ff6b35'
         ctx.beginPath()
         ctx.arc(q.x, q.y, 1.7 * q.k, 0, Math.PI * 2)
         ctx.fill()
@@ -235,7 +236,7 @@ onMounted(() => {
       const glow = 0.5 + 0.5 * Math.sin(t * 0.0022 + i * 0.9)
       const r = (front ? 2.1 : 1.2) * q.k
       ctx.globalAlpha = front ? 0.55 + 0.45 * glow : 0.16
-      ctx.fillStyle = front ? '#c6613f' : '#a8a294'
+      ctx.fillStyle = front ? '#ff5a5f' : '#a9a7c4'
       ctx.beginPath()
       ctx.arc(q.x, q.y, r, 0, Math.PI * 2)
       ctx.fill()
@@ -243,7 +244,8 @@ onMounted(() => {
         ctx.globalAlpha = (glow - 0.75) * 0.9
         ctx.beginPath()
         ctx.arc(q.x, q.y, r * 3.2, 0, Math.PI * 2)
-        ctx.fillStyle = '#d97757'
+        // 节点亮起时的光晕用辅助色明黄。
+        ctx.fillStyle = '#fbbf24'
         ctx.fill()
       }
     }

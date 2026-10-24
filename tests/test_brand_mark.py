@@ -40,8 +40,9 @@ _RING = re.compile(
 _CORE = re.compile(r'<circle\s+cx="16"\s+cy="16"\s+r="4\.2"\s+fill="#fff"')
 # 字形收到 78% 并居中：16 - 16*0.78 = 3.52。
 _INSET = re.compile(r"translate\(3\.52 3\.52\)\s*scale\(0\.78\)")
-# 陶土橙底板，与生成脚本里的 BRAND 同色。
-_TILE = re.compile(r'<rect\s+width="32"\s+height="32"\s+rx="7"\s+fill="#c6613f"')
+# 珊瑚红底板（0.4.164 起；之前是陶土橙 #c6613f），与生成脚本里的 BRAND 同色。
+BRAND_HEX = "#ff5a5f"
+_TILE = re.compile(r'<rect\s+width="32"\s+height="32"\s+rx="7"\s+fill="' + BRAND_HEX + '"')
 
 
 def _read(p: pathlib.Path) -> str:
@@ -81,7 +82,7 @@ def test_the_generator_uses_that_same_geometry():
     assert ns["TILE_R"] == 7.0
     assert ns["GLYPH_INSET"] == 0.78
     assert round(16 - 16 * ns["GLYPH_INSET"], 2) == 3.52
-    assert "#%02x%02x%02x" % ns["BRAND"] == "#c6613f"
+    assert "#%02x%02x%02x" % ns["BRAND"] == BRAND_HEX
     # 旧标记（缺口 + 方块）的参数不能残留：残留说明有人只改了一半。
     for stale in ("GAP_CENTER", "GAP_HALF", "NODE_ANG", "NODE_SIZE"):
         assert stale not in ns, stale
@@ -150,6 +151,31 @@ def test_home_screen_icons_are_pngs_of_the_right_size():
     )
     first_px_alpha = zlib.decompress(idat)[1 + 3]  # 过滤字节之后第一个像素的 A
     assert first_px_alpha == 255, "apple-touch-icon 的角是透明的"
+
+
+def _png_pixel(p: pathlib.Path, x: int, y: int) -> tuple[int, int, int, int]:
+    """make_favicon.py 写的 PNG：8 位 RGBA、每行过滤器 0、一个 IDAT。"""
+    import zlib
+
+    raw = p.read_bytes()
+    w, _ = _png_size(p)
+    idat = b"".join(
+        raw[i + 8 : i + 8 + struct.unpack(">I", raw[i : i + 4])[0]]
+        for i in [m.start() - 4 for m in re.finditer(b"IDAT", raw)]
+    )
+    data = zlib.decompress(idat)
+    off = y * (1 + 4 * w) + 1 + 4 * x
+    return tuple(data[off : off + 4])  # type: ignore[return-value]
+
+
+def test_the_bitmaps_were_regenerated_in_the_brand_colour():
+    """改了 SVG 和脚本里的颜色却忘了重跑脚本的话，标签页 / 主屏图标还是旧颜色 —— 文字检查
+    都会通过，只有打开手机主屏才看得出来。取底板上、字形外面的一个像素：顶边正中往下一点。"""
+    brand = tuple(int(BRAND_HEX[i : i + 2], 16) for i in (1, 3, 5))
+    for name in ("apple-touch-icon.png", "icon-192.png", "icon-512.png"):
+        w, h = _png_size(PUBLIC / name)
+        px = _png_pixel(PUBLIC / name, w // 2, max(1, h // 40))
+        assert px[:3] == brand and px[3] == 255, f"{name} 的底板是 {px}，不是 {BRAND_HEX}：重跑 scripts/make_favicon.py"
 
 
 def test_the_manifest_points_at_icons_that_exist():

@@ -281,8 +281,8 @@ async function submit() {
   position: absolute;
   inset: 0;
   background:
-    radial-gradient(120% 80% at 50% 45%, transparent 30%, rgba(245, 244, 237, 0.85) 78%),
-    linear-gradient(90deg, rgba(245, 244, 237, 0.5) 0%, transparent 35%, transparent 55%, rgba(245, 244, 237, 0.92) 88%);
+    radial-gradient(120% 80% at 50% 45%, transparent 30%, rgba(255, 255, 255, 0.85) 78%),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.5) 0%, transparent 35%, transparent 55%, rgba(255, 255, 255, 0.92) 88%);
 }
 
 /* ------------------------------------------------------------------ chrome */
@@ -332,13 +332,15 @@ async function submit() {
 
 .line {
   display: block;
-  color: var(--text);
+  color: var(--heading);
 }
 
 .line.accent {
-  /* The one gradient on the page, on the one phrase that carries the idea.
-     Both ends stay at 3:1 or better on the paper (large-text threshold). */
-  background: linear-gradient(96deg, #ae4f2b 0%, #c6613f 46%, #943f20 100%);
+  /* The one gradient on the page, on the one phrase that carries the idea:
+     coral into vibrant orange. Every stop stays at 3:1 or better on white
+     (large-text threshold) — #FF5A5F 3.05, #F4622F 3.17, #E8452F 3.94. The
+     orange is #F4622F rather than #FF6B35, which is only 2.84 there. */
+  background: linear-gradient(96deg, #ff5a5f 0%, #f4622f 50%, #e8452f 100%);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
@@ -346,7 +348,7 @@ async function submit() {
 
 .dot.down {
   background: var(--danger);
-  box-shadow: 0 0 0 3px rgba(179, 38, 30, 0.16);
+  box-shadow: 0 0 0 3px rgba(185, 28, 28, 0.16);
 }
 
 .lede {
@@ -366,7 +368,7 @@ async function submit() {
   border: 1px solid var(--border);
   border-radius: 16px;
   padding: clamp(1.25rem, 2.5vw, 1.9rem);
-  box-shadow: 0 24px 60px rgba(31, 30, 27, 0.1);
+  box-shadow: 0 24px 60px rgba(30, 27, 75, 0.1);
 }
 
 .form-head h2 {
@@ -374,7 +376,7 @@ async function submit() {
   font-size: 1.45rem;
   font-weight: 650;
   letter-spacing: -0.02em;
-  color: var(--text);
+  color: var(--heading);
 }
 
 .form-head p {
@@ -408,7 +410,7 @@ async function submit() {
 
 .mode-tabs button.active {
   background: var(--input-bg);
-  color: var(--accent);
+  color: var(--accent-text);
   box-shadow: var(--shadow-sm);
 }
 
@@ -481,7 +483,7 @@ async function submit() {
   height: 6px;
   border-radius: 50%;
   background: var(--ok);
-  box-shadow: 0 0 0 3px rgba(62, 106, 40, 0.16);
+  box-shadow: 0 0 0 3px rgba(21, 128, 61, 0.16);
 }
 
 /* -------------------------------------------------------------- responsive */

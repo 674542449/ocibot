@@ -81,7 +81,7 @@ onBeforeUnmount(() => {
 .toast-info {
   background: var(--accent-soft);
   border-color: transparent;
-  color: var(--accent);
+  color: var(--accent-text);
 }
 @keyframes toast-in {
   from {

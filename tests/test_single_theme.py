@@ -1,4 +1,4 @@
-"""面板只有一套配色（Claude 风格的亮色），暗色模式在 0.4.119 移除。
+"""面板只有一套配色（亮色；0.4.164 起是珊瑚红 + 明黄 + 深紫蓝），暗色模式在 0.4.119 移除。
 
 这条测试防的是「半个暗色模式」回来：没有切换按钮、也没人设置 data-theme，但某个
 组件里又写了 `html[data-theme='dark'] …` 规则 —— 那种规则永远不会生效，只是死代码，
@@ -49,6 +49,6 @@ def test_the_page_declares_light_only():
     css = _read(FRONTEND / "src/styles.css")
     root = css.split(":root {", 1)[1].split("}", 1)[0]
     assert "color-scheme: light" in root
-    # 强调色是陶土橙（Claude 风格），不是原来的靛蓝。
-    assert "--accent: #ae4f2b" in root
+    # 强调色是珊瑚红（0.4.164 起；之前是陶土橙 #ae4f2b）。
+    assert "--accent: #ff5a5f" in root
     assert "prefers-color-scheme" not in css
