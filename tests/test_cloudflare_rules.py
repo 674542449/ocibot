@@ -209,6 +209,47 @@ def test_it_refuses_before_blowing_the_120_rule_ceiling(monkeypatch):
     assert "IPv6" in r.message
 
 
+SIX_V6 = {
+    "ipv4": ["1.1.1.0/24"],
+    "ipv6": [f"2606:4700:{i}::/48" for i in range(1, 7)],
+    "etag": "x",
+    "source": "live",
+    "note": "",
+}
+
+
+def test_it_refuses_before_blowing_the_ipv6_rule_ceiling(monkeypatch):
+    """ipv6.htm："IPv6 security rules in a network security group: 16 total"。
+
+    add_nsg_rules 是分批写的，这里不拦的话 IPv4 那批写进去之后才被打回，留下一半规则。
+    """
+    s = _session([], monkeypatch, feed=SIX_V6)
+    r = s.add_cloudflare_rules("nsg1", ports=[80, 443, 8443])  # 6 × 3 = 18 条 IPv6
+    assert r.ok is False
+    assert not s.added, "明知写不下还是发了请求"
+    assert "16" in r.message
+    assert r.data["needed"] == 18
+
+
+def test_existing_ipv6_rules_count_towards_the_ceiling(monkeypatch):
+    existing = [_rule("2001:db8::/48", 22, 22), _rule("2001:db8:1::/48", 22, 22),
+                _rule("2001:db8:2::/48", 22, 22), _rule("2001:db8:3::/48", 22, 22)]
+    s = _session(existing, monkeypatch, feed=SIX_V6)
+    r = s.add_cloudflare_rules("nsg1", ports=[80, 443])  # 4 + 12 = 16，刚好
+    assert r.ok, r.message
+
+    s = _session(existing + [_rule("2001:db8:4::/48", 22, 22)], monkeypatch, feed=SIX_V6)
+    r = s.add_cloudflare_rules("nsg1", ports=[80, 443])  # 5 + 12 = 17
+    assert r.ok is False
+    assert not s.added
+
+
+def test_the_ipv6_ceiling_does_not_apply_to_ipv4_only_rules(monkeypatch):
+    s = _session([], monkeypatch, feed=SIX_V6)
+    r = s.add_cloudflare_rules("nsg1", ports=[80, 443, 8443], include_ipv6=False)
+    assert r.ok, r.message
+
+
 def test_egress_rules_do_not_count_as_covering_ingress(monkeypatch):
     """出站的 0.0.0.0/0 和入站可达性毫无关系，不能拿它去跳过或告警。"""
     s = _session([_rule("0.0.0.0/0", None, None, direction="EGRESS")], monkeypatch)

@@ -863,9 +863,9 @@ def sanitize_launch_payload(payload: dict, *, for_retry: bool = False) -> dict:
         if not 50 <= boot_size <= 32768:
             raise ValueError("Boot Volume 大小必须在 50–32768 GB 之间")
         clean["boot_volume_size_in_gbs"] = boot_size
-    # 创建路径刻意**不**开放 0（Lower Cost）：前端下拉里也没有这一档，而创建时
-    # 选错性能是要重建机器才能改回来的。已存在的卷读回 0 时不再被改写成 10
-    # （见 _vpus_or_default），调整路径也接受 0 —— 只有「新建」这一步保持保守。
+    # 这里不开放 0（Lower Cost）是 Oracle 的限制，不是面板保守：引导卷没有这一档。
+    # UpdateBootVolumeDetails.vpus_per_gb 的取值只有 10 / 20 / 30–120，文档原话是
+    # "This option is only available for block volumes"。0 只属于块卷那条路径。
     vpus = int(clean.get("boot_volume_vpus_per_gb") or 10)
     if vpus not in (10, 20) and not 30 <= vpus <= 120:
         raise ValueError("Boot Volume 性能必须为 10、20 或 30–120 VPUs/GB")
@@ -3478,7 +3478,7 @@ class TenantSession:
             security_list = self._ensure_open_security_list(
                 vcn_id, vcn_comp, include_ipv6=include_ipv6
             )
-            created_parts.append("开放 Security List")
+            created_parts.append("Security List（入站默认关闭）")
 
             # Pick a free /24 under the VCN CIDR when possible.
             vcn_cidr = (
@@ -3976,11 +3976,15 @@ class TenantSession:
         include_ipv6: bool = False,
         launch_token: str = "",
         open_all: bool = True,
+        bare: bool = False,
     ) -> OperationResult:
-        """open_all=False 时只放 SSH 入站。
+        """open_all=False 时只放 SSH 入站；bare=True 时一条规则都不写。
 
         默认仍是 True:这个方法还有别的调用方(详情页的「一键开放全部端口」),
         它们的语义本来就是全开放。创建路径会显式传 open_all=表单上那个勾选。
+
+        bare 是给一键修复用的:它要把子网现有的放行原样搬进来,所以 NSG 必须从
+        空表开始。open_all=False 并不是空表 —— 它会写一条 22 对全网放行。
         """
         token = launch_token or uuid.uuid4().hex
         safe_name = (display_name or "instance").strip() or "instance"
@@ -3996,7 +4000,15 @@ class TenantSession:
         )
         try:
             nsg = self.network.create_network_security_group(details).data
-            specs = self._open_all_specs(include_ipv6) if open_all else self._ssh_only_specs(include_ipv6)
+            if bare:
+                specs: list[FirewallRuleSpec] = []
+                summary = "已创建实例专属网络安全组（暂无规则）"
+            elif open_all:
+                specs = self._open_all_specs(include_ipv6)
+                summary = "已创建实例专属网络安全组，并开放全部入站/出站规则"
+            else:
+                specs = self._ssh_only_specs(include_ipv6)
+                summary = "已创建实例专属网络安全组，入站只开放 SSH（22）"
             added = self.add_nsg_rules(nsg.id, specs)
             if not added.ok:
                 try:
@@ -4006,7 +4018,7 @@ class TenantSession:
                 return added
             return OperationResult(
                 ok=True,
-                message="已创建实例专属网络安全组，并开放全部入站/出站规则",
+                message=summary,
                 data={"nsg_id": nsg.id, "launch_token": token},
             )
         except ServiceError as exc:
@@ -4028,13 +4040,13 @@ class TenantSession:
             return OperationResult(ok=False, message=_format_service_error(exc))
 
     def ensure_instance_nsg(
-        self, instance_id: str, compartment_id: str, *, open_all: bool = True
+        self, instance_id: str, compartment_id: str, *, open_all: bool = True, bare: bool = False
     ) -> OperationResult:
         """确保这台实例有自己的 NSG,没有就建一个并挂上。
 
         ``open_all`` 默认 True 是历史调用方(详情页「一键开放全部端口」)的语义。
-        一键修复要传 False:它随后会把子网当前的放行原样搬进来,先开全部会把
-        「可达性不变」这个承诺变成谎话 —— 修完比修前更开放。
+        一键修复要传 ``bare=True``:它随后会把子网当前的放行原样搬进来,这里多写
+        任何一条都会把「可达性不变」这个承诺变成谎话 —— 修完比修前更开放。
         """
         try:
             network = self.resolve_primary_network(instance_id, compartment_id)
@@ -4051,6 +4063,7 @@ class TenantSession:
                 display_name=f"{instance_id[-8:]}-firewall",
                 include_ipv6=bool(network.ipv6_addresses),
                 open_all=open_all,
+                bare=bare,
             )
             if not created.ok:
                 return created
@@ -4252,6 +4265,13 @@ class TenantSession:
     def _normalize_firewall_rule(rule: Any, direction: str = "") -> dict:
         options = getattr(rule, "tcp_options", None) or getattr(rule, "udp_options", None)
         port_range = getattr(options, "destination_port_range", None) if options else None
+        # 源端口要单独留着。一键修复靠这份归一化结果把规则搬进 NSG,丢掉它的话,
+        # 一条「只放行源端口 53」的规则会被搬成对应目的端口全开。
+        source_range = getattr(options, "source_port_range", None) if options else None
+        source_port = ""
+        if source_range:
+            start, end = getattr(source_range, "min", None), getattr(source_range, "max", None)
+            source_port = str(start) if start == end else f"{start}-{end}"
         port = "全部"
         if port_range:
             start, end = getattr(port_range, "min", None), getattr(port_range, "max", None)
@@ -4287,6 +4307,7 @@ class TenantSession:
             "protocol_label": TenantSession._firewall_protocol_label(protocol),
             "cidr": getattr(rule, "source", None) or getattr(rule, "destination", None) or "",
             "port": port,
+            "source_port": source_port,
             "stateless": bool(getattr(rule, "is_stateless", False)),
             "description": getattr(rule, "description", "") or "",
         }
@@ -4306,6 +4327,9 @@ class TenantSession:
     # 每个安全列表最多 200 条入站规则（出站另算 200）。服务限额页标注**不可调整**。
     # Cloudflare 一次要写 ~44 条,占掉五分之一,所以写之前必须先算。
     SECURITY_LIST_INGRESS_LIMIT = 200
+    # IPv6 规则另有更小的上限。ipv6.htm 原话:"Limit on number of IPv6 security rules
+    # in a security list: 50 ingress and 50 egress"。
+    SECURITY_LIST_IPV6_INGRESS_LIMIT = 50
 
     # OCI 读回一条它自己也不认识的 source_type 时,SDK 会把它替换成这个字面量
     # （ingress_security_rule.py 的 setter）。读-改-写会把这个字符串原样发回去,
@@ -4853,6 +4877,21 @@ class TenantSession:
                       "limit": self.SECURITY_LIST_INGRESS_LIMIT},
             )
 
+        fresh_v6 = sum(1 for r in fresh if ":" in str(getattr(r, "source", "") or ""))
+        existing_v6 = sum(1 for r in existing if ":" in str(getattr(r, "source", "") or ""))
+        if fresh_v6 and existing_v6 + fresh_v6 > self.SECURITY_LIST_IPV6_INGRESS_LIMIT:
+            return OperationResult(
+                ok=False,
+                message=(
+                    "IPv6 规则数不够:需要新增 " + str(fresh_v6) + " 条,而这份安全列表已有 "
+                    + str(existing_v6) + " 条 IPv6 入站,上限 "
+                    + str(self.SECURITY_LIST_IPV6_INGRESS_LIMIT) + " 条(Oracle 限制)。"
+                    + chr(10) + "先删掉用不到的 IPv6 规则,或减少这次要加的条数。"
+                ),
+                data={**base, "needed": fresh_v6, "existing": existing_v6,
+                      "limit": self.SECURITY_LIST_IPV6_INGRESS_LIMIT},
+            )
+
         written = self._write_security_list_ingress(sl_id, existing + fresh, etag)
         if not written.ok:
             return OperationResult(ok=False, message=written.message, data=base)
@@ -5258,6 +5297,11 @@ class TenantSession:
     # Cloudflare 是 15 个 v4 + 7 个 v6 网段，配 80+443 就是 44 条 —— 占掉三分之一多，
     # 所以写之前必须先算，撞上限时给的是一条能看懂的话，而不是 Oracle 的 400。
     NSG_RULE_LIMIT = 120
+    # IPv6 规则另有上限。ipv6.htm 原话："Limit on number of IPv6 security rules in a
+    # network security group: 16 total"。Cloudflare 7 个 v6 网段配 3 个端口就超了，
+    # 而 add_nsg_rules 是分批写的：只查总数的话，前面的 IPv4 批次写进去之后才被
+    # 这条限制打回，留下一半规则。
+    NSG_IPV6_RULE_LIMIT = 16
 
     def add_cloudflare_rules(
         self,
@@ -5392,6 +5436,24 @@ class TenantSession:
                     + "可以只选一个端口、或关掉 IPv6 来减少条数，也可以把用不到的旧规则删掉。"
                 ),
                 data={"needed": len(specs), "existing": len(existing), "limit": self.NSG_RULE_LIMIT},
+            )
+
+        new_v6 = sum(1 for spec in specs if ":" in spec.cidr)
+        have_v6 = sum(
+            1
+            for rule in existing
+            if ":" in str(getattr(rule, "source", None) or getattr(rule, "destination", None) or "")
+        )
+        if new_v6 and have_v6 + new_v6 > self.NSG_IPV6_RULE_LIMIT:
+            return OperationResult(
+                ok=False,
+                message=(
+                    f"IPv6 规则数不够：需要新增 {new_v6} 条，而这个安全组已有 {have_v6} 条 IPv6 规则，"
+                    f"每组上限 {self.NSG_IPV6_RULE_LIMIT} 条（Oracle 限制）。"
+                    + chr(10)
+                    + "可以少选端口、关掉 IPv6，或把用不到的 IPv6 规则删掉。"
+                ),
+                data={"needed": new_v6, "existing": have_v6, "limit": self.NSG_IPV6_RULE_LIMIT},
             )
 
         result = self.add_nsg_rules(nsg_id, specs)
@@ -5742,7 +5804,7 @@ class TenantSession:
         targets: list[dict] = []
         for sl_id in sl_ids:
             try:
-                sl = self.network.get_security_list(sl_id).data
+                sl, etag, ingress = self._read_security_list(sl_id)
             except Exception:  # noqa: BLE001
                 return OperationResult(
                     ok=False,
@@ -5754,7 +5816,6 @@ class TenantSession:
                 tags.get("managed_by") == "oci-console-helper"
                 or name in LEGACY_DEFAULT_SL_NAMES
             )
-            ingress = list(getattr(sl, "ingress_security_rules", None) or [])
             drop = [r for r in ingress if self._sdk_ingress_opens_public_ports(r)]
             if drop:
                 targets.append(
@@ -5762,6 +5823,7 @@ class TenantSession:
                         "id": sl_id,
                         "name": name,
                         "mine": mine,
+                        "etag": etag,
                         "ingress": ingress,
                         "drop": drop,
                         "rules": [self._describe_sdk_ingress(r) for r in drop],
@@ -5913,27 +5975,19 @@ class TenantSession:
                 if t["mine"]
                 else []
             )
-            try:
-                self.network.update_security_list(
-                    t["id"],
-                    oci.core.models.UpdateSecurityListDetails(
-                        ingress_security_rules=kept + added
-                    ),
-                )
-            except ServiceError as exc:
+            # 这里的读和写之间隔着整段预检（逐台读 VNIC 和 NSG），窗口比别的写路径都长。
+            # 必须走带 etag 的写：别处刚加的规则不能被这份旧快照覆盖掉。
+            written = self._write_security_list_ingress(t["id"], kept + added, t["etag"])
+            if not written.ok:
                 return OperationResult(
                     ok=False,
-                    message="收紧 " + t["name"] + " 失败：" + _format_service_error(exc)
+                    message="收紧 " + t["name"] + " 失败：" + written.message
                     + (
                         chr(10) + "前面 " + str(len(changed)) + " 个列表已经改了。"
                         if changed
                         else ""
                     ),
                     data={"changed": changed},
-                )
-            except Exception as exc:  # noqa: BLE001
-                return OperationResult(
-                    ok=False, message=safe_error_text(exc), data={"changed": changed}
                 )
             changed.append(
                 t["name"] + "：删掉 " + str(len(t["drop"])) + " 条公网入站"
@@ -6003,10 +6057,15 @@ class TenantSession:
         ICMP(带「类型」的)返回 None —— 它开不了端口,tighten 也不会删它,
         搬过去只是噪音。解析不出来的一律返回 None:宁可少搬一条(用户看得见、
         可以自己补),也不要凭猜写一条和原来不一样的规则进去。
+
+        带源端口的规则也返回 None:FirewallRuleSpec 表达不了源端口,硬搬等于把限制
+        丢掉,修完比修前更开放。
         """
         protocol = str(rule.get("protocol", "") or "")
         cidr = str(rule.get("cidr", "") or "").strip()
         if not cidr or protocol not in TenantSession._PORT_PROTOCOLS:
+            return None
+        if rule.get("source_port"):
             return None
         text = str(rule.get("port", "") or "").strip()
         port_min = port_max = None
@@ -6067,8 +6126,8 @@ class TenantSession:
 
         做三件事,顺序固定:
 
-        1. 这台机器还没有自己的安全组就建一个并挂上(建之前不放行任何东西;
-           它是白名单,新挂一个只会让规则变多、不会挡掉任何现有流量)。
+        1. 这台机器还没有自己的安全组就建一个空的并挂上(一条规则都不写;
+           它是白名单,新挂一个不会挡掉任何现有流量,也不会多放行任何东西)。
         2. 把子网安全列表当前**对公网开端口**的每一条原样搬进这个安全组。
         3. 从子网安全列表里删掉那同一批规则。
 
@@ -6167,7 +6226,9 @@ class TenantSession:
 
         # 1. 先确保有自己的安全组。不放行任何东西 —— 要放行什么由第 2 步照搬。
         if not groups:
-            created = self.ensure_instance_nsg(instance_id, compartment_id, open_all=False)
+            # bare,不是 open_all=False:后者会写一条 22 对全网放行。子网原本只给
+            # 自己 IP 开 22 的话,修完 SSH 就对全网开了 —— 正好违背「可达性不变」。
+            created = self.ensure_instance_nsg(instance_id, compartment_id, bare=True)
             if not created.ok:
                 return OperationResult(
                     ok=False,
@@ -6231,7 +6292,8 @@ class TenantSession:
                 "修复完成 —— 从现在起,下面这张表就是这台服务器实际开放的端口,"
                 "删一条就真的少一个端口。" + chr(10)
                 + chr(10).join("  · " + c for c in changed)
-                + chr(10) + "可达性没有变化:搬进来的和从子网删掉的是同一批规则。"
+                # 有规则没搬时这句话不成立:子网那边删掉了,NSG 这边没有。
+                + ("" if skipped_unparsed else chr(10) + "可达性没有变化:搬进来的和从子网删掉的是同一批规则。")
                 + note
             ),
             data={**(tightened.data or {}), "changed": changed, "copied": len(specs)},
@@ -6684,10 +6746,13 @@ class TenantSession:
                     iid = getattr(att, "instance_id", "") or ""
                     if not bvid:
                         continue
-                    attach_map[bvid] = {
-                        "instance_id": iid,
-                        "attachment_state": str(getattr(att, "lifecycle_state", "") or ""),
-                    }
+                    # 服务端会把 DETACHED 的历史附件一起返回。不筛的话，实例终止后
+                    # 保留下来的孤儿卷仍显示「已挂载」，删除入口和 orphan_boot_count
+                    # 都因此失效；重新挂到别的实例时还可能显示成旧实例。
+                    state = str(getattr(att, "lifecycle_state", "") or "")
+                    if state in {"DETACHED", "DETACHING"}:
+                        continue
+                    attach_map[bvid] = {"instance_id": iid, "attachment_state": state}
 
             # Resolve instance display names (best-effort, bounded)
             name_cache: dict[str, str] = {}
@@ -6954,8 +7019,9 @@ class TenantSession:
         """
         if size_in_gbs is None and vpus_per_gb is None:
             return OperationResult(ok=False, message="未指定新的大小或性能")
-        if vpus_per_gb is not None and vpus_per_gb not in (0, 10, 20) and not 30 <= int(vpus_per_gb) <= 120:
-            return OperationResult(ok=False, message="性能必须为 0（低成本）、10、20 或 30–120 VPUs/GB")
+        # 引导卷没有 0（Lower Cost）这一档，见 sanitize_launch_payload。
+        if vpus_per_gb is not None and vpus_per_gb not in (10, 20) and not 30 <= int(vpus_per_gb) <= 120:
+            return OperationResult(ok=False, message="引导卷性能必须为 10、20 或 30–120 VPUs/GB")
         if size_in_gbs is not None and not 50 <= int(size_in_gbs) <= 32768:
             return OperationResult(ok=False, message="引导卷大小必须在 50–32768 GB 之间")
         try:
@@ -6992,6 +7058,21 @@ class TenantSession:
                             f"目标 {int(size_in_gbs)} GB。"
                         ),
                     )
+                # 表单总是把大小和性能一起发上来。没变的那项不能原样发给 Oracle：
+                # 文档写的是 size_in_gbs "Has to be larger than the current size"；
+                # 而没变的性能一旦发出去，只改大小也要等 hydration、撞 409。
+                if cur_size and int(size_in_gbs) == cur_size:
+                    size_in_gbs = None
+            if vpus_per_gb is not None and current is not None:
+                cur_vpus = getattr(current, "vpus_per_gb", None)
+                if cur_vpus is not None and int(vpus_per_gb) == int(cur_vpus):
+                    vpus_per_gb = None
+            if size_in_gbs is None and vpus_per_gb is None:
+                return OperationResult(
+                    ok=True,
+                    message="引导卷已经是这个配置，无需调整",
+                    data={"boot_volume_id": bv_id, "unchanged": True},
+                )
             hydration_deadline = time.monotonic() + hydration_timeout
             if vpus_per_gb is not None:
                 # Wait for hydration to finish before touching VPUs.
@@ -7058,7 +7139,10 @@ class TenantSession:
             self.compute.update_instance(instance_id, details)
             return OperationResult(
                 ok=True,
-                message=f"已提交规格变更：{ocpus:g} OCPU / {memory_in_gbs:g} GB（部分变更需重启生效）",
+                message=(
+                    f"已提交规格变更：{ocpus:g} OCPU / {memory_in_gbs:g} GB"
+                    "（运行中的实例会由 Oracle 重启以应用新规格，不需要手动重启）"
+                ),
             )
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
@@ -7372,6 +7456,37 @@ class TenantSession:
         except Exception as exc:  # noqa: BLE001
             return OperationResult(ok=False, message=safe_error_text(exc))
 
+    @classmethod
+    def _ipv6_mirror_specs(cls, existing: list) -> list[FirewallRuleSpec]:
+        """把 NSG 里对 ``0.0.0.0/0`` 的放行照抄一份给 ``::/0``。
+
+        分配 IPv6 不该改变这台机器开放了什么。以前这里补的是全协议全端口：一台
+        防火墙只开了 22 和 80 的机器，点一下「分配 IPv6」，IPv6 上就所有端口全开。
+        照抄之后全开的机器仍然全开，收紧过的机器 IPv6 上也只开那几个端口。
+
+        ICMP 不抄：v4 和 v6 的类型号不是一回事（见 _norm_rule_to_spec）。
+        """
+        rules = [cls._normalize_firewall_rule(rule) for rule in existing]
+        have = {cls._norm_rule_effect(rule) for rule in rules}
+        specs: list[FirewallRuleSpec] = []
+        for rule in rules:
+            if rule.get("cidr") != "0.0.0.0/0":
+                continue
+            spec = cls._norm_rule_to_spec({**rule, "cidr": "::/0"})
+            if spec is None:
+                continue
+            spec = dataclasses.replace(
+                spec,
+                direction=str(rule.get("direction", "")).upper(),
+                description=(spec.description[:248] + " (IPv6)").strip(),
+            )
+            effect = cls._spec_effect(spec)
+            if effect in have:
+                continue
+            have.add(effect)
+            specs.append(spec)
+        return specs
+
     def _ensure_ipv6_rules_on_managed_nsgs(self, network: Any) -> str:
         """给实例所在的**托管** NSG 补上 IPv6 版安全规则。返回一句给用户看的说明。
 
@@ -7383,6 +7498,7 @@ class TenantSession:
         if not nsg_ids:
             return "未检测到实例专属安全组，IPv6 规则需要自行在子网安全列表里添加"
         touched, skipped = 0, 0
+        failures: list[str] = []
         for nsg_id in nsg_ids:
             try:
                 group = self.network.get_network_security_group(nsg_id).data
@@ -7394,32 +7510,28 @@ class TenantSession:
                     nsg_id,
                     retry_strategy=sdk_bounded_paged_retry_strategy(),
                 ).data or []
-                have = {
-                    (
-                        str(getattr(r, "direction", "") or "").upper(),
-                        str(getattr(r, "protocol", "") or ""),
-                        str(getattr(r, "source", None) or getattr(r, "destination", None) or ""),
-                    )
-                    for r in existing
-                }
-                wanted = [
-                    spec
-                    for spec in self._open_all_specs(include_ipv6=True)
-                    if ":" in spec.cidr
-                    and (spec.direction.upper(), spec.protocol, spec.cidr) not in have
-                ]
+                wanted = self._ipv6_mirror_specs(existing)
                 if wanted:
-                    self.add_nsg_rules(nsg_id, wanted)
-                    touched += len(wanted)
-            except Exception:  # noqa: BLE001
-                skipped += 1
+                    # add_nsg_rules 失败时是返回而不是抛出。不看结果的话，写失败
+                    # （比如撞上 16 条上限）也会报成「已补 N 条」。
+                    added = self.add_nsg_rules(nsg_id, wanted)
+                    if added.ok:
+                        touched += len(wanted)
+                    else:
+                        failures.append(added.message)
+            except ServiceError as exc:
+                failures.append(_format_service_error(exc))
+            except Exception as exc:  # noqa: BLE001
+                failures.append(safe_error_text(exc))
         parts = []
         if touched:
-            parts.append(f"已补 {touched} 条 IPv6 安全规则")
+            parts.append(f"已按现有 IPv4 规则补 {touched} 条 IPv6 安全规则")
         if skipped:
             parts.append(f"{skipped} 个非托管安全组未改动，如不通请自行添加 ::/0 规则")
+        if failures:
+            parts.append("⚠ IPv6 安全规则写入失败：" + failures[0])
         if not parts:
-            parts.append("IPv6 安全规则已存在")
+            parts.append("IPv6 安全规则已和 IPv4 一致")
         return "，".join(parts)
 
     def ensure_ipv6_internet_access(self, subnet_id: str, compartment_id: str) -> OperationResult:
@@ -7597,7 +7709,11 @@ class TenantSession:
                     ok=False, message=f"无法确认实例现有的控制台连接，已中止创建：{exc}"
                 )
             for existing in stale:
-                self.delete_console_connection(existing.id)
+                removed = self.delete_console_connection(existing.id)
+                if not removed.ok:
+                    return OperationResult(
+                        ok=False, message=f"无法删除实例现有的控制台连接，已中止创建：{removed.message}"
+                    )
             details = oci.core.models.CreateInstanceConsoleConnectionDetails(
                 instance_id=instance_id, public_key=key
             )
@@ -8315,7 +8431,7 @@ class TenantSession:
         以前这个按钮用的是账号用量页那整份报告（get_account_status）：租户详情、整张计算
         配额表（要翻好几页）、公网 IP 配额 —— 每个账号十几次 Oracle 调用，租户页却只用到
         等级那几样。这里只读要用的：区域订阅、订阅记录、升级记录、租户创建时间，新号再
-        按名字查一条 A1 配额，一般 5～6 次。省下的请求额度留给抢机重试。
+        按名字查一条 A1 配额，一般 4 次。省下的请求额度留给抢机重试。
         """
         info = self._account_tier_info(None)
         return OperationResult(ok=True, message="已读取账号等级", data=info)
@@ -10534,6 +10650,8 @@ class TenantSession:
 
     @staticmethod
     def _volume_perf_label(vpu: int) -> str:
+        if vpu <= 0:
+            return "低成本"
         if vpu <= 10:
             return "平衡"
         if vpu <= 20:
@@ -10731,10 +10849,11 @@ class TenantSession:
         vpus_per_gb: int = 10,
     ) -> OperationResult:
         size_in_gbs = int(size_in_gbs)
-        vpus_per_gb = int(vpus_per_gb or 10)
+        # 0 是合法值（Lower Cost），不能被 `or 10` 吃掉 —— 见 _vpus_or_default。
+        vpus_per_gb = _vpus_or_default(vpus_per_gb)
         if not 50 <= size_in_gbs <= 32768:
             return OperationResult(ok=False, message="块卷大小必须在 50–32768 GB 之间")
-        if vpus_per_gb not in (10, 20) and not 30 <= vpus_per_gb <= 120:
+        if vpus_per_gb not in (0, 10, 20) and not 30 <= vpus_per_gb <= 120:
             return OperationResult(ok=False, message="性能必须为 0（低成本）、10、20 或 30–120 VPUs/GB")
         ad = (availability_domain or "").strip()
         if not ad:
@@ -10829,6 +10948,18 @@ class TenantSession:
             cur_size = int(getattr(cur, "size_in_gbs", 0) or 0)
             if size_in_gbs is not None and int(size_in_gbs) < cur_size:
                 return OperationResult(ok=False, message=f"块卷只能扩大（当前 {cur_size} GB）")
+            # size_in_gbs "Has to be larger than the current size"，理由同 resize_boot_volume。
+            if size_in_gbs is not None and int(size_in_gbs) == cur_size:
+                size_in_gbs = None
+            cur_vpus = getattr(cur, "vpus_per_gb", None)
+            if vpus_per_gb is not None and cur_vpus is not None and int(vpus_per_gb) == int(cur_vpus):
+                vpus_per_gb = None
+            if size_in_gbs is None and vpus_per_gb is None:
+                return OperationResult(
+                    ok=True,
+                    message="块卷已经是这个配置，无需调整",
+                    data={"id": volume_id, "previous_size_in_gbs": cur_size, "unchanged": True},
+                )
             details = oci.core.models.UpdateVolumeDetails()
             if size_in_gbs is not None:
                 details.size_in_gbs = int(size_in_gbs)

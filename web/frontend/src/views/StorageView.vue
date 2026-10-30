@@ -197,6 +197,7 @@
           <div class="field">
             <label>性能 VPUs/GB</label>
             <select v-model.number="createForm.vpus_per_gb">
+              <option :value="0">0 低成本</option>
               <option :value="10">10 平衡</option>
               <option :value="20">20</option>
               <option :value="30">30</option>

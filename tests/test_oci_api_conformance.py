@@ -217,12 +217,18 @@ def test_vpus_zero_survives(raw, expect):
     assert _vpus_or_default(raw) == expect
 
 
-def test_zero_is_accepted_by_the_resize_validator():
-    """0（低成本）是 Oracle 的合法档次，以前这条校验直接把它拒掉。"""
+def test_zero_is_a_block_volume_tier_and_not_a_boot_volume_tier():
+    """0（低成本）只有块卷有。这里直接读 SDK 文档，校验器要跟着它走。
+
+    这条测试以前断言引导卷也接受 0，把一个 Oracle 不接受的值钉成了预期。
+    """
     import inspect
 
-    src = inspect.getsource(TenantSession.resize_boot_volume)
-    assert "(0, 10, 20)" in src
+    assert "Lower Cost" in oci.core.models.UpdateVolumeDetails.vpus_per_gb.__doc__
+    assert "Lower Cost" not in oci.core.models.UpdateBootVolumeDetails.vpus_per_gb.__doc__
+
+    assert "(0, 10, 20)" in inspect.getsource(TenantSession.update_block_volume)
+    assert "(0, 10, 20)" not in inspect.getsource(TenantSession.resize_boot_volume)
 
 
 # ---------------------------------------------------------------------------

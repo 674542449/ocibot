@@ -135,7 +135,8 @@ def create_block_volume(
             availability_domain=body.availability_domain.strip(),
             size_in_gbs=int(body.size_in_gbs),
             display_name=body.display_name,
-            vpus_per_gb=int(body.vpus_per_gb or 10),
+            # 0 是 Lower Cost 档，不能写成 `or 10`。
+            vpus_per_gb=body.vpus_per_gb,
         )
         write_audit(
             db,

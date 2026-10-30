@@ -296,6 +296,39 @@ def test_adding_a_rule_writes_it_and_carries_the_etag():
     assert s.if_match == ["etag-1"]
 
 
+def test_ipv6_rules_have_their_own_smaller_ceiling():
+    """ipv6.htm："IPv6 security rules in a security list: 50 ingress and 50 egress"。"""
+    existing = [
+        oci.core.models.IngressSecurityRule(
+            protocol="6", source=f"2001:db8:{i:x}::/48", source_type="CIDR_BLOCK"
+        )
+        for i in range(49)
+    ]
+    specs = [
+        _spec(cidr="2606:4700::/32", port_min=80, port_max=80),
+        _spec(cidr="2606:4700::/32", port_min=443, port_max=443),
+    ]
+    s = _session(lists=[_sl()], ingress=existing)
+    r = s.add_security_list_rules("i", "c", security_list_id="sl-1", specs=specs)
+    assert r.ok is False
+    assert not s.written, "明知写不下还是发了请求"
+    assert "50" in r.message
+
+
+def test_ipv4_rules_are_not_held_to_the_ipv6_ceiling():
+    existing = [
+        oci.core.models.IngressSecurityRule(
+            protocol="6", source=f"10.0.{i}.0/24", source_type="CIDR_BLOCK"
+        )
+        for i in range(60)
+    ]
+    s = _session(lists=[_sl()], ingress=existing)
+    r = s.add_security_list_rules(
+        "i", "c", security_list_id="sl-1", specs=[_spec(port_min=80, port_max=80)]
+    )
+    assert r.ok, r.message
+
+
 def test_adding_the_same_rule_twice_is_a_no_op():
     """已经放行过的端口再写一条,只是白占掉 200 条配额里的一格。"""
     existing = T._security_list_ingress_model(_spec(port_min=22, port_max=22))
@@ -806,8 +839,8 @@ def _repair_session(*, groups=None, sl_rules=None, complete=True):
         },
     )
 
-    def _ensure(_i, _c, *, open_all=True):
-        s.created.append(open_all)
+    def _ensure(_i, _c, *, open_all=True, bare=False):
+        s.created.append({"open_all": open_all, "bare": bare})
         # 建完之后这台机器就有安全组了 —— 让下一次读能看到。
         groups_now = [{"id": "nsg-1", "display_name": "fw", "rules": []}]
         s.get_instance_firewall = lambda *a, **k: OperationResult(
@@ -858,7 +891,9 @@ def test_repair_copies_the_subnet_allows_in_before_stripping_them():
     s = _repair_session(sl_rules=[_norm(port="22"), _norm(port="80")])
     r = s.repair_instance_firewall("i", "c")
     assert r.ok, r.message
-    assert s.created == [False], "建安全组时不该顺手全开"
+    # 不只是「别全开」：open_all=False 仍会写一条 22 对全网放行。子网要是只给
+    # 自己的 IP 开了 22，修完 SSH 就对全网开了。这里必须是空表。
+    assert [c["bare"] for c in s.created] == [True], "建安全组时不该写入任何规则"
     assert s.added, "没有把子网的放行搬进来"
     assert s.tightened, "没有收紧子网"
     # 搬进来的端口就是子网原来放行的那些 —— 这是「可达性不变」的全部内容。
