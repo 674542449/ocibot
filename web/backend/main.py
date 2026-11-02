@@ -43,6 +43,7 @@ if _STARTUP_BLOCK is None:
     from web.backend.db import SessionLocal, init_db
     from web.backend.routers import (
         admin,
+        api_keys,
         audit,
         auth,
         backup,
@@ -50,6 +51,7 @@ if _STARTUP_BLOCK is None:
         instances,
         jobs,
         notifications,
+        open_api,
         storage,
         system,
         tenants,
@@ -267,6 +269,9 @@ def create_app() -> FastAPI:
     app.include_router(notifications.router, prefix="/api")
     app.include_router(system.router, prefix="/api")
     app.include_router(admin.router, prefix="/api")
+    app.include_router(api_keys.router, prefix="/api")
+    # 用 API 密钥的接口（/api/v1/...），只能换多出口 IP。
+    app.include_router(open_api.router, prefix="/api")
 
     @app.get("/api/health", response_model=HealthOut, response_model_exclude_none=True, tags=["system"])
     def health(request: Request) -> HealthOut:

@@ -46,13 +46,16 @@ def _fresh_login_limiters():
     所以每条测试开头清空不影响它们。
     """
     from web.backend.rate_limit import (
+        api_key_password_limiter,
         login_ip_limiter,
         login_user_limiter,
         register_ip_limiter,
         unlock_ip_limiter,
     )
 
-    for limiter in (login_ip_limiter, login_user_limiter, register_ip_limiter, unlock_ip_limiter):
+    for limiter in (
+        login_ip_limiter, login_user_limiter, register_ip_limiter, unlock_ip_limiter, api_key_password_limiter
+    ):
         with limiter._lock:  # noqa: SLF001 - test-only reset of shared state
             limiter._hits.clear()  # noqa: SLF001
     yield

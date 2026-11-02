@@ -246,10 +246,69 @@
     </div>
 
     <div class="card stack">
+      <h3 style="margin: 0">API 密钥</h3>
+      <p class="muted" style="margin: 0; font-size: 12px">
+        给脚本调用用，只能换多出口 IP：列出实例的多出口 IP、换某一个私网 IP 的公网 IP、一键换全部、查进度，调不了别的接口。
+        请求头带 <code>Authorization: Bearer 密钥</code>；每台实例的调用示例在实例详情的「多出口 IP」里。
+        改密码、开关两步验证、在所有设备退出登录之后，旧密钥全部失效，需要重新生成。
+      </p>
+      <div class="row">
+        <input v-model="keyForm.name" maxlength="64" placeholder="名称，比如：代理机脚本" style="width: 200px" />
+        <input
+          v-model="keyForm.password"
+          type="password"
+          autocomplete="current-password"
+          placeholder="面板密码"
+          style="width: 180px"
+        />
+        <button class="primary" :disabled="keyBusy" @click="createKey">新建密钥</button>
+      </div>
+      <div v-if="newKey" class="key-once stack">
+        <strong style="font-size: 13px">新密钥只显示这一次，请马上保存</strong>
+        <code class="key-text">{{ newKey }}</code>
+        <div class="row">
+          <button @click="copyKey">复制</button>
+          <button @click="newKey = ''">我已保存</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>名称</th>
+              <th>密钥开头</th>
+              <th>创建时间</th>
+              <th>最近使用</th>
+              <th>状态</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-if="!keys.length">
+              <td colspan="6" class="muted empty">还没有 API 密钥</td>
+            </tr>
+            <tr v-for="k in keys" :key="k.id">
+              <td>{{ k.name }}</td>
+              <td class="mono">{{ k.prefix }}…</td>
+              <td>{{ fmtTime(k.created_at) }}</td>
+              <td>{{ k.last_used_at ? `${fmtTime(k.last_used_at)}（${k.last_used_ip || '—'}）` : '从未使用' }}</td>
+              <td>
+                <span class="badge" :class="k.valid ? 'running' : 'err'">{{ k.valid ? '可用' : '已失效' }}</span>
+              </td>
+              <td>
+                <button class="danger" :disabled="keyBusy" @click="deleteKey(k)">删除</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card stack">
       <h3 style="margin: 0">会话管理</h3>
       <div class="row">
         <button class="danger" @click="logoutAll">在所有设备退出登录</button>
-        <span class="muted" style="font-size: 12px">吊销所有已签发的登录令牌（包括当前设备）</span>
+        <span class="muted" style="font-size: 12px">吊销所有已签发的登录令牌（包括当前设备），API 密钥也会一起失效</span>
       </div>
     </div>
   </div>
@@ -260,6 +319,7 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import api from '@/api/client'
 import { useAuthStore } from '@/stores/auth'
+import { copyText } from '@/utils/toast'
 
 type Channel = {
   id: string
@@ -329,6 +389,79 @@ const pwdForm = reactive({ old: '', next: '' })
 const totpSetup = ref<{ secret: string; otpauth_url: string } | null>(null)
 const totpCode = ref('')
 const totpDisablePwd = ref('')
+
+// ---- API 密钥 ----
+type ApiKeyRow = {
+  id: string
+  name: string
+  prefix: string
+  created_at: string
+  last_used_at: string
+  last_used_ip: string
+  valid: boolean
+}
+const keys = ref<ApiKeyRow[]>([])
+const keyForm = reactive({ name: '', password: '' })
+const keyBusy = ref(false)
+// 明文只在新建那一下拿到；离开页面就没了，服务端也查不回来。
+const newKey = ref('')
+
+function fmtTime(iso: string) {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString('zh-CN', { hour12: false })
+}
+
+async function loadKeys() {
+  const { data } = await api.get<{ items: ApiKeyRow[] }>('/api-keys')
+  keys.value = data.items || []
+}
+
+async function createKey() {
+  error.value = ''
+  msg.value = ''
+  if (!keyForm.password) {
+    error.value = '新建 API 密钥需要输入面板密码'
+    return
+  }
+  keyBusy.value = true
+  try {
+    const { data } = await api.post<ApiKeyRow & { key: string }>('/api-keys', {
+      name: keyForm.name.trim(),
+      password: keyForm.password,
+    })
+    newKey.value = data.key
+    keyForm.name = ''
+    msg.value = `已新建 API 密钥「${data.name}」`
+    await loadKeys()
+  } catch (e: any) {
+    error.value = e?.message || '新建失败'
+  } finally {
+    // 成功失败都清掉密码，不让它留在页面上。
+    keyForm.password = ''
+    keyBusy.value = false
+  }
+}
+
+async function copyKey() {
+  await copyText(newKey.value, '已复制密钥')
+}
+
+async function deleteKey(k: ApiKeyRow) {
+  if (!confirm(`删除 API 密钥「${k.name}」（${k.prefix}…）？用它的脚本会立刻无法调用。`)) return
+  keyBusy.value = true
+  error.value = ''
+  msg.value = ''
+  try {
+    await api.delete(`/api-keys/${k.id}`)
+    msg.value = `已删除 API 密钥「${k.name}」`
+    await loadKeys()
+  } catch (e: any) {
+    error.value = e?.message || '删除失败'
+  } finally {
+    keyBusy.value = false
+  }
+}
 
 function kindLabel(kind: string) {
   const map: Record<string, string> = {
@@ -505,7 +638,7 @@ async function logoutAll() {
 
 onMounted(async () => {
   try {
-    await load()
+    await Promise.all([load(), loadKeys()])
   } catch (e: any) {
     error.value = e?.message || '加载失败'
   }
@@ -545,6 +678,19 @@ onMounted(async () => {
 .tls-box.tls-risky .tls-note,
 .tls-box.tls-risky .tls-note strong {
   color: var(--danger);
+}
+
+.key-once {
+  border: 1px solid var(--warn);
+  border-radius: 8px;
+  padding: 0.6rem 0.75rem;
+  background: var(--panel-2);
+}
+
+.key-text {
+  font-size: 13px;
+  word-break: break-all;
+  user-select: all;
 }
 
 .totp-secret {

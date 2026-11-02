@@ -858,6 +858,7 @@
               <span v-if="rotateJob.state === 'running'" class="muted" style="font-size: 12px">
                 {{ ROTATE_PHASE[rotateJob.phase] || rotateJob.phase }} · {{ rotateFinished }}/{{ rotateTotal }}
               </span>
+              <span v-if="rotateElapsed" class="muted" style="font-size: 12px">用时 {{ rotateElapsed }}</span>
             </div>
             <button v-if="rotateJob.state !== 'running'" @click="rotateJob = null">收起</button>
           </div>
@@ -904,6 +905,22 @@
             </table>
           </div>
         </div>
+
+        <details class="sync-box">
+          <summary style="cursor: pointer; font-size: 13px; font-weight: 600">用 API 换 IP（脚本调用）</summary>
+          <div class="stack" style="margin-top: 0.5rem">
+            <p class="muted" style="margin: 0; font-size: 12px">
+              先到「设置 → API 密钥」新建一个密钥，把下面的 <code>KEY=</code> 换成它。和这里的「更换」是同一套：
+              先删旧公网 IP 再申请新的绑回原来的私网 IP，私网 IP 不变；同一台实例同时只跑一个。
+              <code>wait=90</code> 表示最多等 90 秒、换完就返回结果；IP 多时没换完会先返回进度，再用最后一条查。
+              面板前面有 Cloudflare 或反向代理时，等太久会被它提前断开（更换照常在后台进行），用查进度那条看结果即可。
+            </p>
+            <pre class="api-example">{{ apiExample }}</pre>
+            <div class="row">
+              <button @click="copy(apiExample)">复制示例</button>
+            </div>
+          </div>
+        </details>
 
         <div class="sync-box stack">
           <strong style="font-size: 13px">系统侧同步服务</strong>
@@ -1456,6 +1473,28 @@ const multiAllowed = computed(() => !!multiInfo.value?.allowed)
 const sortedMultiItems = computed(() =>
   sortByName(multiInfo.value?.items || [], (m) => m.public_ip_name || '', (m) => m.private_ip || ''),
 )
+/** 给脚本调用的示例，填好了这台实例的租户 / 实例 ID 和面板地址。 */
+const apiExample = computed(() => {
+  const base = `${window.location.origin}/api/v1/tenants/${tenantId.value}/instances/${instanceId.value}/multi-ips`
+  const sample = sortedMultiItems.value[0]?.private_ip || '10.0.0.11'
+  const head = 'curl -s -A "ip-api/1" -H "Authorization: Bearer $KEY"'
+  return [
+    'KEY="你的 API 密钥"',
+    `BASE="${base}"`,
+    '',
+    '# 列出这台实例的多出口 IP（私网 IP、公网 IP、名字）',
+    `${head} "$BASE"`,
+    '',
+    `# 只换私网 IP ${sample} 的公网 IP`,
+    `${head} -X POST "$BASE/${sample}/rotate?wait=90"`,
+    '',
+    '# 一键换全部',
+    `${head} -X POST "$BASE/rotate-all?wait=90"`,
+    '',
+    '# 查最近一次更换的进度 / 结果（旧地址 → 新地址）',
+    `${head} "$BASE/rotate"`,
+  ].join('\n')
+})
 /** 保留 IP id → 它绑着的本实例多出口条目。上面那张表靠它把「解绑」转给多出口解绑。 */
 const multiByPublic = computed<Record<string, MultiIp>>(() => {
   const out: Record<string, MultiIp> = {}
@@ -1700,7 +1739,7 @@ async function detachSelectedMulti() {
 }
 
 // ---- 多出口：一键更换公网 IP（私网 IP 不变）----
-// 更换在服务端后台跑（几分钟），这里每 3 秒问一次面板自己的进度接口 ——
+// 更换在服务端后台跑（几分钟），这里每 2 秒问一次面板自己的进度接口 ——
 // 那个接口只读面板数据库，不请求 Oracle。
 type RotateItem = {
   private_ip_id: string
@@ -1757,6 +1796,18 @@ const rotateTotal = computed(
 const rotateFinished = computed(
   () => (rotateJob.value?.items || []).filter((it) => it.status === 'done' || it.status === 'failed').length,
 )
+/**
+ * 已用时。两头都用服务端的时间（开始时间、结束时间或最近一次进度更新时间），不用浏览器的
+ * Date.now() —— 本机时钟和服务器差几分钟时，那样算出来的数是错的。进行中时每轮最多差约 2 秒。
+ */
+const rotateElapsed = computed(() => {
+  const job = rotateJob.value
+  const start = job?.started_at ? Date.parse(job.started_at) : NaN
+  const end = job ? Date.parse(job.finished_at || job.updated_at || '') : NaN
+  if (Number.isNaN(start) || Number.isNaN(end)) return ''
+  const sec = Math.max(0, Math.round((end - start) / 1000))
+  return sec >= 60 ? `${Math.floor(sec / 60)} 分 ${sec % 60} 秒` : `${sec} 秒`
+})
 let rotateTimer: ReturnType<typeof setTimeout> | null = null
 // 一次查询正在路上时 timer 是空的；只看 timer 的话「刷新」会再起一条轮询链，
 // 任务结束时两条链各刷新一次两张表（多打两轮 Oracle）。
@@ -1774,7 +1825,7 @@ function scheduleRotatePoll(act: ReturnType<typeof beginAction>) {
   rotateTimer = setTimeout(() => {
     rotateTimer = null
     if (!act.moved()) void pollRotate(act)
-  }, 3000)
+  }, 2000)
 }
 
 async function pollRotate(act: ReturnType<typeof beginAction>) {
@@ -3347,6 +3398,18 @@ watch([tenantId, instanceId], async () => {
 .sync-box {
   border-top: 1px solid var(--border);
   padding-top: 0.75rem;
+}
+
+/* API 调用示例：命令行很长，横向滚动，不折行（折了复制出来就不能直接用）。 */
+.api-example {
+  margin: 0;
+  padding: 0.6rem 0.75rem;
+  border-radius: 6px;
+  background: var(--panel-2);
+  font-size: 12px;
+  overflow-x: auto;
+  white-space: pre;
+  user-select: all;
 }
 
 /* 引导日志是等宽、可能很长的机器输出。给固定高度 + 自己滚动，否则一份几千行的

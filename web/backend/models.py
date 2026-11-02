@@ -286,6 +286,30 @@ class IpBan(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class ApiKey(Base):
+    """给脚本调用的 API 密钥（web/backend/api_keys.py、routers/open_api.py）。
+
+    只存 SHA-256，明文只在创建时返回一次。权限只到「换多出口 IP」：登录用的
+    get_current_user 不认它，拿着它调不了别的接口。创建时记下用户当时的
+    token_version —— 改密码、开关两步验证、退出所有会话都会让旧密钥一起失效，
+    别人趁登录着建的密钥不会在改密码之后还能用。
+    不设 ForeignKey：用户不存在时校验直接拒绝，孤儿行没有危害。
+    """
+
+    __tablename__ = "api_keys"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    owner_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    # 明文开头几位，给人认是哪一把用的（列表里只显示这个）。
+    prefix: Mapped[str] = mapped_column(String(16), nullable=False, default="")
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    token_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_used_ip: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+
+
 class AppMeta(Base):
     """Simple key-value for bootstrap flags."""
 

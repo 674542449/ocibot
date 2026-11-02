@@ -20,6 +20,16 @@ from app.oci_client import PrimaryNetworkInfo, TenantSession
 BUSY = ("ASSIGNING", "ASSIGNED")
 
 
+def _locked(fn):
+    """删除 / 申请是并发发出的（_ROTATE_WORKERS）：假 Oracle 的状态要串行改。"""
+
+    def wrapper(self, *a, **k):
+        with self._lock:
+            return fn(self, *a, **k)
+
+    return wrapper
+
+
 class _Oracle:
     def __init__(self, privs, ips, *, limit=50, release_rounds=2, assign_rounds=1, addresses=None):
         self.privs = list(privs)
@@ -34,12 +44,16 @@ class _Oracle:
         self.delete_errors: dict[str, list] = {}
         self.silent_fail: dict[str, int] = {}
         self.stuck: set[str] = set()
-        self.terminating_at_create: list[bool] = []
+        # 每次申请时，这个私网 IP 自己的旧 IP 是否还没删完（还占着名额）。
+        self.own_old_alive_at_create: list[bool] = []
+        self.max_counted = 0  # 不算 TERMINATED 的保留 IP 数，出现过的最大值
         self.private_ip_writes = 0
+        self._lock = threading.RLock()
         self.list_errors = 0  # 接下来这么多次列表调用直接失败
         self.rebind_lag = 0  # 重绑之后这么多轮列表里仍显示 AVAILABLE
         self.delete_lag = 0  # 删除之后这么多轮列表里仍显示「好好绑着」
         self.hijack: dict[str, str] = {}  # 新 IP 绑好时被别处拿走：私网 IP → 实际绑到的
+        self.release_rounds_for: dict[str, int] = {}  # 某个旧 IP 删得特别慢
         self._n = 0
 
     # ---- VirtualNetworkClient 的那几个方法
@@ -54,6 +68,7 @@ class _Oracle:
         self.private_ip_writes += 1
         raise AssertionError("更换公网 IP 不该删除私网 IP")
 
+    @_locked
     def delete_public_ip(self, public_ip_id):
         self.calls.append(f"delete:{public_ip_id}")
         queue = self.delete_errors.get(public_ip_id)
@@ -63,7 +78,8 @@ class _Oracle:
         ip = self.ips.get(public_ip_id)
         if ip is None or ip["lifecycle_state"] == "TERMINATED":
             raise ServiceError(404, "NotAuthorizedOrNotFound", {}, "gone")
-        ip.update(lifecycle_state="TERMINATING", assigned_to="", timer=self.release_rounds,
+        ip.update(lifecycle_state="TERMINATING", assigned_to="",
+                  timer=self.release_rounds_for.get(public_ip_id, self.release_rounds),
                   _ghost=self.delete_lag, _was=ip["assigned_to"])
         if err is not None:  # ("after", exc)：Oracle 其实删了，只是响应没回来
             raise err[1]
@@ -85,14 +101,17 @@ class _Oracle:
             "timer": self.assign_rounds,
         }
         self.created.append(details)
+        self.max_counted = max(self.max_counted, self._counted())
         return SimpleNamespace(id=pid, ip_address=self.ips[pid]["ip_address"])
 
+    @_locked
     def create_public_ip(self, details):
         assert details.lifetime == "RESERVED"
         self.calls.append(f"create:{details.private_ip_id}")
-        self.terminating_at_create.append(
-            any(ip["lifecycle_state"] == "TERMINATING" for ip in self.ips.values())
-        )
+        self.own_old_alive_at_create.append(any(
+            ip.get("_was") == details.private_ip_id and ip["lifecycle_state"] != "TERMINATED"
+            for ip in self.ips.values()
+        ))
         queue = self.create_errors.get(details.private_ip_id)
         if queue:
             err = queue.pop(0)
@@ -107,6 +126,7 @@ class _Oracle:
             raise ServiceError(409, "Conflict", {}, "private IP already has a public IP")
         return SimpleNamespace(data=self._create(details))
 
+    @_locked
     def update_public_ip(self, public_ip_id, details):
         self.calls.append(f"update:{public_ip_id}")
         ip = self.ips[public_ip_id]
@@ -116,6 +136,7 @@ class _Oracle:
             ip.update(assigned_to=details.private_ip_id, lifecycle_state="ASSIGNING", timer=self.assign_rounds)
         return SimpleNamespace(data=SimpleNamespace(id=public_ip_id))
 
+    @_locked
     def get_public_ip_by_private_ip_id(self, details):
         for ip in self.ips.values():
             if ip["assigned_to"] == details.private_ip_id and ip["lifecycle_state"] in BUSY:
@@ -127,6 +148,7 @@ class _Oracle:
         raise ServiceError(404, "NotAuthorizedOrNotFound", {}, "no public IP")
 
     # ---- TenantSession.list_reserved_public_ips 的替身
+    @_locked
     def list_reserved(self, compartment_id=None):
         # 和真的一样：不给区间就是默认区间（resolve_compartment），不是全部区间。
         compartment_id = compartment_id or "comp"
@@ -170,6 +192,7 @@ class _Oracle:
                 continue
             if state == "TERMINATING":
                 ip["lifecycle_state"] = "TERMINATED"
+                self.calls.append(f"terminated:{ip['id']}")
             elif self.silent_fail.get(ip["assigned_to"], 0) > 0:
                 self.silent_fail[ip["assigned_to"]] -= 1
                 ip.update(lifecycle_state="AVAILABLE", assigned_to="")
@@ -251,10 +274,12 @@ def test_with_the_quota_full_everything_is_released_before_anything_is_created()
 
     writes = o.writes()
     first_create = next(i for i, c in enumerate(writes) if c.startswith("create:"))
-    assert writes[:first_create] == ["delete:old1", "delete:old2", "delete:old3"]
-    assert o.terminating_at_create and not any(o.terminating_at_create), (
-        "TERMINATING 的 IP 还占着名额：要等它们彻底删除才申请"
+    assert sorted(writes[:first_create]) == ["delete:old1", "delete:old2", "delete:old3"], "删除全部先发出去"
+    assert o.own_old_alive_at_create and not any(o.own_old_alive_at_create), (
+        "TERMINATING 的 IP 还占着名额：每个新 IP 都要等它自己的旧 IP 彻底删除才申请"
     )
+    assert o.max_counted <= 3, "保留 IP 总数从不超过更换前"
+    assert len([c for c in writes if c.startswith("create:")]) == 3, "没有撞上限后重试"
     assert all(not c.startswith("delete:new") for c in writes)
 
     bound = o.bound()
@@ -266,6 +291,126 @@ def test_with_the_quota_full_everything_is_released_before_anything_is_created()
     assert o.private_ip_writes == 0, "私网 IP 一个都不能动"
     assert [it["status"] for it in res.data["items"]] == ["done"] * 3
     assert "已更换 3 个" in res.message
+
+
+def test_a_fast_release_gets_its_new_ip_without_waiting_for_the_slowest():
+    """哪个旧 IP 先删完就先给它申请：一个删得慢的不能拖住整批。"""
+    o = _oracle(3, limit=3)
+    o.release_rounds_for["old2"] = 8
+    res = _rotate(_session(o), ["pv1", "pv2", "pv3"])
+    assert res.ok, res.message
+    assert o.calls.index("create:pv1") < o.calls.index("terminated:old2")
+    assert o.calls.index("create:pv3") < o.calls.index("terminated:old2")
+    assert not any(o.own_old_alive_at_create) and o.max_counted <= 3, "名额照样不超"
+
+
+def test_deletes_and_creates_go_out_in_parallel():
+    """几十个 IP 逐个发就是几十个来回；要同时发出几个。"""
+    import time as real_time
+
+    class _Slow(_Oracle):
+        inflight = 0
+        peak = {"delete": 0, "create": 0}
+        guard = threading.Lock()
+
+        def _measure(self, kind, call):
+            with self.guard:
+                type(self).inflight += 1
+                self.peak[kind] = max(self.peak[kind], type(self).inflight)
+            try:
+                real_time.sleep(0.05)
+                return call()
+            finally:
+                with self.guard:
+                    type(self).inflight -= 1
+
+        def delete_public_ip(self, public_ip_id):
+            return self._measure("delete", lambda: _Oracle.delete_public_ip(self, public_ip_id))
+
+        def create_public_ip(self, details):
+            return self._measure("create", lambda: _Oracle.create_public_ip(self, details))
+
+    base = _oracle(8)
+    o = _Slow(base.privs, base.ips.values())
+    res = _rotate(_session(o), [f"pv{i}" for i in range(1, 9)])
+    assert res.ok, res.message
+    assert o.peak["delete"] > 1 and o.peak["create"] > 1, o.peak
+    assert max(o.peak.values()) <= TenantSession.ROTATE_WORKERS
+
+
+def _breaker_open(remaining=5):
+    from circuitbreaker import CircuitBreakerError
+
+    return CircuitBreakerError(SimpleNamespace(
+        name="vcn", open_until="soon", failure_count=10, open_remaining=remaining, last_failure=None,
+    ))
+
+
+def test_an_open_circuit_breaker_is_waited_out_instead_of_failing_the_ip(fake_clock):
+    """并发更容易在限流时把 SDK 熔断器撞开；它开着时请求根本没发出去，等它恢复再试。"""
+    o = _oracle(2)
+    o.delete_errors["old1"] = [_breaker_open()]
+    o.create_errors["pv2"] = [_breaker_open()]
+    res = _rotate(_session(o), ["pv1", "pv2"])
+    assert res.ok, res.message
+    assert o.calls.count("delete:old1") == 2 and o.calls.count("create:pv2") == 2
+    assert set(o.bound()) == {"pv1", "pv2"}
+
+
+def test_a_breaker_that_stays_open_means_not_deleted_rather_than_unknown(fake_clock):
+    """一直开着、重试时限用完：明确是「没删」—— 不能当成「不知道删没删」白等三分钟。"""
+    o = _oracle(2)
+    o.delete_errors["old1"] = [_breaker_open(30) for _ in range(20)]
+    s = _session(o)
+    plan = s.plan_multi_ip_rotation("inst", "comp", ["pv1", "pv2"])
+    start = fake_clock[0]
+    res = s.rotate_multi_ips(plan.data["items"])
+    item = _by_private(res)["pv1"]
+    assert item["status"] == "failed" and "删除旧 IP 失败" in item["message"]
+    assert "熔断器" in item["message"]
+    assert "create:pv1" not in o.calls and o.bound()["pv1"]["id"] == "old1"
+    assert _by_private(res)["pv2"]["status"] == "done"
+    assert fake_clock[0] - start < TenantSession.ROTATE_RETRY_SEC + 60, "不能再白等满释放超时"
+
+
+def test_throttling_backs_off_exponentially(fake_clock, monkeypatch):
+    from app import oci_client
+
+    slept: list[float] = []
+    real_sleep = oci_client.time.sleep
+    monkeypatch.setattr(oci_client.time, "sleep", lambda s: (slept.append(s), real_sleep(s)))
+    o = _oracle(1)
+    o.delete_errors["old1"] = [ServiceError(429, "TooManyRequests", {}, "slow down") for _ in range(4)]
+    res = _rotate(_session(o), ["pv1"])
+    assert res.ok, res.message
+    backoff = slept[:4]
+    assert all(b > a for a, b in zip(backoff, backoff[1:])), backoff
+    assert backoff[0] >= 1.5 and backoff[-1] >= 10, backoff
+
+
+def test_progress_keeps_ticking_while_a_slow_batch_is_out(monkeypatch):
+    """一批并发请求里有慢的：等它的时候也要定时报进度，否则 5 分钟没动静任务会被当成进程没了。"""
+    import time as real_time
+
+    class _Slow(_Oracle):
+        def delete_public_ip(self, public_ip_id):
+            if public_ip_id == "old1":
+                real_time.sleep(0.4)
+            return _Oracle.delete_public_ip(self, public_ip_id)
+
+    base = _oracle(3)
+    o = _Slow(base.privs, base.ips.values())
+    s = _session(o)
+    s.ROTATE_HEARTBEAT_SEC = 0.05  # type: ignore[misc]
+    phases: list[tuple[str, list[str]]] = []
+    plan = s.plan_multi_ip_rotation("inst", "comp", ["pv1", "pv2", "pv3"])
+    res = s.rotate_multi_ips(plan.data["items"], on_progress=lambda p, items: phases.append(
+        (p, [i["status"] for i in items])))
+    assert res.ok, res.message
+    release = [st for p, st in phases if p == "release"]
+    # 慢的那个还没回来时，已经回来的两个就报出去了，而且之后还在定时报
+    still_waiting = [st for st in release if st.count("pending") == 1]
+    assert len(still_waiting) >= 2, release
 
 
 def test_progress_is_reported_through_every_phase():

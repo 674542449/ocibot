@@ -191,6 +191,7 @@ def make_session():
                  "old_ip": "1.1.1.1", "name": "proxy-01", "compartment_id": "c1", "pool_id": "",
                  "new_public_ip_id": "", "new_ip": "", "status": "pending", "message": ""}
     s.plan_multi_ip_rotation.return_value = R(True, "", {"items": [dict(_rot_item)]})
+    s.secondary_private_ip_ids.return_value = {"10.0.0.11": "pv1"}
     s.rotate_multi_ips.return_value = R(
         True, "已更换 1 个公网 IP", {"items": [dict(_rot_item, status="done", new_ip="2.2.2.2")]}
     )
@@ -260,6 +261,7 @@ for mod in (
     "web.backend.routers.tenants",
     "web.backend.routers.jobs",
     "web.backend.routers.webssh",
+    "web.backend.routers.open_api",
 ):
     __import__(mod)
     m = sys.modules[mod]
@@ -535,6 +537,24 @@ def test_every_endpoint_is_wired() -> None:
         r = c.get(p)
         check("GET", p, r)
         assert r.status_code == 200 and r.json()["job"] is not None, r.text
+
+        # API 密钥和给脚本调用的 /api/v1（只认密钥，不认这个客户端的登录 cookie）。
+        check("GET", "/api/api-keys", c.get("/api/api-keys"))
+        r = c.post("/api/api-keys", json={"name": "smoke", "password": "supersecret123"})
+        check("POST", "/api/api-keys", r)
+        assert r.status_code == 200, r.text
+        key, kid = r.json()["key"], r.json()["id"]
+        v1 = f"/api/v1/tenants/{tid}/instances/{iid}/multi-ips"
+        hdr = {"Authorization": f"Bearer {key}"}
+        for method, path in [
+            ("GET", v1),
+            ("GET", v1 + "/rotate"),
+            ("POST", v1 + "/10.0.0.11/rotate"),
+            ("POST", v1 + "/rotate-all"),
+        ]:
+            check(method, path, c.request(method, path, headers=hdr))
+        p = f"/api/api-keys/{kid}"
+        check("DELETE", p, c.delete(p))
         with SessionLocal() as db:
             db.get(Tenant, tid).account_tier = ""
             db.commit()
