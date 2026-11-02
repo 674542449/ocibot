@@ -17,7 +17,8 @@ IP 列表从哪来（0.4.131 改）：
 
 做法：装一个 systemd 定时器，开机 20 秒后、此后每分钟跑一次同步脚本：
 
-* 列表里有、网卡上没有的辅助 IP —— 加上；
+* 列表里有、网卡上没有的辅助 IP —— 按列表顺序加上（面板按公网 IP 名字排好，
+  ``ip addr`` 里的先后就和面板「多出口 IP」表一致）；
 * 自己以前加过、列表里已经没有的 —— 删掉；
 * **从不碰**主 IP、也从不碰不是它加的地址（手工写进 netplan 的那些）。它加过
   哪些记在 ``/var/lib/ocibot-ip-sync/<网卡名>``；
@@ -166,10 +167,19 @@ def main(wait=0):
         except ValueError:
             continue
         primary = str(vnic.get("privateIp") or "")
-        want = set(ip for ip in listed if ip and ":" not in ip and ip != primary)
+        # 按面板给的顺序加（面板按公网 IP 名字排：proxy-01、proxy-02 …），ip addr 里的先后
+        # 就和面板列表一致。以前是按字符串排序加的，10.0.0.100 会排在 10.0.0.11 前面。
+        # 已经在网卡上的不重新排 —— 那要先删再加，会断流；重启后全部按这个顺序重新加。
+        order = []
+        for ip in listed:
+            if ip and ":" not in ip and ip != primary and ip not in order:
+                order.append(ip)
+        want = set(order)
         have = current_ipv4(dev)
         managed = load_state(dev)
-        for ip in sorted(want - have):
+        for ip in order:
+            if ip in have:
+                continue
             if ip_cmd("addr", "add", "%s/%d" % (ip, prefix), "dev", dev):
                 managed.add(ip)
                 log("%s: added %s" % (dev, ip))

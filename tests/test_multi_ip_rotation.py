@@ -747,6 +747,30 @@ def test_the_multi_ip_list_shows_a_public_ip_from_another_compartment():
     assert rows["pv2"]["public_ip"] == ""
 
 
+def test_the_list_for_the_sync_service_uses_the_same_names_as_the_page(monkeypatch):
+    """建在别的区间的公网 IP：面板按名字把它排在中间，写给服务器的顺序也必须一样，不能被当成「没名字」排到最后。"""
+    import json
+
+    o = _oracle(3)
+    o.ips["old1"].update(display_name="proxy-02", compartment_id="other")  # pv1 = 10.0.0.11
+    o.ips["old2"]["display_name"] = "proxy-01"  # pv2 = 10.0.0.12
+    o.ips["old3"]["display_name"] = "proxy-03"  # pv3 = 10.0.0.13
+    s = _session(o)
+    written: list = []
+    s._compute = SimpleNamespace(
+        get_instance=lambda _i: SimpleNamespace(data=SimpleNamespace(metadata={}), headers={}),
+        update_instance=lambda _i, details, **_k: written.append(details.metadata),
+    )
+
+    page = s.list_multi_ips("inst", "comp")
+    page_order = [i["private_ip"] for i in sorted(page.data["items"], key=lambda i: i["public_ip_name"])]
+    assert page_order == ["10.0.0.12", "10.0.0.11", "10.0.0.13"]
+
+    assert s.publish_secondary_ips("inst", "comp").ok
+    (md,) = written
+    assert json.loads(md[TenantSession.SECONDARY_IPS_METADATA_KEY]) == {"vnic1": page_order}
+
+
 def test_the_start_passes_what_the_page_showed_to_the_plan(job_db):
     maker, _threads = job_db
     session = _FakeSession()

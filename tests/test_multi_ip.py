@@ -362,6 +362,76 @@ def test_publishing_keeps_every_existing_metadata_key(monkeypatch):
     assert len(s._compute.updates) == 1
 
 
+def test_the_published_list_follows_the_panel_s_name_order(monkeypatch):
+    """面板「多出口 IP」表按公网 IP 名字排；写进元数据的顺序要一样，同步服务才会照这个先后加。"""
+    import json
+
+    monkeypatch.setattr("oci.pagination.list_call_get_all_results", lambda fn, **kw: fn(**kw))
+    net = _FakeNet(privs=[
+        _priv("pv-primary", "10.0.0.129", primary=True),
+        _priv("pv1", "10.0.0.3"),    # proxy-10
+        _priv("pv2", "10.0.0.20"),   # proxy-2
+        _priv("pv3", "10.0.0.5"),    # 没有公网 IP
+        _priv("pv4", "10.0.0.100"),  # proxy-02（和 proxy-2 同名次，按 IP 排在后面）
+    ])
+    s = _session(net, [
+        _reserved("a", "1.1.1.1", assigned=True, private_ip_id="pv1", name="proxy-10"),
+        _reserved("b", "1.1.1.2", assigned=True, private_ip_id="pv2", name="proxy-2"),
+        _reserved("c", "1.1.1.3", assigned=True, private_ip_id="pv4", name="proxy-02"),
+    ])
+    s._compute = _FakeCompute({})
+    res = s.publish_secondary_ips("inst", "comp")
+    assert res.ok, res.message
+    (md, _kw), = s._compute.updates
+    assert json.loads(md[TenantSession.SECONDARY_IPS_METADATA_KEY]) == {
+        "vnic1": ["10.0.0.20", "10.0.0.100", "10.0.0.3", "10.0.0.5"]
+    }
+
+
+def test_publishing_still_works_when_the_names_cannot_be_read(monkeypatch):
+    monkeypatch.setattr("oci.pagination.list_call_get_all_results", lambda fn, **kw: fn(**kw))
+    net = _FakeNet(privs=[
+        _priv("pv-primary", "10.0.0.129", primary=True),
+        _priv("pv1", "10.0.0.20"),
+        _priv("pv2", "10.0.0.3"),
+    ])
+    s = _session(net, [])
+
+    def broken(*_a, **_k):
+        raise RuntimeError("list failed")
+
+    s.list_reserved_public_ips = broken  # type: ignore[method-assign]
+    s._compute = _FakeCompute({})
+    res = s.publish_secondary_ips("inst", "comp")
+    assert res.ok, "排序用的名字读不到，不能让写元数据失败"
+    (md, _kw), = s._compute.updates
+    assert md[TenantSession.SECONDARY_IPS_METADATA_KEY] == '{"vnic1":["10.0.0.3","10.0.0.20"]}'
+
+
+def test_sync_adds_in_the_order_the_panel_listed(tmp_path):
+    """以前按字符串排序加：10.0.0.100 会排在 10.0.0.11 前面，和面板列表对不上。"""
+    ns = _load_sync(tmp_path)
+    have = {"10.0.0.129", "10.0.0.7"}  # .7 已经在网卡上：不重复加
+    cmds: list[str] = []
+    _wire(ns, _REAL_VNICS, have, cmds,
+          panel={"ocid1.vnic.oc1..v1": ["10.0.0.20", "10.0.0.100", "10.0.0.7", "10.0.0.11", "10.0.0.20"]})
+    ns["main"]()
+    assert cmds == [
+        "addr add 10.0.0.20/24 dev enp0s6",
+        "addr add 10.0.0.100/24 dev enp0s6",
+        "addr add 10.0.0.11/24 dev enp0s6",
+    ]
+
+
+def test_natural_key_orders_numbers_by_value():
+    from app.oci_client import _natural_key
+
+    names = ["proxy-10", "proxy-2", "Proxy-03", "proxy-100", "proxy-01", "代理-2", "代理-10"]
+    assert sorted(names, key=_natural_key) == [
+        "proxy-01", "proxy-2", "Proxy-03", "proxy-10", "proxy-100", "代理-2", "代理-10"
+    ]
+
+
 def test_sync_parses_real_ip_addr_output(tmp_path):
     ns = _load_sync(tmp_path)
     sample = (

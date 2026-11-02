@@ -188,6 +188,29 @@ def _as_list(value: Any) -> list:
     return [value]
 
 
+def _natural_key(text: str) -> list:
+    """自然排序的键：数字段按数值比，proxy-2 在 proxy-10 前面。
+
+    re.split 带捕获组，结果总是「文本、数字、文本、数字 …」交替（以文本开头，可能是空串），
+    所以两个键同一位置上的类型一定相同，可以直接比较。
+    """
+    parts = re.split(r"(\d+)", text or "")
+    return [int(p) if i % 2 else p.casefold() for i, p in enumerate(parts)]
+
+
+def _name_then_ip_key(name: str, ip: str) -> tuple:
+    """面板「多出口 IP」表的顺序：有名字的按名字自然排序在前，没有名字的在后；再按 IP。
+
+    和前端的 Intl.Collator('zh-CN', {numeric: true}) 对同一前缀（proxy-01 … / 代理-01 …）
+    结果一致；不同的中文前缀混在一起时，前端按拼音、这里按码位，先后可能不同。
+    """
+    try:
+        ip_key: Any = ipaddress.ip_address(ip)
+    except ValueError:
+        ip_key = ipaddress.ip_address("0.0.0.0")
+    return (0 if name else 1, _natural_key(name), ip_key)
+
+
 def _public_ip_busy(ip: Any) -> bool:
     """这个公网 IP 是不是「已绑定 或 正在绑定」。
 
@@ -10261,11 +10284,35 @@ class TenantSession:
         ).data
         return network, list(privs)
 
+    def _public_ips_for(self, privs: list[Any]) -> dict[str, dict]:
+        """辅助私网 IP id → 它绑着的公网 IP（list_reserved_public_ips 那种 dict）。
+
+        先取默认区间的保留 IP 列表（一次调用）；不在里面的辅助 IP 再按私网 IP 单独问一次
+        —— 公网 IP 可能建在别的区间，显示成「没有」的话，更换时确认框会写「直接分配」，实际
+        却要删掉一个用户没看到的地址。单个问不到就当没有（更换前的核对会把它拦下）。
+
+        多出口 IP 列表和写给同步服务的列表都用它：两边认的名字一样，顺序才对得上。
+        """
+        by_private = {r["private_ip_id"]: r for r in self.list_reserved_public_ips() if r["private_ip_id"]}
+        out: dict[str, dict] = {}
+        for p in privs:
+            if getattr(p, "is_primary", False):
+                continue
+            pub = by_private.get(p.id)
+            if pub is None:
+                try:
+                    pub = self._public_ip_of_private(p.id)
+                except Exception:  # noqa: BLE001
+                    pub = None
+            if pub is not None:
+                out[p.id] = pub
+        return out
+
     def list_multi_ips(self, instance_id: str, compartment_id: str) -> OperationResult:
         """Secondary private IPs on the primary VNIC and the reserved IP bound to each."""
         try:
             network, privs = self._primary_vnic_private_ips(instance_id, compartment_id)
-            by_private = {r["private_ip_id"]: r for r in self.list_reserved_public_ips() if r["private_ip_id"]}
+            by_private = self._public_ips_for(privs)
         except OCIClientError as exc:
             return OperationResult(ok=False, message=str(exc))
         except ServiceError as exc:
@@ -10274,15 +10321,7 @@ class TenantSession:
         for p in privs:
             if getattr(p, "is_primary", False):
                 continue
-            pub = by_private.get(p.id)
-            if pub is None:
-                # 默认区间的列表里没有，不等于没有公网 IP（可能建在别的区间）。这里显示成「没有」的话，
-                # 更换时确认框会写「直接分配」，实际却要删掉一个用户没看到的地址。只对这些行多问一次。
-                try:
-                    pub = self._public_ip_of_private(p.id)
-                except Exception:  # noqa: BLE001 - 读不到就照旧显示为空；更换前的核对会把它拦下
-                    pub = None
-            pub = pub or {}
+            pub = by_private.get(p.id) or {}
             tags = getattr(p, "freeform_tags", None) or {}
             items.append(
                 {
@@ -10320,6 +10359,11 @@ class TenantSession:
         值是 ``{"<vnic OCID>": ["10.0.0.11", ...]}`` 的 JSON，列出主网卡上**全部**辅助 IP
         （面板建的和手工建的都列；同步服务对已在网卡上的地址不会重复加）。
 
+        列表顺序和面板「多出口 IP」表一致：按所绑公网 IP 的名字自然排序（proxy-01、proxy-02 …
+        proxy-10），没有名字的放最后、按私网 IP 排。同步服务按这个顺序往网卡上加，服务器上
+        ``ip addr`` 看到的先后就和面板对得上。名字和多出口列表从同一处取（_public_ips_for，
+        建在别的区间的公网 IP 也算上）；读不到就退回按私网 IP 排，不因为排序让写元数据失败。
+
         UpdateInstance 的 metadata 是**整体替换**，所以必须把现有的键（含 user_data、
         ssh_authorized_keys —— 这两个 Oracle 不允许改，必须原样带回）一起送回去；
         用 GetInstance 的 etag 做 if-match，别和同时进行的其他修改互相覆盖。
@@ -10328,11 +10372,17 @@ class TenantSession:
 
         try:
             network, privs = self._primary_vnic_private_ips(instance_id, compartment_id)
-            ips = sorted(
-                (str(getattr(p, "ip_address", "") or "") for p in privs if not getattr(p, "is_primary", False)),
-                key=lambda ip: ipaddress.ip_address(ip) if ip else ipaddress.ip_address("0.0.0.0"),
-            )
-            value = json.dumps({network.vnic_id: [ip for ip in ips if ip]}, separators=(",", ":"))
+            try:
+                names = {pid: r.get("display_name") or "" for pid, r in self._public_ips_for(privs).items()}
+            except Exception:  # noqa: BLE001 - 只影响顺序
+                names = {}
+            secondary = [
+                p for p in privs
+                if not getattr(p, "is_primary", False) and (getattr(p, "ip_address", "") or "")
+            ]
+            secondary.sort(key=lambda p: _name_then_ip_key(names.get(p.id, ""), str(p.ip_address)))
+            ips = [str(p.ip_address) for p in secondary]
+            value = json.dumps({network.vnic_id: ips}, separators=(",", ":"))
             resp = self.compute.get_instance(instance_id)
             metadata = dict(getattr(resp.data, "metadata", None) or {})
             if metadata.get(self.SECONDARY_IPS_METADATA_KEY) == value:
