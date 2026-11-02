@@ -212,6 +212,8 @@ def _load_sync(tmp_path):
 
 
 def _wire(ns, vnics, have, cmds, panel=None):
+    # 真的锁要 fcntl（只有 Linux 有），这里换成什么都不做；锁本身见 test_two_syncs_queue_on_the_lock。
+    ns["acquire_lock"] = lambda: None
     ns["read_vnics"] = vnics if callable(vnics) else (lambda: vnics)
     ns["read_panel_list"] = panel if callable(panel) else (lambda: panel)
     ns["interfaces_by_mac"] = lambda: {"02:00:17:00:00:01": "enp0s6"}
@@ -423,6 +425,74 @@ def test_sync_adds_in_the_order_the_panel_listed(tmp_path):
     ]
 
 
+def test_the_lock_is_taken_after_the_list_is_read_and_before_the_interface_is_touched(tmp_path):
+    """等列表（安装时最多 75 秒）不占锁；读网卡、改网卡、写记录都在锁里。"""
+    ns = _load_sync(tmp_path)
+    have = {"10.0.0.129"}
+    cmds: list[str] = []
+    events: list[str] = []
+    _wire(ns, _REAL_VNICS, have, cmds, panel=lambda: events.append("read list") or {"ocid1.vnic.oc1..v1": ["10.0.0.11"]})
+    ns["acquire_lock"] = lambda: events.append("lock")
+    real_current = ns["current_ipv4"]
+    ns["current_ipv4"] = lambda dev: events.append("read interface") or real_current(dev)
+    ns["main"]()
+    assert events[:3] == ["read list", "lock", "read interface"]
+    assert cmds == ["addr add 10.0.0.11/24 dev enp0s6"]
+
+
+def test_two_syncs_queue_on_the_lock(tmp_path):
+    """安装时前台那次和定时器那次同时跑：0.4.174 实测两边一起加同一批地址、各记各的。"""
+    pytest.importorskip("fcntl")  # 只有 Linux 有；Windows 上跳过
+    import threading
+
+    ns = _load_sync(tmp_path)
+    first = ns["acquire_lock"]()
+    got = threading.Event()
+    t = threading.Thread(target=lambda: (ns["acquire_lock"](), got.set()), daemon=True)
+    t.start()
+    assert not got.wait(0.5), "第一个还拿着锁，第二个必须等"
+    first.close()
+    assert got.wait(5), "第一个放了锁，第二个要能接着跑"
+
+
+def test_the_state_file_is_written_through_a_per_process_temp_file(tmp_path):
+    """两个同步同时写记录时，以前共用 <网卡>.tmp，一个挪走了，另一个就 FileNotFoundError。"""
+    ns = _load_sync(tmp_path)
+    moved: list[tuple[str, str]] = []
+    real_os = ns["os"]
+
+    class _Os:
+        def __getattr__(self, name):
+            return getattr(real_os, name)
+
+        @staticmethod
+        def getpid():
+            return 4242
+
+        @staticmethod
+        def replace(src, dst):
+            moved.append((src, dst))
+            real_os.replace(src, dst)
+
+    ns["os"] = _Os()
+    ns["save_state"]("enp0s6", {"10.0.0.11"})
+    ((src, dst),) = moved
+    assert src.endswith("enp0s6.tmp.4242") and dst.endswith("enp0s6")
+    assert ns["load_state"]("enp0s6") == {"10.0.0.11"}
+
+
+def test_the_install_script_starts_the_timer_only_after_the_foreground_sync():
+    """开机超过 20 秒的机器上，定时器一启动就会立刻触发一次，和前台那次同时跑。"""
+    from app import ip_sync
+
+    script = ip_sync.build_install_script()
+    assert "enable --now" not in script
+    enable = script.index("systemctl enable ocibot-ip-sync.timer")
+    foreground = script.index("--wait 75")
+    start = script.index("systemctl restart ocibot-ip-sync.timer")
+    assert enable < foreground < start
+
+
 def test_natural_key_orders_numbers_by_value():
     from app.oci_client import _natural_key
 
@@ -451,7 +521,7 @@ def test_install_script_is_valid_bash_and_embeds_valid_python():
 
     compile(ip_sync._SYNC_PY, "ocibot-ip-sync", "exec")
     script = ip_sync.build_install_script()
-    assert "OCIBOT_SYNC_PY" in script and "systemctl enable --now ocibot-ip-sync.timer" in script
+    assert "OCIBOT_SYNC_PY" in script and "systemctl enable ocibot-ip-sync.timer" in script
     bash = shutil.which("bash")
     if bash is None:
         pytest.skip("bash not available")

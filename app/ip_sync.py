@@ -22,6 +22,8 @@ IP 列表从哪来（0.4.131 改）：
 * 自己以前加过、列表里已经没有的 —— 删掉；
 * **从不碰**主 IP、也从不碰不是它加的地址（手工写进 netplan 的那些）。它加过
   哪些记在 ``/var/lib/ocibot-ip-sync/<网卡名>``；
+* 同一时间只有一个同步在改网卡（``/var/lib/ocibot-ip-sync/.lock``）：安装时前台那次和
+  定时器那次曾经同时跑，各记各的「加了哪些」，后写的把先写的覆盖掉（0.4.175 修）；
 * 读不到列表（启动早期网络没好、元数据服务抖动、面板还没写过）时**什么都不删**
   —— 读失败不能被理解成「一个辅助 IP 都没有」，那会把正在用的出口全部拆掉。
 """
@@ -117,9 +119,29 @@ def save_state(dev, addrs):
     if not os.path.isdir(STATE_DIR):
         os.makedirs(STATE_DIR)
     path = os.path.join(STATE_DIR, dev)
-    with open(path + ".tmp", "w") as fh:
+    # 临时文件带上进程号：两个同步同时写时，以前共用 <网卡>.tmp，一个把它挪走了，
+    # 另一个 os.replace 就 FileNotFoundError（0.4.174 安装时实际出现过）。
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    with open(tmp, "w") as fh:
         fh.write("\n".join(sorted(addrs)) + "\n")
-    os.replace(path + ".tmp", path)
+    os.replace(tmp, path)
+
+
+def acquire_lock():
+    """同一时间只让一个同步改网卡。返回的文件对象要一直拿着，进程退出时自动释放。
+
+    安装脚本在前台跑一次同步，同时定时器也可能正好触发一次：两边各自读到「网卡上还没有」，
+    同一批地址一起加，慢的那个报 Address already assigned；更糟的是两边各记各的「我加了哪些」，
+    后写的覆盖先写的，大部分地址就不在记录里了 —— 以后在面板解绑，它们也不会从网卡上删掉。
+    排队之后，后来的那个会重新读网卡、发现都加好了，什么也不做。
+    """
+    import fcntl
+
+    if not os.path.isdir(STATE_DIR):
+        os.makedirs(STATE_DIR)
+    fh = open(os.path.join(STATE_DIR, ".lock"), "w")
+    fcntl.flock(fh, fcntl.LOCK_EX)
+    return fh
 
 
 def ip_cmd(*args):
@@ -153,6 +175,8 @@ def main(wait=0):
             break
         # 安装时用：面板刚写的元数据要一会儿才在 IMDS 出现（Oracle 说最多约一分钟）。
         time.sleep(5)
+    # 等列表的时候不占锁（那可能要一分多钟）；从这里开始要读网卡、改网卡、写记录，必须排队。
+    lock = acquire_lock()  # noqa: F841 - 拿着就行，进程退出时释放
     macs = interfaces_by_mac()
     for vnic in vnics:
         dev = macs.get(str(vnic.get("macAddr") or "").lower())
@@ -255,10 +279,15 @@ cat > /etc/systemd/system/{SERVICE_NAME}.timer <<'OCIBOT_TIMER'
 OCIBOT_TIMER
 
 systemctl daemon-reload
-systemctl enable --now {SERVICE_NAME}.timer >/dev/null
+# 先只设开机启动，等下面前台那次同步做完再启动定时器：开机超过 20 秒的机器上，定时器一启动
+# 就会立刻触发一次，和前台那次同时改网卡。（同步脚本自己也有锁，这里是让输出里能看到加了哪些。）
+# 成功时不打印 systemctl 的 "Created symlink ..."，失败时把原因原样显示出来。
+if ! out="$(systemctl enable {SERVICE_NAME}.timer 2>&1)"; then echo "$out" >&2; exit 3; fi
 echo "同步服务已安装并启用（开机自动运行，之后每分钟同步一次）。"
 echo "立即同步一次（面板刚写入的 IP 列表最多约一分钟后才能读到）："
 "$PY" {SYNC_SCRIPT_PATH} --wait 75 || true
+# restart 而不是 start：更新时定时器本来就在跑，要换成刚写入的新配置。
+systemctl restart {SERVICE_NAME}.timer
 echo "当前网卡上的 IPv4 地址："
 ip -4 -o addr show | awk '{{print "  " $2 "  " $4}}'
 """
