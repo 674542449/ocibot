@@ -672,7 +672,7 @@
             <tr v-else-if="reservedIps.length === 0">
               <td :colspan="multiAllowed ? 6 : 5" class="muted empty">该区域暂无保留 IP。「新建保留 IP」后即可绑定到实例。</td>
             </tr>
-            <tr v-for="ip in reservedIps" :key="ip.id">
+            <tr v-for="ip in sortedReservedIps" :key="ip.id">
               <td v-if="multiAllowed">
                 <input
                   v-if="!ip.assigned"
@@ -775,7 +775,7 @@
                   本实例还没有多出口 IP。在上面勾选未绑定的保留 IP，点「作为多出口绑定到本实例」。
                 </td>
               </tr>
-              <tr v-for="m in multiInfo.items" :key="m.private_ip_id">
+              <tr v-for="m in sortedMultiItems" :key="m.private_ip_id">
                 <td>
                   <input
                     type="checkbox"
@@ -876,7 +876,7 @@
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="it in rotateJob.items" :key="it.private_ip_id">
+                <tr v-for="it in sortedRotateItems" :key="it.private_ip_id">
                   <td class="mono">{{ it.private_ip }}</td>
                   <td>{{ it.old_ip || '—' }}</td>
                   <td
@@ -1304,6 +1304,24 @@ type ReservedIp = {
 const reservedIps = ref<ReservedIp[]>([])
 const ripBusy = ref(false)
 
+// 名字按「自然顺序」排：数字部分按数值比，proxy-2 在 proxy-10 前面（逐字符比的话
+// proxy-10 会排到 proxy-2 前面）。IP 地址同理，10.0.0.9 在 10.0.0.11 前面。
+const naturalOrder = new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' })
+
+/** 按名字排；没有名字的放最后，名字相同（或都没有）再按 tie 排。只影响显示顺序。 */
+function sortByName<T>(items: readonly T[], name: (x: T) => string, tie: (x: T) => string): T[] {
+  return [...items].sort((a, b) => {
+    const na = name(a)
+    const nb = name(b)
+    if (!na !== !nb) return na ? -1 : 1
+    return naturalOrder.compare(na, nb) || naturalOrder.compare(tie(a), tie(b))
+  })
+}
+
+const sortedReservedIps = computed(() =>
+  sortByName(reservedIps.value, (ip) => ip.display_name || '', (ip) => ip.ip_address || ''),
+)
+
 async function loadReservedIps() {
   const guard = beginLoad('reservedIps')
   ripBusy.value = true
@@ -1432,6 +1450,10 @@ const multiInfo = ref<MultiInfo | null>(null)
 const multiBusy = ref(false)
 /** 是否开放这套功能 —— 判断在服务端（账号等级），这里只照着它显示。 */
 const multiAllowed = computed(() => !!multiInfo.value?.allowed)
+/** 按公网 IP 的名字排（proxy-01、proxy-02 …），还没有公网 IP 的放最后、按私网 IP 排。 */
+const sortedMultiItems = computed(() =>
+  sortByName(multiInfo.value?.items || [], (m) => m.public_ip_name || '', (m) => m.private_ip || ''),
+)
 /** 保留 IP id → 它绑着的本实例多出口条目。上面那张表靠它把「解绑」转给多出口解绑。 */
 const multiByPublic = computed<Record<string, MultiIp>>(() => {
   const out: Record<string, MultiIp> = {}
@@ -1476,7 +1498,7 @@ const selectableMultiIds = computed(() =>
   (multiInfo.value?.items || []).map((m) => m.private_ip_id),
 )
 const selectedManagedMulti = computed(() =>
-  (multiInfo.value?.items || []).filter((m) => m.managed && selectedMulti.has(m.private_ip_id)),
+  sortedMultiItems.value.filter((m) => m.managed && selectedMulti.has(m.private_ip_id)),
 )
 
 function selectState(ids: string[], selected: Set<string>): 'none' | 'some' | 'all' {
@@ -1565,9 +1587,10 @@ async function batchCreateReservedIps() {
 
 async function attachSelectedMulti() {
   const act = beginAction()
-  const ids = reservedIps.value.filter((ip) => selectedReserved.has(ip.id)).map((ip) => ip.id)
+  // 按名字顺序依次绑定（确认框里列的也是这个顺序）。
+  const ids = sortedReservedIps.value.filter((ip) => selectedReserved.has(ip.id)).map((ip) => ip.id)
   if (!ids.length) return
-  const addrs = reservedIps.value
+  const addrs = sortedReservedIps.value
     .filter((ip) => selectedReserved.has(ip.id))
     .map((ip) => ip.ip_address)
   if (
@@ -1602,7 +1625,7 @@ async function attachSelectedMulti() {
 }
 
 async function releaseSelectedReserved() {
-  const picked = reservedIps.value.filter((ip) => selectedReserved.has(ip.id) && !ip.assigned)
+  const picked = sortedReservedIps.value.filter((ip) => selectedReserved.has(ip.id) && !ip.assigned)
   if (!picked.length) return
   const addrs = picked.map((ip) => ip.ip_address)
   if (
@@ -1723,6 +1746,9 @@ const ROTATE_STATUS: Record<string, string> = {
 const rotateJob = ref<RotateJob | null>(null)
 const rotateBusy = ref(false)
 const rotateRunning = computed(() => rotateBusy.value || rotateJob.value?.state === 'running')
+const sortedRotateItems = computed(() =>
+  sortByName(rotateJob.value?.items || [], (it) => it.name || '', (it) => it.private_ip || ''),
+)
 const rotateTotal = computed(
   () => (rotateJob.value?.items || []).filter((it) => it.status !== 'skipped').length,
 )
@@ -1838,11 +1864,11 @@ async function startRotate(picked: MultiIp[]) {
 }
 
 function rotateAll() {
-  void startRotate(multiInfo.value?.items || [])
+  void startRotate(sortedMultiItems.value)
 }
 
 function rotateSelected() {
-  void startRotate((multiInfo.value?.items || []).filter((m) => selectedMulti.has(m.private_ip_id)))
+  void startRotate(sortedMultiItems.value.filter((m) => selectedMulti.has(m.private_ip_id)))
 }
 
 onBeforeUnmount(stopRotatePoll)
