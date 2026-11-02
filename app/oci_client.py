@@ -10659,11 +10659,11 @@ class TenantSession:
             except ServiceError as exc:
                 if getattr(exc, "status", None) == 404:
                     # 不能当成「已经删了」：Oracle 对没有权限的请求也回 404。交给下面按列表确认。
-                    it.update(status="releasing", _unconfirmed="Oracle 回 404，可能是没有删除权限")
+                    it.update(status="releasing", _refused="Oracle 回 404，可能是没有删除权限")
                 else:
                     it.update(status="failed", message=f"删除旧 IP 失败，这个没有更换：{_format_service_error(exc)}")
-            except Exception as exc:  # noqa: BLE001 - 超时之类：删没删不知道，按列表确认
-                it.update(status="releasing", _unconfirmed=safe_error_text(exc))
+            except Exception:  # noqa: BLE001 - 超时之类：删没删不知道，照常等列表确认
+                it["status"] = "releasing"
             report("release")
 
         # 2. 等旧 IP 彻底删除（列表里没有了或 TERMINATED）。只看到解绑还不够：
@@ -10682,11 +10682,13 @@ class TenantSession:
                         it["status"] = "released"
                         continue
                     it["_state"] = state
-                    # 删除请求没被确认、两轮之后还好好绑着：就是没删，别再等满三分钟。
-                    if it.get("_unconfirmed") and state == "ASSIGNED":
+                    # 删除被回了 404、两轮之后还好好绑着：就是没删，别再等满三分钟。
+                    # 只对 404 这样判断 —— 响应丢失的那种请求可能已经生效，列表只是还没跟上，
+                    # 提前判「没删」会让它最后既没旧 IP 也没新 IP，所以照常等到超时。
+                    if it.get("_refused") and state == "ASSIGNED":
                         it["_still"] = it.get("_still", 0) + 1
                         if it["_still"] >= 2:
-                            it.update(status="failed", message=f"旧 IP 没有被删除（{it['_unconfirmed']}），这个没有更换")
+                            it.update(status="failed", message=f"旧 IP 没有被删除（{it['_refused']}），这个没有更换")
             report("wait_release")
             if not waiting("releasing"):
                 break
@@ -10750,7 +10752,11 @@ class TenantSession:
                 for it in waiting("assigning"):
                     r = by_id.get(it["new_public_ip_id"])
                     state = str((r or {}).get("lifecycle_state") or "").upper()
-                    if state == "ASSIGNED":
+                    target = (r or {}).get("private_ip_id") or ""
+                    if state in ("ASSIGNING", "ASSIGNED") and target and target != it["private_ip_id"]:
+                        # 被别处（比如「设为主公网 IP」）拿走了：不能算成换好了，也不能再把它抢回来。
+                        it.update(status="failed", message=f"新 IP {it['new_ip']} 被绑到了别处，这个私网 IP 现在没有公网 IP")
+                    elif state == "ASSIGNED":
                         it["status"] = "done"
                         it["new_ip"] = (r or {}).get("ip_address") or it["new_ip"]
                         if it["old_ip"] and it["new_ip"] == it["old_ip"]:

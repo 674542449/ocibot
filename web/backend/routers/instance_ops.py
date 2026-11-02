@@ -80,6 +80,18 @@ def _row(db: Session, user_id: str, tenant_id: str):
         raise HTTPException(status_code=404, detail=safe_error_text(exc)) from exc
 
 
+def _refuse_during_rotation(db: Session, tenant_id: str, instance_id: str) -> None:
+    """这台实例正在更换多出口公网 IP 时，别的公网 IP 操作先挡下。
+
+    更换会在新 IP 悄悄绑定失败时自动再绑一次：同一时间把它「设为主公网 IP」，
+    Oracle 会把它从主私网 IP 上挪走；新建 / 删除辅助 IP 也会和正在进行的更换互相踩。
+    """
+    from web.backend import ip_rotation
+
+    if ip_rotation.is_running(ip_rotation.read_job(db, tenant_id, instance_id)):
+        raise HTTPException(status_code=409, detail="这台实例正在更换多出口公网 IP，请等它结束再操作")
+
+
 def _unpack_console_list(result: Any) -> tuple[list[Any], str]:
     """Split whatever list_console_connections returned into (connections, error).
 
@@ -1168,6 +1180,7 @@ def attach_reserved_ip(
     db: Annotated[Session, Depends(get_db)],
 ) -> PowerActionResult:
     row = _row(db, user.id, tenant_id)
+    _refuse_during_rotation(db, tenant_id, instance_id)
     try:
         session = get_session_for_row(row)
         info = session.get_instance(instance_id, resolve_ips=False)
@@ -1387,6 +1400,7 @@ def attach_multi_ips(
 ) -> PowerActionResult:
     row = _row(db, user.id, tenant_id)
     _require_paid(db, row)
+    _refuse_during_rotation(db, tenant_id, instance_id)
     try:
         session = get_session_for_row(row)
         info = session.get_instance(instance_id, resolve_ips=False)
@@ -1414,6 +1428,7 @@ def detach_multi_ips(
     db: Annotated[Session, Depends(get_db)],
 ) -> PowerActionResult:
     row = _row(db, user.id, tenant_id)
+    _refuse_during_rotation(db, tenant_id, instance_id)
     try:
         session = get_session_for_row(row)
         info = session.get_instance(instance_id, resolve_ips=False)

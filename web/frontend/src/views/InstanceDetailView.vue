@@ -609,7 +609,13 @@
         </div>
         <div class="row">
           <button :disabled="ripBusy || multiBusy" @click="refreshNetworkTab">刷新</button>
-          <button class="primary" :disabled="ripBusy" @click="createReservedIp">新建保留 IP</button>
+          <!-- 更换进行中不新建：名额用满时，新建的会占掉更换刚腾出来的名额。 -->
+          <button
+            class="primary"
+            :disabled="ripBusy || rotateRunning"
+            :title="rotateRunning ? '正在更换多出口公网 IP，结束后再新建' : ''"
+            @click="createReservedIp"
+          >新建保留 IP</button>
           <button
             v-if="multiAllowed"
             :disabled="ripBusy"
@@ -628,7 +634,7 @@
           名称前缀
           <input v-model="batchForm.prefix" maxlength="40" placeholder="proxy" style="width: 9rem" />
         </label>
-        <button class="primary" :disabled="ripBusy" @click="batchCreateReservedIps">
+        <button class="primary" :disabled="ripBusy || rotateRunning" @click="batchCreateReservedIps">
           {{ ripBusy ? '创建中…' : `创建 ${batchCountClamped} 个` }}
         </button>
         <span class="muted" style="font-size: 12px">
@@ -693,16 +699,18 @@
               </td>
               <td>
                 <div class="row">
+                  <!-- 更换多出口公网 IP 进行中时都锁住：更换会把悄悄绑定失败的新 IP 再绑一次，
+                       同时把它设为主公网 IP / 解绑 / 删除，会和更换互相踩。 -->
                   <button
                     v-if="!ip.assigned"
-                    :disabled="ripBusy"
+                    :disabled="ripBusy || rotateRunning"
                     title="替换本实例的主公网 IP（原来的临时 IP 会被释放）"
                     @click="attachReservedIp(ip)"
                   >
                     设为主公网 IP
                   </button>
-                  <button v-if="ip.assigned" :disabled="ripBusy" @click="detachReservedIp(ip)">解绑</button>
-                  <button v-if="!ip.assigned" class="danger" :disabled="ripBusy" @click="deleteReservedIp(ip)">
+                  <button v-if="ip.assigned" :disabled="ripBusy || rotateRunning" @click="detachReservedIp(ip)">解绑</button>
+                  <button v-if="!ip.assigned" class="danger" :disabled="ripBusy || rotateRunning" @click="deleteReservedIp(ip)">
                     删除
                   </button>
                 </div>
@@ -1722,6 +1730,9 @@ const rotateFinished = computed(
   () => (rotateJob.value?.items || []).filter((it) => it.status === 'done' || it.status === 'failed').length,
 )
 let rotateTimer: ReturnType<typeof setTimeout> | null = null
+// 一次查询正在路上时 timer 是空的；只看 timer 的话「刷新」会再起一条轮询链，
+// 任务结束时两条链各刷新一次两张表（多打两轮 Oracle）。
+let rotatePolling = false
 
 function stopRotatePoll() {
   if (rotateTimer) {
@@ -1739,13 +1750,19 @@ function scheduleRotatePoll(act: ReturnType<typeof beginAction>) {
 }
 
 async function pollRotate(act: ReturnType<typeof beginAction>) {
+  rotatePolling = true
   try {
     const { data } = await api.get(`/tenants/${act.tenant}/instances/${act.target}/multi-ips/rotate`)
     if (act.moved()) return
     rotateJob.value = data.job || null
-  } catch {
-    // 一次没读到（网络抖动）不算结束：任务还在服务端跑，下一轮接着问。
+  } catch (e: any) {
+    // 一次没读到（网络抖动、面板重启中）不算结束：任务还在服务端跑，下一轮接着问。
+    // 4xx 不会自己好（登录过期、租户没了），再问也一样，停下。
     if (act.moved()) return
+    const status = e?.response?.status
+    if (status && status < 500) return
+  } finally {
+    rotatePolling = false
   }
   if (rotateJob.value?.state === 'running') {
     scheduleRotatePoll(act)
@@ -1767,7 +1784,7 @@ async function loadRotateJob() {
   if (act.moved()) return
   // 很久以前顺利完成的任务不必每次刷新都摆出来；进行中、失败、中断的要让人看到。
   rotateJob.value = job && (job.state !== 'done' || rotateJob.value) ? job : null
-  if (rotateJob.value?.state === 'running' && !rotateTimer) scheduleRotatePoll(act)
+  if (rotateJob.value?.state === 'running' && !rotateTimer && !rotatePolling) scheduleRotatePoll(act)
 }
 
 async function startRotate(picked: MultiIp[]) {

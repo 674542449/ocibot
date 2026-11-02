@@ -38,6 +38,8 @@ class _Oracle:
         self.private_ip_writes = 0
         self.list_errors = 0  # 接下来这么多次列表调用直接失败
         self.rebind_lag = 0  # 重绑之后这么多轮列表里仍显示 AVAILABLE
+        self.delete_lag = 0  # 删除之后这么多轮列表里仍显示「好好绑着」
+        self.hijack: dict[str, str] = {}  # 新 IP 绑好时被别处拿走：私网 IP → 实际绑到的
         self._n = 0
 
     # ---- VirtualNetworkClient 的那几个方法
@@ -61,7 +63,8 @@ class _Oracle:
         ip = self.ips.get(public_ip_id)
         if ip is None or ip["lifecycle_state"] == "TERMINATED":
             raise ServiceError(404, "NotAuthorizedOrNotFound", {}, "gone")
-        ip.update(lifecycle_state="TERMINATING", assigned_to="", timer=self.release_rounds)
+        ip.update(lifecycle_state="TERMINATING", assigned_to="", timer=self.release_rounds,
+                  _ghost=self.delete_lag, _was=ip["assigned_to"])
         if err is not None:  # ("after", exc)：Oracle 其实删了，只是响应没回来
             raise err[1]
 
@@ -136,10 +139,13 @@ class _Oracle:
                 continue
             if compartment_id and ip["compartment_id"] != compartment_id:
                 continue
+            state, target = ip["lifecycle_state"], ip["assigned_to"]
+            if ip.get("_ghost"):  # 列表还没跟上：删了的仍显示绑着
+                state, target = "ASSIGNED", ip["_was"]
             out.append({
                 "id": ip["id"], "ip_address": ip["ip_address"], "display_name": ip["display_name"],
-                "lifecycle_state": ip["lifecycle_state"], "assigned": ip["lifecycle_state"] in BUSY,
-                "private_ip_id": ip["assigned_to"], "compartment_id": ip["compartment_id"],
+                "lifecycle_state": state, "assigned": state in BUSY,
+                "private_ip_id": target, "compartment_id": ip["compartment_id"],
                 "public_ip_pool_id": ip["public_ip_pool_id"],
             })
         return out
@@ -150,6 +156,9 @@ class _Oracle:
                 ip["_lag"] -= 1
                 if not ip["_lag"]:
                     ip.update(lifecycle_state="ASSIGNING", timer=self.assign_rounds)
+                continue
+            if ip.get("_ghost"):
+                ip["_ghost"] -= 1
                 continue
             state = ip["lifecycle_state"]
             if state not in ("TERMINATING", "ASSIGNING") or ip["id"] in self.stuck:
@@ -164,6 +173,7 @@ class _Oracle:
                 ip.update(lifecycle_state="AVAILABLE", assigned_to="")
             else:
                 ip["lifecycle_state"] = "ASSIGNED"
+                ip["assigned_to"] = self.hijack.get(ip["assigned_to"], ip["assigned_to"])
 
     # ---- 断言用
     def bound(self):
@@ -461,6 +471,28 @@ def test_the_round_right_after_a_rebind_may_still_show_available():
     assert "pv1" in o.bound()
 
 
+def test_a_lost_delete_response_waits_out_a_lagging_list():
+    """响应丢了、列表又慢几轮：不能提前判「没删」—— 那样这个私网 IP 最后既没旧 IP 也没新 IP。"""
+    o = _oracle(1)
+    o.delete_lag = 4
+    o.delete_errors["old1"] = [("after", ConnectionError("read timed out"))]
+    res = _rotate(_session(o), ["pv1"])
+    assert res.ok, res.message
+    assert "pv1" in o.bound() and o.bound()["pv1"]["id"] != "old1"
+
+
+def test_a_new_ip_taken_elsewhere_is_not_reported_as_done():
+    """新 IP 被「设为主公网 IP」拿走了：不能算成换好，也不能再把它抢回来。"""
+    o = _oracle(1)
+    o.hijack["pv1"] = "pv-primary"
+    res = _rotate(_session(o), ["pv1"])
+    assert not res.ok
+    item = _by_private(res)["pv1"]
+    assert item["status"] == "failed" and "绑到了别处" in item["message"]
+    assert not any(c.startswith("update:") for c in o.calls), "不能把它从主 IP 上挪回来"
+    assert o.bound()["pv-primary"]["id"].startswith("new")
+
+
 def test_internal_bookkeeping_does_not_leak_into_the_result():
     o = _oracle(1)
     o.silent_fail["pv1"] = 1
@@ -641,6 +673,40 @@ def test_a_plan_that_fails_starts_nothing(job_db):
         assert not out["ok"] and "辅助私网 IP" in out["message"]
         assert ip_rotation.read_job(db, "t1", "ocid1.instance.oc1..abc") is None
     assert threads == []
+
+
+def test_other_public_ip_changes_are_refused_while_a_rotation_runs(job_db):
+    """更换进行中，同一台实例的设为主公网 IP / 多出口绑定 / 解绑都要先挡下（409）。"""
+    import json
+
+    from fastapi import HTTPException
+
+    from web.backend import ip_rotation
+    from web.backend.meta import set_meta
+    from web.backend.routers.instance_ops import _refuse_during_rotation
+
+    maker, _threads = job_db
+    key = ip_rotation.job_key("t1", "inst-1")
+    with maker() as db:
+        _refuse_during_rotation(db, "t1", "inst-1")  # 没有任务：放行
+        set_meta(db, key, json.dumps({"state": "running", "updated_at": datetime.now(timezone.utc).isoformat()}))
+        db.commit()
+        with pytest.raises(HTTPException) as err:
+            _refuse_during_rotation(db, "t1", "inst-1")
+        assert err.value.status_code == 409
+        _refuse_during_rotation(db, "t1", "inst-2")  # 别的实例不受影响
+        set_meta(db, key, json.dumps({"state": "done", "updated_at": datetime.now(timezone.utc).isoformat()}))
+        db.commit()
+        _refuse_during_rotation(db, "t1", "inst-1")
+
+
+def test_the_guarded_routes_call_the_rotation_check():
+    import inspect
+
+    from web.backend.routers import instance_ops
+
+    for fn in (instance_ops.attach_reserved_ip, instance_ops.attach_multi_ips, instance_ops.detach_multi_ips):
+        assert "_refuse_during_rotation(db, tenant_id, instance_id)" in inspect.getsource(fn), fn.__name__
 
 
 def test_the_route_refuses_an_empty_selection():
