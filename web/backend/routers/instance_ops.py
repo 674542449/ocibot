@@ -1309,6 +1309,12 @@ class MultiIpDetach(BaseModel):
     private_ip_ids: list[str] = Field(min_length=1, max_length=64)
 
 
+class MultiIpRotate(BaseModel):
+    # 必须逐个列出，没有「空 = 全部」：页面上的列表可能已经过时，服务端自己挑「全部」
+    # 换掉的就不一定是确认框里列出的那一批。
+    private_ip_ids: list[str] = Field(min_length=1, max_length=64)
+
+
 class IpSyncInstall(BaseModel):
     ssh_username: str = "ubuntu"
     ssh_private_key_pem: Optional[str] = None
@@ -1424,6 +1430,59 @@ def detach_multi_ips(
         detail={"tenant_id": tenant_id, "ok": result.ok, "message": result.message},
     )
     return PowerActionResult(**op_result_dict(result))
+
+
+@router.post("/tenants/{tenant_id}/instances/{instance_id}/multi-ips/rotate")
+def rotate_multi_ips(
+    tenant_id: str,
+    instance_id: str,
+    body: MultiIpRotate,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    """一键更换辅助 IP 的公网 IP（私网 IP 不变）。立即返回，更换在后台进行。"""
+    from web.backend import ip_rotation
+
+    row = _row(db, user.id, tenant_id)
+    _require_paid(db, row)
+    try:
+        session = get_session_for_row(row)
+        info = session.get_instance(instance_id, resolve_ips=False)
+        out = ip_rotation.start_rotation(
+            db,
+            session=session,
+            owner_id=user.id,
+            tenant_id=tenant_id,
+            instance_id=instance_id,
+            compartment_id=info.compartment_id,
+            private_ip_ids=body.private_ip_ids,
+        )
+    except ip_rotation.RotationBusy as exc:
+        raise HTTPException(status_code=409, detail=safe_error_text(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=safe_error_text(exc)) from exc
+    write_audit(
+        db,
+        owner_id=user.id,
+        action="multi_ip.rotate",
+        target=instance_id,
+        detail={"tenant_id": tenant_id, "ok": out["ok"], "message": out["message"]},
+    )
+    return out
+
+
+@router.get("/tenants/{tenant_id}/instances/{instance_id}/multi-ips/rotate")
+def get_multi_ip_rotation(
+    tenant_id: str,
+    instance_id: str,
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, Any]:
+    """最近一次更换任务的进度。只读面板自己的数据库，不请求 Oracle。"""
+    from web.backend import ip_rotation
+
+    _row(db, user.id, tenant_id)
+    return {"ok": True, "job": ip_rotation.job_view(ip_rotation.read_job(db, tenant_id, instance_id))}
 
 
 @router.post("/tenants/{tenant_id}/instances/{instance_id}/multi-ips/install-sync")

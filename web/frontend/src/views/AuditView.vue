@@ -148,6 +148,8 @@ const ACTION_LABELS: Record<string, string> = {
   'reserved_ip.batch_delete': '批量释放保留 IP',
   'multi_ip.attach': '多出口 IP · 绑定',
   'multi_ip.detach': '多出口 IP · 解绑',
+  'multi_ip.rotate': '多出口 IP · 开始更换公网 IP',
+  'multi_ip.rotate_done': '多出口 IP · 更换公网 IP 结束',
   'multi_ip.install_sync': '多出口 IP · 安装同步服务',
   'boot_volume.resize': '调整引导卷',
   'boot_volume.rename': '重命名引导卷',

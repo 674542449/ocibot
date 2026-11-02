@@ -713,10 +713,10 @@
       </div>
       <div v-if="multiAllowed && selectedReserved.size" class="row">
         <strong style="font-size: 13px">已选 {{ selectedReserved.size }} 个</strong>
-        <button class="primary" :disabled="multiBusy || ripBusy" @click="attachSelectedMulti">
+        <button class="primary" :disabled="multiBusy || ripBusy || rotateRunning" @click="attachSelectedMulti">
           {{ multiBusy ? '绑定中…' : '作为多出口绑定到本实例' }}
         </button>
-        <button class="danger" :disabled="multiBusy || ripBusy" @click="releaseSelectedReserved">
+        <button class="danger" :disabled="multiBusy || ripBusy || rotateRunning" @click="releaseSelectedReserved">
           {{ ripBusy ? '处理中…' : '批量释放' }}
         </button>
         <button :disabled="multiBusy" @click="selectedReserved.clear()">取消选择</button>
@@ -749,8 +749,8 @@
                     :checked="multiSelectState === 'all'"
                     :indeterminate="multiSelectState === 'some'"
                     :disabled="!selectableMultiIds.length"
-                    title="全选面板创建的多出口 IP"
-                    aria-label="全选面板创建的多出口 IP"
+                    title="全选"
+                    aria-label="全选多出口 IP"
                     @change="toggleAllMulti"
                   />
                 </th>
@@ -758,18 +758,18 @@
                 <th>私网 IP</th>
                 <th>名称</th>
                 <th>来源</th>
+                <th>操作</th>
               </tr>
             </thead>
             <tbody>
               <tr v-if="!multiInfo.items.length">
-                <td colspan="5" class="muted empty">
+                <td colspan="6" class="muted empty">
                   本实例还没有多出口 IP。在上面勾选未绑定的保留 IP，点「作为多出口绑定到本实例」。
                 </td>
               </tr>
               <tr v-for="m in multiInfo.items" :key="m.private_ip_id">
                 <td>
                   <input
-                    v-if="m.managed"
                     type="checkbox"
                     :checked="selectedMulti.has(m.private_ip_id)"
                     :aria-label="`选择 ${m.public_ip || m.private_ip}`"
@@ -789,18 +789,112 @@
                 <td>{{ m.public_ip_name || '—' }}</td>
                 <td>
                   <span v-if="m.managed" class="badge">面板</span>
-                  <span v-else class="muted" title="在 Oracle 控制台手工创建的辅助 IP，面板不会改动它">手工</span>
+                  <span
+                    v-else
+                    class="muted"
+                    title="在 Oracle 控制台手工创建的辅助 IP：可以更换它的公网 IP，但面板不会解绑或删除它"
+                  >手工</span>
+                </td>
+                <td>
+                  <!-- 单独换这一个：和「更换所选」走同一个接口，只是清单里只有它。 -->
+                  <button
+                    :disabled="multiBusy || rotateRunning"
+                    :title="m.public_ip ? '只更换这一个的公网 IP，私网 IP 不变' : '给这个辅助 IP 分配一个公网 IP'"
+                    @click="startRotate([m])"
+                  >
+                    {{ m.public_ip ? '更换' : '分配' }}
+                  </button>
                 </td>
               </tr>
             </tbody>
           </table>
         </div>
+        <div v-if="multiInfo.items.length" class="row">
+          <button class="primary" :disabled="multiBusy || rotateRunning" @click="rotateAll">
+            {{ rotateRunning ? '更换中…' : `一键更换全部公网 IP（${multiInfo.items.length} 个）` }}
+          </button>
+          <span class="muted" style="font-size: 12px">
+            先删除旧公网 IP、再申请新的绑回原来的私网 IP，保留 IP 总数不会增加；期间这些出口断开几分钟
+          </span>
+        </div>
         <div v-if="selectedMulti.size" class="row">
           <strong style="font-size: 13px">已选 {{ selectedMulti.size }} 个</strong>
-          <button class="danger" :disabled="multiBusy" @click="detachSelectedMulti">
-            {{ multiBusy ? '解绑中…' : '解绑所选' }}
+          <button :disabled="multiBusy || rotateRunning" @click="rotateSelected">更换所选公网 IP</button>
+          <button
+            class="danger"
+            :disabled="multiBusy || rotateRunning || !selectedManagedMulti.length"
+            :title="selectedManagedMulti.length ? '' : '手工建的辅助 IP 请到 Oracle 控制台解绑'"
+            @click="detachSelectedMulti"
+          >
+            {{
+              multiBusy
+                ? '解绑中…'
+                : selectedManagedMulti.length === selectedMulti.size
+                  ? '解绑所选'
+                  : `解绑所选（仅面板创建的 ${selectedManagedMulti.length} 个）`
+            }}
           </button>
-          <span class="muted" style="font-size: 12px">保留 IP 仍在，可再次绑定</span>
+          <span class="muted" style="font-size: 12px">解绑后保留 IP 仍在，可再次绑定</span>
+        </div>
+
+        <div v-if="rotateJob" class="sync-box stack">
+          <div class="row" style="justify-content: space-between">
+            <div class="row">
+              <strong style="font-size: 13px">更换公网 IP</strong>
+              <span
+                class="badge"
+                :class="rotateJob.state === 'done' ? 'running' : rotateJob.state === 'running' ? '' : 'err'"
+              >
+                {{ ROTATE_STATE[rotateJob.state] || rotateJob.state }}
+              </span>
+              <span v-if="rotateJob.state === 'running'" class="muted" style="font-size: 12px">
+                {{ ROTATE_PHASE[rotateJob.phase] || rotateJob.phase }} · {{ rotateFinished }}/{{ rotateTotal }}
+              </span>
+            </div>
+            <button v-if="rotateJob.state !== 'running'" @click="rotateJob = null">收起</button>
+          </div>
+          <p v-if="rotateJob.message" style="margin: 0; font-size: 13px">{{ rotateJob.message }}</p>
+          <p v-if="rotateJob.state === 'running'" class="muted" style="margin: 0; font-size: 12px">
+            在服务器后台进行，关掉页面也会继续。
+          </p>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>私网 IP</th>
+                  <th>旧公网 IP</th>
+                  <th>新公网 IP</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="it in rotateJob.items" :key="it.private_ip_id">
+                  <td class="mono">{{ it.private_ip }}</td>
+                  <td>{{ it.old_ip || '—' }}</td>
+                  <td
+                    class="copyable"
+                    :class="{ empty: !it.new_ip }"
+                    title="单击复制"
+                    role="button"
+                    tabindex="0"
+                    @click="copy(it.new_ip)"
+                    @keydown.enter.prevent="copy(it.new_ip)"
+                  >{{ it.new_ip || '—' }}</td>
+                  <td>
+                    <span
+                      class="badge"
+                      :class="it.status === 'done' ? 'running' : it.status === 'failed' ? 'err' : ''"
+                    >
+                      {{ ROTATE_STATUS[it.status] || it.status }}
+                    </span>
+                    <span v-if="it.message" class="muted" style="margin-left: 0.3rem; font-size: 12px">
+                      {{ it.message }}
+                    </span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </div>
 
         <div class="sync-box stack">
@@ -1090,7 +1184,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, defineAsyncComponent, onMounted, reactive, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import api, { type Instance } from '@/api/client'
 import { pickAndReadTextFile } from '@/utils/file'
@@ -1363,13 +1457,18 @@ function toggleMulti(id: string) {
 }
 
 // ---- 全选 ----
-// 只在「能勾的」那些行里算：已绑定的保留 IP、手工建的辅助 IP 本来就没有勾选框，
+// 只在「能勾的」那些行里算：已绑定的保留 IP 本来就没有勾选框，
 // 把它们算进去的话，全选框永远到不了「全选」状态。
 const selectableReservedIds = computed(() =>
   reservedIps.value.filter((ip) => !ip.assigned).map((ip) => ip.id),
 )
+// 多出口的每一行都能勾：「更换公网 IP」不动私网 IP，手工建的辅助 IP 也能换。
+// 解绑会删私网 IP，只对面板建的那些做 —— 见 selectedManagedMulti。
 const selectableMultiIds = computed(() =>
-  (multiInfo.value?.items || []).filter((m) => m.managed).map((m) => m.private_ip_id),
+  (multiInfo.value?.items || []).map((m) => m.private_ip_id),
+)
+const selectedManagedMulti = computed(() =>
+  (multiInfo.value?.items || []).filter((m) => m.managed && selectedMulti.has(m.private_ip_id)),
 )
 
 function selectState(ids: string[], selected: Set<string>): 'none' | 'some' | 'all' {
@@ -1427,7 +1526,7 @@ async function loadMultiIps() {
 }
 
 async function refreshNetworkTab() {
-  await Promise.all([loadReservedIps(), loadMultiIps()])
+  await Promise.all([loadReservedIps(), loadMultiIps(), loadRotateJob()])
   // 勾选只对「还没绑定」的保留 IP 有意义。
   const free = new Set(reservedIps.value.filter((ip) => !ip.assigned).map((ip) => ip.id))
   for (const id of [...selectedReserved]) if (!free.has(id)) selectedReserved.delete(id)
@@ -1559,13 +1658,177 @@ async function detachMulti(privateIpIds: string[], label: string) {
 }
 
 async function detachSelectedMulti() {
-  const items = (multiInfo.value?.items || []).filter((m) => selectedMulti.has(m.private_ip_id))
+  const items = selectedManagedMulti.value
   if (!items.length) return
   await detachMulti(
     items.map((m) => m.private_ip_id),
     `${items.length} 个多出口 IP（${items.map((m) => m.public_ip || m.private_ip).slice(0, 10).join('、')}）`,
   )
 }
+
+// ---- 多出口：一键更换公网 IP（私网 IP 不变）----
+// 更换在服务端后台跑（几分钟），这里每 3 秒问一次面板自己的进度接口 ——
+// 那个接口只读面板数据库，不请求 Oracle。
+type RotateItem = {
+  private_ip_id: string
+  private_ip: string
+  old_ip: string
+  new_ip: string
+  name: string
+  status: string
+  message: string
+  same_address: boolean
+}
+type RotateJob = {
+  state: string // running | done | failed | interrupted
+  phase: string
+  message: string
+  started_at: string
+  updated_at: string
+  finished_at: string
+  items: RotateItem[]
+}
+const ROTATE_STATE: Record<string, string> = {
+  running: '进行中',
+  done: '已完成',
+  failed: '有失败',
+  interrupted: '已中断',
+}
+const ROTATE_PHASE: Record<string, string> = {
+  plan: '准备',
+  release: '删除旧 IP',
+  wait_release: '等待 Oracle 释放名额',
+  create: '申请新 IP 并绑定',
+  wait_assign: '等待绑定完成',
+  done: '结束',
+}
+const ROTATE_STATUS: Record<string, string> = {
+  pending: '待处理',
+  releasing: '删除中',
+  released: '待申请',
+  assigning: '绑定中',
+  create_failed: '申请失败',
+  done: '完成',
+  failed: '失败',
+  skipped: '跳过',
+}
+const rotateJob = ref<RotateJob | null>(null)
+const rotateBusy = ref(false)
+const rotateRunning = computed(() => rotateBusy.value || rotateJob.value?.state === 'running')
+const rotateTotal = computed(
+  () => (rotateJob.value?.items || []).filter((it) => it.status !== 'skipped').length,
+)
+const rotateFinished = computed(
+  () => (rotateJob.value?.items || []).filter((it) => it.status === 'done' || it.status === 'failed').length,
+)
+let rotateTimer: ReturnType<typeof setTimeout> | null = null
+
+function stopRotatePoll() {
+  if (rotateTimer) {
+    clearTimeout(rotateTimer)
+    rotateTimer = null
+  }
+}
+
+function scheduleRotatePoll(act: ReturnType<typeof beginAction>) {
+  stopRotatePoll()
+  rotateTimer = setTimeout(() => {
+    rotateTimer = null
+    if (!act.moved()) void pollRotate(act)
+  }, 3000)
+}
+
+async function pollRotate(act: ReturnType<typeof beginAction>) {
+  try {
+    const { data } = await api.get(`/tenants/${act.tenant}/instances/${act.target}/multi-ips/rotate`)
+    if (act.moved()) return
+    rotateJob.value = data.job || null
+  } catch {
+    // 一次没读到（网络抖动）不算结束：任务还在服务端跑，下一轮接着问。
+    if (act.moved()) return
+  }
+  if (rotateJob.value?.state === 'running') {
+    scheduleRotatePoll(act)
+    return
+  }
+  // 结束了：重读一次两张表，显示新地址（顺带清掉已经不存在的勾选）。
+  await refreshNetworkTab()
+}
+
+async function loadRotateJob() {
+  const act = beginAction()
+  let job: RotateJob | null
+  try {
+    const { data } = await api.get(`/tenants/${act.tenant}/instances/${act.target}/multi-ips/rotate`)
+    job = data.job || null
+  } catch {
+    return // 进度读不到不影响两张表
+  }
+  if (act.moved()) return
+  // 很久以前顺利完成的任务不必每次刷新都摆出来；进行中、失败、中断的要让人看到。
+  rotateJob.value = job && (job.state !== 'done' || rotateJob.value) ? job : null
+  if (rotateJob.value?.state === 'running' && !rotateTimer) scheduleRotatePoll(act)
+}
+
+async function startRotate(picked: MultiIp[]) {
+  const act = beginAction()
+  if (!picked.length) return
+  const withIp = picked.filter((m) => m.public_ip).length
+  const empty = picked.length - withIp
+  const one = picked.length === 1 ? picked[0] : null
+  const lines = [
+    one
+      ? `${one.public_ip ? '更换' : '分配'}实例 ${targetLabel(act.target)} 上辅助 IP ${one.private_ip} 的公网 IP${one.public_ip ? `（现在是 ${one.public_ip}）` : ''}？`
+      : `更换实例 ${targetLabel(act.target)} 上 ${picked.length} 个辅助 IP 的公网 IP？`,
+    '',
+  ]
+  if (withIp) {
+    lines.push(
+      `会先删除${withIp > 1 ? `这 ${withIp} 个` : ''}旧公网 IP（地址立即释放，无法找回），等 Oracle 释放名额后再申请新的，绑回原来的私网 IP。`,
+      withIp > 1 ? '期间这些出口全部断开，估计几分钟。' : '期间这个出口断开，直到新 IP 绑好。',
+    )
+  }
+  if (empty) lines.push(`其中 ${empty} 个现在没有公网 IP，会直接分配新的。`)
+  lines.push('主公网 IP 和 SSH 不受影响；私网 IP 不变，服务器里不用改配置。')
+  if (!confirm(lines.join('\n'))) return
+  rotateBusy.value = true
+  error.value = ''
+  msg.value = ''
+  try {
+    const { data } = await api.post(
+      `/tenants/${act.tenant}/instances/${act.target}/multi-ips/rotate`,
+      { private_ip_ids: picked.map((m) => m.private_ip_id) },
+      // 只做规划（几次只读调用）就返回，更换本身在后台。
+      { timeout: 120_000 },
+    )
+    if (act.moved()) return
+    if (data.ok) {
+      msg.value = data.message
+      rotateJob.value = data.job || null
+      selectedMulti.clear()
+      scheduleRotatePoll(act)
+    } else {
+      error.value = data.message
+    }
+  } catch (e: any) {
+    if (act.moved()) return
+    error.value = e?.message || '更换失败'
+    // 409 = 已经有一个更换在跑（比如在别的页面点的）：把它的进度显示出来。
+    if (e?.response?.status === 409) void loadRotateJob()
+  } finally {
+    rotateBusy.value = false
+  }
+}
+
+function rotateAll() {
+  void startRotate(multiInfo.value?.items || [])
+}
+
+function rotateSelected() {
+  void startRotate((multiInfo.value?.items || []).filter((m) => selectedMulti.has(m.private_ip_id)))
+}
+
+onBeforeUnmount(stopRotatePoll)
 
 async function installIpSync() {
   const act = beginAction()
@@ -2982,6 +3245,9 @@ function resetInstanceState() {
   multiInfo.value = null
   selectedReserved.clear()
   selectedMulti.clear()
+  // 更换进度属于上一台；轮询也要停，否则 A 的进度会继续往 B 的页面上写。
+  stopRotatePoll()
+  rotateJob.value = null
   batchForm.open = false
   syncResult.value = null
   syncCreds.privateKeyPem = ''

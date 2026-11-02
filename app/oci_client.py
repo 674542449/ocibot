@@ -10073,6 +10073,9 @@ class TenantSession:
                     or getattr(ip, "private_ip_id", "")
                     or "",
                     "time_created": str(getattr(ip, "time_created", "") or ""),
+                    # 更换公网 IP 时新 IP 要建在同一个区间、同一个地址池（BYOIP）里。
+                    "compartment_id": getattr(ip, "compartment_id", "") or "",
+                    "public_ip_pool_id": getattr(ip, "public_ip_pool_id", "") or "",
                 }
             )
         return items
@@ -10466,6 +10469,341 @@ class TenantSession:
         else:
             msg = f"已解绑 {len(done)} 个（保留 IP 仍在，可再次绑定）"
         return OperationResult(ok=not failure, message=msg, data={"detached": done, "failed": failure})
+
+    # ------------------------------------------------------------------
+    # 多出口 IP：一键更换公网 IP（私网 IP 不变）
+    #
+    # 辅助私网 IP 只能绑保留 IP（CreatePublicIp 文档：临时 IP 只能给主私网 IP），
+    # 所以「换一个地址」= 删掉旧保留 IP，再申请一个新的绑回同一个私网 IP。
+    # 先把这一批旧 IP **全部**删掉、等 Oracle 真正释放名额，再统一申请：每区域保留 IP
+    # 上限 50 个，先建后删在用满时一定撞上限。代价是这批出口同时断开，直到换完。
+    # 主私网 IP 不在范围内；私网 IP、网卡、实例元数据都不动，服务器里不用改配置。
+    #
+    # 每个条目的 status：pending → releasing → released → assigning → done，
+    # 或 failed / skipped。web/backend/ip_rotation.py 把它们存进数据库给页面看进度。
+    # ------------------------------------------------------------------
+    ROTATE_POLL_SEC = 3.0
+    ROTATE_RELEASE_TIMEOUT = 180.0
+    ROTATE_ASSIGN_TIMEOUT = 180.0
+    # 限流 / 名额还没腾出来时，单次调用最多重试这么久。
+    ROTATE_RETRY_SEC = 90.0
+
+    def _public_ip_of_private(self, private_ip_id: str) -> Optional[dict]:
+        """按私网 IP 问它绑着的公网 IP；没有返回 None（Oracle 回 404）。"""
+        try:
+            ip = self.network.get_public_ip_by_private_ip_id(
+                oci.core.models.GetPublicIpByPrivateIpIdDetails(private_ip_id=private_ip_id)
+            ).data
+        except ServiceError as exc:
+            if getattr(exc, "status", None) == 404:
+                return None
+            raise
+        return {
+            "id": ip.id,
+            "ip_address": getattr(ip, "ip_address", "") or "",
+            "display_name": getattr(ip, "display_name", "") or "",
+            "lifecycle_state": getattr(ip, "lifecycle_state", "") or "",
+            "lifetime": getattr(ip, "lifetime", "") or "",
+            "compartment_id": getattr(ip, "compartment_id", "") or "",
+            "public_ip_pool_id": getattr(ip, "public_ip_pool_id", "") or "",
+        }
+
+    def plan_multi_ip_rotation(
+        self,
+        instance_id: str,
+        compartment_id: str,
+        private_ip_ids: list[str],
+        hints: Optional[dict[str, dict[str, str]]] = None,
+    ) -> OperationResult:
+        """要换哪些辅助私网 IP、它们现在绑着哪个保留 IP —— 只读，不改任何东西。
+
+        没有公网 IP 的辅助 IP 也可以选：上一次更换中途失败、旧 IP 删了新 IP 没申请到，
+        再跑一次就补上。``hints`` 是上一次任务记下的名字 / 区间 / 地址池，补分配时沿用
+        —— 旧 IP 删掉之后，这些就问不到 Oracle 了。
+        """
+        hints = hints or {}
+        wanted = list(dict.fromkeys(i for i in private_ip_ids if i))
+        if not wanted:
+            return OperationResult(ok=False, message="没有选择要更换的 IP")
+        try:
+            _network, privs = self._primary_vnic_private_ips(instance_id, compartment_id)
+            secondary = {p.id: p for p in privs if not getattr(p, "is_primary", False)}
+            for pid in wanted:
+                # 主私网 IP 也在这里被挡掉：它不在 secondary 里。
+                if pid not in secondary:
+                    return OperationResult(ok=False, message="所选 IP 不是本实例的辅助私网 IP，请刷新后重试")
+            targets = [secondary[pid] for pid in wanted]
+            default_comp = self.resolve_compartment()
+            by_private = {
+                r["private_ip_id"]: r
+                for r in self.list_reserved_public_ips(default_comp)
+                if r["private_ip_id"]
+            }
+            items: list[dict[str, Any]] = []
+            for p in targets:
+                private_ip = getattr(p, "ip_address", "") or ""
+                hint = hints.get(p.id) or {}
+                r = by_private.get(p.id)
+                if r is None:
+                    # 不在默认区间的列表里不等于没有公网 IP（可能建在别的区间）：按私网 IP 再问一次。
+                    r = self._public_ip_of_private(p.id)
+                item: dict[str, Any] = {
+                    "private_ip_id": p.id,
+                    "private_ip": private_ip,
+                    "old_public_ip_id": "",
+                    "old_ip": "",
+                    "name": hint.get("name") or f"ip-{private_ip}",
+                    "compartment_id": hint.get("compartment_id") or default_comp,
+                    "pool_id": hint.get("pool_id") or "",
+                    "new_public_ip_id": "",
+                    "new_ip": "",
+                    "status": "pending",
+                    "message": "",
+                }
+                if r is not None:
+                    state = str(r.get("lifecycle_state") or "").upper()
+                    item.update(
+                        old_public_ip_id=r["id"],
+                        old_ip=r.get("ip_address") or "",
+                        name=r.get("display_name") or item["name"],
+                        compartment_id=r.get("compartment_id") or item["compartment_id"],
+                        pool_id=r.get("public_ip_pool_id") or "",
+                    )
+                    if str(r.get("lifetime") or "RESERVED").upper() != "RESERVED":
+                        item.update(status="skipped", message="绑的不是保留 IP，不处理")
+                    elif state != "ASSIGNED":
+                        item.update(
+                            status="skipped",
+                            message=f"公网 IP 正在变更中（{state or '状态未知'}），这次跳过",
+                        )
+                items.append(item)
+        except OCIClientError as exc:
+            return OperationResult(ok=False, message=str(exc))
+        except ServiceError as exc:
+            return OperationResult(ok=False, message=_format_service_error(exc))
+        items.sort(key=lambda i: ipaddress.ip_address(i["private_ip"]) if i["private_ip"] else ipaddress.ip_address("0.0.0.0"))
+        if not any(i["status"] == "pending" for i in items):
+            return OperationResult(ok=False, message=items[0]["message"] or "没有可以更换的 IP", data={"items": items})
+        return OperationResult(ok=True, message="", data={"items": items})
+
+    def _rotate_call(self, fn: Callable[[], Any], retry: Callable[[ServiceError], bool] = lambda _e: False) -> Any:
+        """调一次 Oracle；被限流（或 ``retry`` 认为值得再试）就等一会儿重试，有总时限。"""
+        deadline = time.monotonic() + self.ROTATE_RETRY_SEC
+        while True:
+            try:
+                return fn()
+            except ServiceError as exc:
+                if (is_rate_limit_error(exc) or retry(exc)) and time.monotonic() < deadline:
+                    time.sleep(self.ROTATE_POLL_SEC)
+                    continue
+                raise
+
+    @staticmethod
+    def _rotate_create_retryable(exc: ServiceError) -> bool:
+        """刚删掉的 IP 可能还占着名额（LimitExceeded），或私网 IP 上的旧绑定还没清干净（409）。
+
+        5xx 不重试：那种情况下 Oracle 可能已经建好了，再建一次只会撞「已有公网 IP」。
+        确认阶段会按私网 IP 把它认回来。
+        """
+        if getattr(exc, "status", None) == 409:
+            return True
+        blob = f"{getattr(exc, 'code', '') or ''} {getattr(exc, 'message', '') or ''}".lower()
+        return "limitexceeded" in blob or ("limit" in blob and "exceed" in blob)
+
+    def _rotation_snapshot(self, items: list[dict]) -> tuple[dict[str, dict], dict[str, dict]]:
+        """各条目所在区间的保留 IP（按 id、按私网 IP 索引）。一个区间一次列表调用，覆盖全部条目。"""
+        by_id: dict[str, dict] = {}
+        by_private: dict[str, dict] = {}
+        for comp in dict.fromkeys(i["compartment_id"] for i in items if i.get("compartment_id")):
+            for r in self.list_reserved_public_ips(comp):
+                by_id[r["id"]] = r
+                if r["private_ip_id"]:
+                    by_private[r["private_ip_id"]] = r
+        return by_id, by_private
+
+    def rotate_multi_ips(
+        self,
+        items: list[dict],
+        on_progress: Optional[Callable[[str, list[dict]], None]] = None,
+    ) -> OperationResult:
+        """按 plan_multi_ip_rotation 的结果执行：全部删除 → 等释放 → 申请并绑定 → 确认。
+
+        ``on_progress(phase, items)`` 在每一步之后调用（phase：release / wait_release /
+        create / wait_assign），给后台任务存进度；它出错不影响更换本身。
+        """
+        items = [dict(i) for i in items]
+
+        def report(phase: str) -> None:
+            if on_progress is None:
+                return
+            try:
+                on_progress(phase, items)
+            except Exception:  # noqa: BLE001 - 进度没存上不能让更换停在半路
+                _OCI_LOG.exception("rotation progress callback failed")
+
+        def waiting(status: str) -> list[dict]:
+            return [i for i in items if i["status"] == status]
+
+        # 以 "_" 开头的键只在这次执行里用，结束前去掉。
+        #
+        # 1. 删除这一批的全部旧 IP。Oracle 先解绑再删除，都是异步的。
+        #    每个 IP 单独兜住所有异常：已经删了一部分，一个网络超时不能让其余的半途而废。
+        for it in waiting("pending"):
+            if not it["old_public_ip_id"]:
+                it["status"] = "released"  # 本来就没有公网 IP：直接分配新的
+                continue
+            old_id = it["old_public_ip_id"]
+            try:
+                self._rotate_call(lambda: self.network.delete_public_ip(old_id))
+                it["status"] = "releasing"
+            except ServiceError as exc:
+                if getattr(exc, "status", None) == 404:
+                    # 不能当成「已经删了」：Oracle 对没有权限的请求也回 404。交给下面按列表确认。
+                    it.update(status="releasing", _unconfirmed="Oracle 回 404，可能是没有删除权限")
+                else:
+                    it.update(status="failed", message=f"删除旧 IP 失败，这个没有更换：{_format_service_error(exc)}")
+            except Exception as exc:  # noqa: BLE001 - 超时之类：删没删不知道，按列表确认
+                it.update(status="releasing", _unconfirmed=safe_error_text(exc))
+            report("release")
+
+        # 2. 等旧 IP 彻底删除（列表里没有了或 TERMINATED）。只看到解绑还不够：
+        #    TERMINATING 的 IP 可能还占着名额，用满 50 个时马上申请会被拒。
+        deadline = time.monotonic() + self.ROTATE_RELEASE_TIMEOUT
+        while waiting("releasing"):
+            try:
+                by_id, _ = self._rotation_snapshot(items)
+            except Exception:  # noqa: BLE001 - 这一轮没读到，下一轮再读；旧 IP 已经在删了，不能就此放弃
+                by_id = None
+            if by_id is not None:
+                for it in waiting("releasing"):
+                    r = by_id.get(it["old_public_ip_id"])
+                    state = str((r or {}).get("lifecycle_state") or "").upper()
+                    if r is None or state == "TERMINATED":
+                        it["status"] = "released"
+                        continue
+                    it["_state"] = state
+                    # 删除请求没被确认、两轮之后还好好绑着：就是没删，别再等满三分钟。
+                    if it.get("_unconfirmed") and state == "ASSIGNED":
+                        it["_still"] = it.get("_still", 0) + 1
+                        if it["_still"] >= 2:
+                            it.update(status="failed", message=f"旧 IP 没有被删除（{it['_unconfirmed']}），这个没有更换")
+            report("wait_release")
+            if not waiting("releasing"):
+                break
+            if time.monotonic() >= deadline:
+                for it in waiting("releasing"):
+                    if it.get("_state") == "ASSIGNED":
+                        it.update(status="failed", message="旧 IP 一直没有被删除，这个没有更换")
+                    else:
+                        it.update(
+                            status="failed",
+                            message="旧 IP 超时仍未删除完，没有给它申请新 IP；稍后勾选它再点更换即可补上",
+                        )
+                break
+            time.sleep(self.ROTATE_POLL_SEC)
+
+        # 3. 申请新保留 IP，同一次调用里直接绑到原来的私网 IP。名字、区间、地址池沿用旧的。
+        for it in waiting("released"):
+            details = oci.core.models.CreatePublicIpDetails(
+                compartment_id=it["compartment_id"],
+                lifetime="RESERVED",
+                private_ip_id=it["private_ip_id"],
+                display_name=it["name"] or None,
+                public_ip_pool_id=it["pool_id"] or None,
+            )
+            try:
+                ip = self._rotate_call(
+                    lambda: self.network.create_public_ip(details).data,
+                    retry=self._rotate_create_retryable,
+                )
+                it.update(
+                    status="assigning",
+                    new_public_ip_id=ip.id,
+                    new_ip=getattr(ip, "ip_address", "") or "",
+                )
+            except Exception as exc:  # noqa: BLE001 - 一个失败不能让后面的私网 IP 都没有公网 IP
+                reason = _format_service_error(exc) if isinstance(exc, ServiceError) else safe_error_text(exc)
+                it.update(
+                    status="create_failed",
+                    message=f"申请新 IP 失败，这个私网 IP 现在没有公网 IP（勾选它再点更换可补上）：{reason}",
+                )
+            report("create")
+
+        # 4. 确认绑定完成。UpdatePublicIp 文档：异步绑定可能悄悄失败、IP 变回 AVAILABLE，
+        #    所以一定要看到 ASSIGNED 才算数；变回 AVAILABLE 的再绑一次。
+        deadline = time.monotonic() + self.ROTATE_ASSIGN_TIMEOUT
+        first_round = bool(waiting("assigning") or waiting("create_failed"))
+        while first_round or waiting("assigning"):
+            try:
+                by_id, by_private = self._rotation_snapshot(items)
+            except Exception:  # noqa: BLE001 - 下一轮再读
+                by_id = by_private = None
+            if by_id is not None and by_private is not None:
+                first_round = False
+                # 申请报错的，Oracle 可能其实已经建好并绑上了（超时 / 5xx）：按私网 IP 认回来。
+                # 认回来的不能是旧 IP 本身 —— 那说明旧的根本没删掉，不是「换了」。
+                for it in waiting("create_failed"):
+                    r = by_private.get(it["private_ip_id"])
+                    if r is not None and r["assigned"] and r["id"] != it["old_public_ip_id"]:
+                        it.update(status="assigning", new_public_ip_id=r["id"],
+                                  new_ip=r.get("ip_address") or "", message="")
+                for it in waiting("assigning"):
+                    r = by_id.get(it["new_public_ip_id"])
+                    state = str((r or {}).get("lifecycle_state") or "").upper()
+                    if state == "ASSIGNED":
+                        it["status"] = "done"
+                        it["new_ip"] = (r or {}).get("ip_address") or it["new_ip"]
+                        if it["old_ip"] and it["new_ip"] == it["old_ip"]:
+                            it["same_address"] = True
+                            it["message"] = "Oracle 分回了原来的地址，可以稍后再换一次"
+                    elif state == "AVAILABLE":
+                        left = f"新 IP {it['new_ip']} 申请到了但没能绑上，它留在保留 IP 列表里，可以手动绑定"
+                        if it.get("_rebound"):
+                            # 重绑之后紧接着那一轮，列表可能还没反映出来：连续两轮仍是 AVAILABLE 才算失败。
+                            it["_available"] = it.get("_available", 0) + 1
+                            if it["_available"] >= 2:
+                                it.update(status="failed", message=left)
+                            continue
+                        it["_rebound"] = True
+                        try:
+                            self._rotate_call(lambda: self.network.update_public_ip(
+                                it["new_public_ip_id"],
+                                oci.core.models.UpdatePublicIpDetails(private_ip_id=it["private_ip_id"]),
+                            ))
+                        except Exception as exc:  # noqa: BLE001
+                            reason = _format_service_error(exc) if isinstance(exc, ServiceError) else safe_error_text(exc)
+                            it.update(status="failed", message=f"{left}：{reason}")
+                    else:
+                        it.pop("_available", None)
+            report("wait_assign")
+            if not first_round and not waiting("assigning"):
+                break
+            if time.monotonic() >= deadline:
+                for it in waiting("assigning"):
+                    it.update(
+                        status="failed",
+                        message=f"新 IP {it['new_ip']} 超时仍未绑定完成，请稍后点刷新查看",
+                    )
+                break
+            time.sleep(self.ROTATE_POLL_SEC)
+
+        for it in items:
+            if it["status"] == "create_failed":
+                it["status"] = "failed"
+            for key in [k for k in it if k.startswith("_")]:
+                del it[key]
+        done = waiting("done")
+        failed = waiting("failed")
+        skipped = waiting("skipped")
+        same = [i for i in done if i.get("same_address")]
+        parts = [f"已更换 {len(done)} 个公网 IP（私网 IP 不变）"]
+        if same:
+            parts.append(f"其中 {len(same)} 个 Oracle 分回了原地址")
+        if failed:
+            parts.append(f"{len(failed)} 个失败，见下表")
+        if skipped:
+            parts.append(f"{len(skipped)} 个跳过")
+        return OperationResult(ok=not failed, message="；".join(parts), data={"items": items})
 
     # ------------------------------------------------------------------
     # Boot volume backups

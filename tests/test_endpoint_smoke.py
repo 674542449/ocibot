@@ -187,6 +187,13 @@ def make_session():
     )
     s.detach_multi_ips.return_value = R(True, "已解绑 1 个", {"detached": ["1.1.1.1"], "failed": ""})
     s.publish_secondary_ips.return_value = R(True, "已写入实例元数据", {"ips": ["10.0.0.11"]})
+    _rot_item = {"private_ip_id": "pv1", "private_ip": "10.0.0.11", "old_public_ip_id": "pip1",
+                 "old_ip": "1.1.1.1", "name": "proxy-01", "compartment_id": "c1", "pool_id": "",
+                 "new_public_ip_id": "", "new_ip": "", "status": "pending", "message": ""}
+    s.plan_multi_ip_rotation.return_value = R(True, "", {"items": [dict(_rot_item)]})
+    s.rotate_multi_ips.return_value = R(
+        True, "已更换 1 个公网 IP", {"items": [dict(_rot_item, status="done", new_ip="2.2.2.2")]}
+    )
     s.home_region.return_value = "ap-tokyo-1"
     s.list_subscribed_regions.return_value = R(
         True,
@@ -502,6 +509,7 @@ def test_every_endpoint_is_wired() -> None:
             (f"/api/tenants/{tid}/reserved-ips/batch", {"count": 2, "name_prefix": "proxy"}),
             (f"/api/tenants/{tid}/instances/{iid}/multi-ips/attach", {"public_ip_ids": ["pip1"]}),
             (f"/api/tenants/{tid}/instances/{iid}/multi-ips/install-sync", {"ssh_username": "ubuntu"}),
+            (f"/api/tenants/{tid}/instances/{iid}/multi-ips/rotate", {"private_ip_ids": ["pv1"]}),
         ]
         r = c.get(f"/api/tenants/{tid}/instances/{iid}/multi-ips")
         assert r.status_code == 200 and r.json()["allowed"] is False, r.text
@@ -522,6 +530,11 @@ def test_every_endpoint_is_wired() -> None:
             check("POST", p, c.post(p, json=body))
         p = f"/api/tenants/{tid}/instances/{iid}/multi-ips/detach"
         check("POST", p, c.post(p, json={"private_ip_ids": ["pv1"]}))
+        # 更换在后台线程里跑；进度接口只读数据库，任务还没跑完也不能 5xx。
+        p = f"/api/tenants/{tid}/instances/{iid}/multi-ips/rotate"
+        r = c.get(p)
+        check("GET", p, r)
+        assert r.status_code == 200 and r.json()["job"] is not None, r.text
         with SessionLocal() as db:
             db.get(Tenant, tid).account_tier = ""
             db.commit()
