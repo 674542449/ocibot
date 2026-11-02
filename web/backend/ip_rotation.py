@@ -135,13 +135,14 @@ def start_rotation(
     instance_id: str,
     compartment_id: str,
     private_ip_ids: list[str],
+    expected: Optional[dict[str, str]] = None,
 ) -> dict[str, Any]:
-    """先在请求里做完只读的规划（选错了当场报），再把更换交给后台线程。"""
+    """先在请求里做完只读的规划（选错了、列表过期了当场报），再把更换交给后台线程。"""
     previous = read_job(db, tenant_id, instance_id)
     if is_running(previous):
         raise RotationBusy("这台实例已经有一个更换任务在进行，请等它结束")
     plan = session.plan_multi_ip_rotation(
-        instance_id, compartment_id, private_ip_ids, hints=_hints(previous)
+        instance_id, compartment_id, private_ip_ids, hints=_hints(previous), expected=expected
     )
     if not plan.ok:
         return {"ok": False, "message": plan.message, "job": job_view(previous)}

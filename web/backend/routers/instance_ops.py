@@ -1326,6 +1326,9 @@ class MultiIpRotate(BaseModel):
     # 必须逐个列出，没有「空 = 全部」：页面上的列表可能已经过时，服务端自己挑「全部」
     # 换掉的就不一定是确认框里列出的那一批。
     private_ip_ids: list[str] = Field(min_length=1, max_length=64)
+    # 确认框里每个私网 IP 显示的公网 IP（"" = 没有）。和 Oracle 现在的对不上就不做，
+    # 免得删掉一个用户没看到、没确认过的地址（列表过期，或公网 IP 在别的区间）。
+    expected: Optional[dict[str, str]] = Field(default=None, max_length=64)
 
 
 class IpSyncInstall(BaseModel):
@@ -1471,6 +1474,7 @@ def rotate_multi_ips(
             instance_id=instance_id,
             compartment_id=info.compartment_id,
             private_ip_ids=body.private_ip_ids,
+            expected=body.expected,
         )
     except ip_rotation.RotationBusy as exc:
         raise HTTPException(status_code=409, detail=safe_error_text(exc)) from exc

@@ -10274,7 +10274,15 @@ class TenantSession:
         for p in privs:
             if getattr(p, "is_primary", False):
                 continue
-            pub = by_private.get(p.id) or {}
+            pub = by_private.get(p.id)
+            if pub is None:
+                # 默认区间的列表里没有，不等于没有公网 IP（可能建在别的区间）。这里显示成「没有」的话，
+                # 更换时确认框会写「直接分配」，实际却要删掉一个用户没看到的地址。只对这些行多问一次。
+                try:
+                    pub = self._public_ip_of_private(p.id)
+                except Exception:  # noqa: BLE001 - 读不到就照旧显示为空；更换前的核对会把它拦下
+                    pub = None
+            pub = pub or {}
             tags = getattr(p, "freeform_tags", None) or {}
             items.append(
                 {
@@ -10514,12 +10522,16 @@ class TenantSession:
         compartment_id: str,
         private_ip_ids: list[str],
         hints: Optional[dict[str, dict[str, str]]] = None,
+        expected: Optional[dict[str, str]] = None,
     ) -> OperationResult:
         """要换哪些辅助私网 IP、它们现在绑着哪个保留 IP —— 只读，不改任何东西。
 
         没有公网 IP 的辅助 IP 也可以选：上一次更换中途失败、旧 IP 删了新 IP 没申请到，
         再跑一次就补上。``hints`` 是上一次任务记下的名字 / 区间 / 地址池，补分配时沿用
         —— 旧 IP 删掉之后，这些就问不到 Oracle 了。
+
+        ``expected`` 是确认框里每个私网 IP 显示的公网 IP（"" = 没有）。和 Oracle 现在的
+        不一致就整批不做：要删的必须是用户确认过的那个地址，列表过期或没看到的不能删。
         """
         hints = hints or {}
         wanted = list(dict.fromkeys(i for i in private_ip_ids if i))
@@ -10582,6 +10594,18 @@ class TenantSession:
         except ServiceError as exc:
             return OperationResult(ok=False, message=_format_service_error(exc))
         items.sort(key=lambda i: ipaddress.ip_address(i["private_ip"]) if i["private_ip"] else ipaddress.ip_address("0.0.0.0"))
+        for it in items:
+            if expected is None or it["private_ip_id"] not in expected:
+                continue
+            shown = expected[it["private_ip_id"]] or ""
+            if shown != it["old_ip"]:
+                actual = f"绑的是 {it['old_ip']}" if it["old_ip"] else "没有公网 IP"
+                seen = shown or "没有公网 IP"
+                return OperationResult(
+                    ok=False,
+                    message=f"列表已经过期：私网 IP {it['private_ip']} 现在{actual}，页面上显示的是 {seen}。"
+                    "请点「刷新」后再操作，这次什么都没有改。",
+                )
         if not any(i["status"] == "pending" for i in items):
             return OperationResult(ok=False, message=items[0]["message"] or "没有可以更换的 IP", data={"items": items})
         return OperationResult(ok=True, message="", data={"items": items})

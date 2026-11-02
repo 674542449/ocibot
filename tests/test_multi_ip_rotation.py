@@ -128,6 +128,8 @@ class _Oracle:
 
     # ---- TenantSession.list_reserved_public_ips 的替身
     def list_reserved(self, compartment_id=None):
+        # 和真的一样：不给区间就是默认区间（resolve_compartment），不是全部区间。
+        compartment_id = compartment_id or "comp"
         self.calls.append("list")
         if self.list_errors:
             self.list_errors -= 1
@@ -578,8 +580,9 @@ class _FakeSession:
         self.crash = crash
         self.hints = None
 
-    def plan_multi_ip_rotation(self, instance_id, compartment_id, private_ip_ids, hints=None):
+    def plan_multi_ip_rotation(self, instance_id, compartment_id, private_ip_ids, hints=None, expected=None):
         self.hints = hints
+        self.expected = expected
         return SimpleNamespace(ok=True, message="", data={"items": [dict(_ITEM)]})
 
     def rotate_multi_ips(self, items, on_progress=None):
@@ -707,6 +710,54 @@ def test_the_guarded_routes_call_the_rotation_check():
 
     for fn in (instance_ops.attach_reserved_ip, instance_ops.attach_multi_ips, instance_ops.detach_multi_ips):
         assert "_refuse_during_rotation(db, tenant_id, instance_id)" in inspect.getsource(fn), fn.__name__
+
+
+def test_nothing_is_deleted_when_the_page_showed_a_different_address():
+    """确认框写着「没有公网 IP、直接分配」，Oracle 那边其实绑着一个：不能把它删了。"""
+    o = _oracle(2)
+    res = _session(o).plan_multi_ip_rotation(
+        "inst", "comp", ["pv1", "pv2"], expected={"pv1": "", "pv2": "1.1.1.2"}
+    )
+    assert not res.ok
+    assert "列表已经过期" in res.message and "1.1.1.1" in res.message and "10.0.0.11" in res.message
+    assert o.writes() == []
+
+
+def test_a_stale_address_on_the_page_is_refused_too():
+    o = _oracle(1)
+    res = _session(o).plan_multi_ip_rotation("inst", "comp", ["pv1"], expected={"pv1": "8.8.8.8"})
+    assert not res.ok and "8.8.8.8" in res.message
+
+
+def test_matching_addresses_go_ahead():
+    o = _oracle(2, unbound=(2,))
+    res = _rotate(_session(o), ["pv1", "pv2"], expected={"pv1": "1.1.1.1", "pv2": ""})
+    assert res.ok, res.message
+    assert set(o.bound()) == {"pv1", "pv2"}
+
+
+def test_the_multi_ip_list_shows_a_public_ip_from_another_compartment():
+    """默认区间的列表里没有它；列表上显示成「没有」，确认框就会说错。"""
+    o = _oracle(2, unbound=(2,))
+    o.ips["old1"]["compartment_id"] = "other"
+    res = _session(o).list_multi_ips("inst", "comp")
+    assert res.ok, res.message
+    rows = {i["private_ip_id"]: i for i in res.data["items"]}
+    assert rows["pv1"]["public_ip"] == "1.1.1.1" and rows["pv1"]["public_ip_name"] == "proxy-01"
+    assert rows["pv2"]["public_ip"] == ""
+
+
+def test_the_start_passes_what_the_page_showed_to_the_plan(job_db):
+    maker, _threads = job_db
+    session = _FakeSession()
+    from web.backend import ip_rotation
+
+    with maker() as db:
+        ip_rotation.start_rotation(
+            db, session=session, owner_id="u1", tenant_id="t1", instance_id="ocid1.instance.oc1..abc",
+            compartment_id="comp", private_ip_ids=["pv1"], expected={"pv1": "1.1.1.1"},
+        )
+    assert session.expected == {"pv1": "1.1.1.1"}
 
 
 def test_the_route_refuses_an_empty_selection():

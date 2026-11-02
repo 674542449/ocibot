@@ -1840,7 +1840,11 @@ async function startRotate(picked: MultiIp[]) {
   try {
     const { data } = await api.post(
       `/tenants/${act.tenant}/instances/${act.target}/multi-ips/rotate`,
-      { private_ip_ids: picked.map((m) => m.private_ip_id) },
+      {
+        private_ip_ids: picked.map((m) => m.private_ip_id),
+        // 确认框是照着这些地址问的：服务端发现 Oracle 那边已经不是这样，就整批不做。
+        expected: Object.fromEntries(picked.map((m) => [m.private_ip_id, m.public_ip || ''])),
+      },
       // 只做规划（几次只读调用）就返回，更换本身在后台。
       { timeout: 120_000 },
     )
