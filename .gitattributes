@@ -1,0 +1,2 @@
+# Windows 批处理必须是 CRLF：用 LF 检出时 cmd 偶尔会把行拼错（git 的 core.autocrlf 因机器而异）。
+*.bat text eol=crlf

@@ -26,7 +26,8 @@
 **文档导航**：[快速安装](#快速安装推荐) · [手动部署](#手动-docker-部署) · [配置说明](#配置说明) ·
 [安全建议](#安全建议上线前) · [本地开发](#本地开发) · [故障排查](#故障排查) ·
 [部署细节](docs/DEPLOY.md) · [访问方式](docs/ACCESS-MODES.md) · [换机重装](docs/REDEPLOY.md) ·
-[NPM 反代](docs/NPM-REVERSE-PROXY.md) · [安全审计](web/AUDIT.md) · [变更记录](CHANGELOG.md)
+[NPM 反代](docs/NPM-REVERSE-PROXY.md) · [换 IP API](docs/API.md) · [安全审计](web/AUDIT.md) ·
+[变更记录](CHANGELOG.md)
 
 ---
 
@@ -389,7 +390,8 @@ ocibot/
 │   ├── Dockerfile
 │   └── .env.example            # 环境变量模板（密钥项故意留空）
 ├── tests/                      # pytest 测试（含接口冒烟、安全回归）
-├── docs/                       # 部署、访问方式、换机重装、反代说明
+├── docs/                       # 部署、访问方式、换机重装、反代说明、换 IP API
+├── tools/ip-api-gui/           # 本地图形界面的换 IP 小工具（调用换 IP API，只用 Python 标准库）
 ├── deploy/Caddyfile            # 域名模式下内置 Caddy 的配置
 ├── scripts/
 │   ├── install.sh              # Linux / macOS 安装、更新、切换访问方式
