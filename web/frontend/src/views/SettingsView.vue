@@ -152,7 +152,9 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-if="channels.length === 0">
+            <!-- 读完之前不能说「尚未配置」：那时只是还没读到。 -->
+            <SkeletonRows v-if="!pageLoaded" :cols="6" :rows="2" />
+            <tr v-else-if="channels.length === 0">
               <td colspan="6" class="muted empty">尚未配置任何通知渠道。强烈建议配置——抢机成功后可第一时间收到推送。</td>
             </tr>
             <tr v-for="c in channels" :key="c.id">
@@ -284,7 +286,8 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-if="!keys.length">
+            <SkeletonRows v-if="!pageLoaded" :cols="6" :rows="2" />
+            <tr v-else-if="!keys.length">
               <td colspan="6" class="muted empty">还没有 API 密钥</td>
             </tr>
             <tr v-for="k in keys" :key="k.id">
@@ -320,6 +323,7 @@ import { useRouter } from 'vue-router'
 import api from '@/api/client'
 import { useAuthStore } from '@/stores/auth'
 import { copyText } from '@/utils/toast'
+import SkeletonRows from '@/components/SkeletonRows.vue'
 
 type Channel = {
   id: string
@@ -636,11 +640,16 @@ async function logoutAll() {
   router.push({ name: 'login' })
 }
 
+/** 通知渠道和 API 密钥读完过一次没有（失败也算：有报错框在说原因）。之前两张表画骨架。 */
+const pageLoaded = ref(false)
+
 onMounted(async () => {
   try {
     await Promise.all([load(), loadKeys()])
   } catch (e: any) {
     error.value = e?.message || '加载失败'
+  } finally {
+    pageLoaded.value = true
   }
 })
 </script>

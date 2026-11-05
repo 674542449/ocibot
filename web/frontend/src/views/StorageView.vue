@@ -104,7 +104,9 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-if="!bootVolumes.length">
+            <!-- 读取中先画出表格的样子，不在那一刻说「暂无」或「尚未读取」。 -->
+            <SkeletonRows v-if="!bootVolumes.length && loading" :cols="7" :rows="4" />
+            <tr v-else-if="!bootVolumes.length">
               <td colspan="7" class="muted empty">{{ loaded.boot ? '暂无引导卷' : NOT_LOADED }}</td>
             </tr>
             <tr v-else-if="!filteredBoot.length">
@@ -222,7 +224,8 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-if="!blockVolumes.length">
+            <SkeletonRows v-if="!blockVolumes.length && loading" :cols="6" :rows="3" />
+            <tr v-else-if="!blockVolumes.length">
               <td colspan="6" class="muted empty">{{ loaded.block ? '暂无块卷' : NOT_LOADED }}</td>
             </tr>
             <tr v-for="v in blockVolumes" :key="v.id">
@@ -293,7 +296,8 @@
               </tr>
             </thead>
             <tbody>
-              <tr v-if="!buckets.length">
+              <SkeletonRows v-if="!buckets.length && loading" :cols="4" :rows="3" />
+              <tr v-else-if="!buckets.length">
                 <td colspan="4" class="muted empty">{{ loaded.buckets ? '暂无存储桶' : NOT_LOADED }}</td>
               </tr>
               <tr v-for="b in buckets" :key="b.name">
@@ -347,7 +351,8 @@
               </tr>
             </thead>
             <tbody>
-              <tr v-if="!objects.length">
+              <SkeletonRows v-if="!objects.length && busy" :cols="4" :rows="3" />
+              <tr v-else-if="!objects.length">
                 <td colspan="4" class="muted empty">空桶或未加载</td>
               </tr>
               <tr v-for="o in objects" :key="o.name">
@@ -380,6 +385,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import api, { type Tenant } from '@/api/client'
+import SkeletonRows from '@/components/SkeletonRows.vue'
 import { pickTenantId } from '@/stores/tenantLock'
 
 type TabId = 'boot' | 'block' | 'object'

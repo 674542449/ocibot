@@ -54,7 +54,9 @@
           </tr>
         </thead>
         <tbody>
-          <tr v-if="tenants.length === 0">
+          <!-- 第一次读完之前不能说「还没有租户」：那时只是还没读到。 -->
+          <SkeletonRows v-if="!listLoaded" :cols="7" :rows="3" />
+          <tr v-else-if="tenants.length === 0">
             <td colspan="7" class="muted empty">还没有租户，点击右上角添加，或粘贴原始 API 配置。</td>
           </tr>
           <tr v-for="t in orderedTenants" :key="t.id" :class="{ 'sub-row': !!t.parent_tenant_id }">
@@ -200,7 +202,7 @@
         因此副区租户默认为「允许超额计费」。免费账号通常没有开通副区的权限。
       </p>
 
-      <div v-if="regionsLoading" class="muted">正在读取区域…</div>
+      <SkeletonBlock v-if="regionsLoading" :lines="4" label="正在读取区域…" />
       <div v-else-if="regionsError" class="error-box">{{ regionsError }}</div>
       <template v-else-if="regions">
         <div class="field">
@@ -486,6 +488,8 @@ key_file=~/.oci/oci_api_key.pem"
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import api, { type Tenant, type TenantRegions } from '@/api/client'
+import SkeletonBlock from '@/components/SkeletonBlock.vue'
+import SkeletonRows from '@/components/SkeletonRows.vue'
 import Icon from '@/components/Icon.vue'
 import {
   isTenantLocked,
@@ -914,14 +918,21 @@ function openEdit(t: Tenant) {
   showForm.value = true
 }
 
+/** 租户列表读完过一次没有（成功失败都算：失败时有报错框在说原因）。之前表格画骨架。 */
+const listLoaded = ref(false)
+
 async function load() {
-  const { data } = await api.get<Tenant[]>('/tenants')
-  tenants.value = data
-  pruneSelection()
-  // This page lists every tenant instead of picking one, so pickTenantId never
-  // runs here and the sidebar chip would show a lock with no name after a fresh
-  // sign-in — the session carries the id, not the name.
-  syncLockedTenantName(data)
+  try {
+    const { data } = await api.get<Tenant[]>('/tenants')
+    tenants.value = data
+    pruneSelection()
+    // This page lists every tenant instead of picking one, so pickTenantId never
+    // runs here and the sidebar chip would show a lock with no name after a fresh
+    // sign-in — the session carries the id, not the name.
+    syncLockedTenantName(data)
+  } finally {
+    listLoaded.value = true
+  }
 }
 
 async function pasteFromClipboard() {

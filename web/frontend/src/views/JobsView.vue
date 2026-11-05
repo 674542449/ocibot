@@ -50,7 +50,9 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-if="capacityJobs.length === 0">
+            <!-- 第一次读完之前不能说「暂无」：那时只是还没读到。 -->
+            <SkeletonRows v-if="!listLoaded" :cols="7" :rows="3" />
+            <tr v-else-if="capacityJobs.length === 0">
               <td colspan="7" class="muted empty">
                 暂无容量重试。可在「创建实例」勾选容量不足自动重试，成功后会显示在这里。
               </td>
@@ -92,7 +94,8 @@
               <tr v-if="openLog === j.id">
                 <td colspan="7" style="background: var(--input-bg)">
                   <div class="attempt-log">
-                    <div v-if="!(attempts[j.id] || []).length" class="muted">
+                    <SkeletonBlock v-if="attemptsLoading === j.id && !(attempts[j.id] || []).length" :lines="3" />
+                    <div v-else-if="!(attempts[j.id] || []).length" class="muted">
                       暂无尝试记录（Worker 每 {{ j.interval_sec }}s 尝试一次）
                     </div>
                     <div v-for="a in attempts[j.id] || []" :key="a.id" class="attempt-line">
@@ -121,6 +124,8 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import api, { type CapacityJob, type Tenant } from '@/api/client'
+import SkeletonBlock from '@/components/SkeletonBlock.vue'
+import SkeletonRows from '@/components/SkeletonRows.vue'
 
 type Attempt = {
   id: string
@@ -208,6 +213,11 @@ function fmt(v: string | null | undefined) {
  *  同一个 try 里：后端刚好这一瞬不可用（典型是面板自己做完一键更新、容器还在重启），
  *  load() 抛出来就被动作的 catch 接走，页面同时显示「已删除」和「删除失败」，
  *  表格里那条任务还在 —— 看着像没删掉，于是又删一次。刷新失败和操作失败必须分开说。 */
+/** 列表读完过一次没有（成功失败都算：失败时有报错在说原因）。之前表格画骨架。 */
+const listLoaded = ref(false)
+/** 正在第一次读哪条任务的尝试记录：读到之前画骨架，而不是先说「暂无尝试记录」。 */
+const attemptsLoading = ref('')
+
 async function load() {
   try {
     const [jobs, tenantList] = await Promise.all([
@@ -219,6 +229,8 @@ async function load() {
     if (openLog.value) await loadAttempts(openLog.value)
   } catch (e: any) {
     error.value = e?.message ? `刷新列表失败：${e.message}` : '刷新列表失败'
+  } finally {
+    listLoaded.value = true
   }
 }
 
@@ -248,7 +260,13 @@ async function toggleLog(j: CapacityJob) {
     return
   }
   openLog.value = j.id
-  await loadAttempts(j.id)
+  attemptsLoading.value = j.id
+  try {
+    await loadAttempts(j.id)
+  } finally {
+    // 读失败（任务刚被删）也要收起骨架，否则它会一直转下去。
+    if (attemptsLoading.value === j.id) attemptsLoading.value = ''
+  }
 }
 
 async function refreshCapacity() {

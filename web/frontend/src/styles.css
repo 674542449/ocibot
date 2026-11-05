@@ -874,3 +874,62 @@ td .mono {
   word-break: break-all;
 }
 
+
+/* ---------------------------------------------------------------------------
+   骨架屏（components/SkeletonRows.vue、SkeletonBlock.vue）
+
+   数据还在读的时候，先按真内容的版面画出灰色条块，读完再换成真内容 —— 不在那一刻写
+   「暂无 …」「还没有 …」（那是替一次还没结束的读取下结论），也不让表格先塌成一行字再撑开。
+   条块用描边色和次级面色做一道缓慢扫过的光；系统要求减少动效时，上面的全局规则会把它停住。
+   --------------------------------------------------------------------------- */
+.sk {
+  display: block;
+  height: 0.85em;
+  max-width: 100%;
+  border-radius: 4px;
+  background: linear-gradient(90deg, var(--border) 0%, var(--panel-2) 45%, var(--border) 90%);
+  background-size: 300% 100%;
+  animation: sk-shimmer 1.4s ease-in-out infinite;
+}
+
+.sk.sk-title {
+  height: 1.1em;
+}
+
+@keyframes sk-shimmer {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: 0 0;
+  }
+}
+
+/* 骨架行不跟着悬停变色：它不是一行能点的数据。 */
+tbody tr.sk-row:hover {
+  background: transparent;
+}
+
+tr.sk-row td {
+  padding-top: 0.7rem;
+  padding-bottom: 0.7rem;
+}
+
+.sk-block {
+  display: grid;
+  gap: 0.6rem;
+  padding: 0.25rem 0;
+}
+
+/* 只给读屏软件看的文字（骨架本身对它们没有意义）。 */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

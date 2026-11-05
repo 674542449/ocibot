@@ -80,6 +80,8 @@
           </tr>
         </thead>
         <tbody>
+          <!-- 第一次读取时先画出表格的样子；已经有数据再点刷新，就留着旧数据，不清空成骨架。 -->
+          <SkeletonRows v-if="loading && instances.length === 0" :cols="9" :rows="5" />
           <tr v-if="!loading && filtered.length === 0">
             <td colspan="9" class="muted empty">
               <template v-if="instances.length">没有匹配搜索的实例</template>
@@ -420,6 +422,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import api, { type Instance, type Tenant } from '@/api/client'
+import SkeletonRows from '@/components/SkeletonRows.vue'
 import { pickTenantId } from '@/stores/tenantLock'
 import { downloadBlob } from '@/utils/file'
 import { copyText, showToast } from '@/utils/toast'

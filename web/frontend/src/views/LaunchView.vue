@@ -172,6 +172,9 @@
       </div>
 
       <!-- Account free-tier usage, visible while configuring (not only at confirm). -->
+      <div v-if="loadingQuota && !quotaPreview" class="card quota-panel">
+        <SkeletonBlock title :lines="4" label="正在读取免费额度…" />
+      </div>
       <div v-if="quotaPreview" class="card quota-panel">
         <div class="row" style="justify-content: space-between; align-items: baseline">
           <strong v-if="quotaPreview.secondary_region">副区额度说明</strong>
@@ -249,7 +252,11 @@
         {{ (quotaVerdict.warnings || []).join('；') }}
       </div>
 
-      <div v-if="loadingMeta" class="muted">正在加载镜像 / Shape / 网络…</div>
+      <!-- 第一次加载时还没有任何选项：画出几行表单的样子；已经加载过再刷新，就只提一句，旧选项照常可用。 -->
+      <div v-if="loadingMeta && !meta" class="card" style="padding: 0.75rem">
+        <SkeletonBlock title :lines="5" label="正在加载镜像 / Shape / 网络…" />
+      </div>
+      <div v-else-if="loadingMeta" class="muted">正在重新加载镜像 / Shape / 网络…</div>
       <div v-if="meta?.network_note" class="muted" style="font-size: 13px">
         网络：{{ meta.network_note }}
         <span v-if="meta.network_created">（已自动创建）</span>
@@ -518,6 +525,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import api, { type Tenant } from '@/api/client'
+import SkeletonBlock from '@/components/SkeletonBlock.vue'
 import { pickTenantId } from '@/stores/tenantLock'
 import { pickAndReadTextFile } from '@/utils/file'
 import { copyText } from '@/utils/toast'

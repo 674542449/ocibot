@@ -121,7 +121,9 @@
     </div>
     <!-- 换实例时 instance 会被先清空（见 resetInstanceState），上面的卡片
          整块消失。没有这句占位，页面看起来像是加载失败了。 -->
-    <div v-else-if="loading" class="card muted" style="font-size: 13px">正在读取实例信息…</div>
+    <div v-else-if="loading" class="card">
+      <SkeletonBlock title :lines="3" label="正在读取实例信息…" />
+    </div>
 
     <!-- Tabs: horizontal scroll on narrow screens -->
     <div class="tab-row" role="tablist">
@@ -186,7 +188,13 @@
             <strong class="metric-live">{{ hoverText(key) }}</strong>
           </div>
           <div class="spark-wrap" :ref="(el) => setSparkEl(key, el)">
-            <svg :viewBox="`0 0 ${svgW} ${svgH}`" class="spark" preserveAspectRatio="none">
+            <!-- 第一次读取时还没有曲线：画一块和图一样大的灰条，而不是一片空白。 -->
+            <span
+              v-if="loadingMetrics && !(metricsSeries[key] || []).length"
+              class="sk sk-chart"
+              aria-hidden="true"
+            />
+            <svg v-else :viewBox="`0 0 ${svgW} ${svgH}`" class="spark" preserveAspectRatio="none">
               <defs>
                 <linearGradient :id="`g-${key}`" x1="0" y1="0" x2="0" y2="1">
                   <stop offset="0%" :stop-color="metricColor(key)" stop-opacity="0.35" />
@@ -266,6 +274,9 @@
         </button>
         <button :disabled="consoleBusy" @click="loadConsole">刷新列表</button>
       </div>
+      <div v-if="consoleBusy && !consoleList.length" class="card" style="padding: 0.75rem">
+        <SkeletonBlock :lines="4" />
+      </div>
       <div v-for="c in consoleList" :key="c.id" class="card" style="padding: 0.75rem">
         <div class="row" style="justify-content: space-between">
           <span class="badge">{{ c.lifecycle_state || '—' }}</span>
@@ -304,6 +315,7 @@
       <p v-else-if="!bootlogBusy" class="muted empty" style="margin: 0">
         点「抓取输出」拉取。和本页其他部分一样，进入页面不会自动请求 Oracle。
       </p>
+      <SkeletonBlock v-else :lines="8" label="正在抓取启动日志…" />
     </div>
 
     <div v-if="tab === 'firewall'" class="card stack">
@@ -346,8 +358,8 @@
         ✅ 下面这张表就是这台服务器实际开放的端口 —— 在这里删一条，就真的少一个端口。
       </div>
 
-      <div v-if="fwLoading" class="card muted" style="padding: 0.75rem; font-size: 13px">
-        正在读取防火墙规则…
+      <div v-if="fwLoading" class="card" style="padding: 0.75rem">
+        <SkeletonBlock title :lines="5" label="正在读取防火墙规则…" />
       </div>
       <!-- Nothing at all: say so instead of rendering a blank panel.
            但读回来之前不能说「该实例没有 NSG」：换实例会先清空这两张表，
@@ -666,9 +678,7 @@
           </thead>
           <tbody>
             <!-- 读取中不说「暂无」：换租户会先清空这张表。 -->
-            <tr v-if="ripBusy && !reservedIps.length">
-              <td :colspan="multiAllowed ? 6 : 5" class="muted empty">正在读取…</td>
-            </tr>
+            <SkeletonRows v-if="ripBusy && !reservedIps.length" :cols="multiAllowed ? 6 : 5" :rows="3" />
             <tr v-else-if="reservedIps.length === 0">
               <td :colspan="multiAllowed ? 6 : 5" class="muted empty">该区域暂无保留 IP。「新建保留 IP」后即可绑定到实例。</td>
             </tr>
@@ -740,9 +750,8 @@
           主公网 IP 不受影响，SSH 不会断。一块网卡最多 {{ multiInfo?.limit || 64 }} 个。
         </p>
       </div>
-      <div v-if="!multiInfo" class="muted" style="font-size: 13px">
-        {{ multiBusy ? '正在读取…' : '尚未读取。点上面的「刷新」。' }}
-      </div>
+      <SkeletonBlock v-if="!multiInfo && multiBusy" :lines="3" />
+      <div v-else-if="!multiInfo" class="muted" style="font-size: 13px">尚未读取。点上面的「刷新」。</div>
       <p v-else-if="!multiInfo.allowed" style="margin: 0; font-size: 13px; color: var(--warn)">
         {{ multiInfo.reason }}
       </p>
@@ -1038,9 +1047,10 @@
           {{ bootInfo.usage_note || '无法通过 API 读取系统内磁盘已用/剩余空间；请登录系统用 df 查看。' }}
         </p>
       </div>
-      <div v-else class="muted" style="font-size: 13px">
-        {{ bootBusy ? '正在读取引导卷…' : '尚未加载引导卷信息，点「刷新状态」。' }}
+      <div v-else-if="bootBusy" class="boot-status card" style="padding: 0.75rem">
+        <SkeletonBlock :lines="4" label="正在读取引导卷…" />
       </div>
+      <div v-else class="muted" style="font-size: 13px">尚未加载引导卷信息，点「刷新状态」。</div>
 
       <h4 style="margin: 0.25rem 0 0">调整引导卷</h4>
       <div class="grid-2">
@@ -1139,9 +1149,7 @@
               </tr>
             </thead>
             <tbody>
-              <tr v-if="backupBusy && !backups.length">
-                <td colspan="6" class="muted empty">正在读取…</td>
-              </tr>
+              <SkeletonRows v-if="backupBusy && !backups.length" :cols="6" :rows="3" />
               <tr v-else-if="backups.length === 0">
                 <td colspan="6" class="muted empty">暂无备份</td>
               </tr>
@@ -1178,8 +1186,11 @@
         </template>
         <!-- instance 为 null 时（换实例、清空后还没读回来）既不能显示表单，
              也不能断言「固定规格」—— 那是在替一台还没读到的机器下结论。 -->
+        <!-- 只在真的在读时画骨架：读失败（instance 仍为空、loading 已结束）时一直闪着的骨架
+             看起来像还在读，会让人一直等下去。 -->
+        <SkeletonBlock v-else-if="!instance && loading" :lines="2" label="正在读取实例规格…" />
         <p v-else-if="!instance" class="muted" style="margin: 0; font-size: 13px">
-          正在读取实例规格…
+          还没有读到实例信息，点右上角「刷新」重试。
         </p>
         <p v-else class="muted" style="margin: 0; font-size: 13px">
           当前 Shape <code>{{ instance?.shape || '—' }}</code> 为固定规格，
@@ -1223,6 +1234,8 @@ const WebSshTerminal = defineAsyncComponent(
   () => import('@/components/WebSshTerminal.vue'),
 )
 import SshCredentialFields, { type SshCredModel } from '@/components/SshCredentialFields.vue'
+import SkeletonBlock from '@/components/SkeletonBlock.vue'
+import SkeletonRows from '@/components/SkeletonRows.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -3471,6 +3484,10 @@ watch([tenantId, instanceId], async () => {
   width: 100%;
   height: 96px;
   display: block;
+}
+.sk.sk-chart {
+  height: 96px;
+  border-radius: var(--radius);
 }
 .metric-tip {
   position: absolute;

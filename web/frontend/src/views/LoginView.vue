@@ -29,7 +29,7 @@
         <!-- 锁屏状态读回来之前什么表单都不给：以前先露出账号密码框、再被锁屏换掉，
              锁屏开着的面板会先把登录框亮给访客看一眼。 -->
         <div v-if="!lockChecked" class="login-form stack" aria-busy="true">
-          <p class="muted">正在加载…</p>
+          <SkeletonBlock title :lines="4" label="正在加载…" />
         </div>
 
         <form v-else-if="locked" class="login-form stack" @submit.prevent="doUnlock">
@@ -134,6 +134,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import api from '@/api/client'
 import GlobeField from '@/components/GlobeField.vue'
+import SkeletonBlock from '@/components/SkeletonBlock.vue'
 import { useAuthStore } from '@/stores/auth'
 
 const auth = useAuthStore()

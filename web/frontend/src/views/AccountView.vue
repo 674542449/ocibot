@@ -46,8 +46,9 @@
           {{ trialBusy ? '查询中…' : '查询试用积分' }}
         </button>
       </div>
-      <p v-if="!trial && !trialError" class="muted" style="margin: 0; font-size: 13px">
-        {{ trialBusy ? '正在读取订阅记录与试用期费用…' : '点「查询试用积分」读取注册日期、积分总额、已用、剩余和到期时间。' }}
+      <SkeletonBlock v-if="!trial && !trialError && trialBusy" :lines="4" label="正在读取订阅记录与试用期费用…" />
+      <p v-else-if="!trial && !trialError" class="muted" style="margin: 0; font-size: 13px">
+        点「查询试用积分」读取注册日期、积分总额、已用、剩余和到期时间。
       </p>
       <div v-if="trialError" class="error-box">读取失败：{{ trialError }}</div>
       <template v-if="trial">
@@ -105,6 +106,10 @@
       </template>
     </div>
 
+    <!-- 第一次读取时先画出卡片的样子；已经读过再刷新，旧数据留在原处。 -->
+    <div v-if="loading && !data" class="card">
+      <SkeletonBlock title :lines="5" label="正在读取账号信息…" />
+    </div>
     <div v-if="data" class="card stack">
       <div class="grid-2">
         <div>
@@ -214,6 +219,9 @@
       </div>
     </div>
 
+    <div v-if="loading && !quota" class="card">
+      <SkeletonBlock title :lines="6" label="正在读取免费额度用量…" />
+    </div>
     <div v-if="quota" class="card stack">
       <div class="row" style="justify-content: space-between">
         <h3 style="margin: 0">免费额度用量（Always Free）</h3>
@@ -381,6 +389,7 @@
       </div>
       <div v-else-if="invoiceError" class="error-box">读取账单失败：{{ invoiceError }}</div>
       <div v-else-if="invoicesLoaded" class="empty">该账号暂无账单记录。</div>
+      <SkeletonBlock v-else-if="loading" :lines="3" label="正在读取账单…" />
       <div v-else class="muted" style="font-size: 13px">尚未读取。点右上角「刷新用量」。</div>
     </div>
 
@@ -399,7 +408,8 @@
       <!-- usage 为 null = 还没读过（换租户也会清成 null）。以前这里照样渲染，
            于是一次都没请求过就写着「合计：未能读取 / 本月费用 未能读取 /
            暂无每日费用数据」—— 把「还没问」说成了「问了，失败了」。 -->
-      <p v-if="!usage" class="muted" style="margin: 0; font-size: 13px">
+      <SkeletonBlock v-if="!usage && loading" :lines="4" label="正在读取费用…" />
+      <p v-else-if="!usage" class="muted" style="margin: 0; font-size: 13px">
         尚未读取。点右上角「刷新用量」。
       </p>
       <template v-else>
@@ -478,6 +488,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import api, { type Tenant } from '@/api/client'
+import SkeletonBlock from '@/components/SkeletonBlock.vue'
 import { pickTenantId } from '@/stores/tenantLock'
 import { tierLabel, upgradeStateLabel } from '@/utils/tier'
 

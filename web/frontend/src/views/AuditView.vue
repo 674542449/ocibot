@@ -42,6 +42,8 @@
           </tr>
         </thead>
         <tbody>
+          <!-- 第一次读取（以及换筛选条件后列表被清空时）先画出表格的样子。 -->
+          <SkeletonRows v-if="loading && rows.length === 0" :cols="6" :rows="6" />
           <tr v-if="!loading && rows.length === 0">
             <td colspan="6" class="muted empty">暂无审计记录</td>
           </tr>
@@ -85,6 +87,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import api, { type AuditItem } from '@/api/client'
+import SkeletonRows from '@/components/SkeletonRows.vue'
 import { copyText } from '@/utils/toast'
 
 type Parsed = { ip: string; reason: string; ua: string; consumed?: boolean; note?: string }

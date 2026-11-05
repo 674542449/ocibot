@@ -160,6 +160,7 @@
           </tr>
         </thead>
         <tbody>
+          <SkeletonRows v-if="!pageLoaded" :cols="7" :rows="2" />
           <tr v-for="u in users" :key="u.id">
             <td style="font-weight: 600">{{ u.username }}</td>
             <td>
@@ -293,6 +294,8 @@
           </tbody>
         </table>
       </div>
+      <!-- 读完之前不能说「没有被封禁的 IP」：那时只是还没读到。 -->
+      <SkeletonBlock v-else-if="!pageLoaded" :lines="2" label="正在读取封禁列表…" />
       <p v-else class="muted" style="margin: 0; font-size: 12px">目前没有被封禁的 IP。</p>
     </div>
   </div>
@@ -301,6 +304,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import api from '@/api/client'
+import SkeletonBlock from '@/components/SkeletonBlock.vue'
+import SkeletonRows from '@/components/SkeletonRows.vue'
 import Icon from '@/components/Icon.vue'
 import { useAuthStore } from '@/stores/auth'
 
@@ -712,11 +717,16 @@ async function resetPassword(u: AdminUser) {
   }
 }
 
+/** 用户列表和封禁列表读完过一次没有（失败也算：有报错框在说原因）。之前画骨架。 */
+const pageLoaded = ref(false)
+
 onMounted(async () => {
   try {
     await load()
   } catch (e: any) {
     error.value = e?.message || '加载失败（需要管理员权限）'
+  } finally {
+    pageLoaded.value = true
   }
 })
 
