@@ -522,7 +522,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import api, { type Tenant } from '@/api/client'
 import SkeletonBlock from '@/components/SkeletonBlock.vue'
@@ -899,6 +899,11 @@ async function loadTenants() {
 let pendingTemplate: Record<string, string> | null = null
 
 let metaSeq = 0
+// 离开本页时作废正在进行的「加载配置」：pollMeta 每 2 秒问一次进度，只在换租户 / 新请求时
+// 才停，组件卸载它不知道 —— 以前离开页面后还会在后台一直问，最长 10 分钟。
+onBeforeUnmount(() => {
+  metaSeq += 1
+})
 /** How long the poll keeps waiting before giving up, and how often it asks.
  *  Generous because a first-time tenancy really does need Oracle to create a VCN
  *  and wait for it; the point is that no SINGLE request is long, so nothing in
@@ -1512,6 +1517,8 @@ async function doLaunch() {
         return
       }
       window.setTimeout(() => {
+        // 这 0.8 秒里用户已经点去别的页面了，就别再把他拽回列表 / 任务中心。
+        if (route.name !== 'launch') return
         if (queuedRetry) {
           router.push({ path: '/jobs' }).catch(() => {})
         } else {
@@ -1522,6 +1529,7 @@ async function doLaunch() {
       msg.value = data.message || '已加入容量重试'
       error.value = ''
       window.setTimeout(() => {
+        if (route.name !== 'launch') return
         router.push({ path: '/jobs' }).catch(() => {})
       }, 800)
     } else {
