@@ -397,3 +397,110 @@ def test_an_operator_supplied_password_is_shared_by_every_instance():
     _tick(_Sessions(), job_id)
     _tick(_Sessions(), job_id, rewind=True)
     assert calls == ["First-Pass-2345", "First-Pass-2345"]
+
+
+# ---------------------------------------------------------------- 停止通知：先落库、先放锁，再推送
+
+
+def _probe_notify(monkeypatch, worker: Worker, job_id: str) -> dict:
+    """推送发生的那一刻，从**另一个会话**看任务状态是否已经提交，以及租户创建锁是否已经放掉。"""
+    import web.backend.worker as worker_mod
+
+    seen: dict = {}
+
+    def fake_notify(db, uid, ev, title, body):
+        with SessionLocal() as other:
+            row = other.get(CapacityJob, job_id)
+            seen["status_in_db"] = row.status
+            seen["enabled_in_db"] = row.enabled
+        seen["lock_held"] = worker._launch_lock is not None
+        seen["title"] = title
+        return []
+
+    monkeypatch.setattr(worker_mod, "notify_user", fake_notify)
+    return seen
+
+
+def _tick_with_probe(monkeypatch, result: _Result, **job_over) -> tuple[dict, CapacityJob]:
+    with SessionLocal() as db:
+        owner_id, tenant_id = _seed(db)
+        db.commit()
+        job_id = _make_job(db, owner_id, tenant_id, **job_over)
+    worker = Worker()
+    worker.sessions = _FakeSessions(result)
+    seen = _probe_notify(monkeypatch, worker, job_id)
+    with SessionLocal() as db:
+        worker.tick_capacity(db)
+    with SessionLocal() as db:
+        return seen, db.get(CapacityJob, job_id)
+
+
+def test_a_permanent_failure_is_committed_before_the_notification_goes_out(monkeypatch):
+    """推送是网络 I/O（SMTP 最坏几分钟）。在事务里推送，SQLite 整库写锁一直被占着，
+    面板上的登录、审计都会 database is locked。"""
+    seen, job = _tick_with_probe(monkeypatch, _Result(False, "InvalidParameter: shape not allowed"))
+    assert seen["title"].startswith("❌")
+    assert seen["status_in_db"] == "failed" and seen["enabled_in_db"] is False, seen
+    assert job.status == "failed" and job.locked_until is None
+
+
+def test_a_quota_guard_stop_releases_the_launch_lock_before_notifying(monkeypatch):
+    """额度守卫拦下时还攥着租户创建锁；推送期间页面上的「创建实例」会被告知另一个创建正在进行。"""
+    payload = {
+        "display_name": "i",
+        "shape": "VM.Standard.A1.Flex",
+        "ocpus": 8,  # 免费额度只剩 4 OCPU
+        "memory_in_gbs": 48,
+        "boot_volume_size_in_gbs": 50,
+        "nsg_ids": ["nsg1"],
+    }
+    seen, job = _tick_with_probe(monkeypatch, _Result(True, "should not launch"), launch_payload=payload)
+    assert seen["title"].startswith("⏹"), seen
+    assert seen["lock_held"] is False, "推送时不能还攥着租户创建锁"
+    assert seen["status_in_db"] == "failed", seen
+    assert job.status == "failed" and "额度守卫" in (job.last_error or "")
+
+
+def test_max_attempts_reached_on_a_capacity_miss_commits_before_notifying(monkeypatch):
+    seen, job = _tick_with_probe(
+        monkeypatch, _Result(False, "Out of host capacity."), attempts=199, max_attempts=200
+    )
+    assert seen["title"].startswith("⏹")
+    assert seen["status_in_db"] == "failed", seen
+    assert job.status == "failed"
+
+
+def test_an_open_circuit_breaker_is_retried_not_treated_as_permanent(monkeypatch):
+    """熔断器开着时请求根本没发出去；它不是 ServiceError，字符串里也不一定带着能被认出的字样。
+    以前这种情况会把整晚的抢机任务判成永久失败。"""
+    from types import SimpleNamespace
+
+    from circuitbreaker import CircuitBreakerError
+
+    import web.backend.worker as worker_mod
+
+    breaker = CircuitBreakerError(SimpleNamespace(
+        name="compute", open_until="soon", failure_count=10, open_remaining=12, last_failure=None,
+    ))
+
+    class _BreakerSession(_FakeSession):
+        def launch_from_payload(self, *a, **k):
+            raise breaker
+
+    class _Sessions:
+        def get(self, _cfg):
+            return _BreakerSession(_Result(False, ""))
+
+    monkeypatch.setattr(worker_mod, "notify_user", lambda *a, **k: [])
+    with SessionLocal() as db:
+        owner_id, tenant_id = _seed(db)
+        db.commit()
+        job_id = _make_job(db, owner_id, tenant_id)
+    worker = Worker()
+    worker.sessions = _Sessions()
+    with SessionLocal() as db:
+        worker.tick_capacity(db)
+    with SessionLocal() as db:
+        job = db.get(CapacityJob, job_id)
+    assert job.enabled is True and job.status == "idle", (job.status, job.last_error)
+    assert job.next_run_at is not None

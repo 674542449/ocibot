@@ -12128,6 +12128,13 @@ def is_transient_error(exc: Any = None, text: str = "") -> bool:
     这里只认那些**明确**属于传输层/服务端临时故障的形态；认不出来的仍然按永久
     错误处理（配置错误必须停下来，而不是拿着错参数无限重发）。
     """
+    # SDK 熔断器开着：连续失败 10 次后暂停 30 秒（cb_kwargs），请求根本没发出去 ——
+    # 等一会儿再试是唯一正确的反应。以前它能不能被重试全凭运气：CircuitBreakerError
+    # 不是 ServiceError，字符串里只有在最后那次失败的 repr 碰巧带着「capacity」
+    # 「TooManyRequests」之类的字样时才会被上面几种分类认出来，否则整晚的抢机任务
+    # 在这里被判成永久失败、直接停掉。
+    if exc is not None and _is_circuit_breaker_error(exc):
+        return True
     status = getattr(exc, "status", None) if exc is not None else None
     try:
         # 500/502/503/504：Oracle 自己的服务端故障或网关问题，重试是正确响应。

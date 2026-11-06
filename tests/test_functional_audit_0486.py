@@ -202,3 +202,14 @@ def test_serverchan_unparseable_body_keeps_the_old_benefit_of_the_doubt(monkeypa
 
     monkeypatch.setattr(notify, "_post", lambda *a, **k: (200, "<html>ok</html>"))
     assert notify._send_serverchan({"send_key": "SCTxxx"}, "t", "b") == (True, "sent")
+
+
+def test_an_open_circuit_breaker_counts_as_transient():
+    from types import SimpleNamespace
+
+    from circuitbreaker import CircuitBreakerError
+
+    err = CircuitBreakerError(SimpleNamespace(
+        name="compute", open_until="soon", failure_count=10, open_remaining=12, last_failure=None,
+    ))
+    assert is_transient_error(err, str(err))

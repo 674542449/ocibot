@@ -938,13 +938,12 @@ class Worker:
         prune_audit_log 管着它不会无限长。AuditView 的 ACTION_LABELS 里没有
         notify.* 时会原样显示 action 字符串，不会渲染不出来。
 
-        不用 audit.write_audit 是因为它自己 commit / 失败时 rollback：
-        _notify_capacity_end 是在**调用方那笔还没提交的事务**里被调用的（job.status、
-        enabled=False、attempts 都还挂着），一次 rollback 就会把它们一起撤销 ——
-        正是 _log_attempt 文档里记着的那个死循环（attempts 回滚 → 永远够不到
-        max_attempts → 租约过期后重新认领 → 再发一次 LaunchInstance）。所以这里
-        沿用 _log_attempt 的做法：先 flush 调用方的改动，再用 SAVEPOINT 把这行
-        写入隔离起来，让它最坏只回滚自己，由调用方原有的 commit 一起落库。
+        不用 audit.write_audit 是因为它自己 commit / 失败时 rollback：这一行是在
+        调用方的会话里写的，一次 rollback 会把调用方之后才改的东西一起撤销（比如
+        tick_capacity 的 finally 里要释放的租约）。任务状态本身在推送之前已经提交了
+        （见 _notify_capacity_end 开头、抢机成功那条路径的 db.commit()），但这里仍沿用
+        _log_attempt 的做法：先 flush，再用 SAVEPOINT 把这行写入隔离起来，让它最坏只
+        回滚自己，由调用方之后的 commit 一起落库。
         """
         failed = [r for r in results if not r.get("ok")]
         if not failed:
@@ -1131,6 +1130,19 @@ class Worker:
         return label
 
     def _notify_capacity_end(self, db: Session, job: CapacityJob, *, reason: str) -> None:
+        # 先放创建锁、先落库，再做推送的网络 I/O —— 和抢机成功那条路径同一个顺序。
+        #
+        # 调到这里时，调用方的改动（status / enabled / attempts，以及 _log_attempt 已经
+        # flush 进去的尝试日志）都还挂在没提交的写事务里。notify_user 最坏是几十秒到
+        # 几分钟的网络 I/O（SMTP），这段时间里：
+        #   * SQLite（默认部署）整库写锁被占住，面板上的登录、审计、编辑租户全部
+        #     `database is locked`；
+        #   * 额度守卫那两条停止路径还攥着租户级创建锁（_acquire_launch_lock 拿的，要到
+        #     tick_capacity 的 finally 才放），页面上点「创建实例」会被告知另一个创建正在进行。
+        # 以前只有抢机成功、root 密码解不开这两处是先提交再推送，额度守卫、达到最大次数、
+        # 永久失败这几条停止路径都是在事务里推送的。
+        self._release_launch_lock()
+        db.commit()
         title = "⏹ OCIBot 容量重试已停止"
         if reason == "max_attempts":
             body = (
